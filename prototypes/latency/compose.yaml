@@ -33,11 +33,13 @@ services:
     ports: ["${DDB_HOST_PORT:-18000}:8000"]
 
   # The host binary directly, on the real Lambda base image (same glibc), CPU-limited to approximate a Lambda memory size:
-  # HOST_CPUS=1.0 ~ 1769 MB, 0.29 ~ 512 MB, 0.07 ~ 128 MB.
+  # HOST_CPUS=1.0 HOST_MEM=1769m ~ 1769 MB, 0.29/512m ~ 512 MB, 0.07/128m ~ 128 MB.
   host:
     image: public.ecr.aws/lambda/provided:al2023
     entrypoint: ["/out/spinit-host"]
     cpus: ${HOST_CPUS:-1.0}
+    mem_limit: ${HOST_MEM:-1769m}
+    memswap_limit: ${HOST_MEM:-1769m}
     environment: { <<: *local-env, SPINIT_ADDR: "0.0.0.0:8080", SPINIT_CACHE_DIR: /cache }
     volumes: ["./out:/out:ro", "cache:/cache"]
     ports: ["${SPINIT_HOST_PORT:-18080}:8080"]
@@ -48,6 +50,8 @@ services:
     build: { context: ., dockerfile: docker/lwa.Dockerfile }
     image: spinit-spike-latency-lwa:1
     cpus: ${HOST_CPUS:-1.0}
+    mem_limit: ${HOST_MEM:-1769m}
+    memswap_limit: ${HOST_MEM:-1769m}
     environment: { <<: *local-env, SPINIT_CACHE_DIR: /tmp/cache }
     volumes: ["./out:/out:ro"]
     ports: ["${LWA_HOST_PORT:-19001}:8080"]

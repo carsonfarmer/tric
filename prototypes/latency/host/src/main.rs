@@ -11,7 +11,7 @@
 //!   SPINIT_BUCKET       bucket for blobs and the S3 bench routes; endpoint and credentials come from AWS_* variables
 //!   SPINIT_TABLE        DynamoDB table for the DynamoDB bench routes
 //! Every request, and every cold-path phase, is one JSON line on stdout.
-//! Subcommand: `spinit-host precompile <in.wasm> <out.cwasm>`.
+//! Subcommands: `spinit-host precompile <in.wasm> <out.cwasm>`, `spinit-host publish <in.wasm>` (blob + precompiled artifact to the bucket).
 mod bench;
 mod component;
 mod guest;
@@ -170,10 +170,19 @@ async fn main() -> Result<()> {
     let pooling = env("SPINIT_ALLOCATOR").as_deref() == Some("pooling");
     let target = env("SPINIT_TARGET");
 
-    if std::env::args().nth(1).as_deref() == Some("precompile") {
-        let (input, output) = (std::env::args().nth(2).context("usage: precompile <in.wasm> <out.cwasm>")?, std::env::args().nth(3).context("missing <out.cwasm>")?);
-        emit(component::precompile(&engine(pooling, target.as_deref())?, &input, &output)?);
-        return Ok(());
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("precompile") => {
+            let (input, output) = (args.get(2).context("usage: precompile <in.wasm> <out.cwasm>")?, args.get(3).context("missing <out.cwasm>")?);
+            emit(component::precompile(&engine(pooling, target.as_deref())?, input, output)?);
+            return Ok(());
+        }
+        Some("publish") => {
+            let bucket = bucket()?.context("SPINIT_BUCKET is not set")?;
+            emit(component::publish(&engine(pooling, target.as_deref())?, &*bucket, args.get(2).context("usage: publish <in.wasm>")?).await?);
+            return Ok(());
+        }
+        _ => {}
     }
 
     let engine = engine(pooling, target.as_deref())?;

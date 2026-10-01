@@ -3,7 +3,7 @@
 //! 2. a precompiled artifact in the bucket, copied to the cache and deserialized;
 //! 3. the wasm blob (`blobs/sha256/<hex>`), compiled with Cranelift and written to the cache.
 use anyhow::{Context, Result, ensure};
-use object_store::{Error as StoreError, ObjectStore, ObjectStoreExt, path::Path as Key};
+use object_store::{Error as StoreError, ObjectStore, ObjectStoreExt, PutPayload, path::Path as Key};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, sync::Arc, time::Instant};
@@ -119,4 +119,18 @@ pub fn precompile(engine: &Engine, input: &str, output: &str) -> Result<Value> {
     let compile_us = us(t);
     std::fs::write(output, &cwasm)?;
     Ok(json!({ "event": "precompile", "digest": hex(&bytes), "compile_us": compile_us, "wasm_bytes": bytes.len(), "cwasm_bytes": cwasm.len() }))
+}
+
+/// `spinit-host publish <in.wasm>`: uploads the blob and its precompiled artifact to the bucket (a deploy step, run on the build machine).
+pub async fn publish(engine: &Engine, bucket: &dyn ObjectStore, input: &str) -> Result<Value> {
+    let bytes = std::fs::read(input)?;
+    let digest = hex(&bytes);
+    let t = Instant::now();
+    let cwasm = engine.precompile_component(&bytes)?;
+    let compile_us = us(t);
+    let (wasm_bytes, cwasm_bytes) = (bytes.len(), cwasm.len());
+    bucket.put(&blob_key(&digest), PutPayload::from(bytes)).await?;
+    bucket.put(&cwasm_key(&digest), PutPayload::from(cwasm)).await?;
+    Ok(json!({ "event": "publish", "digest": digest, "blob": blob_key(&digest).to_string(), "cwasm": cwasm_key(&digest).to_string(),
+        "compile_us": compile_us, "wasm_bytes": wasm_bytes, "cwasm_bytes": cwasm_bytes }))
 }
