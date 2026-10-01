@@ -1,0 +1,9 @@
+[package]
+name = "p2-kv-draft2"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wstd = "0.6.8"
+wit-bindgen = "0.62"
+anyhow = "1"

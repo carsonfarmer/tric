@@ -1,0 +1,2 @@
+package spinit:app;
+world app { include wasi:http/service@0.3.0; }

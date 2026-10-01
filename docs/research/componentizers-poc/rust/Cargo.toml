@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["p2-hello", "p3-hello", "p2-kv", "p3-kv", "p2-kv-draft2", "p2-config-draft"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1

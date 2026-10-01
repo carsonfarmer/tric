@@ -1,0 +1,7 @@
+package spinit:app;
+
+world app {
+  include wasi:http/proxy@0.2.10;
+  import wasi:keyvalue/store@0.2.0-draft;
+  import wasi:config/store@0.2.0-rc.1;
+}
