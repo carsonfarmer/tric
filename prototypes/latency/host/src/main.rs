@@ -201,8 +201,9 @@ async fn main() -> Result<()> {
     let linker = linker(&engine)?;
     let linker_us = us(t);
     // The epoch ticker. One sleep per tick (not an interval), so a frozen Lambda environment waking up never replays missed ticks.
+    // An OS thread, not a tokio task: a guest that never yields keeps its worker thread busy, and with every worker busy a task would never run.
     let ticker = engine.clone();
-    tokio::spawn(async move { loop { tokio::time::sleep(guest::EPOCH_TICK).await; ticker.increment_epoch(); } });
+    std::thread::spawn(move || loop { std::thread::sleep(guest::EPOCH_TICK); ticker.increment_epoch(); });
 
     let bucket = bucket()?;
     let table = env("SPINIT_TABLE");
