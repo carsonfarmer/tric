@@ -111,7 +111,7 @@ impl Server {
                 let op = p.trim_start_matches("/__bench/").to_string();
                 log.insert("kind".into(), "bench".into());
                 match self.bench.run(&op, n).await {
-                    Ok(v) => { emit(json!({ "event": "bench", "op": op, "n": n, "setup_us": v["setup_us"], "samples_us": v["samples_us"] })); Ok(reply(200, &v.to_string())) }
+                    Ok(mut v) => { v["event"] = "bench".into(); emit(v.clone()); Ok(reply(200, &v.to_string())) }
                     Err(e) => Err(e),
                 }
             }

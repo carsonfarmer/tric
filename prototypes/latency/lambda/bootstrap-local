@@ -1,0 +1,3 @@
+#!/bin/sh
+# Local stand-in for the LWA layer's /opt/bootstrap, used only in the RIE image (docker/lwa.Dockerfile).
+exec /var/task/run.sh
