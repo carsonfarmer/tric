@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Local (Docker) measurements for the latency spike. Indicative only: Docker on an M-series Mac is not Lambda.
-# Usage: bench/local.sh [functional|cold|bucket|portable|warm|lwa|all]     (default: all)
+# Usage: bench/local.sh [functional|cold|bucket|zstd|portable|warm|lwa|all]     (default: all)
 # Raw logs go to out/local/; `python3 bench/stats.py` turns them into the tables in RESULTS.md.
 # Needs: docker compose, curl, shasum, out/spinit-host and out/hello_*.wasm (docker/build-host.sh, components/build.sh).
 set -euo pipefail
@@ -13,9 +13,9 @@ COMPONENTS="hello_p3 hello_p2 hello_js"
 PROFILES="1.0:1769m 0.29:512m 0.07:128m"
 WARM_N=${WARM_N:-3000}
 
-start() { # start <component | sha256:hex> <cpus> <mem> <allocator> [precompiled]
+start() { # start <component | sha256:hex> <cpus> <mem> <allocator> [precompiled [zstd]]
   local spec=$1; case $1 in sha256:*) ;; *) spec=/out/$1.wasm;; esac
-  HOST_CPUS=$2 HOST_MEM=$3 SPINIT_COMPONENT=$spec SPINIT_ALLOCATOR=${4:-default} SPINIT_PRECOMPILED=${5:-0} \
+  HOST_CPUS=$2 HOST_MEM=$3 SPINIT_COMPONENT=$spec SPINIT_ALLOCATOR=${4:-default} SPINIT_PRECOMPILED=${5:-0} SPINIT_ZSTD=${6:-0} \
     docker compose up -d --force-recreate --no-deps host >/dev/null 2>&1
   for _ in $(seq 150); do curl -sf -m 1 "localhost:$PORT/__ready" >/dev/null 2>&1 && return 0; sleep 0.2; done
   echo "host did not become ready" >&2; return 1
@@ -59,12 +59,16 @@ cold() { # compile vs deserialize per component and CPU share, plus allocator co
   done
 }
 
-bucket() { # the cold path from the bucket: blob + compile (full CPU only) vs precompiled artifact, at each CPU share
-  echo "== bucket (MinIO) fetch routes"
-  docker compose up -d minio >/dev/null 2>&1
+publish_all() { # blobs, precompiled artifacts and their zstd copies into MinIO
   for c in $COMPONENTS; do
     docker compose run --rm --no-deps -T --entrypoint /out/spinit-host host publish "/out/$c.wasm" 2>/dev/null | tee -a "$OUT/publish.log"
   done
+}
+
+bucket() { # the cold path from the bucket: blob + compile (full CPU only) vs precompiled artifact, at each CPU share
+  echo "== bucket (MinIO) fetch routes"
+  docker compose up -d minio >/dev/null 2>&1
+  publish_all
   for p in $PROFILES; do
     local cpus=${p%%:*} mem=${p##*:}
     for c in $COMPONENTS; do
@@ -74,6 +78,19 @@ bucket() { # the cold path from the bucket: blob + compile (full CPU only) vs pr
       clear_cache; start "$d" "$cpus" "$mem" default 1; first_request "$OUT/bucket-$c-$cpus-cwasm.log"
     done
   done
+}
+
+zstd_route() { # the zstd copy of the artifact from MinIO (SPINIT_ZSTD=1): hello_js at 1.0 and 0.29 CPU, hello_p3 at 1.0; then zstd level 3 against 19
+  echo "== zstd route (MinIO)"
+  docker compose up -d minio >/dev/null 2>&1
+  publish_all
+  for p in "hello_js 1.0 1769m" "hello_js 0.29 512m" "hello_p3 1.0 1769m"; do
+    set -- $p; echo "-- $1 cpus=$2 mem=$3"
+    clear_cache; start "sha256:$(digest "$1")" "$2" "$3" default 1 1; first_request "$OUT/bucket-$1-$2-zstd.log"
+  done
+  docker run --rm -v "$PWD/out":/out:ro spinit-spike-latency-build:1 sh -c 'command -v zstd >/dev/null || dnf install -y -q zstd >/dev/null 2>&1
+    for c in hello_p3 hello_p2 hello_js; do /out/spinit-host precompile /out/$c.wasm /tmp/$c.cwasm >/dev/null
+      echo "$c raw=$(stat -c%s /tmp/$c.cwasm) zst3=$(zstd -3 -c /tmp/$c.cwasm | wc -c) zst19=$(zstd -19 -c /tmp/$c.cwasm | wc -c)"; done' | tee "$OUT/zstd-levels.log"
 }
 
 portable() { # is a cwasm built with a baseline target (no host-specific ISA flags) accepted by a normal engine?
@@ -130,8 +147,8 @@ lwa() { # the host as a Lambda function (Web Adapter extension, Runtime Interfac
 
 what=${1:-all}
 case $what in
-  functional) functional;; cold) cold;; cold-one) shift; cold_one "$@";; bucket) bucket;; portable) portable;; warm) warm;; lwa) lwa;;
-  all) functional; cold; bucket; portable; warm; lwa;;
-  *) echo "usage: $0 [functional|cold|bucket|portable|warm|lwa|all]" >&2; exit 2;;
+  functional) functional;; cold) cold;; cold-one) shift; cold_one "$@";; bucket) bucket;; zstd) zstd_route;; portable) portable;; warm) warm;; lwa) lwa;;
+  all) functional; cold; bucket; zstd_route; portable; warm; lwa;;
+  *) echo "usage: $0 [functional|cold|bucket|zstd|portable|warm|lwa|all]" >&2; exit 2;;
 esac
 docker compose stop host lwa >/dev/null 2>&1 || true

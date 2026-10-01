@@ -90,17 +90,18 @@ def bucket():
     rows = []
     for c in COMP:
         for cpus in CPUS:
-            for kind, label in [("blob", "blob + compile"), ("cwasm", "precompiled artifact")]:
+            for kind, label in [("blob", "blob + compile"), ("cwasm", "precompiled artifact"), ("zstd", "precompiled artifact, zstd copy")]:
                 p = f"{D}/bucket-{c}-{cpus}-{kind}.log"
                 if not os.path.exists(p):
                     continue
                 ld, st, rq = ev(p, "load"), ev(p, "status"), next((e for e in lines(p) if e.get("kind") == "guest"), None)
                 if not ld:
-                    rows.append([c, f"{cpus} (~{LAMBDA_MB[cpus]} MB)", label, "-", "-", "-", "-", "-", f"FAILED http {st and st['http']}, oom-killed {st and st['oom']}"]); continue
-                fetch = ld.get("fetch_cwasm_us", 0) + ld.get("fetch_us", 0) if kind == "cwasm" else ld.get("fetch_us", 0)
-                rows.append([c, f"{cpus} (~{LAMBDA_MB[cpus]} MB)", label, ms(fetch), ms(ld.get("compile_us", ld.get("deserialize_us"))), ms(ld.get("write_cache_us")),
+                    rows.append([c, f"{cpus} (~{LAMBDA_MB[cpus]} MB)", label, "-", "-", "-", "-", "-", "-", "-", f"FAILED http {st and st['http']}, oom-killed {st and st['oom']}"]); continue
+                fetch = ld.get("fetch_cwasm_us", 0) + ld.get("fetch_zst_us", 0) if kind != "blob" else ld.get("fetch_us", 0)
+                rows.append([c, f"{cpus} (~{LAMBDA_MB[cpus]} MB)", label, ms(fetch), (ld["zst_bytes"] if kind == "zstd" else ld["wasm_bytes"] if kind == "blob" else ld.get("cwasm_bytes", 0)) // 1000,
+                             ms(ld.get("decompress_us")), ms(ld.get("compile_us", ld.get("deserialize_us"))), ms(ld.get("write_cache_us")),
                              ms(ld["load_total_us"]), ms(rq["total_us"]) if rq else "-", ld["route"]])
-    table(["component", "Docker --cpus", "route", "fetch ms", "compile or deserialize ms", "write /cache ms", "load total ms",
+    table(["component", "Docker --cpus", "route", "fetch ms", "fetched KB", "zstd decompress ms", "compile or deserialize ms", "write /cache ms", "load total ms",
            "whole first request ms", "route taken"], rows)
 
 

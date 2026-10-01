@@ -75,15 +75,16 @@ def cold():
         bad = sum(1 for c, _ in http if c != "200")
         rows.append([comp, mode, mem, len(colds), stat([r["init"] for r in colds]), stat([r["duration"] for r in colds]), stat(total),
                      f"{max(total):.1f}", stat(ms(ev("load", "load_total_us"))), stat(ms(ev("load", "deserialize_us") or ev("load", "compile_us")), 1),
-                     stat(ms(ev("load", "fetch_cwasm_us") or ev("load", "fetch_us")), 1), stat(ms(ev("init", "init_total_us")), 1),
+                     stat(ms(ev("load", "fetch_cwasm_us") or ev("load", "fetch_zst_us") or ev("load", "fetch_us")), 1),
+                     stat(ms(ev("load", "decompress_us")), 1), stat(ms(ev("init", "init_total_us")), 1),
                      stat([r["max_mem"] for r in colds], 0), stat([t for _, t in http]), bad or ""])
-        if mode == "precompiled" and comp == "hello_p3":
-            verdict.append((mem, pct(total, 99)))
+        if mode in ("precompiled", "precompiled-zstd") and comp in ("hello_p3", "hello_js"):
+            verdict.append((comp, mode, mem, pct(total, 99)))
     print("#### Cold starts (REPORT: Init Duration and Duration of the first request, ms; p50 / p99)\n")
     table(["component", "mode", "MB", "n", "Init", "Duration (1st request)", "Init + Duration", "max", "host load total", "deserialize or compile",
-           "fetch from bucket", "host init", "max memory MB", "client curl (reference)", "non-200"], rows)
-    for mem, p99 in verdict:
-        print(f"- hello_p3 precompiled, {mem} MB: p99 of Init + Duration {p99:.0f} ms, "
+           "fetch from bucket", "zstd decompress", "host init", "max memory MB", "client curl (reference)", "non-200"], rows)
+    for comp, mode, mem, p99 in verdict:
+        print(f"- {comp} {mode}, {mem} MB: p99 of Init + Duration {p99:.0f} ms, "
               f"{'meets' if p99 <= TARGETS['cold p99 (init + first request)'] else 'misses'} the 500 ms target (indicative when n < 100).")
     print()
 
@@ -121,7 +122,7 @@ def bench():
         per[(int(mem), op)] = s
         rows.append([op, mem, len(s), f"{s[0]:.1f}", f"{pct(s, 50):.1f}", f"{pct(s, 99):.1f}", f"{max(s):.1f}"])
     rows.sort(key=lambda r: (r[0], int(r[1])))
-    print("#### Storage operations from inside the function (ms; 1 KB object; sequential; the function was warmed with 5 calls first)\n")
+    print("#### Storage operations from inside the function (ms; 1 KB object unless the name says 80kb or 800kb; sequential; the function was warmed with 5 calls first)\n")
     table(["operation", "MB", "n", "first", "p50", "p99", "max"], rows)
     for mem in sorted({m for m, _ in per}):
         g = lambda op, q: pct(per[(mem, op)], q) if (mem, op) in per else None
@@ -131,6 +132,8 @@ def bench():
                  ("bucket KV write, If-Match update", g("s3-put-update", 99), TARGETS["acknowledged write p99"], "p99"),
                  ("DynamoDB read, strongly consistent", g("ddb-get-strong", 50), TARGETS["warm read p50"], "p50"),
                  ("DynamoDB write, conditional", g("ddb-put-cond", 99), TARGETS["acknowledged write p99"], "p99")]
+        lines += [(f"bucket state object, {kb} KB, {what}", g(f"{op}-{kb}kb", 50), TARGETS["warm read p50"], "p50")
+                  for kb in (80, 800) for op, what in (("s3-get", "plain GET"), ("s3-get-304", "revalidation (304)"))]
         print(f"At {mem} MB:")
         for name, v, target, q in lines:
             if v is not None:

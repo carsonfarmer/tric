@@ -19,6 +19,7 @@ x-local-env: &local-env
   SPINIT_ALLOCATOR: ${SPINIT_ALLOCATOR:-default}
   SPINIT_EAGER: ${SPINIT_EAGER:-0}
   SPINIT_PRECOMPILED: ${SPINIT_PRECOMPILED:-0}
+  SPINIT_ZSTD: ${SPINIT_ZSTD:-0}
 
 services:
   minio:

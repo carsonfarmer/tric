@@ -1,6 +1,6 @@
 //! Getting a `Component` by local path or by digest from the bucket, via the cheapest route available:
 //! 1. the `.cwasm` cache on local disk (`/tmp` on Lambda), deserialized;
-//! 2. a precompiled artifact in the bucket, copied to the cache and deserialized;
+//! 2. a precompiled artifact in the bucket (optionally its zstd copy), copied to the cache and deserialized;
 //! 3. the wasm blob (`blobs/sha256/<hex>`), compiled with Cranelift and written to the cache.
 use anyhow::{Context, Result, ensure};
 use object_store::{Error as StoreError, ObjectStore, ObjectStoreExt, PutPayload, path::Path as Key};
@@ -19,12 +19,17 @@ pub struct Source {
     pub cache: PathBuf,
     /// Look for a precompiled artifact in the bucket before compiling.
     pub precompiled: bool,
+    /// With `precompiled`: fetch the zstd copy of the artifact and decompress it in memory.
+    pub zstd: bool,
 }
 
 /// Bucket key of a component blob (OCI image-layout naming).
 pub fn blob_key(hex: &str) -> Key { Key::from(format!("blobs/sha256/{hex}")) }
 /// Bucket key of the precompiled artifact for a blob.
 pub fn cwasm_key(hex: &str) -> Key { Key::from(format!("cwasm/{}/{WASMTIME}/{hex}", std::env::consts::ARCH)) }
+
+/// Bucket key of the zstd-compressed copy of the precompiled artifact.
+pub fn zst_key(hex: &str) -> Key { Key::from(format!("{}.zst", cwasm_key(hex))) }
 
 fn us(t: Instant) -> u64 { t.elapsed().as_micros() as u64 }
 
@@ -51,10 +56,18 @@ impl Source {
         // 2. precompiled artifact from the bucket
         if !cached.exists() && self.precompiled && self.bucket.is_some() {
             let t = Instant::now();
-            match self.bucket()?.get(&cwasm_key(&digest)).await {
+            match self.bucket()?.get(&if self.zstd { zst_key(&digest) } else { cwasm_key(&digest) }).await {
                 Ok(res) => {
-                    let bytes = res.bytes().await?;
-                    m.insert("fetch_cwasm_us".into(), us(t).into());
+                    let mut bytes = res.bytes().await?;
+                    if self.zstd {
+                        m.insert("fetch_zst_us".into(), us(t).into());
+                        m.insert("zst_bytes".into(), bytes.len().into());
+                        let t = Instant::now();
+                        bytes = zstd::decode_all(&bytes[..])?.into();
+                        m.insert("decompress_us".into(), us(t).into());
+                    } else {
+                        m.insert("fetch_cwasm_us".into(), us(t).into());
+                    }
                     self.write_cache(&cached, &bytes, &mut m)?;
                 }
                 Err(StoreError::NotFound { .. }) => { m.insert("fetch_cwasm_miss_us".into(), us(t).into()); }
@@ -129,8 +142,11 @@ pub async fn publish(engine: &Engine, bucket: &dyn ObjectStore, input: &str) -> 
     let cwasm = engine.precompile_component(&bytes)?;
     let compile_us = us(t);
     let (wasm_bytes, cwasm_bytes) = (bytes.len(), cwasm.len());
+    let zst = zstd::encode_all(&cwasm[..], 0)?; // level 0 is zstd's default (3)
+    let zst_bytes = zst.len();
     bucket.put(&blob_key(&digest), PutPayload::from(bytes)).await?;
     bucket.put(&cwasm_key(&digest), PutPayload::from(cwasm)).await?;
+    bucket.put(&zst_key(&digest), PutPayload::from(zst)).await?;
     Ok(json!({ "event": "publish", "digest": digest, "blob": blob_key(&digest).to_string(), "cwasm": cwasm_key(&digest).to_string(),
-        "compile_us": compile_us, "wasm_bytes": wasm_bytes, "cwasm_bytes": cwasm_bytes }))
+        "compile_us": compile_us, "wasm_bytes": wasm_bytes, "cwasm_bytes": cwasm_bytes, "zst_bytes": zst_bytes }))
 }

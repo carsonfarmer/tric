@@ -17,7 +17,7 @@ All paths are relative to `prototypes/latency/`.
 
 | Path | What |
 |---|---|
-| `host/` | The host: Wasmtime 49.0.1, plain hyper, `object_store` 0.14, `aws-sdk-dynamodb`. Config by environment variables (documented at the top of `host/src/main.rs`). One JSON log line per request (microseconds), no response headers. `precompile` and `publish` subcommands. `/__bench/<op>` routes (spike only) and `/__ready` |
+| `host/` | The host: Wasmtime 49.0.1, plain hyper, `object_store` 0.14, `aws-sdk-dynamodb`. Config by environment variables (documented at the top of `host/src/main.rs`). One JSON log line per request (microseconds), no response headers. `precompile` and `publish` subcommands (`publish` also uploads a zstd copy of the artifact, `<cwasm key>.zst`; `SPINIT_ZSTD=1` makes the host fetch and decompress it). `/__bench/<op>` routes (spike only, `kb=` sets the object size for the S3 reads) and `/__ready` |
 | `components/` | Three test components: Rust p3 (`hello_p3`), Rust p2 (`hello_p2`), JavaScript through jco (`hello_js`). All imports are `wasi:*`, checked by `build.sh` with wasm-tools. Sources are copies of the host-research apps with the Spin-specific parts removed |
 | `docker/`, `lambda/` | Build image (Amazon Linux 2023, glibc 2.34, the `provided.al2023` runtime's glibc), host build, Lambda zip, LWA + RIE image |
 | `compose.yaml` | Project `spinit-spike-latency`: MinIO, DynamoDB Local, host (CPU and memory limited), host behind LWA via the Lambda RIE, oha. Host ports are env-configurable (`SPINIT_HOST_PORT` 18080, `MINIO_HOST_PORT` 19000, `DDB_HOST_PORT` 18000, `LWA_HOST_PORT` 19001) |
@@ -30,7 +30,7 @@ Reproduce the local phase (everything runs in Docker; nothing is installed on th
 ```sh
 cd prototypes/latency
 docker/build-host.sh && components/build.sh && lambda/package.sh   # out/spinit-host, out/hello_*.wasm, out/spinit-host.zip
-bench/local.sh all                                                  # or: functional cold bucket portable warm lwa
+bench/local.sh all                                                  # or: functional cold bucket zstd portable warm lwa
 python3 bench/stats.py                                              # the tables in this file
 docker compose -p spinit-spike-latency down -v                      # teardown (named build-cache volumes spinit-spike-latency-* stay)
 ```
@@ -39,8 +39,8 @@ docker compose -p spinit-spike-latency down -v                      # teardown (
 
 | Artifact | Size |
 |---|---|
-| `out/spinit-host` (aarch64, glibc 2.34 at most, stripped, fat LTO, codegen-units 1) | 25,501,160 bytes (24.3 MiB) |
-| `out/spinit-host.zip` (one file, `bootstrap`) | 10,738,148 bytes (10.2 MiB) |
+| `out/spinit-host` (aarch64, glibc 2.34 at most, stripped, fat LTO, codegen-units 1) | 25,763,304 bytes (24.6 MiB) |
+| `out/spinit-host.zip` (one file, `bootstrap`) | 10,844,886 bytes (10.3 MiB) |
 
 The Lambda limits are 50 MB zipped (direct upload) and 250 MB unzipped including layers, so there is room. The binary runs in `public.ecr.aws/lambda/provided:al2023`, which is where every local measurement ran.
 
@@ -72,13 +72,14 @@ What the approximation gets wrong:
 
 - **Compile in the request path does not fit.** Cranelift for the 304 KB Rust component takes 137 ms at 1.0 CPU, 536 ms at 0.29 and 5.9 s at 0.07. The 12.8 MB JavaScript component takes 5.6 s at 1.0 CPU, 28.7 s at 0.29, and is OOM-killed at 128 MB (RSS about 292 MB while compiling). At 512 MB even the small components miss the 500 ms target on the compile alone. So the artifact has to be precompiled at publish time and fetched, and the compile fallback must be limited to the large-memory case or fail clearly.
 - **Deserialize is cheap.** From a cached `.cwasm`, the Rust components load in about 7 to 13 ms (deserialize 5 to 11 ms) at every CPU profile. From the bucket (MinIO) the whole first request is 10 to 19 ms for the Rust components, with the 98 ms p2 first request at 0.07 a one-off to re-check in the cloud run. The JS component, with a 33.5 MB artifact, takes 27 ms at 1.0 and 0.29 CPU and 419 ms at 0.07 CPU (116 ms to fetch from MinIO, 199 ms to deserialize). The real S3 fetch of those 33 MB is the unknown that decides the JS cold start.
+- **zstd copy of the artifact (`SPINIT_ZSTD=1`).** The `hello_js` `.cwasm` is 33,459,536 bytes raw and 10,115,750 bytes at zstd's default level 3 (30%). Level 19 gives 8,012,683 bytes (24%, 21% smaller than level 3) but takes 5.4 s to compress at 1.0 CPU against 69 ms, and decompresses a little slower (33 ms against 29 ms with the CLI at 1.0 CPU). Default level 3 is kept; trying 19 is a one-number change in `publish` (`encode_all(&cwasm[..], 0)`). The Rust artifacts shrink from 985,264 and 900,336 bytes to 270,500 and 244,582. In the host, `hello_js` decompresses in 22 to 24 ms at 1.0 CPU (five runs, in memory, `decompress_us`). At 0.29 CPU it was 23 ms in three of five runs and 62 and 87 ms in the other two, which is CFS throttling: the load costs about 45 ms of CPU against a quota of 29 ms per 100 ms period, and the stall lands on a different step each run (decompress, cache write or deserialize). From MinIO the first request takes 44.5 ms at 1.0 CPU and 123 ms at 0.29 CPU, against 27.5 and 27.1 ms for the raw artifact. Locally zstd costs more than it saves because a localhost transfer is almost free. It pays only if moving the 23 MB it saves takes longer than the roughly 23 ms of decompression, that is, if a single S3 GET moves less than about 1 GB/s. That is the expectation, not a measurement: the cloud run (`precompiled-zstd` against `precompiled`) decides it.
 - **Process init is small.** 12 to 18 ms from process start to listening at 1.0 and 0.29 CPU, 108 to 183 ms at 0.07 CPU (probably less in a Lambda init phase).
 - **Warm requests are dominated by nothing in the host.** Host overhead (host total minus guest handle) is about 2 µs unpaced and about 20 µs paced. Host total p50 at 1.0 CPU: `hello_p3` 31 µs, `hello_p2` 85 µs, `hello_js` 365 µs. Paced at 50 requests per second, client p50 is 0.9, 1.3 and 2.6 ms and p99 is 3.7, 4.7 and 7.1 ms, so guest work fits in a couple of milliseconds and leaves more than 25 ms of the 30 ms read budget to storage. At 0.07 CPU (128 MB) `hello_js` saturates (p99 about 103 ms even paced), so JS apps want 512 MB or more, and the Rust ones are fine at 128 MB.
 - **p3 against p2.** p3 reuses a worker and shows 0 µs per-request instantiate, p2 instantiates every request (22 µs p50 unpaced, about 240 µs paced with cold caches). Both are negligible next to a storage call.
 - **Allocator.** Pooling against the default allocator made no meaningful difference to deserialize, first request or warm latency at 1.0 CPU, so the default (less code) is the provisional choice.
 - **Web Adapter.** Adapter plus RIE overhead is 453 µs p50 (744 µs p99) for `hello_p3` and 525 µs p50 (952 µs p99) for `hello_p2`. The INIT REPORT is 26 to 29 ms against about 12 ms for the host alone, so roughly 14 to 17 ms more at init. Both are far below the switch thresholds (5 ms warm, 50 ms cold). Real Lambda decides.
 - **One bug found.** With 16 concurrent connections the p3 p99 was about 41 ms, which was Nagle plus delayed ACK (headers and body leave in separate writes). The host now sets `TCP_NODELAY` on accepted sockets: p99 2.5 ms. The earlier JSON is in `out/local-pre-nodelay/`. The adapter-to-host loopback hop is the same shape, so keep an eye on it in the cloud numbers.
-- **Functional checks pass.** MinIO (a stand-in for S3): create-if-absent succeeds, then reports AlreadyExists for an existing key; update with the current ETag succeeds; update with a stale ETag fails the precondition; GET with `If-None-Match` of the current ETag returns NotModified. DynamoDB Local: conditional put on the current version succeeds, on a stale version fails with ConditionalCheckFailedException. (S3's ETag is the MD5 of the body, so If-Match tests use distinct payloads.) These behaviours must still be confirmed on real S3.
+- **Functional checks pass.** MinIO (a stand-in for S3): create-if-absent succeeds, then reports AlreadyExists for an existing key; update with the current ETag succeeds; update with a stale ETag fails the precondition; GET with `If-None-Match` of the current ETag returns NotModified. DynamoDB Local: conditional put on the current version succeeds, on a stale version fails with ConditionalCheckFailedException. (S3's ETag is the MD5 of the body, so If-Match tests use distinct payloads.) These behaviours must still be confirmed on real S3. The S3 read bench ops also take an object size (`?kb=80`, `?kb=800`, seeded with `/__bench/seed?kb=...`) to model a state object of that size; locally they run (MinIO p50 0.2 ms at 1 and 80 KB, 0.5 ms at 800 KB, 0.2 ms for every 304), which says nothing about S3.
 
 ### Tables (generated by `python3 bench/stats.py`)
 
@@ -123,20 +124,23 @@ What the approximation gets wrong:
 
 #### Cold path from the bucket (MinIO on localhost: fetch times are optimistic, not S3 times)
 
-| component | Docker --cpus | route | fetch ms | compile or deserialize ms | write /cache ms | load total ms | whole first request ms | route taken |
-|---|---|---|---|---|---|---|---|---|
-| hello_p3 | 1.0 (~1769 MB) | blob + compile | 2.7 | 136.1 | 0.2 | 140.2 | 141.9 | compile |
-| hello_p3 | 1.0 (~1769 MB) | precompiled artifact | 3.0 | 5.8 | 0.2 | 9.2 | 10.8 | cwasm |
-| hello_p3 | 0.29 (~512 MB) | precompiled artifact | 2.8 | 9.4 | 0.1 | 12.5 | 14.2 | cwasm |
-| hello_p3 | 0.07 (~128 MB) | precompiled artifact | 3.9 | 12.5 | 0.2 | 16.9 | 19.1 | cwasm |
-| hello_p2 | 1.0 (~1769 MB) | blob + compile | 2.3 | 109.6 | 0.2 | 113.4 | 114.9 | compile |
-| hello_p2 | 1.0 (~1769 MB) | precompiled artifact | 2.8 | 7.0 | 0.1 | 10.3 | 11.8 | cwasm |
-| hello_p2 | 0.29 (~512 MB) | precompiled artifact | 2.7 | 5.0 | 0.1 | 8.2 | 9.9 | cwasm |
-| hello_p2 | 0.07 (~128 MB) | precompiled artifact | 6.5 | 6.1 | 0.4 | 13.6 | 98.1 | cwasm |
-| hello_js | 1.0 (~1769 MB) | blob + compile | 6.3 | 5053.5 | 6.2 | 5097.9 | 5102.1 | compile |
-| hello_js | 1.0 (~1769 MB) | precompiled artifact | 12.1 | 8.8 | 4.1 | 25.4 | 27.5 | cwasm |
-| hello_js | 0.29 (~512 MB) | precompiled artifact | 11.8 | 8.6 | 3.8 | 24.9 | 27.1 | cwasm |
-| hello_js | 0.07 (~128 MB) | precompiled artifact | 115.6 | 199.1 | 5.6 | 321.9 | 418.7 | cwasm |
+| component | Docker --cpus | route | fetch ms | fetched KB | zstd decompress ms | compile or deserialize ms | write /cache ms | load total ms | whole first request ms | route taken |
+|---|---|---|---|---|---|---|---|---|---|---|
+| hello_p3 | 1.0 (~1769 MB) | blob + compile | 2.7 | 304 | - | 136.1 | 0.2 | 140.2 | 141.9 | compile |
+| hello_p3 | 1.0 (~1769 MB) | precompiled artifact | 3.0 | 985 | - | 5.8 | 0.2 | 9.2 | 10.8 | cwasm |
+| hello_p3 | 1.0 (~1769 MB) | precompiled artifact, zstd copy | 2.6 | 270 | 1.2 | 9.7 | 0.1 | 14.1 | 15.6 | cwasm |
+| hello_p3 | 0.29 (~512 MB) | precompiled artifact | 2.8 | 985 | - | 9.4 | 0.1 | 12.5 | 14.2 | cwasm |
+| hello_p3 | 0.07 (~128 MB) | precompiled artifact | 3.9 | 985 | - | 12.5 | 0.2 | 16.9 | 19.1 | cwasm |
+| hello_p2 | 1.0 (~1769 MB) | blob + compile | 2.3 | 263 | - | 109.6 | 0.2 | 113.4 | 114.9 | compile |
+| hello_p2 | 1.0 (~1769 MB) | precompiled artifact | 2.8 | 900 | - | 7.0 | 0.1 | 10.3 | 11.8 | cwasm |
+| hello_p2 | 0.29 (~512 MB) | precompiled artifact | 2.7 | 900 | - | 5.0 | 0.1 | 8.2 | 9.9 | cwasm |
+| hello_p2 | 0.07 (~128 MB) | precompiled artifact | 6.5 | 900 | - | 6.1 | 0.4 | 13.6 | 98.1 | cwasm |
+| hello_js | 1.0 (~1769 MB) | blob + compile | 6.3 | 12802 | - | 5053.5 | 6.2 | 5097.9 | 5102.1 | compile |
+| hello_js | 1.0 (~1769 MB) | precompiled artifact | 12.1 | 33459 | - | 8.8 | 4.1 | 25.4 | 27.5 | cwasm |
+| hello_js | 1.0 (~1769 MB) | precompiled artifact, zstd copy | 5.2 | 10115 | 22.9 | 9.0 | 4.6 | 42.7 | 44.5 | cwasm |
+| hello_js | 0.29 (~512 MB) | precompiled artifact | 11.8 | 33459 | - | 8.6 | 3.8 | 24.9 | 27.1 | cwasm |
+| hello_js | 0.29 (~512 MB) | precompiled artifact, zstd copy | 5.7 | 10115 | 22.4 | 86.2 | 5.4 | 120.5 | 123.0 | cwasm |
+| hello_js | 0.07 (~128 MB) | precompiled artifact | 115.6 | 33459 | - | 199.1 | 5.6 | 321.9 | 418.7 | cwasm |
 
 #### Warm requests through the guest (oha from another container; host columns are the host's own per-request log, µs)
 
@@ -195,16 +199,18 @@ docker run --rm -v "$PWD":/w -w /w/infra -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCE
 
 ### Cold starts (REPORT: Init Duration plus Duration of the first request, ms; p50 / p99)
 
-| component | mode | MB | n | Init | Duration (1st request) | Init + Duration | max | host load total | fetch from bucket | deserialize or compile |
-|---|---|---|---|---|---|---|---|---|---|---|
-| hello_p3 | precompiled | 128 | | | | | | | | |
-| hello_p3 | precompiled | 512 | | | | | | | | |
-| hello_p3 | precompiled | 1769 | | | | | | | | |
-| hello_p3 | precompiled-eager | 128 / 512 / 1769 | | | | | | | | |
-| hello_p3 | compile | 128 / 512 / 1769 | | | | | | | | |
-| hello_p2 | precompiled | 128 / 512 / 1769 | | | | | | | | |
-| hello_js | precompiled | 128 / 512 / 1769 | | | | | | | | |
-| hello_js | compile | 1769 | | | | | | | | |
+| component | mode | MB | n | Init | Duration (1st request) | Init + Duration | max | host load total | fetch from bucket | zstd decompress | deserialize or compile |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| hello_p3 | precompiled | 128 | | | | | | | | | |
+| hello_p3 | precompiled | 512 | | | | | | | | | |
+| hello_p3 | precompiled | 1769 | | | | | | | | | |
+| hello_p3 | precompiled-eager | 128 / 512 / 1769 | | | | | | | | | |
+| hello_p3 | precompiled-zstd | 1769 | | | | | | | | | |
+| hello_p3 | compile | 128 / 512 / 1769 | | | | | | | | | |
+| hello_p2 | precompiled | 128 / 512 / 1769 | | | | | | | | | |
+| hello_js | precompiled | 128 / 512 / 1769 | | | | | | | | | |
+| hello_js | precompiled-zstd | 128 / 512 / 1769 | | | | | | | | | |
+| hello_js | compile | 1769 | | | | | | | | | |
 
 ### Warm requests through the guest (ms; p50 / p99)
 
@@ -214,12 +220,16 @@ docker run --rm -v "$PWD":/w -w /w/infra -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCE
 | hello_p2 | 128 / 512 / 1769 | | | | |
 | hello_js | 128 / 512 / 1769 | | | | |
 
-### Storage operations from inside the function (ms, 1 KB object, sequential)
+### Storage operations from inside the function (ms, 1 KB object unless noted, sequential)
 
 | operation | MB | n | first | p50 | p99 | max |
 |---|---|---|---|---|---|---|
 | S3 GET | 128 / 512 / 1769 | | | | | |
 | S3 conditional GET (304) | 128 / 512 / 1769 | | | | | |
+| S3 GET, 80 KB object | 128 / 512 / 1769 | | | | | |
+| S3 conditional GET (304), 80 KB object | 128 / 512 / 1769 | | | | | |
+| S3 GET, 800 KB object | 128 / 512 / 1769 | | | | | |
+| S3 conditional GET (304), 800 KB object | 128 / 512 / 1769 | | | | | |
 | S3 PUT create-if-absent | 128 / 512 / 1769 | | | | | |
 | S3 PUT If-Match update | 128 / 512 / 1769 | | | | | |
 | DynamoDB GetItem eventual | 128 / 512 / 1769 | | | | | |
@@ -235,7 +245,8 @@ docker run --rm -v "$PWD":/w -w /w/infra -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCE
 | Bucket KV write p99 at most 200 ms | | |
 | Web Adapter overhead at most 5 ms warm and 50 ms cold | | |
 | Precompiled artifact loads on Graviton (baseline target) | | |
-| JS cold start with a 33 MB artifact | | |
+| JS cold start with a 33 MB artifact, raw against zstd (`precompiled` against `precompiled-zstd`, per memory size) | | |
+| State object read p50 at most 30 ms at 80 KB and 800 KB (plain GET and 304 revalidation) | | |
 | Allocator (default or pooling) | | |
 
 ## Cost of the cloud run
@@ -244,9 +255,9 @@ Prices assumed (arm64, us-west-2): Lambda $0.0000133334 per GB-second and $0.20 
 
 | Item | Volume with the defaults | Cost |
 |---|---|---|
-| Lambda cold starts | 570 starts (6 cells of 30 per memory size, plus 30 JS compiles), mostly 0.1 to 2 s at 128 to 1769 MB; the 30 JS compile starts are about 6 s at 1769 MB each | about $0.01 to $0.02 |
+| Lambda cold starts | 690 starts (7 cells of 30 per memory size, plus 30 JS compiles and 30 `hello_p3` zstd starts at 1769 MB), mostly 0.1 to 2 s at 128 to 1769 MB; the 30 JS compile starts are about 6 s at 1769 MB each | about $0.01 to $0.02 |
 | Lambda warm requests | about 3,000, a few ms each | under $0.01 |
-| Storage operation runs | 7 operations x 3 sizes x 200 samples, plus warm-ups | under $0.01 |
+| Storage operation runs | 11 operations (including the four 80 KB and 800 KB reads) x 3 sizes x 200 samples, plus warm-ups | under $0.01 |
 | S3 requests and storage | a few thousand requests, about 50 MB stored for a day | under $0.02 |
 | DynamoDB | a few thousand requests | under $0.01 |
 | CloudWatch Logs | a few MB ingested, 1-day retention | under $0.01 |
@@ -257,7 +268,7 @@ Expected total about $0.05, pessimistic under $0.50, against a budget of $5. Dou
 ## Open issues and risks
 
 - **Real S3 and Graviton are untested.** Every latency here is local; the storage numbers especially say nothing about S3. The decisions all wait on the cloud run.
-- **JS cold start.** The 33.5 MB artifact is the largest cold-path cost (fetch plus deserialize), and at 128 MB the compile fallback cannot run at all. Options to evaluate if the cloud numbers are bad: compress the artifact (zstd), range-read lazily, keep JS apps at 512 MB or more, or cache in the layer or zip (the zip limit is 50 MB direct upload).
+- **JS cold start.** The 33.5 MB artifact is the largest cold-path cost (fetch plus deserialize), and at 128 MB the compile fallback cannot run at all. The zstd copy (10.1 MB, decompress about 23 ms at 1.0 CPU) is built and measured by `precompiled-zstd`; level 19 would save another 2.1 MB for a few ms more decompression. Other options if the cloud numbers are bad: range-read lazily, keep JS apps at 512 MB or more, or cache in the layer or zip (the zip limit is 50 MB direct upload).
 - **`.cwasm` portability.** The baseline-target artifact is only verified on the same Apple Silicon machine. A Graviton deserialize error would surface as a failed first request; the host then falls back to compiling, which at small sizes would blow the 500 ms target. Artifact keys include the architecture and Wasmtime version, so a mismatch cannot silently reuse a wrong artifact across versions.
 - **Local-path digest cost.** The local-path spec hashes the component; production specs (`sha256:<hex>`) do not. Not a production concern, but it inflates the "load total" in the deserialize table for the JS component.
 - **p2 one-off.** One p2 first request at 0.07 CPU took 98 ms against 10 to 14 ms for the load itself, never reproduced; watch for it in cold p99.

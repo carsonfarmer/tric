@@ -1,4 +1,4 @@
-//! Spike-only `/__bench/<op>?n=<N>` routes: time raw storage operations from inside the function, with no guest involved.
+//! Spike-only `/__bench/<op>?n=<N>[&kb=<K>]` routes: time raw storage operations from inside the function, with no guest involved.
 //! Each call runs the operation `n` times in sequence and returns the per-call latencies in microseconds.
 use anyhow::{Result, bail};
 use aws_sdk_dynamodb::{Client, types::AttributeValue as Av};
@@ -33,13 +33,13 @@ impl Bench {
     }
 
     /// Returns `{op, n, setup_us, samples_us}`. `setup_us` is untimed preparation (seeding, fetching an ETag or version).
-    pub async fn run(&self, op: &str, n: usize) -> Result<Value> {
-        let kv = Key::from("bench/kv-1kb");
+    pub async fn run(&self, op: &str, n: usize, kb: usize) -> Result<Value> {
+        let kv = Key::from(format!("bench/kv-{kb}kb")); // `seed` writes it at this size; s3-get and s3-get-304 read it
         let mut samples = Vec::with_capacity(n);
         let mut setup = 0;
         match op {
             "seed" => {
-                self.s3()?.put(&kv, PutPayload::from(body(0))).await?;
+                self.s3()?.put(&kv, PutPayload::from(vec![b'x'; kb * 1024])).await?;
                 self.put_item(0, None).await?;
             }
             // Correctness of the conditional operations the KV design relies on (run against MinIO and DynamoDB Local before trusting them).

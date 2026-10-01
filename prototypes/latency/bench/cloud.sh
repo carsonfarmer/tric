@@ -16,9 +16,11 @@
 #   functional   conditional-operation checks against real S3 and DynamoDB (/__bench/check)
 #   cold         forced cold starts: an environment variable is bumped before every request, which retires every warm execution
 #                environment of that function. Modes: precompiled (artifact from the bucket), precompiled-eager (load in the init
-#                phase), compile (blob from the bucket, Cranelift in the function)
+#                phase), precompiled-zstd (the .zst copy from the bucket, decompressed in memory), compile (blob from the bucket,
+#                Cranelift in the function)
 #   warm         sequential requests to a warm environment through the guest
-#   bench        raw storage operations from inside the function (S3 GET/304/PUT create/PUT If-Match, DynamoDB eventual/strong/conditional)
+#   bench        raw storage operations from inside the function (S3 GET/304/PUT create/PUT If-Match, DynamoDB eventual/strong/conditional),
+#                plus S3 GET and 304 on 80 KB and 800 KB objects (the global state object: ~78 KB at 1k apps, ~781 KB at 10k)
 #   report       Markdown tables from everything collected (python3 bench/cloud_report.py)
 # In-function numbers (REPORT lines and the host's JSON log lines, pulled from CloudWatch) are the ones that count. The curl timings
 # include the network from here to us-west-2 and are only kept for reference.
@@ -120,14 +122,14 @@ functional() {
 }
 
 cold() { # cold <memory> <component> <mode> [n]
-  local mem=$1 comp=$2 mode=$3 n=${4:-$COLD_N} pre eager label
+  local mem=$1 comp=$2 mode=$3 n=${4:-$COLD_N} pre eager zst label
   case $mode in
-    precompiled) pre=1 eager=0;; precompiled-eager) pre=1 eager=1;; compile) pre=0 eager=0;;
-    *) echo "mode: precompiled | precompiled-eager | compile" >&2; return 2;;
+    precompiled) pre=1 eager=0 zst=0;; precompiled-eager) pre=1 eager=1 zst=0;; precompiled-zstd) pre=1 eager=0 zst=1;; compile) pre=0 eager=0 zst=0;;
+    *) echo "mode: precompiled | precompiled-eager | precompiled-zstd | compile" >&2; return 2;;
   esac
   label=cold-$comp-$mode-$mem
   echo "-- $label (n=$n)"
-  setenv "$mem" "SPINIT_COMPONENT=$(digest "$comp")" "SPINIT_PRECOMPILED=$pre" "SPINIT_EAGER=$eager"
+  setenv "$mem" "SPINIT_COMPONENT=$(digest "$comp")" "SPINIT_PRECOMPILED=$pre" "SPINIT_EAGER=$eager" "SPINIT_ZSTD=$zst"
   : > "$OUT/$label.csv"
   now_ms > "$OUT/$label.start"
   for i in $(seq "$n"); do
@@ -140,7 +142,7 @@ cold() { # cold <memory> <component> <mode> [n]
 warm() { # warm <memory> <component> [n]
   local mem=$1 comp=$2 n=${3:-$WARM_N} label; label=warm-$comp-$mem
   echo "-- $label (n=$n)"
-  setenv "$mem" "SPINIT_COMPONENT=$(digest "$comp")" SPINIT_PRECOMPILED=1 SPINIT_EAGER=0 "COLD_NONCE=$label-$(now_ms)"
+  setenv "$mem" "SPINIT_COMPONENT=$(digest "$comp")" SPINIT_PRECOMPILED=1 SPINIT_EAGER=0 SPINIT_ZSTD=0 "COLD_NONCE=$label-$(now_ms)"
   for _ in $(seq 20); do call "$mem" / >/dev/null; done      # the first one is the cold start, the rest settle the environment
   : > "$OUT/$label.csv"
   now_ms > "$OUT/$label.start"
@@ -149,24 +151,28 @@ warm() { # warm <memory> <component> [n]
 }
 
 bench_ops() { # bench_ops <memory>: raw storage latencies from inside the function; the response bodies are the results
-  local mem=$1 op
+  local mem=$1 op kb
   echo "-- bench $mem"
-  BODY=/dev/null call "$mem" "__bench/seed" >/dev/null
+  for kb in 1 80 800; do BODY=/dev/null call "$mem" "__bench/seed?kb=$kb" >/dev/null; done
   for op in s3-get s3-get-304 s3-put-create s3-put-update ddb-get-eventual ddb-get-strong ddb-put-cond; do
     BODY=/dev/null call "$mem" "__bench/$op?n=5" >/dev/null                      # connections and SDK clients warmed first
     BODY="$OUT/bench-$mem-$op.json" call "$mem" "__bench/$op?n=$BENCH_N" >/dev/null
   done
+  for kb in 80 800; do for op in s3-get s3-get-304; do                          # the same reads on the size of the global state object
+    BODY=/dev/null call "$mem" "__bench/$op?n=5&kb=$kb" >/dev/null
+    BODY="$OUT/bench-$mem-$op-${kb}kb.json" call "$mem" "__bench/$op?n=$BENCH_N&kb=$kb" >/dev/null
+  done; done
 }
 
 all_cold() {
   local mem c
   for mem in $MEMS; do
     for c in $COMPONENTS; do cold "$mem" "$c" precompiled; done
-    cold "$mem" hello_p3 precompiled-eager
+    cold "$mem" hello_p3 precompiled-eager; cold "$mem" hello_js precompiled-zstd
     # Blob + Cranelift in the function: p3 and p2 at every size, the 13 MB JS component only at the full vCPU (it does not fit 128 MB).
     cold "$mem" hello_p3 compile; cold "$mem" hello_p2 compile
   done
-  cold 1769 hello_js compile
+  cold 1769 hello_p3 precompiled-zstd; cold 1769 hello_js compile
 }
 
 all_warm() { local mem c; for mem in $MEMS; do for c in $COMPONENTS; do warm "$mem" "$c"; done; done; }

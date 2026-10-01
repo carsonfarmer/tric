@@ -6,12 +6,13 @@
 //!   SPINIT_CACHE_DIR    where `.cwasm` files are cached (default /tmp/spinit-cache)
 //!   SPINIT_ALLOCATOR    `default` | `pooling`
 //!   SPINIT_PRECOMPILED  `1`: look for a precompiled artifact in the bucket before compiling
+//!   SPINIT_ZSTD         `1`: with SPINIT_PRECOMPILED, fetch the zstd copy (`<cwasm key>.zst`) and decompress it in memory
 //!   SPINIT_EAGER        `1`: load the component before listening (Lambda init phase) instead of on the first request
 //!   SPINIT_TARGET       compile for this target triple with baseline ISA flags (portable `.cwasm`), e.g. aarch64-unknown-linux-gnu
 //!   SPINIT_BUCKET       bucket for blobs and the S3 bench routes; endpoint and credentials come from AWS_* variables
 //!   SPINIT_TABLE        DynamoDB table for the DynamoDB bench routes
 //! Every request, and every cold-path phase, is one JSON line on stdout.
-//! Subcommands: `spinit-host precompile <in.wasm> <out.cwasm>`, `spinit-host publish <in.wasm>` (blob + precompiled artifact to the bucket).
+//! Subcommands: `spinit-host precompile <in.wasm> <out.cwasm>`, `spinit-host publish <in.wasm>` (blob + precompiled artifact + its zstd copy to the bucket).
 mod bench;
 mod component;
 mod guest;
@@ -107,10 +108,11 @@ impl Server {
         let result = match req.uri().path() {
             "/__ready" => Ok(reply(200, "ok")),
             p if p.starts_with("/__bench/") => {
-                let n = query.split('&').find_map(|kv| kv.strip_prefix("n=")?.parse().ok()).unwrap_or(20usize).min(1000);
+                let arg = |k: &str, d: usize| query.split('&').find_map(|kv| kv.strip_prefix(k)?.strip_prefix('=')?.parse().ok()).unwrap_or(d);
+                let (n, kb) = (arg("n", 20).min(1000), arg("kb", 1).min(4096));
                 let op = p.trim_start_matches("/__bench/").to_string();
                 log.insert("kind".into(), "bench".into());
-                match self.bench.run(&op, n).await {
+                match self.bench.run(&op, n, kb).await {
                     Ok(mut v) => { v["event"] = "bench".into(); emit(v.clone()); Ok(reply(200, &v.to_string())) }
                     Err(e) => Err(e),
                 }
@@ -201,6 +203,7 @@ async fn main() -> Result<()> {
         bucket: bucket.clone(),
         cache: env("SPINIT_CACHE_DIR").unwrap_or("/tmp/spinit-cache".into()).into(),
         precompiled: env("SPINIT_PRECOMPILED").as_deref() == Some("1"),
+        zstd: env("SPINIT_ZSTD").as_deref() == Some("1"),
     };
     let server = Arc::new(Server { engine, linker, source, guest: OnceCell::new(), bench: Bench::new(bucket, table), seq: AtomicU64::new(0) });
     let eager = env("SPINIT_EAGER").as_deref() == Some("1");
