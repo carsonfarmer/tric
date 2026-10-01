@@ -1,6 +1,6 @@
 # Milestone 0: latency spike
 
-Status (2026-10-01): the local phase is done. The cloud phase is built and validated but has not been run: it needs AWS credentials, and this phase used none. Every number below the "Local" heading is indicative only, and no decision in the table below is taken yet.
+Status (2026-10-01): the local phase is done, including the follow-up Winch and artifact-MAC measurements (components are now treated as untrusted). The cloud phase is built and validated but has not been run: it needs AWS credentials, and this phase used none. Every number below the "Local" heading is indicative only, and no decision in the table below is taken yet.
 
 ## What the spike decides
 
@@ -8,7 +8,9 @@ Status (2026-10-01): the local phase is done. The cloud phase is built and valid
 |---|---|---|
 | Bucket KV or DynamoDB for app state | Ship bucket KV only if the warm read p50 is at most 30 ms with revalidation (conditional GET, 304) and the acknowledged write p99 is at most 200 ms (conditional PUT) | Needs the cloud run |
 | Web Adapter (LWA) or `lambda_http` | Switch to `lambda_http` if LWA adds more than about 5 ms to the warm p50 or about 50 ms to a cold start | Local: far below both (see below). Needs the cloud run |
-| Precompile strategy | Compile in the function, or deserialize a precompiled `.cwasm` | Local says precompile is mandatory below 1769 MB. Needs the cloud run to confirm |
+| Precompile strategy | Compile in the function, or deserialize a precompiled `.cwasm` | Local: Cranelift compile is too slow below 1769 MB, so precompile. Winch compile at cold start fits for the Rust components (about 45 ms at 1.0 CPU, 135 ms at 0.29) but not for JS (0.9 s, 4.3 s). Needs the cloud run to confirm |
+| Drop stored native code (Winch at cold start) | Only if `compile-winch` meets the 500 ms cold p99 at the memory size in use | Local: Rust components yes at 512 and 1769 MB, JS no. Needs the cloud run |
+| MAC on stored `.cwasm` (components untrusted) | The check before `deserialize` should cost far less than the fetch | Local: HMAC-SHA256 with the SHA-2 instructions is 23 ms for the 33.5 MB JS artifact, about 1 ms for the Rust ones |
 | Targets | Cold start p99 at most 500 ms. Warm read p50 at most 30 ms inside the function. Acknowledged write p99 at most 200 ms | Cloud run |
 
 ## What is here
@@ -17,7 +19,7 @@ All paths are relative to `prototypes/latency/`.
 
 | Path | What |
 |---|---|
-| `host/` | The host: Wasmtime 49.0.1, plain hyper, `object_store` 0.14, `aws-sdk-dynamodb`. Config by environment variables (documented at the top of `host/src/main.rs`). One JSON log line per request (microseconds), no response headers. `precompile` and `publish` subcommands (`publish` also uploads a zstd copy of the artifact, `<cwasm key>.zst`; `SPINIT_ZSTD=1` makes the host fetch and decompress it). `/__bench/<op>` routes (spike only, `kb=` sets the object size for the S3 reads) and `/__ready` |
+| `host/` | The host: Wasmtime 49.0.1, plain hyper, `object_store` 0.14, `aws-sdk-dynamodb`. Config by environment variables (documented at the top of `host/src/main.rs`). One JSON log line per request (microseconds), no response headers. `SPINIT_COMPILER=cranelift|winch`. `precompile` and `publish` subcommands (`publish` also uploads a zstd copy of the artifact, `<cwasm key>.zst`; `SPINIT_ZSTD=1` makes the host fetch and decompress it). `/__bench/<op>` routes (spike only, `kb=` sets the object size for the S3 reads), a `mac-bench` subcommand (spike only) and `/__ready` |
 | `components/` | Three test components: Rust p3 (`hello_p3`), Rust p2 (`hello_p2`), JavaScript through jco (`hello_js`). All imports are `wasi:*`, checked by `build.sh` with wasm-tools. Sources are copies of the host-research apps with the Spin-specific parts removed |
 | `docker/`, `lambda/` | Build image (Amazon Linux 2023, glibc 2.34, the `provided.al2023` runtime's glibc), host build, Lambda zip, LWA + RIE image |
 | `compose.yaml` | Project `spinit-spike-latency`: MinIO, DynamoDB Local, host (CPU and memory limited), host behind LWA via the Lambda RIE, oha. Host ports are env-configurable (`SPINIT_HOST_PORT` 18080, `MINIO_HOST_PORT` 19000, `DDB_HOST_PORT` 18000, `LWA_HOST_PORT` 19001) |
@@ -30,7 +32,7 @@ Reproduce the local phase (everything runs in Docker; nothing is installed on th
 ```sh
 cd prototypes/latency
 docker/build-host.sh && components/build.sh && lambda/package.sh   # out/spinit-host, out/hello_*.wasm, out/spinit-host.zip
-bench/local.sh all                                                  # or: functional cold bucket zstd portable warm lwa
+bench/local.sh all                                                  # or: functional cold bucket zstd winch mac portable warm lwa
 python3 bench/stats.py                                              # the tables in this file
 docker compose -p spinit-spike-latency down -v                      # teardown (named build-cache volumes spinit-spike-latency-* stay)
 ```
@@ -39,8 +41,8 @@ docker compose -p spinit-spike-latency down -v                      # teardown (
 
 | Artifact | Size |
 |---|---|
-| `out/spinit-host` (aarch64, glibc 2.34 at most, stripped, fat LTO, codegen-units 1) | 25,763,304 bytes (24.6 MiB) |
-| `out/spinit-host.zip` (one file, `bootstrap`) | 10,844,886 bytes (10.3 MiB) |
+| `out/spinit-host` (aarch64, glibc 2.34 at most, stripped, fat LTO, codegen-units 1) | 26,615,272 bytes (25.4 MiB), with Winch, blake3, hmac and sha2's `asm` feature added |
+| `out/spinit-host.zip` (one file, `bootstrap`) | 11,171,589 bytes (10.7 MiB) |
 
 The Lambda limits are 50 MB zipped (direct upload) and 250 MB unzipped including layers, so there is room. The binary runs in `public.ecr.aws/lambda/provided:al2023`, which is where every local measurement ran.
 
@@ -64,15 +66,19 @@ What the approximation gets wrong:
 - **Init-phase CPU.** Lambda boosts CPU during init, so process start and eager loading at 128 MB are probably faster in the cloud than the 0.07 CPU rows here.
 - **MinIO and DynamoDB Local are on localhost.** Their latencies (about 0.3 ms GET, 1.3 to 3 ms PUT, 0.4 to 0.7 ms DynamoDB) are not S3 or DynamoDB latencies. They prove the code paths and the conditional operations work, nothing more.
 - **The Lambda RIE is not the Lambda Runtime API.** The Web Adapter overhead is the adapter plus the emulator, measured as REPORT Duration minus the host's own `total_us`.
-- **Local-path component spec.** The local path computes a SHA-256 of the whole wasm for the cache key (22 ms for the 12.8 MB JS component at 1.0 CPU) and reads it from disk. The production `sha256:<hex>` spec skips both, so the "load total" for `hello_js` in the deserialize table overstates it. The bucket table is the production route.
+- **Local-path component spec.** The local path computes a SHA-256 of the whole wasm for the cache key (22 ms for the 12.8 MB JS component at 1.0 CPU, with sha2's software backend) and reads it from disk. The production `sha256:<hex>` spec skips both, so the "load total" for `hello_js` in the deserialize table overstates it. The bucket table is the production route.
 - **CPU compatibility of `.cwasm`.** Artifacts compiled on Apple Silicon use that machine's CPU features. `SPINIT_TARGET=aarch64-unknown-linux-gnu` compiles for a baseline arm64 ISA instead. A baseline artifact deserialized fine in a default engine on the same machine, which does not prove it loads on Graviton. `bench/cloud.sh seed` publishes baseline artifacts, and the first cloud request confirms.
 - The Wasmtime epoch ticker and the 256 MiB `StoreLimits` cap are on in every run. Fuel is off.
 
 ### What the local numbers say
 
-- **Compile in the request path does not fit.** Cranelift for the 304 KB Rust component takes 137 ms at 1.0 CPU, 536 ms at 0.29 and 5.9 s at 0.07. The 12.8 MB JavaScript component takes 5.6 s at 1.0 CPU, 28.7 s at 0.29, and is OOM-killed at 128 MB (RSS about 292 MB while compiling). At 512 MB even the small components miss the 500 ms target on the compile alone. So the artifact has to be precompiled at publish time and fetched, and the compile fallback must be limited to the large-memory case or fail clearly.
+- **Compile in the request path does not fit with Cranelift.** Cranelift for the 304 KB Rust component takes 137 ms at 1.0 CPU, 536 ms at 0.29 and 5.9 s at 0.07. The 12.8 MB JavaScript component takes 5.6 s at 1.0 CPU, 28.7 s at 0.29, and is OOM-killed at 128 MB (RSS about 292 MB while compiling). At 512 MB even the small components miss the 500 ms target on the compile alone. So the artifact has to be precompiled at publish time and fetched, and the compile fallback must be limited to the large-memory case or fail clearly. Winch changes this for the Rust components (the Winch bullets below).
 - **Deserialize is cheap.** From a cached `.cwasm`, the Rust components load in about 7 to 13 ms (deserialize 5 to 11 ms) at every CPU profile. From the bucket (MinIO) the whole first request is 10 to 19 ms for the Rust components, with the 98 ms p2 first request at 0.07 a one-off to re-check in the cloud run. The JS component, with a 33.5 MB artifact, takes 27 ms at 1.0 and 0.29 CPU and 419 ms at 0.07 CPU (116 ms to fetch from MinIO, 199 ms to deserialize). The real S3 fetch of those 33 MB is the unknown that decides the JS cold start.
 - **zstd copy of the artifact (`SPINIT_ZSTD=1`).** The `hello_js` `.cwasm` is 33,459,536 bytes raw and 10,115,750 bytes at zstd's default level 3 (30%). Level 19 gives 8,012,683 bytes (24%, 21% smaller than level 3) but takes 5.4 s to compress at 1.0 CPU against 69 ms, and decompresses a little slower (33 ms against 29 ms with the CLI at 1.0 CPU). Default level 3 is kept; trying 19 is a one-number change in `publish` (`encode_all(&cwasm[..], 0)`). The Rust artifacts shrink from 985,264 and 900,336 bytes to 270,500 and 244,582. In the host, `hello_js` decompresses in 22 to 24 ms at 1.0 CPU (five runs, in memory, `decompress_us`). At 0.29 CPU it was 23 ms in three of five runs and 62 and 87 ms in the other two, which is CFS throttling: the load costs about 45 ms of CPU against a quota of 29 ms per 100 ms period, and the stall lands on a different step each run (decompress, cache write or deserialize). From MinIO the first request takes 44.5 ms at 1.0 CPU and 123 ms at 0.29 CPU, against 27.5 and 27.1 ms for the raw artifact. Locally zstd costs more than it saves because a localhost transfer is almost free. It pays only if moving the 23 MB it saves takes longer than the roughly 23 ms of decompression, that is, if a single S3 GET moves less than about 1 GB/s. That is the expectation, not a measurement: the cloud run (`precompiled-zstd` against `precompiled`) decides it.
+- **Winch (`SPINIT_COMPILER=winch`) works for all three components, with no compile error to record.** Wasmtime 49.0.1 on aarch64 with the component model: `hello_p3` (p3 async), `hello_p2` and `hello_js` compile, instantiate and serve 3000 warm requests each at success rate 1.0. The one failure is `hello_js` at 0.07 CPU and 128 MB, and it is memory, not Winch: compiling it needs about 297 MB of RSS under either compiler, so the container sits at 127.7 of 128 MiB and gives no response in 300 to 600 s (Cranelift in the same cell is OOM-killed). Notes: (1) Wasmtime's config docs say epoch interruption is incompatible with Winch, but the 49.0.1 Winch codegen emits epoch checks and every run here had epoch interruption on; no runaway-loop test was run, so the CPU-time guard under Winch is read from source and unverified. (2) Winch compiles the component trampolines with Cranelift, so the host binary still carries Cranelift and Winch artifacts still contain Cranelift code. (3) By the Winch source, aarch64 Winch does not support threads, GC, function references, relaxed SIMD, tail calls, exceptions or stack switching; none of the three components needs them.
+- **Winch compiles 3.3 to 5.2 times faster than Cranelift for the Rust components and 6.5 times faster for JS** (Winch table, same run, so the ratios are fair; the Cranelift column differs by up to 17% from the older Compile table, so read gaps under that as noise). At 1.0 CPU: `hello_p3` 43 ms, `hello_p2` 37 ms, `hello_js` 836 ms. At 0.29 CPU: 133 ms, 88 ms, 4.1 s. At 0.07 CPU: 1.79 s and 1.51 s for the Rust ones. A design with no cache loads in the "without the cache write" column: `hello_p3` 44.7 ms at 1.0 CPU and 134.6 ms at 0.29, `hello_p2` 38.3 and 88.9 ms, `hello_js` 864 ms and 4.2 s. So compiling the Rust components at cold start would stay inside 500 ms at 512 and 1769 MB (about 35 ms and 125 ms more than deserializing a stored artifact, before the wasm fetch and platform init), and would miss at 128 MB (1.8 s, though Lambda's init CPU boost may help). It does not work for JS: 0.9 s at 1.0 CPU and 4.3 s at 0.29, so JS keeps a stored artifact. RSS after compile matches Cranelift (26 MB Rust, about 297 MB JS).
+- **Winch code is slower, and its artifacts are bigger.** Warm guest-handle p50/p99 at 1.0 CPU, Winch against Cranelift: `hello_p3` 42 / 180 against 36 / 190 µs, `hello_p2` 102 / 236 against 89 / 220, `hello_js` 557 / 950 against 425 / 736. That is +17%, +15% and +31% at p50. Client p50 is 0.15 ms for both on `hello_p3`, 0.20 against 0.19 on `hello_p2` and 0.63 against 0.51 on `hello_js` (throughput 1501 against 1859 requests per second). These guests do almost no compute, so the gap is mostly per-call overhead; a compute-heavy guest would show a larger gap, which is not measured. Winch `.cwasm` is 1,509,680 bytes for `hello_p3` (+53%), 1,228,120 for `hello_p2` (+36%) and 57,645,296 for `hello_js` (+72%). Winch and Cranelift artifacts are not interchangeable (the engine config is embedded), so the host keeps Winch artifacts under `winch/` in the cache and `publish` refuses Winch.
+- **MAC before `deserialize`.** Keyed BLAKE3 (single thread, NEON) against HMAC-SHA256 over buffers the size of the three artifacts (p50 of 9 runs, 150 ms apart; see the MAC table). With sha2's `asm` feature, which uses the aarch64 SHA-2 instructions, HMAC-SHA256 is the faster of the two: 0.28 ms for 0.27 MB, 6.9 ms for 10.1 MB and 23.1 ms for 33.5 MB at 1.0 CPU (about 1.45 GB/s), against 0.35, 10.5 and 29.2 ms for BLAKE3 (about 1.15 GB/s). At 0.29 CPU the two large buffers are within about 10% of the 1.0 CPU figures (21.5 ms against 28.7 ms for the 33.5 MB buffer), because the work just fits inside the 29 ms CFS quota. Without the `asm` feature, which is the `sha2` 0.10 default and what this repo had until now, HMAC-SHA256 runs in software at about 0.42 GB/s: 78.9 ms for 33.5 MB at 1.0 CPU and 155 ms at 0.29 CPU (throttled; 133 to 281 ms across runs), 2.8 to 5.8 times slower than BLAKE3. So the MAC is about 23 ms for the raw JS artifact (the same order as the 23 ms zstd decompress), about 1 ms for the Rust artifacts, and 6.9 ms if it is computed over the 10.1 MB zstd copy before decompressing, which also keeps the decompressor off unauthenticated bytes. Caveat: measured on an Apple M4 Pro under Docker, not Graviton. Graviton exposes the SHA-2 instructions, but its throughput is untested, and the `asm` backend checks for them at run time and falls back to software if they are missing. The host build now enables `asm` for `sha2`; the compile, warm and earlier tables were measured before that change (`sha2` is only on the local-path digest and blob-verify paths).
 - **Process init is small.** 12 to 18 ms from process start to listening at 1.0 and 0.29 CPU, 108 to 183 ms at 0.07 CPU (probably less in a Lambda init phase).
 - **Warm requests are dominated by nothing in the host.** Host overhead (host total minus guest handle) is about 2 µs unpaced and about 20 µs paced. Host total p50 at 1.0 CPU: `hello_p3` 31 µs, `hello_p2` 85 µs, `hello_js` 365 µs. Paced at 50 requests per second, client p50 is 0.9, 1.3 and 2.6 ms and p99 is 3.7, 4.7 and 7.1 ms, so guest work fits in a couple of milliseconds and leaves more than 25 ms of the 30 ms read budget to storage. At 0.07 CPU (128 MB) `hello_js` saturates (p99 about 103 ms even paced), so JS apps want 512 MB or more, and the Rust ones are fine at 128 MB.
 - **p3 against p2.** p3 reuses a worker and shows 0 µs per-request instantiate, p2 instantiates every request (22 µs p50 unpaced, about 240 µs paced with cold caches). Both are negligible next to a storage call.
@@ -142,6 +148,57 @@ What the approximation gets wrong:
 | hello_js | 0.29 (~512 MB) | precompiled artifact, zstd copy | 5.7 | 10115 | 22.4 | 86.2 | 5.4 | 120.5 | 123.0 | cwasm |
 | hello_js | 0.07 (~128 MB) | precompiled artifact | 115.6 | 33459 | - | 199.1 | 5.6 | 321.9 | 418.7 | cwasm |
 
+#### Winch against Cranelift: the blob compiled in the host at a CPU share (empty cache, default allocator)
+
+| component | Docker --cpus | compiler | compile ms | serialize + cache write ms | cwasm KB | RSS MB after | load total ms | load total without the cache write ms | whole first request ms |
+|---|---|---|---|---|---|---|---|---|---|
+| hello_p3 | 1.0 (~1769 MB) | cranelift | 156.6 | 0.7 | 985 | 27 | 159.6 | 159.0 | 161.3 |
+| hello_p3 | 1.0 (~1769 MB) | winch | 43.1 | 1.3 | 1509 | 26 | 45.9 | 44.7 | 47.3 |
+| hello_p3 | 0.29 (~512 MB) | cranelift | 548.4 | 0.8 | 985 | 28 | 550.6 | 549.8 | 552.6 |
+| hello_p3 | 0.29 (~512 MB) | winch | 133.0 | 1.8 | 1509 | 26 | 136.4 | 134.6 | 138.1 |
+| hello_p3 | 0.07 (~128 MB) | cranelift | 6628.6 | 0.6 | 985 | 28 | 6632.6 | 6632.0 | 6719.8 |
+| hello_p3 | 0.07 (~128 MB) | winch | 1786.6 | 92.8 | 1509 | 26 | 1883.7 | 1790.8 | 1985.4 |
+| hello_p2 | 1.0 (~1769 MB) | cranelift | 121.3 | 0.8 | 900 | 25 | 123.5 | 122.7 | 124.9 |
+| hello_p2 | 1.0 (~1769 MB) | winch | 36.9 | 1.1 | 1228 | 25 | 39.4 | 38.3 | 40.7 |
+| hello_p2 | 0.29 (~512 MB) | cranelift | 456.4 | 1.0 | 900 | 25 | 458.9 | 457.9 | 460.6 |
+| hello_p2 | 0.29 (~512 MB) | winch | 87.5 | 1.3 | 1228 | 25 | 90.2 | 88.9 | 91.6 |
+| hello_p2 | 0.07 (~128 MB) | cranelift | 6200.3 | 2.5 | 900 | 25 | 6206.7 | 6204.1 | 6305.6 |
+| hello_p2 | 0.07 (~128 MB) | winch | 1514.6 | 93.8 | 1228 | 24 | 1612.3 | 1518.4 | 1615.6 |
+| hello_js | 1.0 (~1769 MB) | cranelift | 5420.9 | 15.8 | 33459 | 290 | 5464.1 | 5448.3 | 5468.0 |
+| hello_js | 1.0 (~1769 MB) | winch | 835.9 | 31.2 | 57645 | 297 | 894.8 | 863.5 | 898.9 |
+| hello_js | 0.29 (~512 MB) | cranelift | 26714.0 | 92.0 | 33459 | 291 | 26840.8 | 26748.8 | 26848.8 |
+| hello_js | 0.29 (~512 MB) | winch | 4099.6 | 106.0 | 57645 | 298 | 4281.6 | 4175.6 | 4286.5 |
+| hello_js | 0.07 (~128 MB) | cranelift | - | - | - | - | - | - | FAILED (http 000, oom-killed true) |
+| hello_js | 0.07 (~128 MB) | winch | - | - | - | - | - | - | FAILED (http 000, oom-killed false) |
+
+#### Winch against Cranelift: warm requests through the guest at --cpus 1.0 (c=1, default allocator, epoch interruption on in both)
+
+| component | compiler | client p50 ms | client p99 ms | req/s | guest handle p50/p99 µs | instantiate p50/p99 µs |
+|---|---|---|---|---|---|---|
+| hello_p3 | cranelift | 0.15 | 0.36 | 6115 | 36 / 190 | 0 / 0 |
+| hello_p3 | winch | 0.15 | 0.35 | 6126 | 42 / 180 | 0 / 0 |
+| hello_p2 | cranelift | 0.19 | 0.36 | 4922 | 89 / 220 | 23 / 106 |
+| hello_p2 | winch | 0.20 | 0.45 | 4629 | 102 / 236 | 23 / 90 |
+| hello_js | cranelift | 0.51 | 0.87 | 1859 | 425 / 736 | 30 / 102 |
+| hello_js | winch | 0.63 | 1.09 | 1501 | 557 / 950 | 31 / 87 |
+
+#### MAC over a precompiled artifact: keyed BLAKE3 against HMAC-SHA256 (ms, p50 of 9 runs, with min to max; mac-soft-*.log is the same binary built without the sha2 asm feature)
+
+| buffer MB | --cpus | SHA-256 backend | BLAKE3 keyed | min to max | HMAC-SHA256 | min to max | HMAC / BLAKE3 |
+|---|---|---|---|---|---|---|---|
+| 0.27 | 1.0 | SHA2 instructions | 0.35 | 0.25 to 0.59 | 0.28 | 0.15 to 0.76 | 0.8x |
+| 10.12 | 1.0 | SHA2 instructions | 10.46 | 9.81 to 11.93 | 6.87 | 5.80 to 8.58 | 0.7x |
+| 33.46 | 1.0 | SHA2 instructions | 29.24 | 27.19 to 32.62 | 23.09 | 20.18 to 24.26 | 0.8x |
+| 0.27 | 0.29 | SHA2 instructions | 0.39 | 0.31 to 0.48 | 0.22 | 0.17 to 0.71 | 0.6x |
+| 10.12 | 0.29 | SHA2 instructions | 10.37 | 9.10 to 12.13 | 7.05 | 5.53 to 10.07 | 0.7x |
+| 33.46 | 0.29 | SHA2 instructions | 28.72 | 26.80 to 29.45 | 21.52 | 18.68 to 24.61 | 0.7x |
+| 0.27 | 1.0 | software | 0.28 | 0.17 to 0.64 | 1.63 | 1.19 to 3.13 | 5.7x |
+| 10.12 | 1.0 | software | 10.39 | 9.54 to 11.64 | 33.66 | 30.26 to 34.96 | 3.2x |
+| 33.46 | 1.0 | software | 28.24 | 27.16 to 30.12 | 78.87 | 76.25 to 83.77 | 2.8x |
+| 0.27 | 0.29 | software | 0.28 | 0.18 to 0.67 | 1.63 | 1.42 to 3.04 | 5.8x |
+| 10.12 | 0.29 | software | 10.61 | 9.79 to 11.29 | 43.44 | 29.85 to 101.03 | 4.1x |
+| 33.46 | 0.29 | software | 28.32 | 26.97 to 43.38 | 155.45 | 133.12 to 281.03 | 5.5x |
+
 #### Warm requests through the guest (oha from another container; host columns are the host's own per-request log, µs)
 
 | component | --cpus | allocator | conc | client p50 ms | client p99 ms | client p99.9 ms | req/s | host total p50/p99 µs | guest handle p50/p99 µs | instantiate p50/p99 µs | host overhead p50 µs |
@@ -199,18 +256,20 @@ docker run --rm -v "$PWD":/w -w /w/infra -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCE
 
 ### Cold starts (REPORT: Init Duration plus Duration of the first request, ms; p50 / p99)
 
-| component | mode | MB | n | Init | Duration (1st request) | Init + Duration | max | host load total | fetch from bucket | zstd decompress | deserialize or compile |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| hello_p3 | precompiled | 128 | | | | | | | | | |
-| hello_p3 | precompiled | 512 | | | | | | | | | |
-| hello_p3 | precompiled | 1769 | | | | | | | | | |
-| hello_p3 | precompiled-eager | 128 / 512 / 1769 | | | | | | | | | |
-| hello_p3 | precompiled-zstd | 1769 | | | | | | | | | |
-| hello_p3 | compile | 128 / 512 / 1769 | | | | | | | | | |
-| hello_p2 | precompiled | 128 / 512 / 1769 | | | | | | | | | |
-| hello_js | precompiled | 128 / 512 / 1769 | | | | | | | | | |
-| hello_js | precompiled-zstd | 128 / 512 / 1769 | | | | | | | | | |
-| hello_js | compile | 1769 | | | | | | | | | |
+| component | mode | MB | n | Init | Duration (1st request) | Init + Duration | max | host load total | fetch from bucket | zstd decompress | deserialize or compile | serialize + cache write (compile modes) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| hello_p3 | precompiled | 128 | | | | | | | | | | |
+| hello_p3 | precompiled | 512 | | | | | | | | | | |
+| hello_p3 | precompiled | 1769 | | | | | | | | | | |
+| hello_p3 | precompiled-eager | 128 / 512 / 1769 | | | | | | | | | | |
+| hello_p3 | precompiled-zstd | 1769 | | | | | | | | | | |
+| hello_p3 | compile | 128 / 512 / 1769 | | | | | | | | | | |
+| hello_p3 | compile-winch | 512 / 1769 | | | | | | | | | | |
+| hello_p2 | precompiled | 128 / 512 / 1769 | | | | | | | | | | |
+| hello_js | precompiled | 128 / 512 / 1769 | | | | | | | | | | |
+| hello_js | precompiled-zstd | 128 / 512 / 1769 | | | | | | | | | | |
+| hello_js | compile | 1769 | | | | | | | | | | |
+| hello_js | compile-winch | 512 / 1769 | | | | | | | | | | |
 
 ### Warm requests through the guest (ms; p50 / p99)
 
@@ -248,6 +307,7 @@ docker run --rm -v "$PWD":/w -w /w/infra -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCE
 | JS cold start with a 33 MB artifact, raw against zstd (`precompiled` against `precompiled-zstd`, per memory size) | | |
 | State object read p50 at most 30 ms at 80 KB and 800 KB (plain GET and 304 revalidation) | | |
 | Allocator (default or pooling) | | |
+| Winch compile at cold start, `hello_p3` and `hello_js` at 512 and 1769 MB (`compile-winch` against `precompiled`; `host load total` less `serialize + cache write` is the no-cache cost) | | |
 
 ## Cost of the cloud run
 
@@ -255,7 +315,7 @@ Prices assumed (arm64, us-west-2): Lambda $0.0000133334 per GB-second and $0.20 
 
 | Item | Volume with the defaults | Cost |
 |---|---|---|
-| Lambda cold starts | 690 starts (7 cells of 30 per memory size, plus 30 JS compiles and 30 `hello_p3` zstd starts at 1769 MB), mostly 0.1 to 2 s at 128 to 1769 MB; the 30 JS compile starts are about 6 s at 1769 MB each | about $0.01 to $0.02 |
+| Lambda cold starts | 810 starts (7 cells of 30 per memory size, plus 30 JS compiles and 30 `hello_p3` zstd starts at 1769 MB, plus 120 Winch compiles: `hello_p3` and `hello_js` at 512 and 1769 MB), mostly 0.1 to 2 s at 128 to 1769 MB; the 30 JS Cranelift compile starts are about 6 s at 1769 MB each, the JS Winch ones about 1 s at 1769 MB and 4 to 5 s at 512 MB | about $0.01 to $0.02 |
 | Lambda warm requests | about 3,000, a few ms each | under $0.01 |
 | Storage operation runs | 11 operations (including the four 80 KB and 800 KB reads) x 3 sizes x 200 samples, plus warm-ups | under $0.01 |
 | S3 requests and storage | a few thousand requests, about 50 MB stored for a day | under $0.02 |
@@ -270,6 +330,8 @@ Expected total about $0.05, pessimistic under $0.50, against a budget of $5. Dou
 - **Real S3 and Graviton are untested.** Every latency here is local; the storage numbers especially say nothing about S3. The decisions all wait on the cloud run.
 - **JS cold start.** The 33.5 MB artifact is the largest cold-path cost (fetch plus deserialize), and at 128 MB the compile fallback cannot run at all. The zstd copy (10.1 MB, decompress about 23 ms at 1.0 CPU) is built and measured by `precompiled-zstd`; level 19 would save another 2.1 MB for a few ms more decompression. Other options if the cloud numbers are bad: range-read lazily, keep JS apps at 512 MB or more, or cache in the layer or zip (the zip limit is 50 MB direct upload).
 - **`.cwasm` portability.** The baseline-target artifact is only verified on the same Apple Silicon machine. A Graviton deserialize error would surface as a failed first request; the host then falls back to compiling, which at small sizes would blow the 500 ms target. Artifact keys include the architecture and Wasmtime version, so a mismatch cannot silently reuse a wrong artifact across versions.
+- **Winch and untrusted components.** Winch removes stored native code for the Rust components only if the cloud `compile-winch` numbers hold at 512 MB (local: 135 ms at 0.29 CPU), and it costs 15 to 31% on the warm guest-handle median in these near-empty guests, more on compute-heavy ones. JS still needs a stored artifact, so a MAC (or another integrity check) on stored `.cwasm` stays in the design for it. Untested: epoch interruption as a CPU-time guard under Winch with a runaway loop (read from source only), and `hello_js` at 128 MB, which cannot be compiled by either compiler in that memory.
+- **MAC key handling is not part of this spike.** The MAC timings use a fixed test key. Where the key lives, how it is fetched at init and whether the check covers the artifact key and Wasmtime version as well as the bytes are design questions the numbers do not answer. Enable sha2's `asm` feature (done in `host/Cargo.toml`) or HMAC-SHA256 costs 3 to 7 times more.
 - **Local-path digest cost.** The local-path spec hashes the component; production specs (`sha256:<hex>`) do not. Not a production concern, but it inflates the "load total" in the deserialize table for the JS component.
 - **p2 one-off.** One p2 first request at 0.07 CPU took 98 ms against 10 to 14 ms for the load itself, never reproduced; watch for it in cold p99.
 - **Tail latency at 128 MB.** At 0.07 CPU, paced runs still show p99.9 up to 73 ms for p3, and unpaced runs show the throttling artifact. Whether Lambda at 128 MB has comparable jitter is a cloud question.

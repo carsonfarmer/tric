@@ -1,7 +1,7 @@
 //! Getting a `Component` by local path or by digest from the bucket, via the cheapest route available:
 //! 1. the `.cwasm` cache on local disk (`/tmp` on Lambda), deserialized;
 //! 2. a precompiled artifact in the bucket (optionally its zstd copy), copied to the cache and deserialized;
-//! 3. the wasm blob (`blobs/sha256/<hex>`), compiled with Cranelift and written to the cache.
+//! 3. the wasm blob (`blobs/sha256/<hex>`), compiled (Cranelift, or Winch with SPINIT_COMPILER=winch) and written to the cache.
 use anyhow::{Context, Result, ensure};
 use object_store::{Error as StoreError, ObjectStore, ObjectStoreExt, PutPayload, path::Path as Key};
 use serde_json::{Map, Value, json};
@@ -105,7 +105,9 @@ impl Source {
         let component = Component::new(engine, &bytes)?;
         m.insert("compile_us".into(), us(t).into());
         m.insert("wasm_bytes".into(), bytes.len().into());
+        let t = Instant::now();
         let serialized = component.serialize()?;
+        m.insert("serialize_us".into(), us(t).into()); // with write_cache_us: what a design that keeps no artifact on disk would skip
         m.insert("cwasm_bytes".into(), serialized.len().into());
         self.write_cache(&cached, &serialized, &mut m)?;
         m.insert("route".into(), "compile".into());

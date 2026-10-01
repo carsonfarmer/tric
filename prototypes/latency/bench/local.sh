@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Local (Docker) measurements for the latency spike. Indicative only: Docker on an M-series Mac is not Lambda.
-# Usage: bench/local.sh [functional|cold|bucket|zstd|portable|warm|lwa|all]     (default: all)
+# Usage: bench/local.sh [functional|cold|bucket|zstd|winch|mac|portable|warm|lwa|all]     (default: all)
 # Raw logs go to out/local/; `python3 bench/stats.py` turns them into the tables in RESULTS.md.
 # Needs: docker compose, curl, shasum, out/spinit-host and out/hello_*.wasm (docker/build-host.sh, components/build.sh).
 set -euo pipefail
@@ -93,6 +93,27 @@ zstd_route() { # the zstd copy of the artifact from MinIO (SPINIT_ZSTD=1): hello
       echo "$c raw=$(stat -c%s /tmp/$c.cwasm) zst3=$(zstd -3 -c /tmp/$c.cwasm | wc -c) zst19=$(zstd -19 -c /tmp/$c.cwasm | wc -c)"; done' | tee "$OUT/zstd-levels.log"
 }
 
+winch() { # Winch against Cranelift: the blob compiled in the host (empty cache) at each CPU share, then warm requests at full CPU
+  echo "== winch vs cranelift"
+  for c in $COMPONENTS; do
+    for p in $PROFILES; do
+      for k in cranelift winch; do
+        echo "-- $c $k cpus=${p%%:*}"
+        clear_cache; SPINIT_COMPILER=$k start "$c" "${p%%:*}" "${p##*:}" default; first_request "$OUT/compile-$k-$c-${p%%:*}.log"
+      done
+    done
+  done
+  prime
+  for c in $COMPONENTS; do for k in cranelift winch; do WARM_PREFIX=warm-$k SPINIT_COMPILER=$k warm_one "$c" 1.0 1769m default 1; done; done
+}
+
+mac() { # keyed BLAKE3 against HMAC-SHA256 over artifact-sized buffers (what a MAC check before deserialize would cost)
+  echo "== mac"
+  for cpus in 1.0 0.29; do
+    HOST_CPUS=$cpus docker compose run --rm --no-deps -T --entrypoint /out/spinit-host host mac-bench | tee "$OUT/mac-$cpus.log"
+  done
+}
+
 portable() { # is a cwasm built with a baseline target (no host-specific ISA flags) accepted by a normal engine?
   echo "== portable cwasm (SPINIT_TARGET)"
   local d; d=$(digest hello_p3)
@@ -128,8 +149,8 @@ warm_one() { # warm_one <component> <cpus> <mem> <allocator> <concurrency> [requ
   echo "-- $1 cpus=$2 alloc=$4 $tag"
   start "$1" "$2" "$3" "$4"
   for _ in $(seq 30); do curl -s -m 600 -o /dev/null "localhost:$PORT/"; done
-  docker compose run --rm -T oha -n "$n" -c "$5" ${6:+-q "$6"} --no-tui --output-format json http://host:8080/ > "$OUT/warm-$1-$2-$4-$tag-oha.json"
-  sleep 0.5; hostlog > "$OUT/warm-$1-$2-$4-$tag.log"
+  docker compose run --rm -T oha -n "$n" -c "$5" ${6:+-q "$6"} --no-tui --output-format json http://host:8080/ > "$OUT/${WARM_PREFIX:-warm}-$1-$2-$4-$tag-oha.json"
+  sleep 0.5; hostlog > "$OUT/${WARM_PREFIX:-warm}-$1-$2-$4-$tag.log"
 }
 
 lwa() { # the host as a Lambda function (Web Adapter extension, Runtime Interface Emulator), invoked with an HTTP API v2 event
@@ -147,8 +168,8 @@ lwa() { # the host as a Lambda function (Web Adapter extension, Runtime Interfac
 
 what=${1:-all}
 case $what in
-  functional) functional;; cold) cold;; cold-one) shift; cold_one "$@";; bucket) bucket;; zstd) zstd_route;; portable) portable;; warm) warm;; lwa) lwa;;
-  all) functional; cold; bucket; zstd_route; portable; warm; lwa;;
-  *) echo "usage: $0 [functional|cold|bucket|zstd|portable|warm|lwa|all]" >&2; exit 2;;
+  functional) functional;; cold) cold;; cold-one) shift; cold_one "$@";; bucket) bucket;; zstd) zstd_route;; winch) winch;; mac) mac;; portable) portable;; warm) warm;; lwa) lwa;;
+  all) functional; cold; bucket; zstd_route; winch; mac; portable; warm; lwa;;
+  *) echo "usage: $0 [functional|cold|bucket|zstd|winch|mac|portable|warm|lwa|all]" >&2; exit 2;;
 esac
 docker compose stop host lwa >/dev/null 2>&1 || true

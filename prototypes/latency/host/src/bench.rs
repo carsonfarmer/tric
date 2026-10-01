@@ -17,6 +17,23 @@ async fn timed<T>(f: impl Future<Output = T>) -> (T, u64) {
     (v, t.elapsed().as_micros() as u64)
 }
 
+/// `spinit-host mac-bench` (throwaway): keyed BLAKE3 against HMAC-SHA256 over artifact-sized buffers, [min, p50, max] of 9 runs in microseconds.
+pub fn mac_bench() -> Value {
+    use hmac::{Hmac, Mac};
+    let key = [7u8; 32];
+    let time = |f: &dyn Fn() -> u8| {
+        let mut s: Vec<u64> = (0..9).map(|_| { std::thread::sleep(std::time::Duration::from_millis(150)); let t = Instant::now(); std::hint::black_box(f()); t.elapsed().as_micros() as u64 }).collect();
+        s.sort();
+        [s[0], s[4], s[8]] // the sleep lets a CPU quota refill, so each run looks like one hash at the start of a cold start
+    };
+    let rows: Vec<Value> = [270_500, 10_115_750, 33_459_536].into_iter().map(|n| {
+        let buf: Vec<u8> = (0..n).map(|i| (i * 31 + i / 251) as u8).collect();
+        let hmac = || { let mut m = <Hmac<sha2::Sha256>>::new_from_slice(&key).unwrap(); m.update(&buf); m.finalize().into_bytes()[0] };
+        json!({ "bytes": n, "blake3_keyed_us": time(&|| blake3::keyed_hash(&key, &buf).as_bytes()[0]), "hmac_sha256_us": time(&hmac) })
+    }).collect();
+    json!({ "event": "mac-bench", "results": rows })
+}
+
 /// A 1 KB payload that differs per `i` (identical content would give identical ETags and make If-Match tests meaningless).
 fn body(i: usize) -> Bytes { let mut b = format!("{i:016}").into_bytes(); b.resize(1024, b'x'); Bytes::from(b) }
 

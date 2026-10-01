@@ -105,6 +105,51 @@ def bucket():
            "whole first request ms", "route taken"], rows)
 
 
+def winch():
+    print("#### Winch against Cranelift: the blob compiled in the host at a CPU share (empty cache, default allocator)\n")
+    rows = []
+    for c in COMP:
+        for cpus in CPUS:
+            for k in ["cranelift", "winch"]:
+                p = f"{D}/compile-{k}-{c}-{cpus}.log"
+                if not os.path.exists(p):
+                    continue
+                ld, st, rq = ev(p, "load"), ev(p, "status"), next((e for e in lines(p) if e.get("kind") == "guest"), None)
+                if not ld or st["http"] != "200":
+                    rows.append([c, f"{cpus} (~{LAMBDA_MB[cpus]} MB)", k, "-", "-", "-", "-", "-", "-", f"FAILED (http {st['http']}, oom-killed {st['oom']})"]); continue
+                keep = ld["serialize_us"] + ld["write_cache_us"]
+                rows.append([c, f"{cpus} (~{LAMBDA_MB[cpus]} MB)", k, ms(ld["compile_us"]), ms(keep), ld["cwasm_bytes"] // 1000, ld["rss_kb"] // 1024,
+                             ms(ld["load_total_us"]), ms(ld["load_total_us"] - keep), ms(rq["total_us"]) if rq else "-"])
+    table(["component", "Docker --cpus", "compiler", "compile ms", "serialize + cache write ms", "cwasm KB", "RSS MB after", "load total ms",
+           "load total without the cache write ms", "whole first request ms"], rows)
+
+    print("#### Winch against Cranelift: warm requests through the guest at --cpus 1.0 (c=1, default allocator, epoch interruption on in both)\n")
+    rows = []
+    for c in COMP:
+        for k in ["cranelift", "winch"]:
+            p = f"{D}/warm-{k}-{c}-1.0-default-c1"
+            if not os.path.exists(p + "-oha.json"):
+                continue
+            o = oha(p + "-oha.json")
+            reqs = [e for e in lines(p + ".log") if e.get("kind") == "guest"][30:]
+            han, ins = [e["handle_us"] for e in reqs], [e["instantiate_us"] for e in reqs]
+            rows.append([c, k, f"{o['p50']:.2f}", f"{o['p99']:.2f}", f"{o['rps']:.0f}", f"{pct(han, 50):.0f} / {pct(han, 99):.0f}", f"{pct(ins, 50):.0f} / {pct(ins, 99):.0f}"])
+    table(["component", "compiler", "client p50 ms", "client p99 ms", "req/s", "guest handle p50/p99 µs", "instantiate p50/p99 µs"], rows)
+
+
+def mac():
+    print("#### MAC over a precompiled artifact: keyed BLAKE3 against HMAC-SHA256 (ms, p50 of 9 runs, with min to max; mac-soft-*.log is the same binary built without the sha2 asm feature)\n")
+    rows = []
+    for pre, sha in (("mac", "SHA2 instructions"), ("mac-soft", "software")):
+        for cpus in ["1.0", "0.29"]:
+            p = f"{D}/{pre}-{cpus}.log"
+            r = ev(p, "mac-bench") if os.path.exists(p) else None
+            for x in (r or {"results": []})["results"]:
+                b, h = x["blake3_keyed_us"], x["hmac_sha256_us"]
+                rows.append([f"{x['bytes'] / 1e6:.2f}", cpus, sha, ms(b[1], 2), f"{ms(b[0], 2)} to {ms(b[2], 2)}", ms(h[1], 2), f"{ms(h[0], 2)} to {ms(h[2], 2)}", f"{h[1] / b[1]:.1f}x"])
+    table(["buffer MB", "--cpus", "SHA-256 backend", "BLAKE3 keyed", "min to max", "HMAC-SHA256", "min to max", "HMAC / BLAKE3"], rows)
+
+
 def oha(path):
     j = json.load(open(path))
     lp = j["latencyPercentiles"]
@@ -159,7 +204,7 @@ def lwa():
 
 
 if __name__ == "__main__":
-    for f in (cold, bucket, warm, lwa):
+    for f in (cold, bucket, winch, mac, warm, lwa):
         try:
             f()
         except Exception as e:  # keep going: partial runs are normal

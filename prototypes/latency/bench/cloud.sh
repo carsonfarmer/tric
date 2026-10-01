@@ -17,7 +17,7 @@
 #   cold         forced cold starts: an environment variable is bumped before every request, which retires every warm execution
 #                environment of that function. Modes: precompiled (artifact from the bucket), precompiled-eager (load in the init
 #                phase), precompiled-zstd (the .zst copy from the bucket, decompressed in memory), compile (blob from the bucket,
-#                Cranelift in the function)
+#                Cranelift in the function), compile-winch (the same with Wasmtime's Winch compiler, no stored native code)
 #   warm         sequential requests to a warm environment through the guest
 #   bench        raw storage operations from inside the function (S3 GET/304/PUT create/PUT If-Match, DynamoDB eventual/strong/conditional),
 #                plus S3 GET and 304 on 80 KB and 800 KB objects (the global state object: ~78 KB at 1k apps, ~781 KB at 10k)
@@ -27,7 +27,7 @@
 #
 # Knobs (environment): REGION=us-west-2  MEMS="128 512 1769"  COLD_N=30  WARM_N=300  BENCH_N=200  COMPONENTS="hello_p3 hello_p2 hello_js"
 # p99 of 30 cold starts is the maximum; for a defensible p99 run e.g. COLD_N=100 bench/cloud.sh cold 1769 hello_p3 precompiled
-# Rough cost of `all` with the defaults: well under $1 (about 600 cold starts and 3000 warm requests of at most a few seconds each at
+# Rough cost of `all` with the defaults: well under $1 (about 800 cold starts and 3000 warm requests of at most a few seconds each at
 # 128 to 1769 MB, a few thousand S3 and DynamoDB requests, CloudWatch ingestion of a few MB); see RESULTS.md.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -122,14 +122,14 @@ functional() {
 }
 
 cold() { # cold <memory> <component> <mode> [n]
-  local mem=$1 comp=$2 mode=$3 n=${4:-$COLD_N} pre eager zst label
+  local mem=$1 comp=$2 mode=$3 n=${4:-$COLD_N} pre eager zst label cc=cranelift
   case $mode in
-    precompiled) pre=1 eager=0 zst=0;; precompiled-eager) pre=1 eager=1 zst=0;; precompiled-zstd) pre=1 eager=0 zst=1;; compile) pre=0 eager=0 zst=0;;
-    *) echo "mode: precompiled | precompiled-eager | precompiled-zstd | compile" >&2; return 2;;
+    precompiled) pre=1 eager=0 zst=0;; precompiled-eager) pre=1 eager=1 zst=0;; precompiled-zstd) pre=1 eager=0 zst=1;; compile) pre=0 eager=0 zst=0;; compile-winch) pre=0 eager=0 zst=0 cc=winch;;
+    *) echo "mode: precompiled | precompiled-eager | precompiled-zstd | compile | compile-winch" >&2; return 2;;
   esac
   label=cold-$comp-$mode-$mem
   echo "-- $label (n=$n)"
-  setenv "$mem" "SPINIT_COMPONENT=$(digest "$comp")" "SPINIT_PRECOMPILED=$pre" "SPINIT_EAGER=$eager" "SPINIT_ZSTD=$zst"
+  setenv "$mem" "SPINIT_COMPONENT=$(digest "$comp")" "SPINIT_PRECOMPILED=$pre" "SPINIT_EAGER=$eager" "SPINIT_ZSTD=$zst" "SPINIT_COMPILER=$cc"
   : > "$OUT/$label.csv"
   now_ms > "$OUT/$label.start"
   for i in $(seq "$n"); do
@@ -142,7 +142,7 @@ cold() { # cold <memory> <component> <mode> [n]
 warm() { # warm <memory> <component> [n]
   local mem=$1 comp=$2 n=${3:-$WARM_N} label; label=warm-$comp-$mem
   echo "-- $label (n=$n)"
-  setenv "$mem" "SPINIT_COMPONENT=$(digest "$comp")" SPINIT_PRECOMPILED=1 SPINIT_EAGER=0 SPINIT_ZSTD=0 "COLD_NONCE=$label-$(now_ms)"
+  setenv "$mem" "SPINIT_COMPONENT=$(digest "$comp")" SPINIT_PRECOMPILED=1 SPINIT_EAGER=0 SPINIT_ZSTD=0 SPINIT_COMPILER=cranelift "COLD_NONCE=$label-$(now_ms)"
   for _ in $(seq 20); do call "$mem" / >/dev/null; done      # the first one is the cold start, the rest settle the environment
   : > "$OUT/$label.csv"
   now_ms > "$OUT/$label.start"
@@ -171,6 +171,7 @@ all_cold() {
     cold "$mem" hello_p3 precompiled-eager; cold "$mem" hello_js precompiled-zstd
     # Blob + Cranelift in the function: p3 and p2 at every size, the 13 MB JS component only at the full vCPU (it does not fit 128 MB).
     cold "$mem" hello_p3 compile; cold "$mem" hello_p2 compile
+    [ "$mem" = 128 ] || { cold "$mem" hello_p3 compile-winch; cold "$mem" hello_js compile-winch; }   # no stored native code at all
   done
   cold 1769 hello_p3 precompiled-zstd; cold 1769 hello_js compile
 }

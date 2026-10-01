@@ -8,11 +8,12 @@
 //!   SPINIT_PRECOMPILED  `1`: look for a precompiled artifact in the bucket before compiling
 //!   SPINIT_ZSTD         `1`: with SPINIT_PRECOMPILED, fetch the zstd copy (`<cwasm key>.zst`) and decompress it in memory
 //!   SPINIT_EAGER        `1`: load the component before listening (Lambda init phase) instead of on the first request
+//!   SPINIT_COMPILER     `cranelift` (default) | `winch`: compile with Wasmtime's baseline compiler (own cache subdirectory)
 //!   SPINIT_TARGET       compile for this target triple with baseline ISA flags (portable `.cwasm`), e.g. aarch64-unknown-linux-gnu
 //!   SPINIT_BUCKET       bucket for blobs and the S3 bench routes; endpoint and credentials come from AWS_* variables
 //!   SPINIT_TABLE        DynamoDB table for the DynamoDB bench routes
 //! Every request, and every cold-path phase, is one JSON line on stdout.
-//! Subcommands: `spinit-host precompile <in.wasm> <out.cwasm>`, `spinit-host publish <in.wasm>` (blob + precompiled artifact + its zstd copy to the bucket).
+//! Subcommands: `spinit-host mac-bench`, `spinit-host precompile <in.wasm> <out.cwasm>`, `spinit-host publish <in.wasm>` (blob + precompiled artifact + its zstd copy to the bucket).
 mod bench;
 mod component;
 mod guest;
@@ -22,9 +23,9 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use object_store::{ObjectStore, aws::AmazonS3Builder};
 use serde_json::{Map, Value, json};
-use std::{pin::Pin, sync::{Arc, atomic::{AtomicU64, Ordering::Relaxed}}, task::{Context as Cx, Poll}, time::Instant};
+use std::{path::PathBuf, pin::Pin, sync::{Arc, atomic::{AtomicU64, Ordering::Relaxed}}, task::{Context as Cx, Poll}, time::Instant};
 use tokio::{net::TcpListener, sync::OnceCell};
-use wasmtime::{Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, component::Linker};
+use wasmtime::{Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig, Strategy, component::Linker};
 use wasmtime_wasi_http::{WasiBody, handler::ProxyPre, io::TokioIo};
 
 use {bench::Bench, component::Source, guest::Guest};
@@ -39,8 +40,13 @@ fn rss_kb() -> u64 {
     s.lines().find_map(|l| l.strip_prefix("VmRSS:")?.trim().trim_end_matches("kB").trim().parse().ok()).unwrap_or(0)
 }
 
+fn winch() -> Result<bool> {
+    match env("SPINIT_COMPILER").as_deref() { None | Some("cranelift") => Ok(false), Some("winch") => Ok(true), Some(c) => anyhow::bail!("SPINIT_COMPILER is cranelift or winch, not {c}") }
+}
+
 fn engine(pooling: bool, target: Option<&str>) -> Result<Engine> {
     let mut cfg = Config::new();
+    if winch()? { cfg.strategy(Strategy::Winch); }
     cfg.wasm_component_model_async(true).wasm_component_model_async_stackful(true).wasm_component_model_more_async_builtins(true);
     cfg.epoch_interruption(true);
     if let Some(t) = target { cfg.target(t)?; }
@@ -179,7 +185,9 @@ async fn main() -> Result<()> {
             emit(component::precompile(&engine(pooling, target.as_deref())?, input, output)?);
             return Ok(());
         }
+        Some("mac-bench") => { emit(bench::mac_bench()); return Ok(()); }
         Some("publish") => {
+            anyhow::ensure!(!winch()?, "publish writes Cranelift artifacts");
             let bucket = bucket()?.context("SPINIT_BUCKET is not set")?;
             emit(component::publish(&engine(pooling, target.as_deref())?, &*bucket, args.get(2).context("usage: publish <in.wasm>")?).await?);
             return Ok(());
@@ -201,7 +209,7 @@ async fn main() -> Result<()> {
     let source = Source {
         spec: env("SPINIT_COMPONENT").context("SPINIT_COMPONENT is not set")?,
         bucket: bucket.clone(),
-        cache: env("SPINIT_CACHE_DIR").unwrap_or("/tmp/spinit-cache".into()).into(),
+        cache: { let mut c = PathBuf::from(env("SPINIT_CACHE_DIR").unwrap_or("/tmp/spinit-cache".into())); if winch()? { c.push("winch"); } c }, // artifacts differ per compiler
         precompiled: env("SPINIT_PRECOMPILED").as_deref() == Some("1"),
         zstd: env("SPINIT_ZSTD").as_deref() == Some("1"),
     };
@@ -212,7 +220,7 @@ async fn main() -> Result<()> {
     let addr = env("SPINIT_ADDR").unwrap_or("127.0.0.1:8080".into());
     let listener = TcpListener::bind(&addr).await?;
     emit(json!({ "event": "init", "addr": addr, "allocator": if pooling { "pooling" } else { "default" }, "eager": eager,
-        "target": target, "wasmtime": component::WASMTIME, "engine_us": engine_us, "linker_us": linker_us, "init_total_us": us(start), "rss_kb": rss_kb() }));
+        "target": target, "compiler": if winch()? { "winch" } else { "cranelift" }, "wasmtime": component::WASMTIME, "engine_us": engine_us, "linker_us": linker_us, "init_total_us": us(start), "rss_kb": rss_kb() }));
     loop {
         let (stream, _) = listener.accept().await?;
         stream.set_nodelay(true).ok(); // headers and body leave in separate writes; with Nagle and delayed ACK that stalls a request by ~40 ms
