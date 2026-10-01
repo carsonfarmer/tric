@@ -1,0 +1,5 @@
+# Used by bench/runaway.py with `-f compose.yaml -f bench/runaway.compose.yaml`: pins the host's tokio worker threads.
+services:
+  host:
+    environment:
+      TOKIO_WORKER_THREADS: ${TOKIO_WORKER_THREADS}
