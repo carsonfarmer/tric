@@ -212,6 +212,7 @@ async fn main() -> Result<()> {
         "target": target, "wasmtime": component::WASMTIME, "engine_us": engine_us, "linker_us": linker_us, "init_total_us": us(start), "rss_kb": rss_kb() }));
     loop {
         let (stream, _) = listener.accept().await?;
+        stream.set_nodelay(true).ok(); // headers and body leave in separate writes; with Nagle and delayed ACK that stalls a request by ~40 ms
         let server = server.clone();
         tokio::spawn(async move {
             let svc = hyper::service::service_fn(|req| { let server = server.clone(); async move { Ok::<_, std::convert::Infallible>(server.handle(req).await) } });
