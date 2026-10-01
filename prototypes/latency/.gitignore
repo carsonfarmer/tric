@@ -1,0 +1,11 @@
+# Build outputs and large test components (rebuild with the commands in RESULTS.md / components/README)
+out/
+host/target/
+infra/.terraform/
+infra/*.tfstate*
+infra/*.zip
+components/**/target/
+components/**/node_modules/
+components/**/dist/
+*.wasm
+*.cwasm
