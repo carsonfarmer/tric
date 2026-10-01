@@ -1,0 +1,20 @@
+[package]
+name = "minihost"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+toml = "0.9"
+wasmtime = { version = "=49.0.1", features = ["component-model-async"] }
+wasmtime-wasi = "=49.0.1"
+wasmtime-wasi-http = { version = "=49.0.1", features = ["component-model-async"] }

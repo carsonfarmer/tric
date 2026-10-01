@@ -1,0 +1,11 @@
+spin_manifest_version = 2
+[variables]
+greet = { default = "hello" }
+[[trigger.http]]
+route = "/..."
+component = "c"
+[component.c]
+source = "../../apps/app-http-rust-p2/target/wasm32-wasip2/release/app_http_rust_p2.wasm"
+allowed_outbound_hosts = ["https://example.com"]
+key_value_stores = ["default"]
+variables = { greeting = "{{ greet }} world" }

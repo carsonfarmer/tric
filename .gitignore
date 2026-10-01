@@ -1,0 +1,9 @@
+.worktrees/
+.DS_Store
+target/
+node_modules/
+*.cwasm
+.terraform/
+*.tfstate
+*.tfstate.*
+.env

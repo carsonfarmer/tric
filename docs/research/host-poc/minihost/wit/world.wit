@@ -1,0 +1,8 @@
+package local:adapters;
+
+world adapters {
+  import spin:key-value/key-value@3.0.0;
+  import spin:variables/variables@3.0.0;
+  import fermyon:spin/key-value@2.0.0;
+  import fermyon:spin/variables@2.0.0;
+}
