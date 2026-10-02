@@ -1,26 +1,35 @@
 //! `torpor serve`: runs the app in a directory over HTTP/1.
 use hyper::{Request, body::Incoming, server::conn::http1, service::service_fn};
+use object_store::memory::InMemory;
 use serde::Deserialize;
-use std::{collections::BTreeMap, convert::Infallible, env, fs, path::Path, path::PathBuf};
+use std::{collections::BTreeMap, convert::Infallible, env, fs, path::Path, path::PathBuf, sync::Arc};
 use tokio::net::TcpListener;
 use torpor::Engine;
 use wasmtime::Result;
 use wasmtime_wasi_http::io::TokioIo;
 
-/// `torpor.toml`.
+const MANIFEST: &str = "torpor.toml";
+const VAR_PREFIX: &str = "TORPOR_VAR_";
+
+/// The app's `MANIFEST`.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)] // a misspelt `allowed_outbound_hosts` would silently grant no access
 struct Manifest {
     name: String,
     component: PathBuf, // relative to the manifest's directory
     #[serde(default)]
     config: BTreeMap<String, String>,
+    #[serde(default)]
+    allowed_outbound_hosts: Vec<String>, // as in Spin: `scheme://host[:port]`
 }
 
 pub async fn run(dir: &Path, listener: TcpListener) -> Result<()> {
-    let Manifest { name, component, mut config } = toml::from_str(&fs::read_to_string(dir.join("torpor.toml"))?)?;
-    // Secrets never go in `torpor.toml`: `TORPOR_VAR_<KEY>` sets `key` and overrides `[config]`.
-    config.extend(env::vars().filter_map(|(k, v)| Some((k.strip_prefix("TORPOR_VAR_")?.to_lowercase(), v))));
-    let app = Engine::new()?.load(&name, fs::read(dir.join(component))?, config)?;
+    let Manifest { name, component, mut config, allowed_outbound_hosts } =
+        toml::from_str(&fs::read_to_string(dir.join(MANIFEST))?)?;
+    // Secrets never go in the manifest: `TORPOR_VAR_<KEY>` sets `key` and overrides `[config]`.
+    config.extend(env::vars().filter_map(|(k, v)| Some((k.strip_prefix(VAR_PREFIX)?.to_lowercase(), v))));
+    let engine = Engine::new(Arc::new(InMemory::new()))?; // until the S3 store is in
+    let app = engine.load(&name, fs::read(dir.join(component))?, config, &allowed_outbound_hosts)?;
     loop {
         let (stream, _) = listener.accept().await?;
         stream.set_nodelay(true)?; // otherwise Nagle plus delayed ACK stalls a response by ~40 ms

@@ -20,6 +20,10 @@ Running log from the grilling session. Background research is in [research/](res
 
 **Write as little custom code as possible.** Lean on existing libraries. Prefer elegant designs that reduce total lines of code, and keep implementations clean and idiomatic. When options are otherwise close, the one with less code wins.
 
+## No backward compatibility (added 2026-10-02)
+
+**Until the first public release, never keep backward compatibility.** There are no users and no outside consumers, so any breaking change is fine and expected. That means no migrations, no compatibility shims, no format or protocol versions, and no hedges written for a later change. Docs describe what the code does today. This dropped a version field from the Q45 state object and the "at most 1 s old" promise from the KV docs.
+
 ## Round 2: architecture (2026-09-30)
 
 | # | Topic | Decision |
@@ -83,7 +87,7 @@ Running log from the grilling session. Background research is in [research/](res
 | Q42 | KV limits and listing | Keys of 256 bytes or less, stored percent-encoded, one object each. Values of 1 MiB or less, rejected on `set`. `list-keys` passes straight through to the bucket LIST, one page of up to 1,000 keys per call, and the cost ($0.005 per 1,000 calls) is documented loudly. **Accepted for now only:** the user wants a way out of the LIST cost as soon as possible (next round). |
 | Q43 | Name | "spinit" is a **working name only**. Keep it out of everything stored (bucket keys, manifest fields, media types), so a rename is a find-and-replace and never a migration. The user dislikes the name; candidates are being vetted ([research/names.md](research/names.md)). |
 | Q44 | KV and config interface versions | **Open.** The user leans toward (c), supporting both `wasi:keyvalue@0.2.0-draft` (Wasmtime's) and `0.2.0-draft2` (upstream, Spin; has CAS and a string cursor), and wants to lean on Wasmtime more than Spin. Waiting on research into `wasmtime-wasi-keyvalue`: is it pluggable, and is it moving to a newer draft? Config is settled: `wasi:config@0.2.0-rc.1`, reusing Wasmtime's implementation. |
-| Q45 | State object (closes Q19/Q26) | **Accepted.** One small global CAS object `{v, apps: name → manifest hash, domains: host → app, cron}`; routes, config and limits stay in each immutable manifest. About 78 bytes per app (78 KB at 1k apps, 781 KB at 10k). A request finding cached state 5 s old or older first makes one blocking conditional GET. The CLI retries the swap with randomized backoff; a multi-app deploy is one atomic swap; retries are idempotent; writes are paced to 1/s on GCS. About $1.10–1.25/month at the reference load. Revisit (sharding or a change log) at about 10k apps or one deploy per second. |
+| Q45 | State object (closes Q19/Q26) | **Accepted.** One small global CAS object `{apps: name → manifest hash, domains: host → app, cron}`; routes, config and limits stay in each immutable manifest. About 78 bytes per app (78 KB at 1k apps, 781 KB at 10k). A request finding cached state 5 s old or older first makes one blocking conditional GET. The CLI retries the swap with randomized backoff; a multi-app deploy is one atomic swap; retries are idempotent; writes are paced to 1/s on GCS. About $1.10–1.25/month at the reference load. Revisit (sharding or a change log) at about 10k apps or one deploy per second. |
 | Q46 | Precompile at deploy | **Superseded by Q54.** Precompiling is still needed for large components, but the user rejected the trust note: bucket write access must never mean control of the host. |
 | Q47 | Cold-start target by size | **(b)** 500 ms p99 for components of about 5 MB or less (Rust, C, Go, TinyGo, QuickJS-based JS). StarlingMonkey JS and Python get a documented target of about 1 s p99 until measured. A dedicated-function mode can follow if needed. |
 | Q48 | Retention and gc | A manual `spinit gc` (about 100 lines) keeps everything reachable from the state object through each app's last **10** releases (also the rollback depth) and deletes the rest, skipping anything younger than 1 hour. Bucket lifecycle rules can't be used because they can't see references. **Expected to be automated later.** |
@@ -123,6 +127,34 @@ Running log from the grilling session. Background research is in [research/](res
 | Q59 | Embeddable runtime (the user's ask) | **The host runtime is a library that can be embedded without the CLI.** One package (`torpor-cli`, refining Q18) holds a library `torpor` (`src/lib.rs`: `engine`, `guest`, later `outbound`, `kv`, `config`) and the `torpor` binary (`src/main.rs`: `serve`, `state`, `compile`, the deploy CLI). Modules declared in `main.rs` are invisible to the library, so the compiler keeps the runtime free of `torpor.toml`, the bucket layout and the CLI. The public API is small: build an engine, load a component into an app, `app.handle(request) -> response`. Limits stay constants (Q35). The library never installs a logging subscriber. Split into a separately published crate only when someone embeds it from crates.io (Q18: split only when forced). |
 | Q57 (applied) | Timeout mechanism | `torpor serve` is a concurrent server, which is Q57's own trigger, and Q35's 10 s must also hold for a guest that is only waiting. So M1 yields on every 10 ms epoch tick and drops the store at a 10 s deadline (what `wasmtime serve` does): about one line more than the plain trap ([research/wasmtime-embedding.md](research/wasmtime-embedding.md), section 6). |
 
+## During M2 (2026-10-01)
+
+From the research brief, [research/m2-interfaces.md](research/m2-interfaces.md).
+
+| # | Topic | Decision |
+|---|---|---|
+| Q38 (applied) | Allow-list matcher | **Hand-written on `http::Uri`, not the `url` crate.** `url` cannot parse `*://*:*`, `http://*:*` or `host:*`, so the wildcard parts would have to be split by hand first, and that split is the whole matcher. About 36 lines with parsing. It matches the request's literal host text, which is stricter than Spin (Spin normalises `127.1` first); the address filter judges the resolved address either way. |
+| Q34 (applied) | Address filter and dialling | **Our own connect, not `default_send_request`.** That function resolves the name again inside its connect, so the address checked is not the address dialled (a rebinding gap), and its timeouts default to 600 s. We resolve, reject the request if **any** address is blocked (Spin drops the blocked ones and dials the rest), and dial only the checked list. The blocked set is hand-written with stable `std` (12 lines): `ip_network`'s `is_global` lets through `::127.0.0.1`, NAT64, 6to4 and IPv4 multicast. |
+| — | KV cache scope | **Per app per process**, not per store: each request gets a fresh store, so a per-store cache would never hit. Bounded by a byte cap that sits outside the guest's memory cap. |
+| — | Spin SDK guests | The SDK's own config import is `wasi:config@0.2.0-draft-2024-09-27`, which does not link on rc.1, and its KV module imports `spin:*`. Spin SDK apps use the SDK for HTTP only and `wit_bindgen::generate!` for KV and config. The app docs say so. |
+| Q44 (applied) | KV list cursor | **The last key returned, not an S3 continuation token.** We list with `start-after` (`list_with_offset`), so a cursor stays valid across processes and caches, and the same code works on stores without continuation tokens. |
+| — | Optional KV and outbound behaviour | **All kept, over the first budget:** the batch interface (about 18 lines), the page cache (about 8), the cache byte cap (about 6) and the allow-list host check (about 4). Each is real behaviour, not ceremony (2026-10-02). |
+| — | Hung DNS lookups | **Accepted for now.** A lookup that hangs holds a blocking-pool thread after the 10 s deadline has already answered the guest. A timeout around the lookup would not free the thread either. |
+
+## M2 review (2026-10-02)
+
+| # | Topic | Decision |
+|---|---|---|
+| Q33, Q42 | KV cache (replaces Q33's value cache, round 6's Q42 and the cache rows of "During M2") | **No cache.** Every KV call goes to the store: `get` is a GET, a write one PUT, a page of `list-keys` one LIST. This removes the generation object (and with it the breach of Q12's one-write-per-second rule on GCS), the page cache, the byte cap and every staleness case. `kv.rs` drops from 312 to 236 lines, not counting tests. Uncached reads cost more on hot keys: one key read 100 times a second all month is about $104 in GETs. At the reference load, about $0.90 a month. |
+| Q12 | Hot keys on GCS | GCS takes about one write a second per object and answers faster writes with 429. `object_store` retries those with backoff for up to 3 minutes. S3 and Azure have no such limit. Documented for app authors; the host does no pacing. |
+| — | KV fixes found in review | GCS conditional writes need the object's generation, not its ETag, so a CAS keeps both (`UpdateVersion`). Deleting a missing key is not an error (GCS and Azure answer 404). A swap on a key deleted since `cas::new` loses instead of failing (S3 answers 404 to `If-Match` there). |
+| Q9 | App state backend (the user's note) | **Revisit after M2.** Only platform state must live in buckets (the clarification under round 1); app data need not. M2 ships KV over the object store with no cache, and a later round weighs other backends. |
+| Q34 | Use Wasmtime's sender? | **Keep our own connect.** `default_send_request` is the only public sender and takes no resolver or connector. It resolves the name inside its own connect, so checking addresses first and then calling it means a second lookup that a DNS answer can change. That would let a request rebind to loopback, and so to the Lambda runtime API. It also builds TLS with `ClientConfig::builder()`, which panics once a second crypto provider is linked; M3 adds aws-lc-rs for S3. A connector hook upstream would let us drop about 40 lines. |
+| Q38 | Allow-list matcher (replaces "Hand-written on `http::Uri`" above) | **An item is kept as its origin, `scheme://host:port`, and matched as a whole string, or by prefix and suffix around the one `*` of `*.`.** It saves 2 lines and rejects more malformed items. Dropped: `*` as a scheme, port or whole host (`https://*`, `https://example.com:*`, `*://example.com:*`, `http://*:*`). Only `*://*:*` remains as a catch-all, and it now allows http and https only. Added: an IPv6 host without a port. No library fits: Spin's matcher is not on crates.io, and `urlpattern` brings `regex` and still needs our own parsing. |
+| — | User names in request URLs | **Refused with `HttpRequestUriInvalid`**, not `HttpRequestDenied`. RFC 9110 deprecates userinfo in http(s) URLs and says recipients should treat it as an error; fetch throws. The docs point to an `Authorization` header. This costs 3 lines. |
+| Q55 | Data copied in by one host call | **32 MiB** (`HOSTCALL_FUEL`), down from Wasmtime's 128 MiB default. Wasmtime charges every string and list it lifts out of a guest against this budget, so it bounds what one call such as `fields.from-list` or `set-many` can make the host allocate. A call over it traps. |
+| — | Wasmtime issue | **No new issue.** An earlier claim here that Wasmtime lifts lists without limit was wrong (see the corrected deferred row). A short comment on bytecodealliance/wasmtime#14430 goes up only after the user approves its text. |
+
 ## Deferred work and fast follows
 
 Kept here so nothing agreed in the grilling gets lost.
@@ -133,7 +165,7 @@ Kept here so nothing agreed in the grilling gets lost.
 | Read-only `/v2/` registry view of the bucket; `spinit export` | Q40 | Only if wanted. Generate OCI manifests on the fly. |
 | Custom domains through CloudFront | Q11, Q50 | Secret origin header checked by the host; certificate in us-east-1. |
 | Dedicated-function mode | Q11, Q47, Q55 | For apps needing hard isolation, more memory, or the strict cold-start target for large components. |
-| Skip the `gen` write on plain updates | Q42 | When the instance's cache already shows the key existed, an update needs only the data write. |
+| ~~Skip the `gen` write on plain updates~~ | Q42 | Moot: there is no generation object since the M2 review. |
 | Automated gc | Q48 | Today: manual `spinit gc`. |
 | Cron design revisit | Q23, Q49 | Once-a-minute ticker, opt-in. |
 | Rename to torpor | Q43 | Find-and-replace `spinit` → `torpor`, plus a trademark and domain check, before the first public release. |
@@ -144,4 +176,10 @@ Kept here so nothing agreed in the grilling gets lost.
 | HMAC on native code | Q54 (a) | Defence in depth against a misconfigured bucket policy. About 30 lines plus a shared key. |
 | ~~Yield on each epoch tick plus a request timeout~~ | Q57 | Done in M1 (see "During M1"). |
 | Load hot apps during start-up | Q56 (c) | Only if reading state during start-up falls short. |
+| Watch Wasmtime for `wasi:keyvalue` draft2 | Q44 | `wasmtime-wasi-keyvalue` implements only the first draft and keeps its bindings private. If it moves to draft2 with public bindings or a backend trait, replace our `bindgen!` with it. |
+| Field lists lifted before their size check | Q53, Q55 | Wasmtime charges every lifted string and list against the per-call budget (`HOSTCALL_FUEL`, 32 MiB; GHSA-852m-cvvp-9p4w), so no host call allocates without bound. `fields.from-list` still lifts every field before its 128 KiB check, so a call it refuses can cost up to that budget. Upstream agreed in bytecodealliance/wasmtime#14430 to charge lifting to Store fuel as well. Watch it. |
+| ~~Pace generation writes on GCS~~ | Q12, Q42 | Moot: there is no generation object since the M2 review. |
+| KV backend round | Q9 | App data need not live in object storage. Weigh other backends (DynamoDB, a serverless Redis, the SQLite family, or pluggable backends as in Spin's runtime config) against KV over the object store with no cache. |
+| Outbound connector hook upstream | Q34 | If `wasmtime-wasi-http` gains a connector or resolver hook, or a way to send over a given stream, our connect and TLS code (about 40 lines) can go. |
+| Certificate errors as `TlsCertificateError` | Q34 | Today every TLS failure reaches the guest as `TlsProtocolError`. |
 | Second short cloud session | Q51, Q56 | `deserialize_file` against `deserialize`, state read during start-up, 1024 MB, n = 100, compile-function timings. Needs its own explicit apply approval. |
