@@ -33,21 +33,34 @@ enum Cmd {
         #[arg(long, env = "TORPOR_IDENTITY", hide_env_values = true)]
         identity: Option<String>,
     },
-    /// Deploy the app described by each DIR/torpor.toml, all in one change
-    Deploy {
-        #[arg(required = true)]
-        dirs: Vec<PathBuf>,
+    /// Upload the app described by DIR/torpor.toml as a release, without serving it, and print `APP ID`
+    Publish {
+        #[arg(default_value = ".")]
+        dir: PathBuf,
     },
-    /// Move APP back to the release before its current one
-    Rollback { app: String },
+    /// Serve APP from its release ID
+    Release { app: String, id: String },
+    /// List APP's releases, newest first, each with when it was first published
+    Releases { app: String },
+    #[command(subcommand)]
+    Apps(Apps),
     #[command(subcommand)]
     Secrets(Secrets),
+}
+
+/// The install's apps, each in a team. Changing them takes the admin's credentials
+#[derive(Subcommand)]
+enum Apps {
+    /// Add APP to TEAM, or move it there, where it starts with nothing published and no KV data
+    Add { app: String, team: String },
+    /// Take APP out of the install. Its objects stay in the bucket
+    Remove { app: String },
 }
 
 /// An app's secrets
 #[derive(Subcommand)]
 enum Secrets {
-    /// Set APP's secret NAME to stdin, less a trailing newline, in a new release
+    /// Set APP's secret NAME to stdin, less a trailing newline, whichever release it runs
     Set {
         app: String,
         name: String,
@@ -65,6 +78,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().json().with_env_filter(filter).init();
     let Args { store, cmd } = Args::parse();
     let store = store.map(|url| AmazonS3Builder::from_env().with_url(url).build()).transpose()?;
+    let s = || store.as_ref().context(NO_STORE);
     match cmd {
         Cmd::Serve { dir, listen, identity } => {
             let identity = identity.map(|i| i.parse()).transpose().map_err(Error::msg)?;
@@ -74,15 +88,25 @@ async fn main() -> Result<()> {
             };
             return serve::run(apps, TcpListener::bind(listen).await?).await;
         }
-        Cmd::Deploy { dirs } => cli::deploy(&store.context(NO_STORE)?, &dirs).await?,
-        Cmd::Rollback { app } => cli::rollback(&store.context(NO_STORE)?, &app).await?,
+        Cmd::Publish { dir } => {
+            let (app, id) = cli::publish(s()?, &dir).await?;
+            println!("{app} {id}");
+            return Ok(());
+        }
+        Cmd::Release { app, id } => cli::release(s()?, &app, &id).await?,
+        Cmd::Releases { app } => {
+            cli::releases(s()?, &app).await?.iter().for_each(|r| println!("{r}"));
+            return Ok(());
+        }
+        Cmd::Apps(Apps::Add { app, team }) => cli::assign(s()?, &app, Some(&team)).await?,
+        Cmd::Apps(Apps::Remove { app }) => cli::assign(s()?, &app, None).await?,
         Cmd::Secrets(Secrets::Set { app, name, recipient }) => {
             let value = std::io::read_to_string(std::io::stdin())?;
             let value = value.strip_suffix('\n').unwrap_or(&value);
-            cli::set_secret(&store.context(NO_STORE)?, &app, &name, value, &recipient).await?
+            cli::set_secret(s()?, &app, &name, value, &recipient).await?
         }
         Cmd::Secrets(Secrets::List { app }) => {
-            cli::secrets(&store.context(NO_STORE)?, &app).await?.iter().for_each(|n| println!("{n}"));
+            cli::secrets(s()?, &app).await?.iter().for_each(|n| println!("{n}"));
             return Ok(());
         }
     }

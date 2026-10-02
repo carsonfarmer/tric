@@ -76,7 +76,7 @@ async fn errors_are_values() {
     for (path, want) in [
         ("/kv?op=open&store=Bad_Name".to_string(), &no_store),
         ("/kv?op=open&store=".to_string(), &no_store),
-        (format!("/kv?op=open&store={}", "a".repeat(65)), &no_store),
+        (format!("/kv?op=open&store={}", "a".repeat(64)), &no_store),
         (format!("/kv?op=get&store=s&key={}", "k".repeat(257)), &bad_key),
         ("/kv?op=get&store=s&key=".to_string(), &bad_key),
         ("/kv?op=set&store=s&key=&value=1".to_string(), &bad_key),
@@ -84,7 +84,7 @@ async fn errors_are_values() {
         assert_eq!(&j(&app, &path).await, want, "{}", &path[..path.len().min(60)]);
     }
     assert_eq!(
-        j(&app, &format!("/kv?op=get&store={}&key={}", "a".repeat(64), "k".repeat(256))).await,
+        j(&app, &format!("/kv?op=get&store={}&key={}", "a".repeat(63), "k".repeat(256))).await,
         json!({"ok": null})
     );
     j(&app, "/kv?op=set&store=s&key=t&value=abc").await;

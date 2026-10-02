@@ -5,4 +5,5 @@ mod guest;
 mod kv;
 mod outbound;
 
+pub use kv::{NAME_MAX, is_name};
 pub use {engine::Engine, guest::App};

@@ -9,7 +9,7 @@ use wasmtime::component::Resource;
 
 const KEY_MAX: usize = 256; // bytes, before percent-encoding
 const VALUE_MAX: usize = 1 << 20;
-pub(crate) const NAME_MAX: usize = 64; // bytes in a bucket or app name
+pub const NAME_MAX: usize = 63; // bytes in a bucket, app or team name: a DNS label, as an app's is
 const PAGE: usize = 1000; // keys per `list-keys`, the most S3 gives for one LIST
 const BATCH_MAX: usize = 16 << 20; // bytes of values in one `get-many` reply
 const RETRIES: usize = 16; // CAS attempts for one `increment`
@@ -28,8 +28,9 @@ fn other(e: impl ToString) -> Error {
     Error::Other(e.to_string())
 }
 
-/// Whether `s` can name a bucket or an app, which both become one segment of a key: 1 to 64 of `a-z`, `0-9` and `-`.
-pub(crate) fn is_name(s: &str) -> bool {
+/// Whether `s` can name a bucket, an app or a team, which all become one segment of a key: 1 to 63 of `a-z`, `0-9` and
+/// `-`.
+pub fn is_name(s: &str) -> bool {
     (1..=NAME_MAX).contains(&s.len()) && s.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
 }
 
@@ -43,22 +44,22 @@ pub struct Cas {
     seen: Option<(Bytes, UpdateVersion)>,
 }
 
-/// One app's view of the object store.
+/// One app's view of the object store: its keys under `root`.
 pub(crate) struct Kv {
     store: Arc<dyn ObjectStore>,
-    app: String,
+    root: Path,
 }
 
 impl Kv {
-    pub(crate) fn new(store: Arc<dyn ObjectStore>, app: &str) -> Self {
-        Self { store, app: app.into() }
+    pub(crate) fn new(store: Arc<dyn ObjectStore>, root: &str) -> Self {
+        Self { store, root: root.into() }
     }
 
     fn path(&self, bucket: &str, key: &str) -> R<Path> {
         if key.is_empty() || key.len() > KEY_MAX {
             return Err(Error::Other(format!("a key is 1 to {KEY_MAX} bytes"))); // an empty key would be the bucket's prefix
         }
-        Ok(Path::from_iter(["kv", &self.app, bucket, key])) // each part is percent-encoded, so `/` stays inside it
+        Ok(self.root.clone().join(bucket).join(key)) // each part is percent-encoded, so `/` stays inside it
     }
 
     /// The key as the store has it, with the version a conditional write needs.
@@ -121,7 +122,7 @@ impl Kv {
 
     /// One page of keys in order: the first `PAGE` after `cursor`, which is the last key of the page before.
     async fn list(&self, bucket: &str, cursor: Option<String>) -> R<KeyResponse> {
-        let prefix = Path::from_iter(["kv", &self.app, bucket]);
+        let prefix = self.root.clone().join(bucket);
         let after = cursor.map_or(Ok(prefix.clone()), |k| self.path(bucket, &k))?; // everything is after the prefix itself
         let keys: Vec<String> = (self.store.list_with_offset(Some(&prefix), &after).take(PAGE))
             .map_ok(|m| percent_decode_str(m.location.filename().unwrap_or_default()).decode_utf8_lossy().into_owned())
@@ -245,7 +246,7 @@ mod tests {
     /// Too big for the guest tests, as a `Uri` of 64 KiB is the most their fixture can pass.
     #[tokio::test]
     async fn value_limit() {
-        let kv = Kv::new(Arc::new(InMemory::new()), "app");
+        let kv = Kv::new(Arc::new(InMemory::new()), "kv/app");
         let put = |n| kv.set("b", "k", Bytes::from(vec![0; n]));
         assert!(put(VALUE_MAX).await.is_ok());
         assert!(put(VALUE_MAX + 1).await.is_err());
@@ -255,7 +256,7 @@ mod tests {
     /// A listing is the store's: a write is in it at once, and a failed write is not.
     #[tokio::test]
     async fn listing_is_the_stores() {
-        let kv = Kv::new(Arc::new(InMemory::new()), "app");
+        let kv = Kv::new(Arc::new(InMemory::new()), "kv/app");
         assert!(kv.list("b", None).await.unwrap().keys.is_empty());
         kv.set("b", "a", "1".into()).await.unwrap();
         assert!(kv.set("b", "z", vec![0; VALUE_MAX + 1].into()).await.is_err());
@@ -268,7 +269,7 @@ mod tests {
     /// The condition of a swap is the version it read, so the second of two swaps from one read loses.
     #[tokio::test]
     async fn swap_is_conditional() {
-        let kv = Kv::new(Arc::new(InMemory::new()), "app");
+        let kv = Kv::new(Arc::new(InMemory::new()), "kv/app");
         let (first, second) = (kv.cas("b", "k").await.unwrap(), kv.cas("b", "k").await.unwrap());
         assert!(kv.swap(first, "1".into()).await.unwrap().is_none());
         let lost = kv.swap(second, "2".into()).await.unwrap().expect("the key was created since");

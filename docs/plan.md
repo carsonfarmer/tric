@@ -4,8 +4,8 @@
 
 ## What v1 is
 
-An operator installs torpor into their own AWS account with one OpenTofu module, then deploys WASI components with `torpor deploy`.
-- One shared Lambda function serves every app (Q11).
+An operator installs torpor into their own AWS account with one OpenTofu module, then its teams publish and release WASI components with `torpor publish` and `torpor release`.
+- One shared Lambda function serves every app, each at its own subdomain of one domain (Q11, Q67).
 - All platform state lives in buckets (Q1).
 - An idle install costs only its storage.
 
@@ -17,12 +17,12 @@ An operator installs torpor into their own AWS account with one OpenTofu module,
 | Idle cost | ≤ $0.05/month | Q4 |
 | 1M requests + 100k writes | about $1–2/month | Q4 |
 
-**Not in v1:** cron, custom domains (CloudFront), GCP and Azure installs, `deploy --from oci://`, `deploy --plug`, the Spin adapter, dedicated functions, and the rest of the [deferred table](decisions.md#deferred-work-and-fast-follows).
+**Not in v1:** cron, custom domains (Q66), GCP and Azure installs, `deploy --from oci://`, `deploy --plug`, the Spin adapter, dedicated functions, and the rest of the [deferred table](decisions.md#deferred-work-and-fast-follows).
 
 ## Shape of the code
 
 - **Crate and binary (Q18, Q43):** one crate, `torpor-cli`, and one binary, `torpor`.
-- **Subcommands:** `serve`, `compile-worker`, `deploy`, `rollback`, `secrets` and `gc`.
+- **Subcommands:** `serve`, `compile-worker`, `publish`, `release`, `releases`, `apps`, `secrets` and `gc`.
 - **Lambda adapter:** Lambda runs `torpor serve` and `torpor compile-worker` behind the Lambda Web Adapter (Q29), so there is no Lambda crate.
 - **Libraries:**
   - Wasmtime (the latest release when M1 starts; 49.0.1 in the spike), with `wasmtime-wasi`, `wasmtime-wasi-http` and `wasmtime-wasi-config`;
@@ -30,7 +30,7 @@ An operator installs torpor into their own AWS account with one OpenTofu module,
   - tokio and hyper;
   - `age`, `zstd`, serde, `toml`, `clap` and `tracing`.
 
-**Line budget:** about 1,290 lines of Rust (1,200 before M2) plus about 250 of HCL. A module that runs well past its budget is a design problem to raise, not to push through.
+**Line budget:** about 1,390 lines of Rust (1,200 before M2, 1,290 before M3 and its review raised `serve` and `state`; 1,125 written so far) plus about 250 of HCL. A module that runs well past its budget is a design problem to raise, not to push through.
 
 | Module | Does | Budget |
 |---|---|---|
@@ -39,10 +39,10 @@ An operator installs torpor into their own AWS account with one OpenTofu module,
 | `outbound` | Allow list plus the resolved-address block, in the HTTP send hook | ~100 (raised in M2 from ~60: the matcher is hand-written, and the connect is our own) |
 | `kv` | `wasi:keyvalue` draft2 over the bucket: one object per key, CAS, no cache | ~250 (raised in M2 from ~200; 236 after the M2 review) |
 | `config` | `wasi:config` from the manifest, with secrets decrypted | 0 (Wasmtime's crate serves it, and `serve` decrypts secrets in 4 lines) |
-| `state` | State object and manifests, revalidation, defensive reads | ~100 (96 after M3) |
-| `serve` | hyper server, routing, logs | ~140 (raised in M3 from ~100: it also serves one app from a directory; 134 after M3) |
+| `state` | The bucket layout, releases, compare-and-swap updates, defensive reads | ~130 (raised in the M3 review from ~100: per-team paths, and one read and one update for both the index and each app's pointer; 127) |
+| `serve` | hyper server, routing, logs | ~170 (raised in M3 from ~100, which was the router alone, then in the M3 review from ~140 for a pointer recheck per app; 168) |
 | `compile` | The compile worker and compile-request markers | ~70 |
-| `cli` | `deploy`, `rollback`, `secrets`, `gc`, and `main`'s arguments | ~350 (184 after M3, before `gc` and `compile`) |
+| `cli` | `publish`, `release`, `releases`, `apps`, `secrets`, `gc`, and `main`'s arguments | ~350 (207 after the M3 review, before `gc` and `compile`) |
 | `infra/aws` | OpenTofu module | ~250 HCL |
 
 ### Bucket layout
@@ -51,16 +51,18 @@ Q43 applies: no product name appears in any stored key or field, so a rename nev
 
 | Bucket | Key | What | Who writes |
 |---|---|---|---|
-| app | `state` | The global state object (Q45) | CLI (CAS) |
-| app | `blobs/sha256/<hex>` | Components, at the OCI layout path (Q40) | CLI (put-if-absent) |
-| app | `manifests/<hex>` | Immutable, parent-linked release manifests | CLI (put-if-absent) |
-| app | `kv/<app>/<store>/<key>` | KV values, percent-encoded keys (Q42) | serving function |
-| app | `compile/<hex>` | Compile requests | CLI, serving function; compile function deletes |
+| app | `index` | Each app's team (Q68) | admin (CAS) |
+| app | `blobs/<team>/sha256/<hex>` | Components, in the OCI layout under the team (Q40, Q64) | team (put-if-absent) |
+| app | `apps/<team>/<app>/releases/<hex>` | Immutable releases: component, config, allow list (Q69) | team (put-if-absent) |
+| app | `apps/<team>/<app>/current` | The release the app serves, and its secrets (Q65) | team (CAS) |
+| app | `kv/<team>/<app>/<store>/<key>` | KV values, percent-encoded keys (Q42) | serving function |
+| app | `compile/<hex>` | Compile requests | team, serving function; compile function deletes |
 | native | `<hex>/<compat hash>.zst` | Compiled native code (Q54) | **compile function only** |
 
 **IAM shape:**
 - The serving function reads the app bucket and may write only `kv/` and `compile/`. It can only read the native bucket.
-- Deployers have full access to the app bucket. In the native bucket they get delete but never put, so `gc` can prune **(choice)**.
+- The admin writes `index`. Each team has a role tagged `team`, and one ABAC policy lets it write only `blobs/${team}/` and `apps/${team}/` (and list only those prefixes), plus `compile/` (Q64). Nobody but the serving function writes `kv/`.
+- The admin, who runs `gc`, gets delete but never put in the native bucket, so `gc` can prune **(choice)**.
 - The compile function reads `blobs/`, deletes `compile/`, and writes the native bucket.
 
 ## Milestones
@@ -101,7 +103,7 @@ It is then merged locally into `main`.
   - Nothing is cached: every call goes to the bucket (M2 review, replacing Q33's cache).
   - `cas` maps to `If-Match`; `increment` is a CAS loop.
   - `list-keys` is one LIST per page.
-  - An app may open any store whose name matches `[a-z0-9-]{1,64}`, scoped to that app, with no manifest field **(choice)**.
+  - An app may open any store whose name matches `[a-z0-9-]{1,63}` (64 until the M3 review), scoped to that app, with no manifest field **(choice)**.
 - **`wasi:config@0.2.0-rc.1`:** `wasmtime-wasi-config` over the manifest's flat key set (Q32).
 - **Outbound `wasi:http`:**
   - The allow list uses the Spin subset syntax (Q38), and denies everything when an app lists no hosts (Q37).
@@ -117,30 +119,31 @@ It is then merged locally into `main`.
   - `127.0.0.1`, `::1`, `::ffff:127.0.0.1`, `169.254.169.254` and `10.0.0.1`;
   - an allowed hostname whose DNS points at a private address.
 
-### M3: State and deploy (many apps, one host)
+### M3: State and releases (many apps, many teams, one host)
 
-- **`torpor deploy`:**
-  - Builds a release manifest from `torpor.toml` and puts the component and manifest put-if-absent.
-  - Swaps the state object with CAS and randomized backoff (Q45). A deploy of several apps is one swap.
-  - Waits 5 s (Q10).
-  - Carries the previous release's secrets forward.
-  - Rejects a key that appears in both config and secrets (Q32).
-- **`torpor secrets set NAME` and `list`:** each value is age-encrypted separately to `TORPOR_RECIPIENT`, read from the environment and never from the bucket **(choice)**. `secrets set NAME` reads the value from stdin and makes a new release. `list` shows names only.
-- **`torpor rollback <app>`:** moves the app to its parent release. Rollback depth is 10 (Q48).
+The M3 review reshaped this milestone; decisions.md Q60–Q71 has the why.
+
+- **`torpor apps add APP TEAM` and `apps remove APP`** (admin): change `index` with CAS and randomized backoff (Q45, Q68).
+- **`torpor publish [DIR]`:** checks that the component loads, puts it and a release put-if-absent under the app's team, and prints `APP ID` (Q61, Q70).
+- **`torpor release APP ID`:** checks the release, then swaps it into the app's `current` with CAS. Rolling back is releasing an older id, and `torpor releases APP` lists them newest first (Q69).
+- **`torpor secrets set APP NAME` and `list APP`:** each value is age-encrypted separately to `TORPOR_RECIPIENT`, read from the environment and never from the bucket **(choice)**, into the app's `current`, so it takes effect without a release and outlives releases (Q65). A secret overrides config. `list` shows names only.
+- Every command that changes what is served waits 5 s (Q10).
 - **`torpor serve --store <url>`** (the install mode, which Lambda runs):
-  - Reads `state` before it starts listening, so the read happens in Lambda's start-up phase (Q56).
-  - Rechecks `state` with a conditional GET once it is 5 s old (Q45).
-  - Routes by `domains`, then by path prefix, stripping the prefix and adding `X-Forwarded-Prefix` (Q41).
+  - Reads `index` before it starts listening, so the read happens in Lambda's start-up phase (Q56).
+  - Routes by the first label of `Host` (Q67), then reads that app's `current`.
+  - Rechecks `index` and each app's `current` with a conditional GET once they are 5 s old (Q45), and gives up a recheck after 1 s, serving what it last read.
+  - Loads each app once per release, compiling on tokio's blocking pool; a failed load stands until the next recheck (Q62, Q63).
   - Decrypts secrets with the age identity from its environment.
 - **Bucket contents are never trusted (Q53):**
   - reads are size-capped and parsed strictly;
-  - every blob's hash is checked on read.
+  - every blob's and release's hash is checked on read.
 - **Logs:** one request line per request in a span tagged with the app, so a log filter turns on one app (Q14, see decisions.md "During M3").
 
 **Done when:**
-- In-process tests deploy two apps, serve them, and roll one back, all on the in-memory store.
+- In-process tests publish and release two apps in two teams, serve them by subdomain, move one between teams, roll one back, and list its releases, all on the in-memory store.
 - A blob with the wrong hash is refused.
-- Concurrent deploys both land.
+- Concurrent changes to `index` all land.
+- A hung recheck serves the last read within its timeout.
 - Secrets round-trip, and `secrets list` never decrypts.
 
 ### M4: Native code (compile once, run everywhere)
@@ -156,7 +159,7 @@ This refines the trigger in Q58 **(choice)**; see [Choices to confirm](#choices-
 - **Serving:**
   - **Loading:** native code comes only from the native bucket. It is decompressed into `/tmp` and loaded with `deserialize_file`, which maps the file.
   - **On a miss:** the host writes `compile/<hex>` once per environment, then compiles locally with Cranelift into `/tmp` (Q58).
-- **Deploy:** writes `compile/<hex>` and waits until it is deleted. A timeout points at the compile logs. The CLI never reads the native bucket.
+- **Publish:** writes `compile/<hex>` and waits until it is deleted. A timeout points at the compile logs. The CLI never reads the native bucket.
 
 **Done when:** tests over two in-memory stores (app and native) cover:
 - the normal path;
@@ -171,6 +174,7 @@ This refines the trigger in Q58 **(choice)**; see [Choices to confirm](#choices-
   - the app and native buckets;
   - the **serving function:** arm64 on `provided.al2023` with the Lambda Web Adapter layer. 1769 MB by default, rejecting anything under 512 MB (Q51). A public Function URL with a reserved-concurrency cap and a budget alert (Q50). The age identity as a sensitive variable;
   - the **compile function:** the same binary at 3008 MB with a 120 s timeout **(choice)**, fired by bucket events on `compile/`, and updated before the serving function;
+  - **CloudFront in front of the Function URL**, with a wildcard certificate and wildcard DNS for `*.tric.works` in its Route 53 zone (Q71). It passes the viewer's `Host` on in a header, since the Function URL needs its own;
   - the IAM shape above, a log-retention variable (default 7 days) **(choice)**, and tags on everything.
 - **Build:** the release build runs in Docker against AL2023's glibc and produces the zip.
 - **One cloud session:** apply, run the checks below, and destroy the same day, with a $5 cap.
@@ -178,27 +182,27 @@ This refines the trigger in Q58 **(choice)**; see [Choices to confirm](#choices-
   - `deserialize_file` against `deserialize` (the 46–58 ms lead).
   - The state read during start-up.
   - Compile times, and marker-to-native-code latency.
-  - Deploy time, end to end.
+  - Publish-and-release time, end to end.
   - The storage suite against a real S3 bucket (Q12).
 
 **Done when:**
-- On a fresh account: apply, deploy, and the request works.
+- On a fresh account: apply, publish and release, and `https://<app>.tric.works` works.
 - The targets are met, or each gap is written up with options.
 - After destroy, nothing tagged is left.
 
 ### M6: First release
 
-- **`torpor gc` (Q48):** keeps each app's last 10 releases, with a 1 h grace period. It prunes unreachable blobs, manifests and native code, and keeps only the newest compat hash per component.
+- **`torpor gc` (Q48):** keeps each app's current release and its last 10 by `releases`, with a 1 h grace period. It prunes unreachable blobs, releases and native code, and keeps only the newest compat hash per component.
 - **Docs:**
   - a README quick start;
   - an app-author guide: the contract, consistency, limits, and composition with `wac plug`, including that composed parts share capabilities;
-  - an operator guide: install, lazy recompiles on upgrade, the rollback-restores-old-secrets catch, the trust model, and costs.
+  - an operator guide: install, lazy recompiles on upgrade, adding teams and their roles, the trust model, and costs.
 - **Release:**
   - Rename `spinit` to `torpor` across the docs, and run a trademark and domain check (Q43).
   - Create the GitHub repo, with Actions running the Docker tests (the real-bucket suite is run by hand).
   - Publish `torpor-cli`.
 
-**Done when:** a new user can get from nothing to a deployed app using only the README.
+**Done when:** a new user can get from nothing to a released app using only the README.
 
 ## Risks being watched
 
@@ -216,11 +220,11 @@ These are small calls this plan makes. Say which, if any, to change.
 
 1. **Merge `spike/latency` into `main`** at the start of M1, so `prototypes/latency/` and its results stay on record (Q13).
 2. **One kind of compile marker** (refines Q58):
-   - **What:** `compile/<hex>`. Deploy writes it, and so does a serving miss (once per environment). The compile worker deletes it when the native code exists, and deploy waits for that deletion.
-   - **Why:** compared with Q58's create-only `compile/<compat hash>/<hex>` plus a component-upload trigger, this needs one trigger instead of two. The CLI never needs the compat hash or the native bucket, a failed compile retries on the next miss, and redeploying an already-uploaded component still works.
+   - **What:** `compile/<hex>`. Publish writes it, and so does a serving miss (once per environment). The compile worker deletes it when the native code exists, and publish waits for that deletion.
+   - **Why:** compared with Q58's create-only `compile/<compat hash>/<hex>` plus a component-upload trigger, this needs one trigger instead of two. The CLI never needs the compat hash or the native bucket, a failed compile retries on the next miss, and republishing an already-uploaded component still works.
    - **Cost:** at most one tiny PUT per cold environment until the native code lands.
-3. **Deployers get delete-only on the native bucket** so `gc` can prune it. Deleting live native code only causes a recompile.
-4. **KV store names:** any `[a-z0-9-]{1,64}`, scoped to the app, with no manifest field.
+3. **The admin gets delete-only on the native bucket** so `gc` can prune it. Deleting live native code only causes a recompile.
+4. **KV store names:** any `[a-z0-9-]{1,63}`, scoped to the app, with no manifest field.
 5. **CLI settings from the environment:** `TORPOR_STORE` (bucket URL) and `TORPOR_RECIPIENT` (age public key, copied from `tofu output`). The recipient is never read from the bucket, because a bucket writer could swap it and read secrets set afterwards.
 6. **Dev-mode secrets:** `TORPOR_VAR_<KEY>` environment variables. `torpor.toml` never holds secrets.
 7. **Guest stdout/stderr:** captured into the host log, tagged with the app and capped per request.

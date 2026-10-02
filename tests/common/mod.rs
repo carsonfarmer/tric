@@ -61,7 +61,9 @@ impl ObjectStore for Counting {
 pub fn load(engine: &Engine, fixture: &str, allow: &[&str]) -> App {
     let config = [("greeting".to_string(), "hi".to_string()), ("empty".to_string(), String::new())];
     let allow: Vec<String> = allow.iter().map(|a| a.to_string()).collect();
-    engine.load("app", fs::read(format!("tests/fixtures/{fixture}.wasm")).unwrap(), config.into(), &allow).unwrap()
+    engine
+        .load("app", "kv/app", fs::read(format!("tests/fixtures/{fixture}.wasm")).unwrap(), config.into(), &allow)
+        .unwrap()
 }
 
 pub fn engine() -> (Arc<Counting>, Engine) {

@@ -2,7 +2,7 @@
 
 This page is for someone writing an app that runs on torpor. torpor calls a WASI HTTP component once per request, in a fresh instance, so nothing in memory survives from one request to the next. All state goes in KV, which torpor keeps in object storage (S3 in production). Working examples are in [`tests/components/rust/`](../tests/components/rust/) (plain `wit-bindgen`) and [`tests/components/spin/`](../tests/components/spin/) (Spin SDK).
 
-**Two modes.** `torpor serve DIR` runs one app from a directory and keeps its KV data in memory, so the data is lost when the process stops. `torpor serve --store s3://BUCKET`, or `torpor serve` with `TORPOR_STORE` set, runs every app deployed to that bucket, with KV in the bucket. Everything below holds in both modes unless it says otherwise.
+**Two modes.** `torpor serve DIR` runs one app from a directory and keeps its KV data in memory, so the data is lost when the process stops. `torpor serve --store s3://BUCKET`, or `torpor serve` with `TORPOR_STORE` set, runs every app released to that bucket, with KV in the bucket. Everything below holds in both modes unless it says otherwise.
 
 ## The manifest
 
@@ -19,29 +19,38 @@ greeting = "hi"
 
 | Field | Meaning |
 |---|---|
-| `name` | The app's name: 1 to 64 of `a-z`, `0-9` and `-`. It is the app's path prefix and the prefix of its KV data, so renaming an app starts it with empty stores. |
+| `name` | The app's name: 1 to 63 of `a-z`, `0-9` and `-`, so a DNS label. An install serves the app at that subdomain and keeps its KV data under that name, so renaming an app starts it with empty stores. |
 | `component` | Path to the `.wasm` component, relative to the manifest. |
 | `allowed_outbound_hosts` | Hosts the app may call. Absent or empty means no outbound requests at all. See [Outbound HTTP](#outbound-http). |
 | `[config]` | Keys and values the app reads through `wasi:config`. Values must be strings. |
 
 - **Typos:** an unknown field is an error, so a misspelled `allowed_outbound_hosts` stops `torpor serve` at start-up instead of leaving the app with no outbound access. So does a bad allow-list entry.
-- **Secrets** never go in the manifest. In a deployed app they come from [`torpor secrets set`](#secrets). In a directory, `torpor serve` turns each environment variable `TORPOR_VAR_<KEY>` into the config key `<key>`, lowercased: `TORPOR_VAR_API_KEY=s3cret` gives the app `api_key`. A variable overrides the same key in `[config]`. Either way the app reads config and secrets through `wasi:config` as one flat set. Use lowercase keys in `[config]`, or an override will not match.
+- **Secrets** never go in the manifest. In an install they come from [`torpor secrets set`](#releasing). In a directory, `torpor serve` turns each environment variable `TORPOR_VAR_<KEY>` into the config key `<key>`, lowercased: `TORPOR_VAR_API_KEY=s3cret` gives the app `api_key`. A variable overrides the same key in `[config]`. Either way the app reads config and secrets through `wasi:config` as one flat set. Use lowercase keys in `[config]`, or an override will not match.
 
-## Deploying
+## Releasing
 
-An install is one bucket. Name it with `--store s3://BUCKET` or `TORPOR_STORE`. Credentials, the region and an endpoint (for MinIO and the like) come from the usual `AWS_` variables. Anyone who can write the bucket can deploy, roll back and set secrets: there is no other auth.
+An install is one bucket. Name it with `--store s3://BUCKET` or `TORPOR_STORE`. Credentials, the region and an endpoint (for MinIO and the like) come from the usual `AWS_` variables. There is no other auth: the bucket's IAM decides who may change what.
 
-| Command | What it does |
-|---|---|
-| `torpor deploy DIR...` | Deploys the app in each directory as a new release, all in one change. Each release keeps its app's secrets. A key in both `[config]` and the secrets is an error. |
-| `torpor rollback APP` | Moves APP back to the release its current one replaced. Run it again to go back further. |
-| `torpor secrets set APP NAME` | Sets the secret NAME to stdin, less one trailing newline, in a new release of APP. The value is encrypted to the age recipient in `--recipient` or `TORPOR_RECIPIENT`. |
-| `torpor secrets list APP` | Prints the names of APP's secrets. It never decrypts anything. |
-| `torpor serve --store ...` | Serves every app. Secrets are decrypted with the age identity in `--identity` or `TORPOR_IDENTITY`. |
+- **Teams.** Each app belongs to a team, and everything of an app's sits under its team's prefix in the bucket, so one IAM policy can keep each team to its own apps. Only the admin, who writes the install's `index`, can add apps or move them between teams.
+- **Releases.** A release is the component, `[config]` and `allowed_outbound_hosts` of one `torpor.toml`, and its id is the hash of those. Releases never change. An app serves at most one of them, which `torpor release` picks.
 
-- **Propagation:** a host rechecks the bucket when its view is 5 s old, so a change is live everywhere within 5 s. `deploy`, `rollback` and `secrets set` wait that long before they return.
-- **Routing:** a request whose `Host` (without its port) is in the install's `domains` goes to that app unchanged. Any other request goes by its first path segment: `/hello/users/1` reaches the app `hello` as `/users/1`, with the header `X-Forwarded-Prefix: /hello` added so the app can build its own links. `/hello` and `/hello/` both reach it as `/`. A path that names no app gets an empty `404`. There is no command to set `domains` yet.
-- **Rolling back a secret:** `secrets set` makes a release, so the next `rollback` undoes it.
+| Command | Who | What it does |
+|---|---|---|
+| `torpor apps add APP TEAM` | admin | Adds APP to TEAM. Run on an app already in a team, it moves the app, which starts in its new team with nothing released, no secrets and no KV data. |
+| `torpor apps remove APP` | admin | Stops serving APP. Its objects stay in the bucket. |
+| `torpor publish [DIR]` | team | Uploads the app in DIR (default `.`) as a release, without serving it, and prints `APP ID`. It refuses a component that would not load. |
+| `torpor release APP ID` | team | Serves APP from its release ID. To roll back, release an older ID. |
+| `torpor releases APP` | team | Lists APP's release IDs, newest first, each with when it was first published. |
+| `torpor secrets set APP NAME` | team | Sets APP's secret NAME to stdin, less one trailing newline. The value is encrypted to the age recipient in `--recipient` or `TORPOR_RECIPIENT`. |
+| `torpor secrets list APP` | team | Prints the names of APP's secrets. It never decrypts anything. |
+| `torpor serve --store ...` | host | Serves every app. Secrets are decrypted with the age identity in `--identity` or `TORPOR_IDENTITY`. |
+
+Publishing and releasing in one go is `torpor release $(torpor publish DIR)`.
+
+- **Propagation:** a host rechecks the index and each app it serves when its view is 5 s old, so a change is live everywhere within 5 s. `release`, `apps` and `secrets set` wait that long before they return. If a recheck fails or takes over a second, the host goes on serving what it last read.
+- **Secrets** belong to the app, not to a release: `secrets set` takes effect without a release, and releasing an older ID keeps today's secrets, so rolling back never brings back a rotated one. A secret overrides the `[config]` key of the same name.
+- **Routing:** an install serves each app at its own subdomain: the first label of `Host`, lowercased, names the app, and the request reaches it unchanged. Locally, `curl hello.localhost:3000` reaches `hello`. A host that names no app, or an app with nothing released, gets an empty `404`.
+- **A release that fails to load** gets an empty `500`, and the host tries it again at its next recheck, not on every request.
 - **Logs:** each request is logged at `info` with its method and path, in a span tagged with the app. `RUST_LOG='warn,[request{app=hello}]=info'` turns on request lines for `hello` only.
 
 ## Interfaces
@@ -147,7 +156,7 @@ Each page is one LIST of the store, so it includes every write that finished bef
 |---|---|
 | Keys | 1 to 256 bytes (UTF-8), any characters. An empty or longer key returns `other("a key is 1 to 256 bytes")`. |
 | Values | At most 1 MiB (1,048,576 bytes). A larger one returns `other(...)` and writes nothing. |
-| Store names | `[a-z0-9-]{1,64}`, else `no-such-store`. Any such name opens, with no manifest field. Stores belong to one app, and no app can see another's. |
+| Store names | `[a-z0-9-]{1,63}`, else `no-such-store`. Any such name opens, with no manifest field. Stores belong to one app, and no app can see another's. |
 | Pages | At most 1,000 keys. |
 | `get-many` result | At most 16 MiB of values in one call, else `other("get-many returns 16777216 bytes or less")`. Nothing is returned, so ask for fewer keys at a time. |
 
