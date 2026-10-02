@@ -1,11 +1,11 @@
 //! torpor: a scale-to-zero host for WASI components.
 mod serve;
 
-use anyhow::Result;
 use clap::Parser;
 use std::{net::SocketAddr, path::PathBuf};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
+use wasmtime::Result;
 
 #[derive(Parser)]
 enum Cmd {

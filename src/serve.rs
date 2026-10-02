@@ -1,10 +1,10 @@
 //! `torpor serve`: runs the app in a directory over HTTP/1.
-use anyhow::Result;
 use hyper::{Request, body::Incoming, server::conn::http1, service::service_fn};
 use serde::Deserialize;
 use std::{collections::BTreeMap, convert::Infallible, env, fs, path::Path, path::PathBuf};
 use tokio::net::TcpListener;
 use torpor::Engine;
+use wasmtime::Result;
 use wasmtime_wasi_http::io::TokioIo;
 
 /// `torpor.toml`.

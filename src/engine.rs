@@ -1,9 +1,8 @@
 //! The Wasmtime engine, its epoch ticker, and loading components into it.
 use crate::guest::{App, Host};
-use anyhow::Result;
 use std::{collections::BTreeMap, thread, time::Duration};
 use wasmtime::{
-    Config,
+    Config, Result,
     component::{Component, Linker},
 };
 use wasmtime_wasi_config::WasiConfig;
