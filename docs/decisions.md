@@ -137,6 +137,20 @@ From the research brief, [research/m2-interfaces.md](research/m2-interfaces.md).
 | — | Optional KV and outbound behaviour | **All kept, over the first budget:** the batch interface (about 18 lines), the page cache (about 8), the cache byte cap (about 6) and the allow-list host check (about 4). Each is real behaviour, not ceremony (2026-10-02). |
 | — | Hung DNS lookups | **Accepted for now.** A lookup that hangs holds a blocking-pool thread after the 10 s deadline has already answered the guest. A timeout around the lookup would not free the thread either. |
 
+## M2 review (2026-10-02)
+
+| # | Topic | Decision |
+|---|---|---|
+| Q33, Q42 | KV cache (replaces Q33's value cache, round 6's Q42 and the cache rows of "During M2") | **No cache.** Every KV call goes to the store: `get` is a GET, a write one PUT, a page of `list-keys` one LIST. This removes the generation object (and with it the breach of Q12's one-write-per-second rule on GCS), the page cache, the byte cap and every staleness case. `kv.rs` drops from 312 to 236 lines, not counting tests. Uncached reads cost more on hot keys: one key read 100 times a second all month is about $104 in GETs. At the reference load, about $0.90 a month. The app docs still promise only "at most 1 s old", so a cache can return without breaking apps. |
+| Q12 | Hot keys on GCS | GCS takes about one write a second per object and answers faster writes with 429. `object_store` retries those with backoff for up to 3 minutes. S3 and Azure have no such limit. Documented for app authors; the host does no pacing. |
+| — | KV fixes found in review | GCS conditional writes need the object's generation, not its ETag, so a CAS keeps both (`UpdateVersion`). Deleting a missing key is not an error (GCS and Azure answer 404). A swap on a key deleted since `cas::new` loses instead of failing (S3 answers 404 to `If-Match` there). |
+| Q9 | App state backend (the user's note) | **Revisit after M2.** Only platform state must live in buckets (the clarification under round 1); app data need not. M2 ships KV over the object store with no cache, and a later round weighs other backends. |
+| Q34 | Use Wasmtime's sender? | **Keep our own connect.** `default_send_request` is the only public sender and takes no resolver or connector. It resolves the name inside its own connect, so checking addresses first and then calling it means a second lookup that a DNS answer can change. That would let a request rebind to loopback, and so to the Lambda runtime API. It also builds TLS with `ClientConfig::builder()`, which panics once a second crypto provider is linked; M3 adds aws-lc-rs for S3. A connector hook upstream would let us drop about 40 lines. |
+| Q38 | Allow-list matcher (replaces "Hand-written on `http::Uri`" above) | **An item is kept as its origin, `scheme://host:port`, and matched as a whole string, or by prefix and suffix around the one `*` of `*.`.** It saves 2 lines and rejects more malformed items. Dropped: `*` as a scheme, port or whole host (`https://*`, `https://example.com:*`, `*://example.com:*`, `http://*:*`). Only `*://*:*` remains as a catch-all, and it now allows http and https only. Added: an IPv6 host without a port. No library fits: Spin's matcher is not on crates.io, and `urlpattern` brings `regex` and still needs our own parsing. |
+| — | User names in request URLs | **Refused with `HttpRequestUriInvalid`**, not `HttpRequestDenied`. RFC 9110 deprecates userinfo in http(s) URLs and says recipients should treat it as an error; fetch throws. The docs point to an `Authorization` header. This costs 3 lines. |
+| Q55 | Data copied in by one host call | **32 MiB** (`HOSTCALL_FUEL`), down from Wasmtime's 128 MiB default. Wasmtime charges every string and list it lifts out of a guest against this budget, so it bounds what one call such as `fields.from-list` or `set-many` can make the host allocate. A call over it traps. |
+| — | Wasmtime issue | **No new issue.** An earlier claim here that Wasmtime lifts lists without limit was wrong (see the corrected deferred row). A short comment on bytecodealliance/wasmtime#14430 goes up only after the user approves its text. |
+
 ## Deferred work and fast follows
 
 Kept here so nothing agreed in the grilling gets lost.
@@ -147,7 +161,7 @@ Kept here so nothing agreed in the grilling gets lost.
 | Read-only `/v2/` registry view of the bucket; `spinit export` | Q40 | Only if wanted. Generate OCI manifests on the fly. |
 | Custom domains through CloudFront | Q11, Q50 | Secret origin header checked by the host; certificate in us-east-1. |
 | Dedicated-function mode | Q11, Q47, Q55 | For apps needing hard isolation, more memory, or the strict cold-start target for large components. |
-| Skip the `gen` write on plain updates | Q42 | A winning `swap` or `increment` on an existing key already skips it. A plain `set` still writes it: when the instance's cache already shows the key existed, an update would need only the data write. |
+| ~~Skip the `gen` write on plain updates~~ | Q42 | Moot: there is no generation object since the M2 review. |
 | Automated gc | Q48 | Today: manual `spinit gc`. |
 | Cron design revisit | Q23, Q49 | Once-a-minute ticker, opt-in. |
 | Rename to torpor | Q43 | Find-and-replace `spinit` → `torpor`, plus a trademark and domain check, before the first public release. |
@@ -159,7 +173,9 @@ Kept here so nothing agreed in the grilling gets lost.
 | ~~Yield on each epoch tick plus a request timeout~~ | Q57 | Done in M1 (see "During M1"). |
 | Load hot apps during start-up | Q56 (c) | Only if reading state during start-up falls short. |
 | Watch Wasmtime for `wasi:keyvalue` draft2 | Q44 | `wasmtime-wasi-keyvalue` implements only the first draft and keeps its bindings private. If it moves to draft2 with public bindings or a backend trait, replace our `bindgen!` with it. |
-| Host memory when lifting nested lists | Q53, Q55 | Wasmtime 49 lifts `list<list<u8>>` and `list<string>` parameters into host `Vec`s with no size limit, before the host function runs. Entries can all point at one guest buffer, so a guest within its 256 MiB cap can make the host allocate far more. Reachable through `wasi:http` `fields.from-list` (since M1) and `wasi:keyvalue` `set-many`. Upstream; nothing to cap on our side short of hand-lifting with `WasmList`. |
-| Pace generation writes on GCS | Q12, Q42 | Every KV write overwrites its bucket's generation object, which breaks Q12's one-write-per-second rule under load. Fine on S3; GCS needs pacing or a different marker. |
+| Field lists lifted before their size check | Q53, Q55 | Wasmtime charges every lifted string and list against the per-call budget (`HOSTCALL_FUEL`, 32 MiB; GHSA-852m-cvvp-9p4w), so no host call allocates without bound. `fields.from-list` still lifts every field before its 128 KiB check, so a call it refuses can cost up to that budget. Upstream agreed in bytecodealliance/wasmtime#14430 to charge lifting to Store fuel as well. Watch it. |
+| ~~Pace generation writes on GCS~~ | Q12, Q42 | Moot: there is no generation object since the M2 review. |
+| KV backend round | Q9 | App data need not live in object storage. Weigh other backends (DynamoDB, a serverless Redis, the SQLite family, or pluggable backends as in Spin's runtime config) against KV over the object store with no cache. |
+| Outbound connector hook upstream | Q34 | If `wasmtime-wasi-http` gains a connector or resolver hook, or a way to send over a given stream, our connect and TLS code (about 40 lines) can go. |
 | Certificate errors as `TlsCertificateError` | Q34 | Today every TLS failure reaches the guest as `TlsProtocolError`. |
 | Second short cloud session | Q51, Q56 | `deserialize_file` against `deserialize`, state read during start-up, 1024 MB, n = 100, compile-function timings. Needs its own explicit apply approval. |

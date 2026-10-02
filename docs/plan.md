@@ -37,7 +37,7 @@ An operator installs torpor into their own AWS account with one OpenTofu module,
 | `engine` | Wasmtime config, epoch ticker, limits, loading native code, Cranelift fallback | ~120 |
 | `guest` | A fresh store per request, a WASI context that grants nothing, p2/p3 dispatch | ~90 |
 | `outbound` | Allow list plus the resolved-address block, in the HTTP send hook | ~100 (raised in M2 from ~60: the matcher is hand-written, and the connect is our own) |
-| `kv` | `wasi:keyvalue` draft2 over the bucket: cache, CAS, generation-cached listing | ~250 (raised in M2 from ~200) |
+| `kv` | `wasi:keyvalue` draft2 over the bucket: one object per key, CAS, no cache | ~250 (raised in M2 from ~200; 236 after the M2 review) |
 | `config` | `wasi:config` from the manifest, with secrets decrypted | ~30 (M2 needed none: Wasmtime's crate does it; this is for secrets) |
 | `state` | State object and manifests, revalidation, defensive reads | ~100 |
 | `serve` | hyper server, routing, logs | ~100 |
@@ -55,12 +55,11 @@ Q43 applies: no product name appears in any stored key or field, so a rename nev
 | app | `blobs/sha256/<hex>` | Components, at the OCI layout path (Q40) | CLI (put-if-absent) |
 | app | `manifests/<hex>` | Immutable, parent-linked release manifests | CLI (put-if-absent) |
 | app | `kv/<app>/<store>/<key>` | KV values, percent-encoded keys (Q42) | serving function |
-| app | `kvgen/<app>/<store>` | Generation object for cached listing (Q42) | serving function |
 | app | `compile/<hex>` | Compile requests | CLI, serving function; compile function deletes |
 | native | `<hex>/<compat hash>.zst` | Compiled native code (Q54) | **compile function only** |
 
 **IAM shape:**
-- The serving function reads the app bucket and may write only `kv/`, `kvgen/` and `compile/`. It can only read the native bucket.
+- The serving function reads the app bucket and may write only `kv/` and `compile/`. It can only read the native bucket.
 - Deployers have full access to the app bucket. In the native bucket they get delete but never put, so `gc` can prune **(choice)**.
 - The compile function reads `blobs/`, deletes `compile/`, and writes the native bucket.
 
@@ -99,9 +98,9 @@ It is then merged locally into `main`.
 
 - **`wasi:keyvalue@0.2.0-draft2`** through our own `bindgen!` over vendored WIT (Q44):
   - Keys are 256 B or less and percent-encoded; values are 1 MiB or less (Q42).
-  - Each instance caches values with their ETags for 1 s and sees its own writes immediately (Q33).
+  - Nothing is cached: every call goes to the bucket (M2 review, replacing Q33's cache).
   - `cas` maps to `If-Match`; `increment` is a CAS loop.
-  - `list-keys` uses the generation object and cached LIST (Q42).
+  - `list-keys` is one LIST per page.
   - An app may open any store whose name matches `[a-z0-9-]{1,64}`, scoped to that app, with no manifest field **(choice)**.
 - **`wasi:config@0.2.0-rc.1`:** `wasmtime-wasi-config` over the manifest's flat key set (Q32).
 - **Outbound `wasi:http`:**

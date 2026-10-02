@@ -2,7 +2,7 @@
 
 This page is for someone writing an app that runs on torpor. torpor calls a WASI HTTP component once per request, in a fresh instance, so nothing in memory survives from one request to the next. All state goes in KV, which torpor keeps in object storage (S3 in production). Working examples are in [`tests/components/rust/`](../tests/components/rust/) (plain `wit-bindgen`) and [`tests/components/spin/`](../tests/components/spin/) (Spin SDK).
 
-**Today:** `torpor serve` runs one app from a directory and keeps KV data in memory. It is lost when the process stops, and there is only one host, so the staleness described under [KV consistency](#kv-consistency) cannot show up locally. The S3-backed host, `deploy` and `secrets` commands come later. Everything below describes the S3-backed host unless it says otherwise.
+**Today:** `torpor serve` runs one app from a directory and keeps KV data in memory. It is lost when the process stops. The S3-backed host, `deploy` and `secrets` commands come later. Everything below describes the S3-backed host unless it says otherwise.
 
 ## The manifest
 
@@ -97,39 +97,33 @@ JavaScript components built with `jco` serve HTTP. KV and outbound requests from
 
 ## KV consistency
 
-KV is one S3 object per key, plus one small **generation** object per store that records when the store last changed. Reads go through a cache. Everything below follows from those two facts.
+KV is one S3 object per key, and nothing is cached: every call goes to the store. Everything below follows from that.
 
-A **host** is one running torpor process. In production several hosts can serve the same app at once. Every request gets a fresh instance, but all requests of one app on one host share a cache of values and key lists (32 MiB at most; when it fills, the host drops it and starts again). A new host starts with an empty cache.
+A **host** is one running torpor process. In production several hosts can serve the same app at once.
 
 ### One key
 
 | Call | What you get |
 |---|---|
-| `get`, `exists` after a write on the same host | That write or a newer one, never an older value. This holds across requests, not only within one. |
-| `get`, `exists` of a key another host wrote | A value up to **1 s old**. A host serves what it read for up to 1 s, then asks the store again (a conditional GET) and sees the latest. A missing key is cached the same way. |
-| `cas::new`, then `current` | `new` reads the store, never the cache, and `current` returns what it read. |
-| `swap` | Succeeds only if the key is unchanged since `cas::new`, checked by the store with `If-Match`. Atomic across all hosts. A lost swap returns `cas-failed` with a new handle that holds the latest value. A swap on a missing key succeeds only if the key is still missing. |
+| `get`, `exists` | The value in the store when the call ran, whichever host wrote it. **Rely only on "at most 1 s old"**: a later version may cache values for that long. |
+| `cas::new`, then `current` | `new` reads the store and `current` returns what it read. It will never be cached. |
+| `swap` | Succeeds only if the key is unchanged since `cas::new`, checked by the store with `If-Match`. Atomic across all hosts. A lost swap returns `cas-failed` with a new handle that holds the latest value. A swap on a missing key succeeds only if the key is still missing, and a swap on a key deleted since `cas::new` loses. |
 | `increment` | Atomic across hosts. A missing key counts as 0. It retries a lost race up to 16 times, then fails with `too much contention`. |
 | `set`, `delete` | In the store before the call returns. The last writer wins. `delete` of a missing key is not an error. |
 
-- **Two requests, two hosts:** a user's write and the next read can land on different hosts, and the read can be up to 1 s behind. If that matters, read with `cas::new` and `current`. It costs a GET every time.
+- **A read that must be current**, now and if a cache comes back, uses `cas::new` and `current`.
 - **Counters** are 8 bytes, a little-endian `i64`, as in Spin. `increment` on any other length fails with `not a counter`, and on overflow with `overflow`. Read a counter with `get` and decode the 8 bytes.
 - **`swap` compares content.** On S3 the ETag is normally a hash of the value, so if a value changes and changes back between your read and your swap, the swap still succeeds. Keep a version number inside the value if that matters.
 - **Batches are not atomic.** `get-many`, `set-many` and `delete-many` do one key at a time, so they save no round trips. If `set-many` fails part-way, the keys before the failure stay written, and other callers can see the partial result. Keys are checked before anything is written, but a value over 1 MiB is only found when its turn comes, after the earlier keys are already in the store.
+- **A write that fails** may still have reached the store, and so may part of a batch. After an error, treat the key as unknown and read it again.
 - **No transactions across keys.** Use `increment` or `cas` instead of `get` then `set`.
+- **Hot keys on GCS:** GCS takes about one write a second to any one object and throttles faster writes, which the host retries with backoff, so they slow down and can fail. Spread a busy counter over several keys. S3 and Azure have no such limit.
 
 ### Listing keys
 
 `list-keys` returns a page of up to 1,000 keys. When the page is full it also returns a cursor, which is the last key on that page. Pass it back for the next page, and stop when the cursor is none. A bucket with exactly 1,000 keys returns a full page and then an empty one, so an empty page at the end is normal. Keys come back in the order of their stored names, and the store percent-encodes characters such as `/`, `%`, `?` and non-ASCII text in those names. For keys that use such characters the order can differ from a plain sort of the keys, so do not rely on it.
 
-Every write (`set`, `delete`, the batch calls, and a `swap` or `increment` that creates the key) writes the data object first and then overwrites the store's generation object with the current time. A `swap` or `increment` on a key that exists writes only the data, since the listing cannot change. A host keeps each page it listed together with the generation it saw, and lists again only when the generation has changed.
-
-| Case | What you get |
-|---|---|
-| A list after a write on the same host | The page includes the write. The write replaces the host's cached generation, so the next list goes to the store. |
-| A list after another host's write | Can lag by up to **1 s**. A host looks at the generation at most once a second. |
-| A write that fails | **It still bumps the generation.** This includes a `set-many` or `delete-many` that fails part-way. The store may have applied the write, or some of the batch, even though you got an error. Bumping makes every host list again, so a listing never hides a partly applied write. After an error, treat the key as unknown and read it again. A bad key is the exception: it is refused before anything is written, so nothing is bumped. |
-| A crash between the data write and the generation write | Hosts that already hold a page keep serving it, so it can miss the new key or still show a deleted one. It stays stale **until the next write to that store**. The same holds if the generation write itself fails. A host with no cached page lists from the store and sees the truth. |
+Each page is one LIST of the store, so it includes every write that finished before it, from any host. As with `get`, rely only on "at most 1 s old".
 
 ### Limits
 
@@ -145,38 +139,26 @@ KV failures come back as error values, not traps.
 
 ## What KV costs
 
-On S3 every store call is billed. The prices below are us-east-1 list prices and vary by region: PUT, LIST and POST are $0.005 per 1,000 requests, and GET is $0.0004 per 1,000. DELETE is free. Storage and data transfer are extra. A conditional GET that answers "not modified" still counts as a GET, but it moves no value.
+On S3 every store call is billed. The prices below are us-east-1 list prices and vary by region: PUT, LIST and POST are $0.005 per 1,000 requests, and GET is $0.0004 per 1,000. DELETE is free. Storage and data transfer are extra.
 
 | Operation | Store calls | Request cost per 1,000 operations |
 |---|---|---|
 | `open`, `current` | none | $0 |
-| `get`, `exists`, value read in the last 1 s (or written by this host in the last 1 s) | 0 | $0 |
-| `get`, `exists`, otherwise | 1 GET (conditional when the host has the value) | $0.0004 |
-| `set` | 2 PUTs: the data, then the generation | $0.010 |
-| `delete` | 1 DELETE and 1 PUT | $0.005 |
-| `increment` | GET, PUT. A second PUT for the generation when it creates the key | $0.0054, or $0.0104 |
-| `cas::new` | 1 GET | $0.0004 |
-| `swap` | 1 PUT, and a second for the generation when it creates the key. A lost swap costs a PUT, then 1 GET for the new handle | $0.005, or $0.010 |
-| `get-many`, N keys | N `get`s | N x $0.0004 |
-| `set-many`, N keys | N PUTs and 1 PUT for the generation | (N + 1) x $0.005 |
-| `delete-many`, N keys | N DELETEs and 1 PUT | $0.005 |
-| `list-keys`, page held and checked in the last 1 s | 0 | $0 |
-| `list-keys`, after 1 s, nothing written | 1 conditional GET of the generation | $0.0004 |
-| `list-keys`, first list, or another host changed the store | GET of the generation, then 1 LIST | $0.0054 |
-| `list-keys`, after a write on this host | 1 LIST (the host already holds the new generation) | $0.005 |
+| `get`, `exists`, `cas::new` | 1 GET | $0.0004 |
+| `set` | 1 PUT | $0.005 |
+| `delete` | 1 DELETE | $0 |
+| `increment` | GET, PUT, and both again for each lost race | $0.0054 |
+| `swap` | 1 PUT. A lost swap costs a PUT, then 1 GET for the new handle | $0.005 |
+| `get-many`, `set-many`, `delete-many`, N keys | N of the single call | N times the single call |
+| `list-keys` | 1 LIST per page | $0.005 |
 
-Each page of a listing is one `list-keys` call, so a store of 2,500 keys read through three pages costs three LISTs, plus one GET of the generation if it has not been checked in the last second.
-
-For scale, 100,000 `set`s a month is $1.00 in requests. A million reads that all miss the cache is $0.40.
+For scale, 100,000 `set`s a month is $0.50 in requests, and a million `get`s is $0.40. Reads add up on a hot key: one read 100 times a second all month is about 260 million GETs, or about $104.
 
 ### Listing is the expensive operation
 
-**One LIST costs 12.5 GETs, and a LIST on every request adds up to $5 per million requests.** Each page of 1,000 keys is its own LIST.
+**One LIST costs 12.5 GETs, and a LIST on every request adds up to $5 per million requests.** Each page of 1,000 keys is its own LIST, so a store of 2,500 keys read through three pages costs three LISTs.
 
-The generation object is what keeps this down. With no writes, a host spends at most one conditional GET a second on listing a store, however many lists the app makes. But a store that is written all the time never settles. Each write changes the generation, so a host re-LISTs on every check: at most once a second after other hosts' writes, and on its next list after its own. A store that changes at least once a second costs a LIST per list.
-
-- Do not list on the hot path of a read-heavy page. If most requests need the same list, keep it in a key of its own, update it with `cas`, and `get` it.
-- The generation is per store. A write to one store never makes a list of another store stale or costly, so keep fast-changing data in a different store from the data you list.
+Do not list on the hot path of a read-heavy page. If most requests need the same list, keep it in a key of its own, update it with `cas`, and `get` it.
 
 ## Outbound HTTP
 
@@ -190,14 +172,14 @@ An entry is `scheme://host[:port]`, in the same shape as Spin's but a subset of 
 |---|---|
 | `https://api.example.com` | That host, https, port 443. |
 | `https://*.example.com` | Any subdomain at any depth, https, port 443. It does **not** match `example.com`, so list that too if you need it. |
-| `https://example.com:8443` | Port 8443 only. `:*` allows any port. |
-| `https://*` | Any host over https on port 443. |
+| `https://example.com:8443` | Port 8443 only. |
 | `http://localhost:3000` | Parses, but can never succeed: `localhost` resolves to a loopback address, which is always blocked. |
-| `*://*:*` | Any scheme, host and port. The address rule below still applies. |
+| `*://*:*` | Any http or https request. The address rule below still applies. |
 
-- Use `http`, `https` or `*` as the scheme. The port defaults to 80 or 443 from the scheme. With `*` as the scheme, give the port too (`*://example.com:*`).
-- The host is an exact name, `*`, or `*.suffix`. Case does not matter, and a trailing dot (`example.com.`) does not match. The match is on the host as the guest wrote it, before any DNS lookup. A request URL with a user name (`https://user@example.com/`) is denied whatever the list says.
-- There are no port ranges, `{{ }}` templates, CIDR hosts or `self`, unlike Spin. A bare `*`, an entry with a path or user name, and an IPv6 host without a port are rejected.
+- The scheme is `http` or `https`. The port defaults to 80 or 443 from the scheme.
+- The host is an exact name or address, or `*.` and a domain. Case does not matter, and a trailing dot (`example.com.`) does not match. The match is on the host as the guest wrote it, before any DNS lookup.
+- Unlike Spin, there is no `*` scheme, port or host other than in `*://*:*`, and no port ranges, `{{ }}` templates, CIDR hosts or `self`. An entry with any of those, a path (even a trailing `/`), a query or a user name stops the app at start-up.
+- A request URL with a user name (`https://user@example.com/`) fails whatever the list says. Send credentials in an `Authorization` header.
 
 ### Blocked addresses
 
@@ -209,7 +191,8 @@ Blocked: `10/8`, `172.16/12`, `192.168/16`, loopback, `169.254/16` (which holds 
 
 | Case | Error code |
 |---|---|
-| Not on the allow list, the list is empty, or the URL has a user name | `HttpRequestDenied` |
+| Not on the allow list, or the list is empty | `HttpRequestDenied` |
+| The URL has a user name | `HttpRequestUriInvalid` |
 | A resolved address is blocked | `DestinationIpProhibited` |
 | The name does not resolve | `DnsError` |
 | The TCP connection fails | `ConnectionRefused` |
@@ -227,6 +210,7 @@ Blocked: `10/8`, `172.16/12`, `192.168/16`, loopback, `169.254/16` (which holds 
 | Time per request | 10 s, from the start of instantiation to the end of the response. Outbound calls, KV calls and a streaming body all count. | The request ends with an empty `500`. The cause is logged. |
 | Memory | 256 MiB, all of the request's memories together | Growth past it is refused. The guest usually aborts, and the request ends with a `500`. |
 | Requests in flight | 64 per app on each host | The next request waits for a free slot. The wait is not part of its 10 s. |
+| Data passed to one call | 32 MiB of strings and lists a guest hands to a single host call, such as `set-many` or `wasi:http` `fields.from-list` | The call traps and the request ends with a `500`. |
 | Live resources | 256 per request (handles to buckets, CAS operations, and `wasi:http` fields, requests, responses and bodies) | `store::open` and `cas::new` return `other("resource table has no free keys")`. A `wasi:http` call that needs a new handle fails the request with a `500`. |
 | Component shape | At most 16 instances, 16 tables and 4 memories, and 100,000 elements in a table | Instantiation fails, so every request gets a `500`, or the growth is refused. Parts composed into one component all count. |
 | Log output | 64 KiB per stream (stdout, stderr) per request | The stream closes, so later writes to it fail. A guest that treats a failed write as fatal (Rust's `println!` panics) ends the request. Log little. |
