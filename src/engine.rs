@@ -1,6 +1,6 @@
 //! The Wasmtime engine, its epoch ticker, and loading components into it.
 use crate::guest::{App, Host};
-use crate::kv::{Imports, Kv};
+use crate::kv::{Imports, Kv, NAME_MAX, is_name};
 use crate::outbound::Allow;
 use object_store::ObjectStore;
 use std::{collections::BTreeMap, sync::Arc, thread, time::Duration};
@@ -56,7 +56,7 @@ impl Engine {
         config: BTreeMap<String, String>,
         allowed: &[String],
     ) -> Result<App> {
-        wasmtime::ensure!(!name.is_empty(), "an app needs a name"); // else its keys would be another app's
+        wasmtime::ensure!(is_name(name), "an app name is 1 to {NAME_MAX} of a-z, 0-9 and -, not {name:?}");
         let allow = allowed.iter().map(|a| Allow::parse(a)).collect::<Result<_, _>>().map_err(wasmtime::Error::msg)?;
         let pre = self.linker.instantiate_pre(&Component::new(&self.engine, wasm)?)?;
         let pre = match p3::bindings::ServiceIndices::new(&pre) {

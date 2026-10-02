@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, lookup_host};
 use tokio_rustls::TlsConnector;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::ring::default_provider, pki_types::ServerName};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs::default_provider, pki_types::ServerName};
 use wasmtime_wasi_http::handler::{Request, Response};
 use wasmtime_wasi_http::{Error, RequestOptions, WasiHttpHooks, io::TokioIo};
 
