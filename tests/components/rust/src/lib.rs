@@ -7,14 +7,13 @@ fn respond(target: &str) -> String {
         return "hello".into();
     }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let n: usize = query.split_once('=').and_then(|(_, v)| v.parse().ok()).unwrap_or(1); // `mb=` or `n=`
     match path {
         "/loop" => loop {
             std::hint::spin_loop()
         },
-        "/hog" => {
-            let mb: usize = query.strip_prefix("mb=").and_then(|v| v.parse().ok()).unwrap_or(1);
-            format!("hogged {} MiB", black_box(vec![1u8; mb << 20]).len() >> 20)
-        }
+        "/hog" => format!("hogged {} MiB", black_box(vec![1u8; n << 20]).len() >> 20),
+        "/fields" => format!("held {} fields", black_box((0..n).map(|_| world::Fields::new()).collect::<Vec<_>>()).len()),
         "/env" => json!({
             "env": std::env::vars().collect::<std::collections::BTreeMap<_, _>>(),
             "args": std::env::args().collect::<Vec<_>>(),
@@ -48,7 +47,8 @@ fn outcome<T: Debug>(result: io::Result<T>) -> Value {
 #[cfg(feature = "p2")]
 mod world {
     use std::io::Write;
-    use wasip2::http::types::{Fields, IncomingRequest, OutgoingBody, OutgoingResponse, ResponseOutparam};
+    pub use wasip2::http::types::Fields;
+    use wasip2::http::types::{IncomingRequest, OutgoingBody, OutgoingResponse, ResponseOutparam};
 
     wasip2::http::proxy::export!(Fixture);
     struct Fixture;
@@ -70,6 +70,7 @@ mod world {
 
 #[cfg(feature = "p3")]
 mod world {
+    pub use wasip3::http::types::Fields;
     use wasip3::http::types::{ErrorCode, Request, Response};
     use wasip3::http_compat::http_into_wasi_response;
 

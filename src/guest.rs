@@ -4,17 +4,17 @@ use hyper::body::{Body, Bytes};
 use std::task::{Context, Poll};
 use std::{collections::BTreeMap, pin::Pin, sync::Arc, time::Duration, time::Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio::time::{Sleep, sleep};
+use tokio::time::{Sleep, sleep, timeout_at};
 use wasmtime::component::{GuestTaskId, ResourceTable};
-use wasmtime::{Engine, Store, StoreContextMut, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Engine, ResourceLimiter, Store, StoreContextMut};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView, p2::pipe::MemoryOutputPipe};
 use wasmtime_wasi_config::WasiConfigVariables;
 use wasmtime_wasi_http::handler::{HandlerState, Instance, ProxyHandler, ProxyPre, Request, Response, ShouldAccept};
 use wasmtime_wasi_http::handler::{WorkerExpiration, WorkerState, WorkerStatus};
 use wasmtime_wasi_http::{Error, RequestOptions, WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
 
-const TIMEOUT: Duration = Duration::from_secs(10);
-const MEMORY: usize = 256 << 20; // per linear memory
+const TIMEOUT: Duration = Duration::from_secs(10); // from the start of instantiation to the end of the request
+const MEMORY: usize = 256 << 20; // all linear memories of a store together
 const LOG_CAP: usize = 64 << 10; // per stream, per request
 const MAX_INFLIGHT: usize = 64;
 
@@ -25,7 +25,29 @@ pub struct Host {
     http: WasiHttpCtx,
     hooks: Deny,
     pub config: WasiConfigVariables,
-    limits: StoreLimits,
+    memory: usize, // linear memory in use
+}
+impl ResourceLimiter for Host {
+    fn memory_growing(&mut self, current: usize, desired: usize, _: Option<usize>) -> wasmtime::Result<bool> {
+        let total = self.memory - current + desired;
+        let fits = total <= MEMORY;
+        if fits {
+            self.memory = total;
+        }
+        Ok(fits)
+    }
+    fn table_growing(&mut self, _: usize, desired: usize, _: Option<usize>) -> wasmtime::Result<bool> {
+        Ok(desired <= 100_000)
+    }
+    fn instances(&self) -> usize {
+        16
+    }
+    fn tables(&self) -> usize {
+        16
+    }
+    fn memories(&self) -> usize {
+        4
+    }
 }
 impl WasiView for Host {
     fn ctx(&mut self) -> WasiCtxView<'_> {
@@ -47,7 +69,7 @@ impl WasiHttpHooks for Deny {
     }
 }
 
-/// Expires the worker, which drops its store, `TIMEOUT` after instantiation, even if the guest is only waiting.
+/// Expires the worker, which drops its store, at `TIMEOUT`, even if the guest is only waiting.
 pub struct Deadline(Pin<Box<Sleep>>);
 impl WorkerExpiration for Deadline {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>, _: WorkerStatus, _: Instant) -> Poll<()> {
@@ -129,27 +151,22 @@ impl HandlerState for State {
     type WorkerState = Worker;
     async fn instantiate(&self) -> wasmtime::Result<Instance<Host, Deadline, Worker>> {
         let _permit = self.permits.clone().acquire_owned().await?;
+        let expiration = Deadline(Box::pin(sleep(TIMEOUT)));
         let (out, err) = (MemoryOutputPipe::new(LOG_CAP), MemoryOutputPipe::new(LOG_CAP));
-        let host = Host {
+        let mut host = Host {
             table: ResourceTable::new(),
             wasi: WasiCtx::builder().stdout(out.clone()).stderr(err.clone()).build(), // nothing else is granted
             http: WasiHttpCtx::new(),
             hooks: Deny,
             config: self.config.clone().into_iter().collect(),
-            limits: StoreLimitsBuilder::new()
-                .memory_size(MEMORY)
-                .instances(16)
-                .tables(16)
-                .memories(4)
-                .table_elements(100_000)
-                .build(),
+            memory: 0,
         };
+        host.table.set_max_capacity(256); // live resources; the default is a million
         let mut store = Store::new(&self.engine, host);
-        store.limiter(|h| &mut h.limits);
+        store.limiter(|h| h);
         // Q57: `serve` is concurrent, so yield at every tick instead of trapping, and let `Deadline` end the request.
         store.epoch_deadline_async_yield_and_update(1);
-        let proxy = self.pre.instantiate_async(&mut store).await?;
-        let expiration = Deadline(Box::pin(sleep(TIMEOUT)));
+        let proxy = timeout_at(expiration.0.deadline(), self.pre.instantiate_async(&mut store)).await??;
         Ok(Instance {
             store,
             proxy,
