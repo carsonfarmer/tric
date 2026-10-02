@@ -11,39 +11,37 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::ring::default_pr
 use wasmtime_wasi_http::handler::{Request, Response};
 use wasmtime_wasi_http::{Error, RequestOptions, WasiHttpHooks, io::TokioIo};
 
-/// One allow-list item, `scheme://host[:port]`. A scheme, host or port of `*` matches any, and a host may start with `*.`.
-pub(crate) struct Allow {
-    scheme: String,
-    host: String,
-    port: Option<u16>, // None is any
+const ANY: &str = "*://*:*";
+
+/// A URI's `scheme://host:port`, lowercase and with the port filled in, if it is http or https with a host.
+fn origin(uri: &Uri) -> Option<String> {
+    let default = match uri.scheme_str()? {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    Some(format!("{}://{}:{}", uri.scheme_str()?, uri.host()?, uri.port_u16().unwrap_or(default)).to_ascii_lowercase())
 }
+
+/// One allow-list item, `scheme://host[:port]`, kept as its origin. A host may start with `*.`, and `*://*:*` allows any.
+pub(crate) struct Allow(String);
 
 impl Allow {
     pub(crate) fn parse(item: &str) -> Result<Self, String> {
-        let bad = || format!("bad allowed host {item:?}");
-        let (scheme, rest) = item.split_once("://").ok_or_else(bad)?;
-        let (host, port) = rest.rsplit_once(':').unwrap_or((rest, ""));
-        let port = match (port, scheme) {
-            ("*", _) => None,
-            ("", "http") => Some(80),
-            ("", "https") => Some(443),
-            (p, _) => Some(p.parse().map_err(|_| bad())?),
-        };
-        let name = host.strip_prefix("*.").unwrap_or(host);
-        if host != "*" && (name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-.[]:".contains(&b)))
-        {
-            return Err(bad());
+        let item = item.to_ascii_lowercase();
+        // The item must be the start of its own origin, which a path, a user name or a port that is no number is not.
+        let ok = |o: &String| o.starts_with(&item) && !o.contains(".:") && !o.replacen("//*.", "//", 1).contains('*');
+        match item.parse().ok().as_ref().and_then(origin).filter(ok) {
+            _ if item == ANY => Ok(Self(item)),
+            Some(o) => Ok(Self(o)),
+            None => Err(format!("bad allowed host {item:?}")),
         }
-        Ok(Self { scheme: scheme.into(), host: host.to_ascii_lowercase(), port })
     }
 
     fn allows(&self, uri: &Uri) -> bool {
-        let (Some(scheme), Some(host)) = (uri.scheme_str(), uri.host()) else { return false };
-        let port = uri.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
-        let host = host.to_ascii_lowercase();
-        (self.scheme == "*" || self.scheme == scheme)
-            && self.port.is_none_or(|p| p == port)
-            && self.host.strip_prefix('*').map_or(host == self.host, |suffix| host.ends_with(suffix)) // the suffix keeps its dot
+        let Some(o) = origin(uri) else { return false };
+        self.0 == ANY
+            || self.0.split_once('*').map_or(o == self.0, |(head, tail)| o.starts_with(head) && o.ends_with(tail))
     }
 }
 
@@ -81,8 +79,11 @@ impl WasiHttpHooks for Outbound {
 
 async fn send(app: Arc<Shared>, req: Request) -> Result<(Response, Fut<()>), Error> {
     let uri = req.uri();
-    // A user name before an `@` is guest text that would reach the `Host` header.
-    if uri.authority().is_some_and(|a| a.as_str().contains('@')) || !app.allow.iter().any(|a| a.allows(uri)) {
+    // A user name before an `@` is guest text that would reach the `Host` header. Credentials go in `Authorization`.
+    if uri.authority().is_some_and(|a| a.as_str().contains('@')) {
+        return Err(Error::HttpRequestUriInvalid);
+    }
+    if !app.allow.iter().any(|a| a.allows(uri)) {
         return Err(Error::HttpRequestDenied);
     }
     let tls = uri.scheme_str() == Some("https");
@@ -218,30 +219,47 @@ mod tests {
                 "http://a.example.com/",
             ],
         );
-        t("*://*:*", &["http://1.2.3.4:81/", "https://[::1]/", "ftp://x/", "http://localhost/"], &[]);
+        t("*://*:*", &["http://1.2.3.4:81/", "https://[::1]/", "http://localhost/"], &["ftp://x/"]);
         t(
             "http://localhost:3000",
             &["http://localhost:3000/a"],
             &["http://localhost/", "http://localhost:3001/", "https://localhost:3000/"],
         );
-        t("https://*:8443", &["https://a.com:8443/"], &["https://a.com/"]);
+        t("https://api.example.com:8443", &["https://api.example.com:8443/"], &["https://api.example.com/"]);
+        t("https://*.example.com:8443", &["https://a.example.com:8443/"], &["https://a.example.com/"]);
         t("http://[2606:4700::1111]:80", &["http://[2606:4700::1111]/"], &["http://[2606:4700::1112]/"]);
-        t("https://example.com:*", &["https://example.com:1/", "https://example.com/"], &["http://example.com/"]);
-        t("https://*", &["https://a.com/", "https://a.com:443/"], &["https://a.com:444/", "http://a.com/"]);
+        t("HTTPS://Example.COM", &["https://example.com/"], &[]);
+        t(
+            "https://example.com:443",
+            &["https://example.com/", "https://example.com:443/"],
+            &["https://example.com:80/"],
+        );
         for bad in [
             "example.com",
             "*",
             "",
             "https://",
-            "ftp://example.com",
+            "https://*",  // dropped: no wildcard host on its own
+            "https://*.", // would match every name with a trailing dot
             "https://a*.example.com",
             "https://*.*.com",
+            "https://example.com/", // no trailing slash
             "https://example.com/path",
+            "https://example.com?q=1",
             "https://example.com:99999",
+            "https://example.com:*", // dropped: no wildcard port
+            "*://example.com",       // dropped: no wildcard scheme
+            "https://*:8443",        // dropped
+            "http://*:*",            // dropped: spell it `*://*:*`
             "https://user@example.com",
-            "https://[::1]",
+            "redis://example.com:6379",
+            "ftp://example.com",
         ] {
             assert!(Allow::parse(bad).is_err(), "{bad:?} should not parse");
+        }
+        // an address parses, and the address rule still applies when it is dialled
+        for ok in ["https://127.0.0.1:8080", "https://[::1]"] {
+            assert!(Allow::parse(ok).is_ok(), "{ok:?} should parse");
         }
     }
 

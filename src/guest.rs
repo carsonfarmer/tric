@@ -1,5 +1,5 @@
-//! Runs each request in a fresh store, under hard limits: 10 s, 256 MiB, nothing inherited, and outbound HTTP only to
-//! the hosts the app allows.
+//! Runs each request in a fresh store, under hard limits: 10 s, 256 MiB, 32 MiB copied in by one host call, nothing
+//! inherited, and outbound HTTP only to the hosts the app allows.
 use crate::kv::Kv;
 use crate::outbound::{Allow, Outbound};
 use http_body_util::BodyExt;
@@ -21,6 +21,7 @@ const MEMORY: usize = 256 << 20; // all linear memories of a store together
 const LOG_CAP: usize = 64 << 10; // per stream, per request
 const MAX_INFLIGHT: usize = 64;
 const RESOURCES: usize = 256; // live resources per store; the default is a million
+const HOSTCALL_FUEL: usize = 32 << 20; // bytes one host call may copy out of the guest; the default is 128 MiB
 
 /// What every store of one app shares, so a request costs one reference count, not a copy.
 pub(crate) struct Shared {
@@ -172,6 +173,7 @@ impl HandlerState for State {
         host.table.set_max_capacity(RESOURCES);
         let mut store = Store::new(&self.engine, host);
         store.limiter(|h| h);
+        store.set_hostcall_fuel(HOSTCALL_FUEL);
         // `serve` is concurrent, so yield at every tick instead of trapping, and let `Deadline` end the request.
         store.epoch_deadline_async_yield_and_update(1);
         let proxy = timeout_at(expiration.0.deadline(), self.pre.instantiate_async(&mut store)).await??;

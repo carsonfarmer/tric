@@ -3,12 +3,7 @@ mod common;
 use common::*;
 use object_store::{ObjectStoreExt, path::Path};
 use serde_json::{Value, json};
-use std::time::Duration;
-use tokio::time::sleep;
 use torpor::App;
-
-/// How long a cached value or list is served without asking the store, and a little more.
-const FRESH: Duration = Duration::from_millis(1100);
 
 async fn j(app: &App, path: &str) -> Value {
     let (status, body) = get(app, path).await;
@@ -137,58 +132,15 @@ async fn racing_writers_lose_nothing() {
     assert_eq!(raw(&store, "kv/app/s/guest").await, b"80", "guest counter, after {retries} retries");
 }
 
-/// What a value costs the store: nothing for our own writes and within `FRESH`, then a conditional GET.
+/// Nothing is cached, so each call is one request to the store, and another host sees a write at once.
 #[tokio::test(flavor = "multi_thread")]
-async fn values_are_cached_and_revalidated() {
+async fn every_call_is_the_stores() {
     let (store, engine) = engine();
     let (a, b) = (load(&engine, "kv-p3", &[]), load(&engine, "kv-p3", &[]));
-    let (get, set) = ("/kv?op=get&store=s&key=k", "/kv?op=set&store=s&key=k&value=");
-    j(&a, &format!("{set}1")).await;
-    assert_eq!(store.take(), ["put kv/app/s/k", "put kvgen/app/s"]);
-    assert_eq!(j(&a, get).await["ok"], "1");
-    assert_eq!(store.take(), [""; 0], "read your own write");
-    assert_eq!(j(&b, get).await["ok"], "1");
-    assert_eq!(j(&b, get).await["ok"], "1");
-    assert_eq!(store.take(), ["get kv/app/s/k"], "a miss costs a GET, and a hit within FRESH nothing");
-    j(&a, &format!("{set}2")).await;
-    store.take();
-    assert_eq!(j(&b, get).await["ok"], "1", "b has not asked since");
-    sleep(FRESH).await;
-    assert_eq!(j(&b, get).await["ok"], "2");
-    sleep(FRESH).await;
-    assert_eq!(j(&b, get).await["ok"], "2");
-    assert_eq!(store.take(), ["get kv/app/s/k if-none-match"; 2]);
-    j(&a, "/kv?op=delete&store=s&key=k").await;
-    sleep(FRESH).await;
-    assert_eq!(j(&b, get).await["ok"], Value::Null);
-}
-
-/// What a list costs: a GET of the generation object and, only if that changed, a LIST.
-#[tokio::test(flavor = "multi_thread")]
-async fn lists_are_cached_by_generation() {
-    let (store, engine) = engine();
-    let (a, b) = (load(&engine, "kv-p2", &[]), load(&engine, "kv-p2", &[]));
-    let (list, set) = ("/kv?op=list&store=s", "/kv?op=set&store=s&value=1&key=");
-    j(&a, &format!("{set}x")).await;
-    store.take();
-    assert_eq!(keys(&a, list).await, json!(["x"]));
-    assert_eq!(keys(&a, list).await, json!(["x"]));
-    assert_eq!(store.take(), ["list kv/app/s"], "the page is kept");
-    j(&a, &format!("{set}y")).await;
-    store.take();
-    assert_eq!(keys(&a, list).await, json!(["x", "y"]), "a list within FRESH of a write sees it");
-    assert_eq!(store.take(), ["list kv/app/s"]);
-    assert_eq!(keys(&b, list).await, json!(["x", "y"]));
-    assert_eq!(store.take(), ["get kvgen/app/s", "list kv/app/s"]);
-    j(&a, &format!("{set}z")).await;
-    store.take();
-    assert_eq!(keys(&b, list).await, json!(["x", "y"]), "b has not asked since");
-    sleep(FRESH).await;
-    assert_eq!(keys(&b, list).await, json!(["x", "y", "z"]));
-    assert_eq!(store.take(), ["get kvgen/app/s if-none-match", "list kv/app/s"]);
-    sleep(FRESH).await;
-    assert_eq!(keys(&b, list).await, json!(["x", "y", "z"]));
-    assert_eq!(store.take(), ["get kvgen/app/s if-none-match"], "nothing was written, so the page is kept");
+    j(&a, "/kv?op=set&store=s&key=k&value=1").await;
+    assert_eq!(j(&b, "/kv?op=get&store=s&key=k").await["ok"], "1");
+    assert_eq!(keys(&b, "/kv?op=list&store=s").await, json!(["k"]));
+    assert_eq!(store.take(), ["put kv/app/s/k", "get kv/app/s/k", "list kv/app/s"]);
 }
 
 /// The allow list is checked before any lookup, and every address a name resolves to is checked after it.
@@ -199,17 +151,19 @@ async fn outbound_is_allow_listed_and_public_only() {
         let fetch = |app: App, url: &'static str| async move { get(&app, &format!("/fetch?url={url}")).await.1 };
         let none = load(&engine, fixture, &[]);
         let some = load(&engine, fixture, &["https://example.com", "https://*.example.org:8443"]);
-        for url in [
-            "http://example.com/",
-            "https://example.com:444/",
-            "https://example.org:8443/",
-            "https://x.example.net/",
-            "https://user@example.com/", // a user name would reach the `Host` header
-        ] {
+        for url in
+            ["http://example.com/", "https://example.com:444/", "https://example.org:8443/", "https://x.example.net/"]
+        {
             assert_eq!(fetch(none.clone(), url).await, "ErrorCode::HttpRequestDenied", "{fixture} {url}");
             assert_eq!(fetch(some.clone(), url).await, "ErrorCode::HttpRequestDenied", "{fixture} {url}");
         }
-        let any = load(&engine, fixture, &["http://*:*"]);
+        // a user name would reach the `Host` header
+        assert_eq!(
+            fetch(some.clone(), "https://user@example.com/").await,
+            "ErrorCode::HttpRequestUriInvalid",
+            "{fixture}"
+        );
+        let any = load(&engine, fixture, &["*://*:*"]);
         for url in [
             "http://127.0.0.1/",
             "http://127.1/",
