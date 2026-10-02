@@ -123,6 +123,19 @@ Running log from the grilling session. Background research is in [research/](res
 | Q59 | Embeddable runtime (the user's ask) | **The host runtime is a library that can be embedded without the CLI.** One package (`torpor-cli`, refining Q18) holds a library `torpor` (`src/lib.rs`: `engine`, `guest`, later `outbound`, `kv`, `config`) and the `torpor` binary (`src/main.rs`: `serve`, `state`, `compile`, the deploy CLI). Modules declared in `main.rs` are invisible to the library, so the compiler keeps the runtime free of `torpor.toml`, the bucket layout and the CLI. The public API is small: build an engine, load a component into an app, `app.handle(request) -> response`. Limits stay constants (Q35). The library never installs a logging subscriber. Split into a separately published crate only when someone embeds it from crates.io (Q18: split only when forced). |
 | Q57 (applied) | Timeout mechanism | `torpor serve` is a concurrent server, which is Q57's own trigger, and Q35's 10 s must also hold for a guest that is only waiting. So M1 yields on every 10 ms epoch tick and drops the store at a 10 s deadline (what `wasmtime serve` does): about one line more than the plain trap ([research/wasmtime-embedding.md](research/wasmtime-embedding.md), section 6). |
 
+## During M2 (2026-10-01)
+
+From the research brief, [research/m2-interfaces.md](research/m2-interfaces.md).
+
+| # | Topic | Decision |
+|---|---|---|
+| Q38 (applied) | Allow-list matcher | **Hand-written on `http::Uri`, not the `url` crate.** `url` cannot parse `*://*:*`, `http://*:*` or `host:*`, so the wildcard parts would have to be split by hand first, and that split is the whole matcher. About 36 lines with parsing. It matches the request's literal host text, which is stricter than Spin (Spin normalises `127.1` first); the address filter judges the resolved address either way. |
+| Q34 (applied) | Address filter and dialling | **Our own connect, not `default_send_request`.** That function resolves the name again inside its connect, so the address checked is not the address dialled (a rebinding gap), and its timeouts default to 600 s. We resolve, reject the request if **any** address is blocked (Spin drops the blocked ones and dials the rest), and dial only the checked list. The blocked set is hand-written with stable `std` (12 lines): `ip_network`'s `is_global` lets through `::127.0.0.1`, NAT64, 6to4 and IPv4 multicast. |
+| — | KV cache scope | **Per app per process**, not per store: each request gets a fresh store, so a per-store cache would never hit. Bounded by a byte cap that sits outside the guest's memory cap. |
+| — | Spin SDK guests | The SDK's own config import is `wasi:config@0.2.0-draft-2024-09-27`, which does not link on rc.1, and its KV module imports `spin:*`. Spin SDK apps use the SDK for HTTP only and `wit_bindgen::generate!` for KV and config. The app docs say so. |
+| Q44 (applied) | KV list cursor | **The last key returned, not an S3 continuation token.** We list with `start-after` (`list_with_offset`), so a cursor stays valid across processes and caches, and the same code works on stores without continuation tokens. |
+| — | Hung DNS lookups | **Accepted for now.** A lookup that hangs holds a blocking-pool thread after the 10 s deadline has already answered the guest. A timeout around the lookup would not free the thread either. |
+
 ## Deferred work and fast follows
 
 Kept here so nothing agreed in the grilling gets lost.
@@ -133,7 +146,7 @@ Kept here so nothing agreed in the grilling gets lost.
 | Read-only `/v2/` registry view of the bucket; `spinit export` | Q40 | Only if wanted. Generate OCI manifests on the fly. |
 | Custom domains through CloudFront | Q11, Q50 | Secret origin header checked by the host; certificate in us-east-1. |
 | Dedicated-function mode | Q11, Q47, Q55 | For apps needing hard isolation, more memory, or the strict cold-start target for large components. |
-| Skip the `gen` write on plain updates | Q42 | When the instance's cache already shows the key existed, an update needs only the data write. |
+| Skip the `gen` write on plain updates | Q42 | A winning `swap` or `increment` on an existing key already skips it. A plain `set` still writes it: when the instance's cache already shows the key existed, an update would need only the data write. |
 | Automated gc | Q48 | Today: manual `spinit gc`. |
 | Cron design revisit | Q23, Q49 | Once-a-minute ticker, opt-in. |
 | Rename to torpor | Q43 | Find-and-replace `spinit` → `torpor`, plus a trademark and domain check, before the first public release. |
@@ -144,4 +157,8 @@ Kept here so nothing agreed in the grilling gets lost.
 | HMAC on native code | Q54 (a) | Defence in depth against a misconfigured bucket policy. About 30 lines plus a shared key. |
 | ~~Yield on each epoch tick plus a request timeout~~ | Q57 | Done in M1 (see "During M1"). |
 | Load hot apps during start-up | Q56 (c) | Only if reading state during start-up falls short. |
+| Watch Wasmtime for `wasi:keyvalue` draft2 | Q44 | `wasmtime-wasi-keyvalue` implements only the first draft and keeps its bindings private. If it moves to draft2 with public bindings or a backend trait, replace our `bindgen!` with it. |
+| Host memory when lifting nested lists | Q53, Q55 | Wasmtime 49 lifts `list<list<u8>>` and `list<string>` parameters into host `Vec`s with no size limit, before the host function runs. Entries can all point at one guest buffer, so a guest within its 256 MiB cap can make the host allocate far more. Reachable through `wasi:http` `fields.from-list` (since M1) and `wasi:keyvalue` `set-many`. Upstream; nothing to cap on our side short of hand-lifting with `WasmList`. |
+| Pace generation writes on GCS | Q12, Q42 | Every KV write overwrites its bucket's generation object, which breaks Q12's one-write-per-second rule under load. Fine on S3; GCS needs pacing or a different marker. |
+| Certificate errors as `TlsCertificateError` | Q34 | Today every TLS failure reaches the guest as `TlsProtocolError`. |
 | Second short cloud session | Q51, Q56 | `deserialize_file` against `deserialize`, state read during start-up, 1024 MB, n = 100, compile-function timings. Needs its own explicit apply approval. |

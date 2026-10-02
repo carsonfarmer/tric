@@ -30,15 +30,15 @@ An operator installs torpor into their own AWS account with one OpenTofu module,
   - tokio and hyper;
   - `age`, `zstd`, serde, `toml`, `clap` and `tracing`.
 
-**Line budget:** about 1,200 lines of Rust plus about 250 of HCL. A module that runs well past its budget is a design problem to raise, not to push through.
+**Line budget:** about 1,290 lines of Rust (1,200 before M2) plus about 250 of HCL. A module that runs well past its budget is a design problem to raise, not to push through.
 
 | Module | Does | Budget |
 |---|---|---|
 | `engine` | Wasmtime config, epoch ticker, limits, loading native code, Cranelift fallback | ~120 |
 | `guest` | A fresh store per request, a WASI context that grants nothing, p2/p3 dispatch | ~90 |
-| `outbound` | Allow list plus the resolved-address block, in the HTTP send hook | ~60 |
-| `kv` | `wasi:keyvalue` draft2 over the bucket: cache, CAS, generation-cached listing | ~200 |
-| `config` | `wasi:config` from the manifest, with secrets decrypted | ~30 |
+| `outbound` | Allow list plus the resolved-address block, in the HTTP send hook | ~100 (raised in M2 from ~60: the matcher is hand-written, and the connect is our own) |
+| `kv` | `wasi:keyvalue` draft2 over the bucket: cache, CAS, generation-cached listing | ~250 (raised in M2 from ~200) |
+| `config` | `wasi:config` from the manifest, with secrets decrypted | ~30 (M2 needed none: Wasmtime's crate does it; this is for secrets) |
 | `state` | State object and manifests, revalidation, defensive reads | ~100 |
 | `serve` | hyper server, routing, logs | ~100 |
 | `compile` | The compile worker and compile-request markers | ~70 |
@@ -80,7 +80,7 @@ It is then merged locally into `main`.
   - Add a root `compose.yaml` (the spike's AL2023 build image, plus a `test` service).
   - Merge `spike/latency` into `main` so `prototypes/latency/` stays on record (Q13) **(choice)**.
 - **Engine:** Cranelift with the p3 async features.
-  - An epoch ticker on an OS thread every 100 ms, with a 10 s deadline that traps (Q35, Q57).
+  - An epoch ticker on an OS thread every 10 ms; a guest yields on each tick, and a 10 s deadline drops its store (Q35, Q57 as applied in M1).
   - `StoreLimits` of 256 MiB, plus caps on instance and table counts (Q55).
 - **Each request:** a fresh store, and a WASI context that grants nothing: no environment, arguments, preopened files or sockets (Q55).
 - **Guest output:** stdout and stderr are captured into the host log, tagged with the app and capped per request **(choice)**.
