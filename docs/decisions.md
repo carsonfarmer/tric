@@ -134,6 +134,7 @@ From the research brief, [research/m2-interfaces.md](research/m2-interfaces.md).
 | — | KV cache scope | **Per app per process**, not per store: each request gets a fresh store, so a per-store cache would never hit. Bounded by a byte cap that sits outside the guest's memory cap. |
 | — | Spin SDK guests | The SDK's own config import is `wasi:config@0.2.0-draft-2024-09-27`, which does not link on rc.1, and its KV module imports `spin:*`. Spin SDK apps use the SDK for HTTP only and `wit_bindgen::generate!` for KV and config. The app docs say so. |
 | Q44 (applied) | KV list cursor | **The last key returned, not an S3 continuation token.** We list with `start-after` (`list_with_offset`), so a cursor stays valid across processes and caches, and the same code works on stores without continuation tokens. |
+| — | Optional KV and outbound behaviour | **All kept, over the first budget:** the batch interface (about 18 lines), the page cache (about 8), the cache byte cap (about 6) and the allow-list host check (about 4). Each is real behaviour, not ceremony (2026-10-02). |
 | — | Hung DNS lookups | **Accepted for now.** A lookup that hangs holds a blocking-pool thread after the 10 s deadline has already answered the guest. A timeout around the lookup would not free the thread either. |
 
 ## Deferred work and fast follows
