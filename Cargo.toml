@@ -19,18 +19,24 @@ required-features = ["cli"]
 default = ["cli"]
 cli = [
     "dep:clap", "dep:serde", "dep:toml", "dep:tracing-subscriber",
-    "hyper/http1", "hyper/server", "tokio/macros", "tokio/net", "tokio/rt-multi-thread",
+    "hyper/server", "tokio/macros", "tokio/rt-multi-thread",
 ]
 
 [dependencies]
+bytes = "1"
 clap = { version = "4", features = ["derive"], optional = true }
+futures-util = "0.3"
 http-body-util = "0.1"
-hyper = "1"
+hyper = { version = "1", features = ["client", "http1"] }
+object_store = { version = "=0.14.2", default-features = false }
+percent-encoding = "2"
 serde = { version = "1", features = ["derive"], optional = true }
-tokio = { version = "1", features = ["sync", "time"] }
+tokio = { version = "1", features = ["net", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 toml = { version = "1", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
+webpki-roots = "1"
 # The defaults minus what torpor never uses: cache, profiling, coredump, debug, stack-switching, gc-copying and
 # compile-time-builtins (so no wit-parser either).
 wasmtime = { version = "=49.0.1", default-features = false, features = [
@@ -39,10 +45,12 @@ wasmtime = { version = "=49.0.1", default-features = false, features = [
 ] }
 wasmtime-wasi = { version = "=49.0.1", default-features = false, features = ["p2", "p3"] }
 wasmtime-wasi-config = "=49.0.1"
-# No `default-send-request`: that is the built-in outbound client (hyper, rustls, webpki-roots) and a way around `Deny`.
+# No `default-send-request`: that is the built-in outbound client, which resolves names after any check on them.
 wasmtime-wasi-http = { version = "=49.0.1", default-features = false, features = ["component-model-async", "p2", "p3"] }
 
 [dev-dependencies]
+async-trait = "0.1"
+serde_json = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
 
 [profile.release]
