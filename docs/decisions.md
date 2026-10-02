@@ -116,6 +116,13 @@ Running log from the grilling session. Background research is in [research/](res
 
 [plan.md](plan.md) is approved with all nine of its choices. Choice 2 replaces Q58's marker detail: one marker, `compile/<hex>`, written by deploy and by a serving miss, deleted by the compile worker when the native code exists; deploy waits for the deletion. **Primary goal while building: the fewest lines of code and the most elegant design. Performance work comes only after that.** A remote repo may be created under the user's personal GitHub account (`carsonfarmer`) when needed.
 
+## During M1 (2026-10-01)
+
+| # | Topic | Decision |
+|---|---|---|
+| Q59 | Embeddable runtime (the user's ask) | **The host runtime is a library that can be embedded without the CLI.** One package (`torpor-cli`, refining Q18) holds a library `torpor` (`src/lib.rs`: `engine`, `guest`, later `outbound`, `kv`, `config`) and the `torpor` binary (`src/main.rs`: `serve`, `state`, `compile`, the deploy CLI). Modules declared in `main.rs` are invisible to the library, so the compiler keeps the runtime free of `torpor.toml`, the bucket layout and the CLI. The public API is small: build an engine, load a component into an app, `app.handle(request) -> response`. Limits stay constants (Q35). The library never installs a logging subscriber. Split into a separately published crate only when someone embeds it from crates.io (Q18: split only when forced). |
+| Q57 (applied) | Timeout mechanism | `torpor serve` is a concurrent server, which is Q57's own trigger, and Q35's 10 s must also hold for a guest that is only waiting. So M1 yields on every 10 ms epoch tick and drops the store at a 10 s deadline (what `wasmtime serve` does): about one line more than the plain trap ([research/wasmtime-embedding.md](research/wasmtime-embedding.md), section 6). |
+
 ## Deferred work and fast follows
 
 Kept here so nothing agreed in the grilling gets lost.
@@ -135,6 +142,6 @@ Kept here so nothing agreed in the grilling gets lost.
 | Semi-trusted deployers | Q53 (b) | A deploy endpoint in the function as the only trusted writer, plus auth. About 200 lines. |
 | State sharding or change log | Q45 | At about 10k apps or one deploy per second. |
 | HMAC on native code | Q54 (a) | Defence in depth against a misconfigured bucket policy. About 30 lines plus a shared key. |
-| Yield on each epoch tick plus a request timeout | Q57 | When Cloud Run or a concurrent `serve` becomes a target. |
+| ~~Yield on each epoch tick plus a request timeout~~ | Q57 | Done in M1 (see "During M1"). |
 | Load hot apps during start-up | Q56 (c) | Only if reading state during start-up falls short. |
 | Second short cloud session | Q51, Q56 | `deserialize_file` against `deserialize`, state read during start-up, 1024 MB, n = 100, compile-function timings. Needs its own explicit apply approval. |
