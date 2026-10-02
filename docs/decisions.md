@@ -155,6 +155,19 @@ From the research brief, [research/m2-interfaces.md](research/m2-interfaces.md).
 | Q55 | Data copied in by one host call | **32 MiB** (`HOSTCALL_FUEL`), down from Wasmtime's 128 MiB default. Wasmtime charges every string and list it lifts out of a guest against this budget, so it bounds what one call such as `fields.from-list` or `set-many` can make the host allocate. A call over it traps. |
 | — | Wasmtime issue | **No new issue.** An earlier claim here that Wasmtime lifts lists without limit was wrong (see the corrected deferred row). A short comment on bytecodealliance/wasmtime#14430 goes up only after the user approves its text. |
 
+## During M3 (2026-10-02)
+
+| # | Topic | Decision |
+|---|---|---|
+| Q14 (applied) | Per-app request logs | **A span per request tagged with the app, not sampling.** Each request is one `info` line inside `request{app=NAME}`, so `RUST_LOG='warn,[request{app=NAME}]=info'` turns on one app's lines with no code. Sampling would need a rate stored per app and a counter. Turned on, a busy app logs every request. |
+| — | One TLS provider | **aws-lc-rs for everything.** `object_store`'s S3 client uses it, so outbound HTTP moved from ring to it too: one provider is linked, and `ClientConfig::builder()` can't panic over two. |
+| — | Store URL | `AmazonS3Builder::from_env().with_url(URL)`, so S3 (and S3-compatible stores) only, configured by the usual `AWS_` variables. `parse_url_opts` would cover GCS and Azure too, but needs the `url` crate; it can come with those installs. |
+| — | App names | **1 to 64 of `a-z`, `0-9` and `-`**, the KV store-name rule, checked when an app loads. A name is one segment of a KV key and an app's path prefix, so nothing else is safe. |
+| — | Release manifests | JSON with unknown fields refused: the component's hash, the parent release, config, secrets and the allow list. Each secret is armored age ciphertext on its own, so `secrets list` reads names without a key. Deploy and `secrets set` read the parent inside the state swap, so a racing `secrets set` is never dropped. |
+| Q48 | Rollback | Moves the app to its current release's parent, so a second rollback goes back further and there is no roll-forward (redeploy instead). The depth of 10 is what `gc` will keep; nothing limits it before then. |
+| Q53 | Secrets and bucket writers (**needs your call**) | **Q53's "can't read secrets" does not hold.** A bucket writer can deploy a release that lists any app's sealed secrets next to a component that sends them to an allowed host, and the host decrypts them. Holding the claim needs authenticated deploys (Q53 (b)). Proposed: correct Q53 to say a bucket writer can read secrets, and leave the design as is. |
+| — | Where the M3 tests live | In the binary (`serve.rs`), since `state`, `cli` and `serve` are binary modules (Q59). They call the router directly, with no sockets. |
+
 ## Deferred work and fast follows
 
 Kept here so nothing agreed in the grilling gets lost.
@@ -176,6 +189,11 @@ Kept here so nothing agreed in the grilling gets lost.
 | HMAC on native code | Q54 (a) | Defence in depth against a misconfigured bucket policy. About 30 lines plus a shared key. |
 | ~~Yield on each epoch tick plus a request timeout~~ | Q57 | Done in M1 (see "During M1"). |
 | Load hot apps during start-up | Q56 (c) | Only if reading state during start-up falls short. |
+| One load per cold app | M3 | Concurrent first requests to an app may each fetch and compile it. Harmless, and gone once native code (M4) makes a load cheap. |
+| Compile off the async thread | M3 | `Engine::load` compiles on the tokio thread that took the request. Performance work, after M4. |
+| Remember a release that fails to load | M3 | A release whose blob is bad or whose secrets don't decrypt is fetched again on every request to it, and each request gets a 500. A short negative cache would spare the bucket. |
+| A timeout on the state recheck | M3 | The recheck holds the state lock, so a slow GET stalls every request on the host until it returns. A timeout of about 1 s, then serve the last state read. |
+| Case-insensitive domains, a `domains` command | Q41, Q50 | `domains` is matched exactly, and nothing sets it yet. Comes with custom domains. |
 | Watch Wasmtime for `wasi:keyvalue` draft2 | Q44 | `wasmtime-wasi-keyvalue` implements only the first draft and keeps its bindings private. If it moves to draft2 with public bindings or a backend trait, replace our `bindgen!` with it. |
 | Field lists lifted before their size check | Q53, Q55 | Wasmtime charges every lifted string and list against the per-call budget (`HOSTCALL_FUEL`, 32 MiB; GHSA-852m-cvvp-9p4w), so no host call allocates without bound. `fields.from-list` still lifts every field before its 128 KiB check, so a call it refuses can cost up to that budget. Upstream agreed in bytecodealliance/wasmtime#14430 to charge lifting to Store fuel as well. Watch it. |
 | ~~Pace generation writes on GCS~~ | Q12, Q42 | Moot: there is no generation object since the M2 review. |

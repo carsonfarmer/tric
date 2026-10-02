@@ -38,11 +38,11 @@ An operator installs torpor into their own AWS account with one OpenTofu module,
 | `guest` | A fresh store per request, a WASI context that grants nothing, p2/p3 dispatch | ~90 |
 | `outbound` | Allow list plus the resolved-address block, in the HTTP send hook | ~100 (raised in M2 from ~60: the matcher is hand-written, and the connect is our own) |
 | `kv` | `wasi:keyvalue` draft2 over the bucket: one object per key, CAS, no cache | ~250 (raised in M2 from ~200; 236 after the M2 review) |
-| `config` | `wasi:config` from the manifest, with secrets decrypted | ~30 (M2 needed none: Wasmtime's crate does it; this is for secrets) |
-| `state` | State object and manifests, revalidation, defensive reads | ~100 |
-| `serve` | hyper server, routing, logs | ~100 |
+| `config` | `wasi:config` from the manifest, with secrets decrypted | 0 (Wasmtime's crate serves it, and `serve` decrypts secrets in 4 lines) |
+| `state` | State object and manifests, revalidation, defensive reads | ~100 (96 after M3) |
+| `serve` | hyper server, routing, logs | ~140 (raised in M3 from ~100: it also serves one app from a directory; 134 after M3) |
 | `compile` | The compile worker and compile-request markers | ~70 |
-| `cli` | `deploy`, `rollback`, `secrets`, `gc` | ~350 |
+| `cli` | `deploy`, `rollback`, `secrets`, `gc`, and `main`'s arguments | ~350 (184 after M3, before `gc` and `compile`) |
 | `infra/aws` | OpenTofu module | ~250 HCL |
 
 ### Bucket layout
@@ -135,7 +135,7 @@ It is then merged locally into `main`.
 - **Bucket contents are never trusted (Q53):**
   - reads are size-capped and parsed strictly;
   - every blob's hash is checked on read.
-- **Logs:** per-app sampling of request log lines (Q14).
+- **Logs:** one request line per request in a span tagged with the app, so a log filter turns on one app (Q14, see decisions.md "During M3").
 
 **Done when:**
 - In-process tests deploy two apps, serve them, and roll one back, all on the in-memory store.

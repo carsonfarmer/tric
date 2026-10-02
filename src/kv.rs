@@ -9,7 +9,7 @@ use wasmtime::component::Resource;
 
 const KEY_MAX: usize = 256; // bytes, before percent-encoding
 const VALUE_MAX: usize = 1 << 20;
-const BUCKET_MAX: usize = 64; // bytes in a bucket name
+pub(crate) const NAME_MAX: usize = 64; // bytes in a bucket or app name
 const PAGE: usize = 1000; // keys per `list-keys`, the most S3 gives for one LIST
 const BATCH_MAX: usize = 16 << 20; // bytes of values in one `get-many` reply
 const RETRIES: usize = 16; // CAS attempts for one `increment`
@@ -26,6 +26,11 @@ type R<T> = Result<T, Error>;
 
 fn other(e: impl ToString) -> Error {
     Error::Other(e.to_string())
+}
+
+/// Whether `s` can name a bucket or an app, which both become one segment of a key: 1 to 64 of `a-z`, `0-9` and `-`.
+pub(crate) fn is_name(s: &str) -> bool {
+    (1..=NAME_MAX).contains(&s.len()) && s.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
 }
 
 /// The handle for an opened bucket: its name.
@@ -135,9 +140,7 @@ impl Host {
 
 impl store::Host for Host {
     async fn open(&mut self, name: String) -> R<Resource<Bucket>> {
-        let ok = (1..=BUCKET_MAX).contains(&name.len())
-            && name.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'));
-        ok.then_some(Bucket(name)).ok_or(Error::NoSuchStore).and_then(|b| self.table.push(b).map_err(other))
+        is_name(&name).then_some(Bucket(name)).ok_or(Error::NoSuchStore).and_then(|b| self.table.push(b).map_err(other))
     }
 }
 
