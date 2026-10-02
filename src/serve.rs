@@ -13,6 +13,7 @@ const VAR_PREFIX: &str = "TORPOR_VAR_";
 
 /// The app's `MANIFEST`.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)] // a misspelt `allowed_outbound_hosts` would silently grant no access
 struct Manifest {
     name: String,
     component: PathBuf, // relative to the manifest's directory

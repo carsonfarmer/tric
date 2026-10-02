@@ -110,6 +110,15 @@ async fn paging() {
     );
 }
 
+/// A guest cannot make the host copy one cached value into the reply as often as it likes.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_many_is_capped() {
+    let app = load(&engine().1, "kv-p2", &[]);
+    j(&app, &format!("/kv?op=set&store=s&key=k&value={}", "v".repeat(60_000))).await;
+    let err = j(&app, &format!("/kv?op=get-many&store=s&keys={}", ["k"; 300].join(","))).await;
+    assert!(err["err"].as_str().is_some_and(|e| e.contains("get-many")), "{err}");
+}
+
 /// Eight guests on two apps and one store: no increment is lost, whichever way they interleave.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn racing_writers_lose_nothing() {
@@ -190,9 +199,13 @@ async fn outbound_is_allow_listed_and_public_only() {
         let fetch = |app: App, url: &'static str| async move { get(&app, &format!("/fetch?url={url}")).await.1 };
         let none = load(&engine, fixture, &[]);
         let some = load(&engine, fixture, &["https://example.com", "https://*.example.org:8443"]);
-        for url in
-            ["http://example.com/", "https://example.com:444/", "https://example.org:8443/", "https://x.example.net/"]
-        {
+        for url in [
+            "http://example.com/",
+            "https://example.com:444/",
+            "https://example.org:8443/",
+            "https://x.example.net/",
+            "https://user@example.com/", // a user name would reach the `Host` header
+        ] {
             assert_eq!(fetch(none.clone(), url).await, "ErrorCode::HttpRequestDenied", "{fixture} {url}");
             assert_eq!(fetch(some.clone(), url).await, "ErrorCode::HttpRequestDenied", "{fixture} {url}");
         }

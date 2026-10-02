@@ -5,7 +5,7 @@ use hyper::body::Bytes;
 use object_store::{Error as E, GetOptions, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion, path::Path};
 use percent_encoding::percent_decode_str;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use wasmtime::component::Resource;
 
@@ -15,6 +15,8 @@ const BUCKET_MAX: usize = 64; // bytes in a bucket name
 const FRESH: Duration = Duration::from_secs(1); // how long a cached value or generation is served without asking the store
 const PAGE: usize = 1000; // keys per `list-keys`, the most S3 gives for one LIST
 const CACHE_MAX: usize = 32 << 20; // bytes of cached values and pages per app
+const STRING: usize = 64; // bytes a cached string costs beyond its text: header, allocation and table slot, near enough
+const BATCH_MAX: usize = 16 << 20; // bytes of values in one `get-many` reply
 const RETRIES: usize = 16; // CAS attempts for one `increment`
 
 wasmtime::component::bindgen!({
@@ -63,6 +65,16 @@ struct Cache {
     bytes: usize,
 }
 
+impl Cache {
+    /// Counts an entry of `n` bytes that replaces one of `old`. Over `CACHE_MAX` it starts again empty: crude, and bounded.
+    fn charge(&mut self, n: usize, old: usize) {
+        self.bytes = self.bytes - old + n;
+        if self.bytes > CACHE_MAX {
+            *self = Cache { bytes: n, ..Default::default() };
+        }
+    }
+}
+
 impl Kv {
     pub(crate) fn new(store: Arc<dyn ObjectStore>, app: &str) -> Self {
         Self { store, app: app.into(), cache: Default::default() }
@@ -75,21 +87,14 @@ impl Kv {
         Ok(Path::from_iter(["kv", &self.app, bucket, key])) // each part is percent-encoded, so `/` stays inside it
     }
 
-    /// Locks the cache to add `n` bytes. Over `CACHE_MAX` it starts again empty: crude, and bounded.
-    fn cache(&self, n: usize) -> MutexGuard<'_, Cache> {
-        let mut c = self.cache.lock().unwrap();
-        c.bytes += n;
-        if c.bytes > CACHE_MAX {
-            *c = Cache { bytes: n, ..Default::default() };
-        }
-        c
-    }
-
     /// Caches what the store said at `at`, unless the cache already has something newer: a write that finished while a
     /// read was in flight must not be overwritten by what that read found.
     fn remember(&self, p: &Path, seen: Arc<Seen>, at: Instant) -> Arc<Seen> {
-        let mut c = self.cache(p.as_ref().len() + seen.value.as_ref().map_or(0, Bytes::len));
-        if c.values.get(p).is_none_or(|(prev, _)| *prev <= at) {
+        let weigh = |s: &Seen| p.as_ref().len() + STRING + s.value.as_ref().map_or(0, Bytes::len);
+        let mut c = self.cache.lock().unwrap();
+        let old = c.values.get(p).map(|(prev, s)| (*prev, weigh(s)));
+        if old.is_none_or(|(prev, _)| prev <= at) {
+            c.charge(weigh(&seen), old.map_or(0, |(_, n)| n));
             c.values.insert(p.clone(), (at, seen.clone()));
         }
         seen
@@ -119,11 +124,12 @@ impl Kv {
     }
 
     /// Writes `v` at `p` (`None` deletes) and remembers it, so that we read our own writes at once. `false` when the
-    /// condition in `mode` failed.
+    /// condition in `mode` failed. An unconditional write that the store refuses is an error.
     async fn put(&self, p: &Path, v: Option<Bytes>, mode: PutMode) -> R<bool> {
         if v.as_ref().is_some_and(|v| v.len() > VALUE_MAX) {
             return Err(Error::Other(format!("a value is {VALUE_MAX} bytes or less")));
         }
+        let conditional = mode != PutMode::Overwrite;
         let done = match &v {
             Some(v) => self.store.put_opts(p, v.clone().into(), mode.into()).await.map(|r| r.e_tag),
             None => self.store.delete(p).await.map(|()| None),
@@ -133,21 +139,26 @@ impl Kv {
                 self.remember(p, Arc::new(Seen { value: v, etag }), Instant::now());
                 Ok(true)
             }
-            Err(E::Precondition { .. } | E::AlreadyExists { .. }) => Ok(false),
+            Err(E::Precondition { .. } | E::AlreadyExists { .. }) if conditional => Ok(false),
             Err(e) => Err(other(e)),
         }
     }
 
-    /// Writes the items, then the bucket's generation once. The generation is the time, since S3's ETag is a hash of
-    /// the body. A write that fails leaves the generation, and so the listing, as it was.
+    /// Writes the items in order up to the first failure, then the bucket's generation once, failure or not: a write
+    /// that failed may have been applied, and so may the items before it, and a listing must not hide them.
     async fn write(&self, bucket: &str, items: impl IntoIterator<Item = (String, Option<Bytes>)>) -> R<()> {
         let items = items.into_iter().map(|(k, v)| Ok((self.path(bucket, &k)?, v))).collect::<R<Vec<_>>>()?;
-        for (p, v) in items {
-            self.put(&p, v, PutMode::Overwrite).await?;
+        let done = async {
+            for (p, v) in items {
+                self.put(&p, v, PutMode::Overwrite).await?;
+            }
+            Ok(())
         }
-        self.touch(bucket).await
+        .await;
+        done.and(self.touch(bucket).await)
     }
 
+    /// Overwrites the bucket's generation with the time in nanoseconds, so that every write changes its body.
     async fn touch(&self, bucket: &str) -> R<()> {
         let now = UNIX_EPOCH.elapsed().map_err(other)?.as_nanos().to_string();
         self.put(&Path::from_iter(["kvgen", &self.app, bucket]), Some(now.into()), PutMode::Overwrite).await.map(drop)
@@ -159,14 +170,15 @@ impl Kv {
         Ok(Cas { bucket: bucket.into(), seen: self.read(&path, Duration::ZERO).await?, path })
     }
 
-    /// `None` when the swap won, or else a handle that sees what the winner wrote.
+    /// `None` when the swap won, or else a handle that sees what the winner wrote. Only a swap that creates the key
+    /// changes the listing, so only that one writes the generation.
     async fn swap(&self, c: Cas, v: Bytes) -> R<Option<Cas>> {
         let mode = match &c.seen.etag {
             Some(e_tag) => PutMode::Update(UpdateVersion { e_tag: Some(e_tag.clone()), version: None }),
             None => PutMode::Create,
         };
         if self.put(&c.path, Some(v), mode).await? {
-            return self.touch(&c.bucket).await.map(|_| None);
+            return if c.seen.etag.is_none() { self.touch(&c.bucket).await.map(|_| None) } else { Ok(None) };
         }
         Ok(Some(Cas { seen: self.read(&c.path, Duration::ZERO).await?, ..c }))
     }
@@ -178,7 +190,7 @@ impl Kv {
         let prefix = Path::from_iter(["kv", &self.app, bucket]);
         let after = cursor.map_or(Ok(prefix.clone()), |k| self.path(bucket, &k))?; // everything is after the prefix itself
         if let Some((g, page)) = self.cache.lock().unwrap().pages.get(&after)
-            && g.etag == generation.etag
+            && g.value == generation.value
         {
             return Ok(page.clone());
         }
@@ -187,9 +199,12 @@ impl Kv {
             .map_err(other)
             .try_collect()
             .await?;
-        let n = keys.iter().map(String::len).sum();
         let page = KeyResponse { cursor: (keys.len() == PAGE).then(|| keys[PAGE - 1].clone()), keys }; // may end on an empty page
-        self.cache(n).pages.insert(after, (generation, page.clone()));
+        let weigh = |p: &KeyResponse| after.as_ref().len() + p.keys.iter().map(|k| k.len() + STRING).sum::<usize>();
+        let mut c = self.cache.lock().unwrap();
+        let old = c.pages.get(&after).map_or(0, |(_, p)| weigh(p));
+        c.charge(weigh(&page), old);
+        c.pages.insert(after, (generation, page.clone()));
         Ok(page)
     }
 }
@@ -237,10 +252,14 @@ impl store::HostBucket for Host {
 impl wasi::keyvalue::batch::Host for Host {
     async fn get_many(&mut self, b: Resource<Bucket>, keys: Vec<String>) -> R<Vec<(String, Option<Vec<u8>>)>> {
         let (kv, bucket) = self.at(&b)?;
-        let mut out = vec![];
+        let (mut out, mut bytes) = (vec![], 0);
         for key in keys {
-            let value = kv.get(bucket, &key).await?.map(|v| v.to_vec());
-            out.push((key, value));
+            let value = kv.get(bucket, &key).await?;
+            bytes += value.as_ref().map_or(0, Bytes::len);
+            if bytes > BATCH_MAX {
+                return Err(Error::Other(format!("get-many returns {BATCH_MAX} bytes or less")));
+            }
+            out.push((key, value.map(|v| v.to_vec())));
         }
         Ok(out)
     }
@@ -304,5 +323,15 @@ mod tests {
         assert!(put(VALUE_MAX).await.is_ok());
         assert!(put(VALUE_MAX + 1).await.is_err());
         assert_eq!(kv.get("b", "k").await.unwrap().unwrap().len(), VALUE_MAX); // the failed write changed nothing
+    }
+
+    /// A batch that fails part-way has written the items before the failure, so a listing must not keep hiding them.
+    #[tokio::test]
+    async fn failed_write_changes_the_listing() {
+        let kv = Kv::new(Arc::new(InMemory::new()), "app");
+        assert!(kv.list("b", None).await.unwrap().keys.is_empty());
+        let items = [("a".into(), Some(Bytes::from("1"))), ("b".into(), Some(vec![0; VALUE_MAX + 1].into()))];
+        assert!(kv.write("b", items).await.is_err());
+        assert_eq!(kv.list("b", None).await.unwrap().keys, ["a"]);
     }
 }

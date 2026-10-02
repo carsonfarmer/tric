@@ -81,7 +81,8 @@ impl WasiHttpHooks for Outbound {
 
 async fn send(app: Arc<Shared>, req: Request) -> Result<(Response, Fut<()>), Error> {
     let uri = req.uri();
-    if !app.allow.iter().any(|a| a.allows(uri)) {
+    // A user name before an `@` is guest text that would reach the `Host` header.
+    if uri.authority().is_some_and(|a| a.as_str().contains('@')) || !app.allow.iter().any(|a| a.allows(uri)) {
         return Err(Error::HttpRequestDenied);
     }
     let tls = uri.scheme_str() == Some("https");
@@ -106,11 +107,17 @@ async fn exchange<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     mut req: Request,
 ) -> Result<(Response, Fut<()>), Error> {
     let (mut sender, conn) = http1::handshake(TokioIo::new(io)).await?;
-    let driver = wasmtime_wasi::runtime::spawn(conn); // stops when the response is dropped, which is when the store is
+    // The driver feeds the body, so it lives as long as the body does: Wasmtime drops the io future early when a p3 guest
+    // drops its transmit result. Dropping the body, or this future before there is one, aborts it.
+    let driver = wasmtime_wasi::runtime::spawn(conn);
     let path = req.uri().path_and_query().map_or("/", |p| p.as_str()); // the wire wants the path only
     *req.uri_mut() = path.parse().map_err(|_| Error::HttpRequestUriInvalid)?;
     let res = sender.send_request(req).await?;
-    Ok((res.map(|b| b.map_err(Error::from).boxed_unsync()), Box::new(async move { driver.await.map_err(Error::from) })))
+    let keep = move |e| {
+        let _ = &driver;
+        Error::from(e)
+    };
+    Ok((res.map(|b| b.map_err(keep).boxed_unsync()), Box::new(std::future::ready(Ok(())))))
 }
 
 #[cfg(test)]
@@ -239,21 +246,25 @@ mod tests {
     }
 
     /// The one path the suite cannot reach through `send`, as every local address is blocked: a request goes out in
-    /// origin form, and the response comes back.
+    /// origin form, and the response comes back whole, even when the io future is dropped at once (Wasmtime does that
+    /// when a p3 guest drops its transmit result).
     #[tokio::test]
     async fn exchange_speaks_http1() {
+        const BODY: usize = 64 << 10; // far more than the pipe holds
         let (client, mut server) = tokio::io::duplex(1024);
         let body = Empty::new().map_err(|n| match n {}).boxed_unsync();
         let req = hyper::Request::get("http://host/p?q=1").body(body).unwrap();
         let peer = tokio::spawn(async move {
             let mut head = [0; 64];
             let n = server.read(&mut head).await.unwrap();
-            server.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi").await.unwrap();
+            server.write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {BODY}\r\n\r\n").as_bytes()).await.unwrap();
+            server.write_all(&vec![b'x'; BODY]).await.unwrap();
             head[..n].starts_with(b"GET /p?q=1 HTTP/1.1\r\n")
         });
-        let (res, _driver) = exchange(client, req).await.unwrap();
+        let (res, io) = exchange(client, req).await.unwrap();
+        drop(io);
         assert_eq!(res.status(), 200);
-        assert_eq!(res.into_body().collect().await.unwrap().to_bytes(), "hi");
+        assert_eq!(res.into_body().collect().await.unwrap().to_bytes().len(), BODY);
         assert!(peer.await.unwrap(), "the request line");
     }
 }

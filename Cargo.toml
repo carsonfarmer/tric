@@ -53,6 +53,10 @@ async-trait = "0.1"
 serde_json = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
 
+# Test binaries link side by side, and full debug info for Wasmtime sent `ld` past the 7.7 GiB Podman VM.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 lto = true
 strip = true
