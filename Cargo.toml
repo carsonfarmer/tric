@@ -1,0 +1,39 @@
+[package]
+name = "torpor-cli"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A scale-to-zero host for WASI components"
+publish = false
+
+[lib]
+name = "torpor"
+
+[[bin]]
+name = "torpor"
+path = "src/main.rs"
+required-features = ["cli"]
+
+# Embedders use `default-features = false`: the runtime is the library, the platform is the binary.
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:serde", "dep:toml", "dep:tracing-subscriber"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"], optional = true }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+serde = { version = "1", features = ["derive"], optional = true }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+toml = { version = "1", optional = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
+wasmtime = "=49.0.1"
+wasmtime-wasi = { version = "=49.0.1", default-features = false, features = ["p2", "p3"] }
+wasmtime-wasi-config = "=49.0.1"
+wasmtime-wasi-http = { version = "=49.0.1", features = ["component-model-async"] }
+
+[profile.release]
+lto = true
+strip = true
