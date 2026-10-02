@@ -97,6 +97,19 @@ Running log from the grilling session. Background research is in [research/](res
 
 **Superseded entries:** Q1's "trusted code" and "fuel is a cost guardrail, not a security boundary" are replaced by Q53 and Q55. Q27 is replaced by Q32. Q46 is replaced by Q54.
 
+## Round 6: follow-ups after the cloud spike (2026-10-01)
+
+| # | Decision | Answer |
+|---|---|---|
+| Q39 | Components per app (follow-up) | **Unchanged: one component per app, no composition code in v1.** The ecosystem's practice is to compose into one component and then deploy that: `spin registry push` composes by default, `wasm-tools compose` is deprecated in favour of `wac`, and WASI 0.3 adds a `middleware` world. The docs show `wac plug`. Parts composed into one app share its allow-list, KV and config, because their imports are merged; the docs say so. Fast follow: `deploy --plug` in the CLI only. |
+| Q42 | A way out of the LIST cost (replaces Q42's listing) | **(ii) A generation object plus a cached LIST.** Every `set` and `delete` writes the data, then overwrites a tiny per-bucket `gen` object (unconditional, so writers never conflict). Each instance caches LIST pages with the generation's ETag. A `list-keys` within 1 s of the last check is free; after that it makes one conditional GET of `gen` (12.5 times cheaper than a LIST) and re-LISTs only if it changed. About 30 lines. Writes cost 2×, inside the round 2 budget. A list can lag a write by up to 1 s (as Q33), and a crash between the two writes leaves the list stale until the next write. **No DynamoDB KV backend for now.** |
+| Q43 | Name | **torpor.** Binary `torpor`, crate `torpor-cli` (the `torpor` crate is an unrelated 23-download crate). No trademark search has been done yet. |
+| Q44 | KV and config interface versions | **(b) `wasi:keyvalue@0.2.0-draft2` only.** `wasmtime-wasi-keyvalue` 49.0.1 is draft-only, in-memory, has private bindings and no backend trait, and upstream declined backends in-tree, so we need our own `bindgen!` either way. draft2's `cas` resource maps to `If-Match` and its string cursor is the S3 continuation token; it matches Spin 4.2.1, wRPC and upstream `main`. Add the original draft only if a real guest needs it. Config stays `wasi:config@0.2.0-rc.1` through Wasmtime's crate. |
+| Q54 | Who produces native code | **Open; waiting on the user.** (c) is ruled out: Winch misses 500 ms p99 at every memory size. Recommended: (b) a compile function writes native code to a second bucket only its role can write. |
+| Q51 | Default function memory (revisit) | **Open; waiting on the user.** Recommended: 1769 MB, with OpenTofu rejecting anything below 512 MB. |
+| Q56 | Work during Lambda's start-up phase | **Open; waiting on the user.** Recommended: read the state object during start-up. |
+| Q57 | Runaway guests holding a worker | **Open; waiting on the user.** Recommended: keep the trap; switch to yielding on each epoch tick when Cloud Run is a target. |
+
 ## Deferred work and fast follows
 
 Kept here so nothing agreed in the grilling gets lost.
@@ -107,11 +120,11 @@ Kept here so nothing agreed in the grilling gets lost.
 | Read-only `/v2/` registry view of the bucket; `spinit export` | Q40 | Only if wanted. Generate OCI manifests on the fly. |
 | Custom domains through CloudFront | Q11, Q50 | Secret origin header checked by the host; certificate in us-east-1. |
 | Dedicated-function mode | Q11, Q47, Q55 | For apps needing hard isolation, more memory, or the strict cold-start target for large components. |
-| A way out of the `list-keys` LIST cost | Q42 | Next round. |
+| Skip the `gen` write on plain updates | Q42 | When the instance's cache already shows the key existed, an update needs only the data write. |
 | Automated gc | Q48 | Today: manual `spinit gc`. |
 | Cron design revisit | Q23, Q49 | Once-a-minute ticker, opt-in. |
-| Rename | Q43 | Before the first public release. |
+| Rename to torpor | Q43 | Find-and-replace `spinit` → `torpor`, plus a trademark and domain check, before the first public release. |
 | Spin adapter behind a cargo feature | Q31 | Only if there's demand. |
-| Composition at deploy time | Q39 | Pending the composition research. |
+| `deploy --plug <component>` | Q39 | About 17 lines with `wac-graph`, about 0.82 MB, in the CLI only (not the Lambda binary). |
 | Semi-trusted deployers | Q53 (b) | A deploy endpoint in the function as the only trusted writer, plus auth. About 200 lines. |
 | State sharding or change log | Q45 | At about 10k apps or one deploy per second. |
