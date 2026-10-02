@@ -4,13 +4,12 @@ use crate::state::{self, BLOB_MAX, Current, FRESH, INDEX, Index};
 use age::x25519::Identity;
 use hyper::body::{Body, Bytes, Incoming};
 use hyper::{Request, StatusCode, header::HOST, server::conn::http1, service::service_fn};
-use object_store::{ObjectStore, UpdateVersion, memory::InMemory};
+use object_store::{ObjectStore, memory::InMemory};
 use serde::de::DeserializeOwned;
 use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, collections::HashMap, convert::Infallible, env, path::Path, sync::Arc};
 use tokio::{net::TcpListener, sync::Mutex, task::spawn_blocking, time::timeout};
 use torpor::{App, Engine};
-use tracing::Instrument;
 use wasmtime::{Error, Result, bail};
 use wasmtime_wasi_http::{handler::Response, io::TokioIo};
 
@@ -72,12 +71,7 @@ impl Apps {
             Self::Install(install) => install,
         };
         match install.route(&req).await.inspect_err(|e| tracing::warn!("{e}")) {
-            Ok(Some((name, app))) => {
-                // A span, so a filter like `warn,[request{app=NAME}]=info` turns on one app's request lines.
-                let span = tracing::info_span!("request", app = name);
-                span.in_scope(|| tracing::info!(method = %req.method(), path = req.uri().path()));
-                app.handle(req).instrument(span).await
-            }
+            Ok(Some(app)) => app.handle(req).await,
             Ok(None) => status(StatusCode::NOT_FOUND),
             Err(_) => status(StatusCode::INTERNAL_SERVER_ERROR),
         }
@@ -86,13 +80,13 @@ impl Apps {
 
 impl Install {
     /// The app `req` is for, named by the first label of its host, loading it if it is new or its release changed.
-    async fn route<B>(&self, req: &Request<B>) -> Result<Option<(String, App)>> {
+    async fn route<B>(&self, req: &Request<B>) -> Result<Option<App>> {
         let host = req.headers().get(HOST).and_then(|h| h.to_str().ok()).unwrap_or_default();
         let name = host.split(['.', ':']).next().unwrap_or_default().to_ascii_lowercase();
         let team = {
             let mut i = self.index.lock().await;
             if i.2.elapsed() >= FRESH {
-                match recheck(&*self.store, INDEX, i.1.clone()).await {
+                match self.recheck(INDEX, i.1.clone()).await {
                     Ok(Some((index, v))) => (i.0, i.1) = (index, v.e_tag),
                     Ok(None) => {}
                     Err(e) => tracing::warn!("serving the last index read: {e}"), // and trying again at `FRESH`
@@ -109,7 +103,7 @@ impl Install {
             *s = Served { team, ..Default::default() }; // new, or moved to another team
         }
         if s.read.is_none_or(|r| r.elapsed() >= FRESH) {
-            match recheck(&*self.store, &state::current(&s.team, &name), s.etag.clone()).await {
+            match self.recheck(&state::current(&s.team, &name), s.etag.clone()).await {
                 Ok(Some((current, v))) => (s.current, s.etag, s.app) = (current, v.e_tag, None),
                 Ok(None) => {}
                 Err(e) if s.read.is_some() => tracing::warn!("serving {name} as last read: {e}"),
@@ -122,7 +116,7 @@ impl Install {
         if s.app.is_none() {
             s.app = Some(self.load(&name, &s.team, release, &s.current.secrets).await.map_err(|e| e.to_string()));
         }
-        Ok(Some((name, s.app.clone().expect("loaded above").map_err(Error::msg)?)))
+        Ok(Some(s.app.clone().expect("loaded above").map_err(Error::msg)?))
     }
 
     /// The app `name` of `team` from its release `id`, with `secrets` decrypted over its config, and its component
@@ -138,15 +132,11 @@ impl Install {
         let (engine, name, kv) = (self.engine.clone(), name.to_owned(), state::kv(team, name));
         spawn_blocking(move || engine.load(&name, &kv, wasm, config, &r.allowed_outbound_hosts)).await?
     }
-}
 
-/// `state::read`, given up at `RECHECK_MAX`.
-async fn recheck<T: DeserializeOwned>(
-    s: &dyn ObjectStore,
-    path: &str,
-    etag: Option<String>,
-) -> Result<Option<(T, UpdateVersion)>> {
-    timeout(RECHECK_MAX, state::read(s, path, etag)).await.unwrap_or_else(|e| Err(e.into()))
+    /// `state::read`, given up at `RECHECK_MAX`.
+    async fn recheck<T: DeserializeOwned>(&self, path: &str, etag: Option<String>) -> state::Read<T> {
+        timeout(RECHECK_MAX, state::read(&*self.store, path, etag)).await.unwrap_or_else(|e| Err(e.into()))
+    }
 }
 
 fn status(code: StatusCode) -> Response {

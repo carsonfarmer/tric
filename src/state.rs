@@ -27,6 +27,8 @@ pub const FRESH: Duration = Duration::from_secs(5);
 
 /// Each app's team.
 pub type Index = BTreeMap<String, String>;
+/// An object read back with its version, or `None` for no such object, or none newer.
+pub type Read<T> = Result<Option<(T, UpdateVersion)>>;
 
 /// The release an app runs, and its secrets. Each secret is age-encrypted on its own, so names show without decrypting.
 /// They outlive releases, and override config of the same name.
@@ -88,11 +90,7 @@ pub async fn release(store: &dyn ObjectStore, dir: &str, id: &str) -> Result<Rel
 }
 
 /// The object at `path` and its version, or `None` if there is none or its ETag is still `etag`.
-pub async fn read<T: DeserializeOwned>(
-    store: &dyn ObjectStore,
-    path: &str,
-    etag: Option<String>,
-) -> Result<Option<(T, UpdateVersion)>> {
+pub async fn read<T: DeserializeOwned>(store: &dyn ObjectStore, path: &str, etag: Option<String>) -> Read<T> {
     match store.get_opts(&path.into(), GetOptions { if_none_match: etag, ..Default::default() }).await {
         Ok(r) => {
             ensure!(r.meta.size <= JSON_MAX, "{path} is over {JSON_MAX} bytes");

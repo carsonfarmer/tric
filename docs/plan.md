@@ -30,19 +30,18 @@ An operator installs torpor into their own AWS account with one OpenTofu module,
   - tokio and hyper;
   - `age`, `zstd`, serde, `toml`, `clap` and `tracing`.
 
-**Line budget:** about 1,390 lines of Rust (1,200 before M2, 1,290 before M3 and its review raised `serve` and `state`; 1,125 written so far) plus about 250 of HCL. A module that runs well past its budget is a design problem to raise, not to push through.
+**Line budget:** about 1,390 lines of Rust (1,200 before M2, 1,290 before M3 and its review raised `serve` and `state`; 1,066 written so far, after a first trim pass) plus about 250 of HCL. A module that runs well past its budget is a design problem to raise, not to push through.
 
 | Module | Does | Budget |
 |---|---|---|
-| `engine` | Wasmtime config, epoch ticker, limits, loading native code, Cranelift fallback | ~120 |
-| `guest` | A fresh store per request, a WASI context that grants nothing, p2/p3 dispatch | ~90 |
+| `engine` | Wasmtime config, epoch ticker, limits, a fresh store per request with a WASI context that grants nothing, p2/p3 dispatch, loading native code, Cranelift fallback | ~210 (`engine` ~120 and `guest` ~90, merged in the trim pass; 231 before native code) |
 | `outbound` | Allow list plus the resolved-address block, in the HTTP send hook | ~100 (raised in M2 from ~60: the matcher is hand-written, and the connect is our own) |
-| `kv` | `wasi:keyvalue` draft2 over the bucket: one object per key, CAS, no cache | ~250 (raised in M2 from ~200; 236 after the M2 review) |
+| `kv` | `wasi:keyvalue` draft2 over the bucket: one object per key, CAS, no cache | ~250 (raised in M2 from ~200; 227 after the trim pass) |
 | `config` | `wasi:config` from the manifest, with secrets decrypted | 0 (Wasmtime's crate serves it, and `serve` decrypts secrets in 4 lines) |
-| `state` | The bucket layout, releases, compare-and-swap updates, defensive reads | ~130 (raised in the M3 review from ~100: per-team paths, and one read and one update for both the index and each app's pointer; 127) |
-| `serve` | hyper server, routing, logs | ~170 (raised in M3 from ~100, which was the router alone, then in the M3 review from ~140 for a pointer recheck per app; 168) |
+| `state` | The bucket layout, releases, compare-and-swap updates, defensive reads | ~130 (raised in the M3 review from ~100: per-team paths, and one read and one update for both the index and each app's pointer; 125) |
+| `serve` | hyper server, routing, logs | ~170 (raised in M3 from ~100, which was the router alone, then in the M3 review from ~140 for a pointer recheck per app; 158) |
 | `compile` | The compile worker and compile-request markers | ~70 |
-| `cli` | `publish`, `release`, `releases`, `apps`, `secrets`, `gc`, and `main`'s arguments | ~350 (207 after the M3 review, before `gc` and `compile`) |
+| `cli` | `publish`, `release`, `releases`, `apps`, `secrets`, `gc`, and `main`'s arguments | ~350 (199 after the trim pass, before `gc` and `compile`) |
 | `infra/aws` | OpenTofu module | ~250 HCL |
 
 ### Bucket layout

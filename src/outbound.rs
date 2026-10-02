@@ -1,5 +1,5 @@
 //! Outbound HTTP: the allow list, then name lookup and TCP by hand, so only an address that passed the block check is dialled.
-use crate::guest::{Fut, Shared};
+use crate::engine::{Fut, Shared};
 use http_body_util::BodyExt;
 use hyper::{Uri, client::conn::http1};
 use std::net::IpAddr;
@@ -69,6 +69,7 @@ static TLS: LazyLock<TlsConnector> = LazyLock::new(|| {
 
 /// The hooks of one store.
 pub(crate) struct Outbound(pub(crate) Arc<Shared>);
+type Sent = Result<(Response, Fut<()>), Error>;
 
 impl WasiHttpHooks for Outbound {
     /// Timeouts are the store's 10 s deadline, so `RequestOptions` is ignored.
@@ -77,7 +78,7 @@ impl WasiHttpHooks for Outbound {
     }
 }
 
-async fn send(app: Arc<Shared>, req: Request) -> Result<(Response, Fut<()>), Error> {
+async fn send(app: Arc<Shared>, req: Request) -> Sent {
     let uri = req.uri();
     // A user name before an `@` is guest text that would reach the `Host` header. Credentials go in `Authorization`.
     if uri.authority().is_some_and(|a| a.as_str().contains('@')) {
@@ -103,10 +104,7 @@ async fn send(app: Arc<Shared>, req: Request) -> Result<(Response, Fut<()>), Err
     exchange(TLS.connect(name, tcp).await.map_err(Error::Tls)?, req).await
 }
 
-async fn exchange<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
-    io: T,
-    mut req: Request,
-) -> Result<(Response, Fut<()>), Error> {
+async fn exchange(io: impl AsyncRead + AsyncWrite + Send + Unpin + 'static, mut req: Request) -> Sent {
     let (mut sender, conn) = http1::handshake(TokioIo::new(io)).await?;
     // The driver feeds the body, so it lives as long as the body does: Wasmtime drops the io future early when a p3 guest
     // drops its transmit result. Dropping the body, or this future before there is one, aborts it.
@@ -114,10 +112,7 @@ async fn exchange<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     let path = req.uri().path_and_query().map_or("/", |p| p.as_str()); // the wire wants the path only
     *req.uri_mut() = path.parse().map_err(|_| Error::HttpRequestUriInvalid)?;
     let res = sender.send_request(req).await?;
-    let keep = move |e| {
-        let _ = &driver;
-        Error::from(e)
-    };
+    let keep = move |e| (&driver, Error::from(e)).1; // holds the driver
     Ok((res.map(|b| b.map_err(keep).boxed_unsync()), Box::new(std::future::ready(Ok(())))))
 }
 

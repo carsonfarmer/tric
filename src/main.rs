@@ -79,6 +79,7 @@ async fn main() -> Result<()> {
     let Args { store, cmd } = Args::parse();
     let store = store.map(|url| AmazonS3Builder::from_env().with_url(url).build()).transpose()?;
     let s = || store.as_ref().context(NO_STORE);
+    let wait = matches!(cmd, Cmd::Release { .. } | Cmd::Apps(_) | Cmd::Secrets(Secrets::Set { .. }));
     match cmd {
         Cmd::Serve { dir, listen, identity } => {
             let identity = identity.map(|i| i.parse()).transpose().map_err(Error::msg)?;
@@ -86,30 +87,21 @@ async fn main() -> Result<()> {
                 Some(store) => serve::Apps::install(Arc::new(store), identity).await?,
                 None => serve::Apps::dir(&dir)?,
             };
-            return serve::run(apps, TcpListener::bind(listen).await?).await;
+            serve::run(apps, TcpListener::bind(listen).await?).await?
         }
-        Cmd::Publish { dir } => {
-            let (app, id) = cli::publish(s()?, &dir).await?;
-            println!("{app} {id}");
-            return Ok(());
-        }
+        Cmd::Publish { dir } => cli::publish(s()?, &dir).await.map(|(app, id)| println!("{app} {id}"))?,
         Cmd::Release { app, id } => cli::release(s()?, &app, &id).await?,
-        Cmd::Releases { app } => {
-            cli::releases(s()?, &app).await?.iter().for_each(|r| println!("{r}"));
-            return Ok(());
-        }
+        Cmd::Releases { app } => cli::releases(s()?, &app).await?.iter().for_each(|r| println!("{r}")),
         Cmd::Apps(Apps::Add { app, team }) => cli::assign(s()?, &app, Some(&team)).await?,
         Cmd::Apps(Apps::Remove { app }) => cli::assign(s()?, &app, None).await?,
         Cmd::Secrets(Secrets::Set { app, name, recipient }) => {
             let value = std::io::read_to_string(std::io::stdin())?;
-            let value = value.strip_suffix('\n').unwrap_or(&value);
-            cli::set_secret(s()?, &app, &name, value, &recipient).await?
+            cli::set_secret(s()?, &app, &name, value.strip_suffix('\n').unwrap_or(&value), &recipient).await?
         }
-        Cmd::Secrets(Secrets::List { app }) => {
-            cli::secrets(s()?, &app).await?.iter().for_each(|n| println!("{n}"));
-            return Ok(());
-        }
+        Cmd::Secrets(Secrets::List { app }) => cli::secrets(s()?, &app).await?.iter().for_each(|n| println!("{n}")),
     }
-    tokio::time::sleep(state::FRESH).await; // until every host has the change
+    if wait {
+        tokio::time::sleep(state::FRESH).await; // until every host has the change
+    }
     Ok(())
 }
