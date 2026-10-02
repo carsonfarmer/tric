@@ -1,7 +1,7 @@
 # Everything runs in Docker, one isolated stack per worktree:
 #   COMPOSE_PROJECT_NAME=torpor-<worktree> docker compose run --rm dev        (a shell in the toolchain)
 #   COMPOSE_PROJECT_NAME=torpor-<worktree> docker compose run --rm fixtures   (build tests/fixtures/*.wasm)
-#   COMPOSE_PROJECT_NAME=torpor-<worktree> docker compose run --rm test       (cargo test)
+#   COMPOSE_PROJECT_NAME=torpor-<worktree> docker compose run --rm test       (fixtures, then cargo test)
 name: ${COMPOSE_PROJECT_NAME:-torpor-main}
 
 x-toolchain: &toolchain
@@ -16,7 +16,7 @@ services:
     command: bash
   test:
     <<: *toolchain
-    command: cargo test
+    command: sh -c 'CARGO_TARGET_DIR=/src/target/fixtures tests/components/build.sh && cargo test'
   fixtures:
     <<: *toolchain
     command: tests/components/build.sh
