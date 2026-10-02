@@ -4,7 +4,7 @@ RUN dnf install -y gcc gcc-c++ make cmake perl git tar gzip xz zip findutils cla
 # The toolchain lives in the image; the cargo registry and target dir are named volumes mounted at run time.
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable \
- && rustup target add wasm32-wasip2 && rustc --version && ldd --version | head -1
+ && rustup target add wasm32-wasip2 && rustup component add rustfmt clippy && rustc --version && ldd --version | head -1
 # Release binaries for wasm-tools and the wasmtime CLI. The CLI must match the Wasmtime version the host crate pins.
 RUN arch=$(uname -m) \
  && curl -fsSL https://github.com/bytecodealliance/wasm-tools/releases/download/v1.260.0/wasm-tools-1.260.0-$arch-linux.tar.gz | tar xz --strip-components=1 -C /usr/local/bin --wildcards '*/wasm-tools' \
