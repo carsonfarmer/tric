@@ -43,7 +43,7 @@ async fn probe(name: &str) {
     assert_eq!(ok(&app, "/fs").await.matches(r#""err""#).count(), 3);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")] // each probe compiles its app while the other is timing
 async fn probes() {
     tokio::join!(probe("probe-p2"), probe("probe-p3"));
 }
@@ -74,7 +74,7 @@ async fn spin(memories: &str) -> Duration {
     start.elapsed()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn instantiation_is_limited() {
     let (fits, over) = tokio::join!(
         spin("(memory 1600) (memory 1600)"), // 100 MiB twice
