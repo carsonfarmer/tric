@@ -7,7 +7,10 @@ use torpor::Engine;
 use wasmtime::Result;
 use wasmtime_wasi_http::io::TokioIo;
 
-/// `torpor.toml`.
+const MANIFEST: &str = "torpor.toml";
+const VAR_PREFIX: &str = "TORPOR_VAR_";
+
+/// The app's `MANIFEST`.
 #[derive(Deserialize)]
 struct Manifest {
     name: String,
@@ -17,9 +20,9 @@ struct Manifest {
 }
 
 pub async fn run(dir: &Path, listener: TcpListener) -> Result<()> {
-    let Manifest { name, component, mut config } = toml::from_str(&fs::read_to_string(dir.join("torpor.toml"))?)?;
-    // Secrets never go in `torpor.toml`: `TORPOR_VAR_<KEY>` sets `key` and overrides `[config]`.
-    config.extend(env::vars().filter_map(|(k, v)| Some((k.strip_prefix("TORPOR_VAR_")?.to_lowercase(), v))));
+    let Manifest { name, component, mut config } = toml::from_str(&fs::read_to_string(dir.join(MANIFEST))?)?;
+    // Secrets never go in the manifest: `TORPOR_VAR_<KEY>` sets `key` and overrides `[config]`.
+    config.extend(env::vars().filter_map(|(k, v)| Some((k.strip_prefix(VAR_PREFIX)?.to_lowercase(), v))));
     let app = Engine::new()?.load(&name, fs::read(dir.join(component))?, config)?;
     loop {
         let (stream, _) = listener.accept().await?;

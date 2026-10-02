@@ -1,5 +1,5 @@
 //! Runs each request in a fresh store, under hard limits: 10 s, 256 MiB, nothing inherited, no outbound HTTP.
-use http_body_util::{BodyExt, Empty};
+use http_body_util::BodyExt;
 use hyper::body::{Body, Bytes};
 use std::task::{Context, Poll};
 use std::{collections::BTreeMap, pin::Pin, sync::Arc, time::Duration, time::Instant};
@@ -17,6 +17,13 @@ const TIMEOUT: Duration = Duration::from_secs(10); // from the start of instanti
 const MEMORY: usize = 256 << 20; // all linear memories of a store together
 const LOG_CAP: usize = 64 << 10; // per stream, per request
 const MAX_INFLIGHT: usize = 64;
+const RESOURCES: usize = 256; // live resources per store; the default is a million
+
+/// What every store of one app shares, so a request costs one reference count, not a copy.
+pub(crate) struct Shared {
+    name: String,
+    pub(crate) config: WasiConfigVariables,
+}
 
 /// Per-store state.
 pub(crate) struct Host {
@@ -24,7 +31,7 @@ pub(crate) struct Host {
     wasi: WasiCtx,
     http: WasiHttpCtx,
     hooks: Deny,
-    pub(crate) config: WasiConfigVariables,
+    pub(crate) app: Arc<Shared>,
     memory: usize, // linear memory in use
 }
 impl ResourceLimiter for Host {
@@ -77,9 +84,8 @@ impl WorkerExpiration for Deadline {
     }
 }
 
-/// What outlives the store: the app's name, its output pipes, and its slot among the in-flight requests.
+/// What outlives the store: its output pipes and its slot among the in-flight requests.
 struct Worker {
-    app: Arc<str>,
     out: MemoryOutputPipe,
     err: MemoryOutputPipe,
     _permit: OwnedSemaphorePermit,
@@ -95,8 +101,8 @@ impl WorkerState for Worker {
         Box::pin(std::future::pending()) // `Deadline` enforces the timeout
     }
     /// Runs once the worker is done, also after a trap or a timeout, when `result` is the cause.
-    fn drop(&self, _: Store<Host>, result: wasmtime::Result<()>) {
-        let (app, out, err) = (&self.app, self.out.contents(), self.err.contents());
+    fn drop(&self, store: Store<Host>, result: wasmtime::Result<()>) {
+        let (app, out, err) = (&store.data().app.name, self.out.contents(), self.err.contents());
         if let Err(e) = result {
             tracing::warn!(app = %app, "guest failed: {e}");
         }
@@ -114,8 +120,8 @@ impl WorkerState for Worker {
 pub struct App(ProxyHandler<State>);
 impl App {
     pub(crate) fn new(name: &str, engine: Engine, pre: ProxyPre<Host>, config: BTreeMap<String, String>) -> Self {
-        let state = State { name: name.into(), engine, pre, config, permits: Arc::new(Semaphore::new(MAX_INFLIGHT)) };
-        Self(ProxyHandler::new(state))
+        let app = Arc::new(Shared { name: name.into(), config: config.into_iter().collect() });
+        Self(ProxyHandler::new(State { engine, pre, app, permits: Arc::new(Semaphore::new(MAX_INFLIGHT)) }))
     }
 
     /// Serves one request. A guest that traps, times out or hits a limit before it responds gives an empty 500 and a
@@ -127,17 +133,18 @@ impl App {
         B::Error: Into<Error>,
     {
         self.0.handle((), req.map(|b| b.map_err(Into::into).boxed_unsync())).await.unwrap_or_else(|e| {
-            tracing::warn!(app = %self.0.state().name, "request failed: {e}");
-            hyper::Response::builder().status(500).body(Empty::new().map_err(|n| match n {}).boxed_unsync()).unwrap()
+            tracing::warn!(app = %self.0.state().app.name, "request failed: {e}");
+            let mut res = Response::default(); // an empty body
+            *res.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
+            res
         })
     }
 }
 
 struct State {
-    name: Arc<str>,
     engine: Engine,
     pre: ProxyPre<Host>,
-    config: BTreeMap<String, String>,
+    app: Arc<Shared>,
     permits: Arc<Semaphore>,
 }
 impl HandlerState for State {
@@ -153,21 +160,15 @@ impl HandlerState for State {
             wasi: WasiCtx::builder().stdout(out.clone()).stderr(err.clone()).build(), // nothing else is granted
             http: WasiHttpCtx::new(),
             hooks: Deny,
-            config: self.config.clone().into_iter().collect(),
+            app: self.app.clone(),
             memory: 0,
         };
-        host.table.set_max_capacity(256); // live resources; the default is a million
+        host.table.set_max_capacity(RESOURCES);
         let mut store = Store::new(&self.engine, host);
         store.limiter(|h| h);
-        // Q57: `serve` is concurrent, so yield at every tick instead of trapping, and let `Deadline` end the request.
+        // `serve` is concurrent, so yield at every tick instead of trapping, and let `Deadline` end the request.
         store.epoch_deadline_async_yield_and_update(1);
         let proxy = timeout_at(expiration.0.deadline(), self.pre.instantiate_async(&mut store)).await??;
-        Ok(Instance {
-            store,
-            proxy,
-            view: Host::http,
-            expiration,
-            state: Worker { app: self.name.clone(), out, err, _permit },
-        })
+        Ok(Instance { store, proxy, view: Host::http, expiration, state: Worker { out, err, _permit } })
     }
 }

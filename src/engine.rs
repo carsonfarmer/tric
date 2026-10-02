@@ -36,7 +36,7 @@ impl Engine {
         p2::add_only_http_to_linker_async(&mut linker)?;
         wasmtime_wasi::p3::add_to_linker(&mut linker)?;
         p3::add_to_linker(&mut linker)?;
-        wasmtime_wasi_config::add_to_linker(&mut linker, |h: &mut Host| WasiConfig::from(&h.config))?;
+        wasmtime_wasi_config::add_to_linker(&mut linker, |h: &mut Host| WasiConfig::from(&h.app.config))?;
         Ok(Self { engine, linker })
     }
 
@@ -44,8 +44,8 @@ impl Engine {
     /// exports either `wasi:http/handler` (p3) or `incoming-handler` (p2).
     pub fn load(&self, name: &str, wasm: impl AsRef<[u8]>, config: BTreeMap<String, String>) -> Result<App> {
         let pre = self.linker.instantiate_pre(&Component::new(&self.engine, wasm)?)?;
-        let pre = match p3::bindings::ServicePre::new(pre.clone()) {
-            Ok(p) => ProxyPre::P3(p),
+        let pre = match p3::bindings::ServiceIndices::new(&pre) {
+            Ok(_) => ProxyPre::P3(p3::bindings::ServicePre::new(pre)?),
             Err(_) => ProxyPre::P2(p2::bindings::ProxyPre::new(pre)?),
         };
         Ok(App::new(name, self.engine.clone(), pre, config))
