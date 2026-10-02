@@ -105,13 +105,12 @@ A **host** is one running torpor process. In production several hosts can serve 
 
 | Call | What you get |
 |---|---|
-| `get`, `exists` | The value in the store when the call ran, whichever host wrote it. **Rely only on "at most 1 s old"**: a later version may cache values for that long. |
-| `cas::new`, then `current` | `new` reads the store and `current` returns what it read. It will never be cached. |
+| `get`, `exists` | The value in the store when the call ran, whichever host wrote it. |
+| `cas::new`, then `current` | `new` reads the store and `current` returns what it read. |
 | `swap` | Succeeds only if the key is unchanged since `cas::new`, checked by the store with `If-Match`. Atomic across all hosts. A lost swap returns `cas-failed` with a new handle that holds the latest value. A swap on a missing key succeeds only if the key is still missing, and a swap on a key deleted since `cas::new` loses. |
 | `increment` | Atomic across hosts. A missing key counts as 0. It retries a lost race up to 16 times, then fails with `too much contention`. |
 | `set`, `delete` | In the store before the call returns. The last writer wins. `delete` of a missing key is not an error. |
 
-- **A read that must be current**, now and if a cache comes back, uses `cas::new` and `current`.
 - **Counters** are 8 bytes, a little-endian `i64`, as in Spin. `increment` on any other length fails with `not a counter`, and on overflow with `overflow`. Read a counter with `get` and decode the 8 bytes.
 - **`swap` compares content.** On S3 the ETag is normally a hash of the value, so if a value changes and changes back between your read and your swap, the swap still succeeds. Keep a version number inside the value if that matters.
 - **Batches are not atomic.** `get-many`, `set-many` and `delete-many` do one key at a time, so they save no round trips. If `set-many` fails part-way, the keys before the failure stay written, and other callers can see the partial result. Keys are checked before anything is written, but a value over 1 MiB is only found when its turn comes, after the earlier keys are already in the store.
@@ -123,7 +122,7 @@ A **host** is one running torpor process. In production several hosts can serve 
 
 `list-keys` returns a page of up to 1,000 keys. When the page is full it also returns a cursor, which is the last key on that page. Pass it back for the next page, and stop when the cursor is none. A bucket with exactly 1,000 keys returns a full page and then an empty one, so an empty page at the end is normal. Keys come back in the order of their stored names, and the store percent-encodes characters such as `/`, `%`, `?` and non-ASCII text in those names. For keys that use such characters the order can differ from a plain sort of the keys, so do not rely on it.
 
-Each page is one LIST of the store, so it includes every write that finished before it, from any host. As with `get`, rely only on "at most 1 s old".
+Each page is one LIST of the store, so it includes every write that finished before it, from any host.
 
 ### Limits
 
