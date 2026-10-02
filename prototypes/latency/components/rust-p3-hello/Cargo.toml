@@ -1,0 +1,14 @@
+[package]
+name = "hello-p3"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+spin-sdk = "7.0.0"
+
+[workspace]

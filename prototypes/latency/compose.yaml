@@ -1,0 +1,68 @@
+# Local environment for the latency spike. Everything is namespaced by the project name; host ports are env-configurable.
+#   docker compose up -d minio ddb
+#   docker compose run --rm -T host            (the host, directly)
+#   docker compose up -d lwa                   (the host behind the Lambda Web Adapter, via the Lambda RIE)
+#   docker compose run --rm oha ...            (load generator)
+# The credentials below are throwaway values for the local MinIO and DynamoDB Local containers.
+name: ${COMPOSE_PROJECT_NAME:-spinit-spike-latency}
+
+x-local-env: &local-env
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+  AWS_REGION: us-west-2
+  AWS_ENDPOINT: http://minio:9000          # object_store: S3 endpoint (path-style)
+  AWS_ALLOW_HTTP: "true"
+  AWS_ENDPOINT_URL_DYNAMODB: http://ddb:8000
+  SPINIT_BUCKET: spinit-spike
+  SPINIT_TABLE: spinit-spike
+  SPINIT_COMPONENT: ${SPINIT_COMPONENT:-/out/hello_p3.wasm}
+  SPINIT_ALLOCATOR: ${SPINIT_ALLOCATOR:-default}
+  SPINIT_EAGER: ${SPINIT_EAGER:-0}
+  SPINIT_PRECOMPILED: ${SPINIT_PRECOMPILED:-0}
+  SPINIT_ZSTD: ${SPINIT_ZSTD:-0}
+  SPINIT_COMPILER: ${SPINIT_COMPILER:-cranelift}
+
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    entrypoint: ["sh", "-c", "mkdir -p /data/spinit-spike && exec minio server /data --address :9000"]
+    environment: { MINIO_ROOT_USER: minioadmin, MINIO_ROOT_PASSWORD: minioadmin }
+    ports: ["${MINIO_HOST_PORT:-19000}:9000"]
+
+  ddb:
+    image: amazon/dynamodb-local:latest
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports: ["${DDB_HOST_PORT:-18000}:8000"]
+
+  # The host binary directly, on the real Lambda base image (same glibc), CPU-limited to approximate a Lambda memory size:
+  # HOST_CPUS=1.0 HOST_MEM=1769m ~ 1769 MB, 0.29/512m ~ 512 MB, 0.07/128m ~ 128 MB.
+  host:
+    image: public.ecr.aws/lambda/provided:al2023
+    entrypoint: ["/out/spinit-host"]
+    cpus: ${HOST_CPUS:-1.0}
+    mem_limit: ${HOST_MEM:-1769m}
+    memswap_limit: ${HOST_MEM:-1769m}
+    environment: { <<: *local-env, SPINIT_ADDR: "0.0.0.0:8080", SPINIT_CACHE_DIR: /cache }
+    volumes: ["./out:/out:ro", "cache:/cache"]
+    ports: ["${SPINIT_HOST_PORT:-18080}:8080"]
+    depends_on: [minio, ddb]
+
+  # The same binary as a Lambda function: Web Adapter extension, run by the Runtime Interface Emulator.
+  lwa:
+    build: { context: ., dockerfile: docker/lwa.Dockerfile }
+    image: spinit-spike-latency-lwa:1
+    cpus: ${HOST_CPUS:-1.0}
+    mem_limit: ${HOST_MEM:-1769m}
+    memswap_limit: ${HOST_MEM:-1769m}
+    environment: { <<: *local-env, SPINIT_CACHE_DIR: /tmp/cache }
+    volumes: ["./out:/out:ro"]
+    ports: ["${LWA_HOST_PORT:-19001}:8080"]
+    depends_on: [minio, ddb]
+
+  oha:
+    image: ghcr.io/hatoo/oha:latest
+    entrypoint: ["oha"]
+    profiles: [tools]
+
+volumes:
+  cache:

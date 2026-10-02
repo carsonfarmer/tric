@@ -1,0 +1,30 @@
+[package]
+name = "spinit-host"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+# DynamoDB is spike-only (bench routes); lean feature set, no SSO or credential-process.
+aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+blake3 = "1"
+bytes = "1"
+hmac = "0.12"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+object_store = { version = "0.14", features = ["aws"] }
+serde_json = "1"
+sha2 = { version = "0.10", features = ["asm"] }
+tokio = { version = "1", features = ["full"] }
+wasmtime = { version = "=49.0.1", features = ["component-model-async", "winch"] }
+wasmtime-wasi = "=49.0.1"
+wasmtime-wasi-http = { version = "=49.0.1", features = ["component-model-async"] }
+zstd = "0.13"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
