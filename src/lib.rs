@@ -2,5 +2,7 @@
 //! subscriber: guest output and errors go through `tracing`, and the embedder decides where they end up.
 mod engine;
 mod guest;
+mod kv;
+mod outbound;
 
 pub use {engine::Engine, guest::App};

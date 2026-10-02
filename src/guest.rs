@@ -1,4 +1,7 @@
-//! Runs each request in a fresh store, under hard limits: 10 s, 256 MiB, nothing inherited, no outbound HTTP.
+//! Runs each request in a fresh store, under hard limits: 10 s, 256 MiB, nothing inherited, and outbound HTTP only to
+//! the hosts the app allows.
+use crate::kv::Kv;
+use crate::outbound::{Allow, Outbound};
 use http_body_util::BodyExt;
 use hyper::body::{Body, Bytes};
 use std::task::{Context, Poll};
@@ -9,9 +12,9 @@ use wasmtime::component::{GuestTaskId, ResourceTable};
 use wasmtime::{Engine, ResourceLimiter, Store, StoreContextMut};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView, p2::pipe::MemoryOutputPipe};
 use wasmtime_wasi_config::WasiConfigVariables;
-use wasmtime_wasi_http::handler::{HandlerState, Instance, ProxyHandler, ProxyPre, Request, Response, ShouldAccept};
+use wasmtime_wasi_http::handler::{HandlerState, Instance, ProxyHandler, ProxyPre, Response, ShouldAccept};
 use wasmtime_wasi_http::handler::{WorkerExpiration, WorkerState, WorkerStatus};
-use wasmtime_wasi_http::{Error, RequestOptions, WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
+use wasmtime_wasi_http::{Error, WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 const TIMEOUT: Duration = Duration::from_secs(10); // from the start of instantiation to the end of the request
 const MEMORY: usize = 256 << 20; // all linear memories of a store together
@@ -23,14 +26,16 @@ const RESOURCES: usize = 256; // live resources per store; the default is a mill
 pub(crate) struct Shared {
     name: String,
     pub(crate) config: WasiConfigVariables,
+    pub(crate) kv: Kv,
+    pub(crate) allow: Vec<Allow>,
 }
 
 /// Per-store state.
 pub(crate) struct Host {
-    table: ResourceTable,
+    pub(crate) table: ResourceTable,
     wasi: WasiCtx,
     http: WasiHttpCtx,
-    hooks: Deny,
+    hooks: Outbound,
     pub(crate) app: Arc<Shared>,
     memory: usize, // linear memory in use
 }
@@ -67,14 +72,8 @@ impl WasiHttpView for Host {
     }
 }
 
-/// No outbound HTTP yet; M2's allow list goes in this `send_request`. Never `default_hooks()`: it ignores the socket checks.
-struct Deny;
-type Fut<T> = Box<dyn Future<Output = Result<T, Error>> + Send>;
-impl WasiHttpHooks for Deny {
-    fn send_request(&mut self, _: Request, _: Option<RequestOptions>, _: Fut<()>) -> Fut<(Response, Fut<()>)> {
-        Box::new(async { Err(Error::HttpRequestDenied) })
-    }
-}
+/// The boxed futures `WasiHttpHooks` deals in.
+pub(crate) type Fut<T> = Box<dyn Future<Output = Result<T, Error>> + Send>;
 
 /// Expires the worker, which drops its store, at `TIMEOUT`, even if the guest is only waiting.
 struct Deadline(Pin<Box<Sleep>>);
@@ -119,8 +118,15 @@ impl WorkerState for Worker {
 #[derive(Clone)]
 pub struct App(ProxyHandler<State>);
 impl App {
-    pub(crate) fn new(name: &str, engine: Engine, pre: ProxyPre<Host>, config: BTreeMap<String, String>) -> Self {
-        let app = Arc::new(Shared { name: name.into(), config: config.into_iter().collect() });
+    pub(crate) fn new(
+        name: &str,
+        engine: Engine,
+        pre: ProxyPre<Host>,
+        config: BTreeMap<String, String>,
+        kv: Kv,
+        allow: Vec<Allow>,
+    ) -> Self {
+        let app = Arc::new(Shared { name: name.into(), config: config.into_iter().collect(), kv, allow });
         Self(ProxyHandler::new(State { engine, pre, app, permits: Arc::new(Semaphore::new(MAX_INFLIGHT)) }))
     }
 
@@ -159,7 +165,7 @@ impl HandlerState for State {
             table: ResourceTable::new(),
             wasi: WasiCtx::builder().stdout(out.clone()).stderr(err.clone()).build(), // nothing else is granted
             http: WasiHttpCtx::new(),
-            hooks: Deny,
+            hooks: Outbound(self.app.clone()),
             app: self.app.clone(),
             memory: 0,
         };

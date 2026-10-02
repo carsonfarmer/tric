@@ -1,12 +1,13 @@
 //! The M1 "done when" list, through the public API only: requests go straight to `App::handle`, with no sockets.
 use http_body_util::{BodyExt, Empty};
 use hyper::{StatusCode, body::Bytes};
-use std::{fs, time::Duration, time::Instant};
+use object_store::memory::InMemory;
+use std::{fs, sync::Arc, time::Duration, time::Instant};
 use torpor::{App, Engine};
 
 fn load(name: &str) -> App {
     let wasm = fs::read(format!("tests/fixtures/{name}.wasm")).unwrap();
-    Engine::new().unwrap().load(name, wasm, Default::default()).unwrap()
+    Engine::new(Arc::new(InMemory::new())).unwrap().load(name, wasm, Default::default(), &[]).unwrap()
 }
 
 async fn get(app: &App, path: &str) -> (StatusCode, String) {
@@ -68,7 +69,7 @@ async fn spin(memories: &str) -> Duration {
             (instance $h (export "handle" (func $handle)))
             (export "wasi:http/incoming-handler@0.2.12" (instance $h)))"#
     );
-    let app = Engine::new().unwrap().load("wat", wat, Default::default()).unwrap();
+    let app = Engine::new(Arc::new(InMemory::new())).unwrap().load("wat", wat, Default::default(), &[]).unwrap();
     let start = Instant::now();
     assert_eq!(get(&app, "/").await.0, 500);
     start.elapsed()
