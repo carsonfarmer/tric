@@ -18,6 +18,7 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Configures Wasmtime and starts the thread that ticks its epoch until the engine and its apps are dropped.
     pub fn new() -> Result<Self> {
         let mut cfg = Config::new();
         cfg.wasm_component_model_async(true).wasm_component_model_async_stackful(true);
@@ -39,14 +40,14 @@ impl Engine {
         Ok(Self { engine, linker })
     }
 
-    /// Loads the component `wasm` as the app `name`, with `config` for its `wasi:config`. The component exports either
-    /// `wasi:http/handler` (p3) or `incoming-handler` (p2).
+    /// Loads the component `wasm` (binary, or WAT text) as the app `name`, with `config` for its `wasi:config`. It
+    /// exports either `wasi:http/handler` (p3) or `incoming-handler` (p2).
     pub fn load(&self, name: &str, wasm: impl AsRef<[u8]>, config: BTreeMap<String, String>) -> Result<App> {
         let pre = self.linker.instantiate_pre(&Component::new(&self.engine, wasm)?)?;
         let pre = match p3::bindings::ServicePre::new(pre.clone()) {
             Ok(p) => ProxyPre::P3(p),
             Err(_) => ProxyPre::P2(p2::bindings::ProxyPre::new(pre)?),
         };
-        Ok(App::new(name.into(), self.engine.clone(), pre, config))
+        Ok(App::new(name, self.engine.clone(), pre, config))
     }
 }

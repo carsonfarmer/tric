@@ -19,12 +19,12 @@ const LOG_CAP: usize = 64 << 10; // per stream, per request
 const MAX_INFLIGHT: usize = 64;
 
 /// Per-store state.
-pub struct Host {
+pub(crate) struct Host {
     table: ResourceTable,
     wasi: WasiCtx,
     http: WasiHttpCtx,
     hooks: Deny,
-    pub config: WasiConfigVariables,
+    pub(crate) config: WasiConfigVariables,
     memory: usize, // linear memory in use
 }
 impl ResourceLimiter for Host {
@@ -70,7 +70,7 @@ impl WasiHttpHooks for Deny {
 }
 
 /// Expires the worker, which drops its store, at `TIMEOUT`, even if the guest is only waiting.
-pub struct Deadline(Pin<Box<Sleep>>);
+struct Deadline(Pin<Box<Sleep>>);
 impl WorkerExpiration for Deadline {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>, _: WorkerStatus, _: Instant) -> Poll<()> {
         self.0.as_mut().poll(cx)
@@ -78,24 +78,20 @@ impl WorkerExpiration for Deadline {
 }
 
 /// What outlives the store: the app's name, its output pipes, and its slot among the in-flight requests.
-pub struct Worker {
+struct Worker {
     app: Arc<str>,
     out: MemoryOutputPipe,
     err: MemoryOutputPipe,
     _permit: OwnedSemaphorePermit,
 }
+type Wait = Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
 impl WorkerState for Worker {
     type StoreData = Host;
     type RequestData = ();
     fn should_accept_request(&self, _: usize, _: usize) -> ShouldAccept {
         ShouldAccept::Never // one request per store
     }
-    fn on_request_start(
-        &self,
-        _: StoreContextMut<Host>,
-        _: (),
-        _: GuestTaskId,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + Sync>> {
+    fn on_request_start(&self, _: StoreContextMut<Host>, _: (), _: GuestTaskId) -> Wait {
         Box::pin(std::future::pending()) // `Deadline` enforces the timeout
     }
     /// Runs once the worker is done, also after a trap or a timeout, when `result` is the cause.
@@ -115,30 +111,29 @@ impl WorkerState for Worker {
 
 /// An app that serves HTTP, one fresh instance per request. Clones share the component and the in-flight limit.
 #[derive(Clone)]
-pub struct App {
-    name: Arc<str>,
-    handler: ProxyHandler<State>,
-}
+pub struct App(ProxyHandler<State>);
 impl App {
-    pub(crate) fn new(name: Arc<str>, engine: Engine, pre: ProxyPre<Host>, config: BTreeMap<String, String>) -> Self {
-        let state = State { name: name.clone(), engine, pre, config, permits: Arc::new(Semaphore::new(MAX_INFLIGHT)) };
-        Self { name, handler: ProxyHandler::new(state) }
+    pub(crate) fn new(name: &str, engine: Engine, pre: ProxyPre<Host>, config: BTreeMap<String, String>) -> Self {
+        let state = State { name: name.into(), engine, pre, config, permits: Arc::new(Semaphore::new(MAX_INFLIGHT)) };
+        Self(ProxyHandler::new(state))
     }
 
-    /// Serves one request. A guest that traps, times out or hits a limit gives a 500, never an `Err`.
+    /// Serves one request. A guest that traps, times out or hits a limit before it responds gives an empty 500 and a
+    /// log line with the cause; the guest's own output is logged too. Waits while 64 requests are already in flight.
+    /// The 10 s deadline also cuts a body that is still streaming, so read it to the end promptly.
     pub async fn handle<B>(&self, req: hyper::Request<B>) -> Response
     where
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Error>,
     {
-        self.handler.handle((), req.map(|b| b.map_err(Into::into).boxed_unsync())).await.unwrap_or_else(|e| {
-            tracing::warn!(app = %self.name, "request failed: {e}");
+        self.0.handle((), req.map(|b| b.map_err(Into::into).boxed_unsync())).await.unwrap_or_else(|e| {
+            tracing::warn!(app = %self.0.state().name, "request failed: {e}");
             hyper::Response::builder().status(500).body(Empty::new().map_err(|n| match n {}).boxed_unsync()).unwrap()
         })
     }
 }
 
-pub struct State {
+struct State {
     name: Arc<str>,
     engine: Engine,
     pre: ProxyPre<Host>,
