@@ -35,6 +35,9 @@ enum Cmd {
         dir: PathBuf,
         #[arg(long, default_value = "127.0.0.1:3000")]
         listen: SocketAddr,
+        /// The bucket of the apps' KV data, if not --store: one of its own keeps KV's keys from whoever may list --store
+        #[arg(long, env = "TORPOR_KV")]
+        kv: Option<String>,
     },
     /// Make the native code that the install's markers ask for, as the Lambda Web Adapter posts their events
     CompileWorker {
@@ -66,9 +69,12 @@ async fn main() -> Result<()> {
     let (store, native) = (store.map(bucket).transpose()?, native.map(bucket).transpose()?);
     let s = || store.as_deref().context(NO_STORE);
     match cmd {
-        Cmd::Serve { dir, listen } => {
+        Cmd::Serve { dir, listen, kv } => {
             let install = match store {
-                Some(store) => Arc::new(serve::Install::new(store, native)?),
+                Some(store) => {
+                    let kv = kv.map(bucket).transpose()?.unwrap_or_else(|| store.clone());
+                    Arc::new(serve::Install::new(store, native, kv)?)
+                }
                 None => serve::Install::dev(&dir).await?,
             };
             serve::run(TcpListener::bind(listen).await?, move |req| install.clone().handle(req)).await?

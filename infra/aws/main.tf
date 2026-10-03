@@ -11,6 +11,7 @@ locals {
   account = data.aws_caller_identity.current.account_id
   app     = aws_s3_bucket.this["app"].arn
   native  = aws_s3_bucket.this["native"].arn
+  kv      = aws_s3_bucket.this["kv"].arn
   # The Lambda Web Adapter, published by AWS: an extension that turns invocations into HTTP requests to the function.
   adapter = "arn:aws:lambda:${var.region}:753240598075:layer:LambdaAdapterLayerArm64:30"
   zip     = "../../dist/torpor.zip"     # as `docker compose run --rm release` builds it
@@ -25,9 +26,9 @@ locals {
   grants = {
     serve = [
       { Action = ["s3:GetObject"], Resource = ["${local.app}/apps/*", "${local.native}/*"] },
-      { Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"], Resource = ["${local.app}/kv/*"] },
+      { Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"], Resource = ["${local.kv}/kv/*"] },
       { Action = ["s3:PutObject"], Resource = ["${local.app}/compile/*"] },
-      { Action = ["s3:ListBucket"], Resource = [local.app, local.native] }, # so a missing key is a 404, not a 403
+      { Action = ["s3:ListBucket"], Resource = [local.app, local.native, local.kv] }, # so a missing key is a 404, not a 403
     ]
     compile = [
       { Action = ["s3:GetObject"], Resource = ["${local.app}/apps/*/blobs/*"] },
@@ -38,10 +39,10 @@ locals {
   }
 }
 
-# The app bucket holds what teams publish and the apps' KV data; the native bucket, what only the compile function
-# writes and every host runs.
+# The app bucket holds what teams publish; the native bucket, what only the compile function writes and every host
+# runs; the KV bucket, the apps' data, which only `serve` reaches.
 resource "aws_s3_bucket" "this" {
-  for_each      = toset(["app", "native"])
+  for_each      = toset(["app", "native", "kv"])
   bucket        = "${var.name}-${local.account}-${var.region}-${each.key}"
   force_destroy = var.force_destroy
 }
@@ -125,7 +126,9 @@ resource "aws_lambda_function" "serve" {
   timeout                        = 30
   reserved_concurrent_executions = var.concurrency.serve
   ephemeral_storage { size = var.serve.storage }
-  environment { variables = merge(local.env, { AWS_LWA_PORT = "3000" }) }
+  environment {
+    variables = merge(local.env, { AWS_LWA_PORT = "3000", TORPOR_KV = "s3://${aws_s3_bucket.this["kv"].bucket}" })
+  }
   # After the compile function, so a new build's hosts ask for native code from a compile function of the same build.
   depends_on = [aws_iam_role_policy.fn, aws_lambda_function.compile]
 }
@@ -231,8 +234,9 @@ resource "aws_route53_record" "apps" {
 
 # A team owns the apps named `<team>-…`: it may read and write them, and the markers that ask for their native code.
 # The `team` tag of its role says which; the roles allow no session tags, which could otherwise claim another team.
-# Its list is for 404s: S3 answers a missing key with a 403 to a caller that may not list. A GET or HEAD has no
-# `s3:prefix`, hence `IfExists`; a list that names a prefix must name one of the team's. (Both checked in M5's session.)
+# It may list the whole app bucket, as S3 answers a missing key with a 403 to a caller that may not list. A condition
+# that held lists to the team's prefixes but let a GET's 404 through would also let through a list of no prefix (as
+# M5's session found), so teams see each other's app names and release ids; KV's keys are in a bucket of their own.
 resource "aws_iam_policy" "team" {
   name = "${var.name}-team"
   policy = jsonencode({
@@ -240,11 +244,7 @@ resource "aws_iam_policy" "team" {
     Statement = [for s in [
       { Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"], Resource = ["${local.app}/apps/${local.team}-*"] },
       { Action = ["s3:GetObject", "s3:PutObject"], Resource = ["${local.app}/compile/${local.team}-*"] },
-      {
-        Action    = ["s3:ListBucket"]
-        Resource  = [local.app]
-        Condition = { StringLikeIfExists = { "s3:prefix" = ["apps/${local.team}-*", "compile/${local.team}-*"] } }
-      },
+      { Action = ["s3:ListBucket"], Resource = [local.app] },
     ] : merge(s, { Effect = "Allow" })]
   })
 }

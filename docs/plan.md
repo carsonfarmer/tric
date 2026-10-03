@@ -53,13 +53,13 @@ Q43 applies: no product name appears in any stored key or field, so a rename nev
 | app | `apps/<app>/blobs/sha256/<hex>` | Components, in the OCI layout under the app (Q40, Q72) | team (put-if-absent) |
 | app | `apps/<app>/releases/<hex>` | Immutable releases: component, config, allow list (Q69) | team (put-if-absent) |
 | app | `apps/<app>/current` | The release the app serves, and its secrets, in plain (Q65, Q73) | team (CAS) |
-| app | `kv/<app>/<store>/<key>` | KV values, percent-encoded keys (Q42) | serving function |
+| kv | `kv/<app>/<store>/<key>` | KV values, percent-encoded keys (Q42), in a bucket of their own (`TORPOR_KV`, Q88); without one, in the app bucket | serving function |
 | app | `compile/<app>/<hex>` | Compile requests | team, serving function; compile function deletes |
 | native | `<app>/<hex>/<compat hash>.zst` | Compiled native code, under the app that owns the component (Q54) | **compile function only** |
 
 **IAM shape:**
-- The serving function reads the app bucket and may write only `kv/` and `compile/`. It can only read the native bucket, and lists it too, so a miss is a 404 rather than a 403.
-- Each team has a role tagged `team`, and one ABAC policy lets it read, write and list only `apps/${team}-*`, so a team owns the apps named `<team>-…`, plus read, write and list `compile/${team}-*`, which `publish` waits on: without the list, S3 answers its check on a deleted marker with a 403 (Q64, Q72). Team names have no hyphens. Nobody but the serving function writes `kv/`.
+- The serving function reads the app bucket and may write only its `compile/`, reads and writes the KV bucket, and can only read the native bucket. It lists all three, so a miss is a 404 rather than a 403.
+- Each team has a role tagged `team`, and one ABAC policy lets it read and write only `apps/${team}-*`, so a team owns the apps named `<team>-…`, plus read and write `compile/${team}-*`, which `publish` waits on. It lists the whole app bucket: without the list, S3 answers a missing key (a new app's `current`, a deleted marker) with a 403, and a list can't be held to the team's prefixes (Q64, Q72, Q88). Team names have no hyphens. Nobody but the serving function reaches the KV bucket.
 - The admin, who runs `gc`, gets delete but never put in the native bucket, so `gc` can prune **(choice)**.
 - The compile function reads `apps/*/blobs/`, deletes `compile/`, and reads, lists and writes the native bucket.
 
@@ -169,7 +169,7 @@ All of these are covered, plus another app's native code and corrupt native code
 ### M5: AWS install and cloud validation (needs your explicit approval to apply)
 
 - **`infra/aws`** (latest OpenTofu, Q20) contains:
-  - the app and native buckets;
+  - the app, native and KV buckets;
   - the **serving function:** arm64 on `provided.al2023` with the Lambda Web Adapter layer. 1769 MB by default, rejecting anything under 512 MB (Q51). A public Function URL with a reserved-concurrency cap and a budget alert (Q50);
   - the **compile function:** the same binary at 3008 MB with a 120 s timeout **(choice)**, and updated before the serving function. It is fired by `s3:ObjectCreated:*` events on the prefix `compile/`, with `AWS_LWA_ERROR_STATUS_CODES` covering 500 so a failed marker counts as a failed invocation and is retried. A small reserved concurrency queues a burst of markers, so the later ones find the native code and skip;
   - for the serving function, ephemeral storage that fits the native code of every app a host loads (512 MB by default), and the adapter's readiness check over TCP, as an HTTP one costs a bucket read;
