@@ -245,6 +245,29 @@ From the research brief, [research/m2-interfaces.md](research/m2-interfaces.md).
 | — | `compile-worker`'s port | **127.0.0.1:8080, the adapter's default.** The adapter's readiness check (`GET /`) gets a 404, which it counts as ready. `serve` answers the same check with one GET of `apps/127/current` (its `Host` is `127.0.0.1:…`); M5 makes the check TCP-only. |
 | — | Error logs | **Every log line of an error prints its whole chain (`{e:#}`), here and in `engine` and `serve`.** A Wasmtime error's top level can leave out the cause: for a trap, it is only the backtrace. |
 
+## M5 preparation (2026-10-03; the user was away, so these are choices for review)
+
+Nothing here has been applied. The cloud session (plan.md, M5) needs your approval.
+
+| # | Topic | Decision |
+|---|---|---|
+| — | One zip, two functions | **The zip's own `bootstrap` runs `torpor "$_HANDLER"`, so each function's handler is its subcommand** (`serve`, `compile-worker`). A `bootstrap` in the zip comes before the adapter layer's, and the adapter still runs, as an extension. |
+| — | Routing behind CloudFront | **The viewer's host goes on in `X-Forwarded-Host`, and `serve` moves it back into `Host`**, which names the app and is what the app sees as its authority. A Function URL answers only to its own `Host`, so a CloudFront Function copies the viewer's into the header, replacing any the viewer sent, and the origin request policy (`AllViewerExceptHostHeader`) passes the rest on. Outside Lambda, a proxy can do the same. |
+| — | The Function URL is public | **With no secret header from CloudFront.** A caller that skips CloudFront can set `X-Forwarded-Host` itself, but reaches only the app CloudFront would send it to. The budget alert and the reserved concurrency bound what a flood costs, either way. |
+| — | No caching | **CloudFront caches nothing** (`CachingDisabled`). Honouring apps' `Cache-Control` needs a cache policy keyed on `X-Forwarded-Host` and the whole query string; deferred. |
+| — | Response size | **Buffered, so a response is at most 6 MB**, the Function URL's limit. Streaming would need the adapter's response-stream mode; deferred. |
+| — | The adapter | **Layer `LambdaAdapterLayerArm64:30`, pinned.** Readiness over TCP for both functions; `serve` on 3000, `compile-worker` on the adapter's default 8080; the compile function's 5xx counts as a failed invocation (`AWS_LWA_ERROR_STATUS_CODES=500-599`), so S3's async event is retried twice. |
+| — | Team roles | **Each trusts the account root and has a `team` tag; the policy is one, on `${aws:PrincipalTag/team}`.** So `teams` is just a set of names, and who may assume each role is the account's own IAM to say. The roles allow `sts:AssumeRole` only, not `sts:TagSession`, so a session cannot bring a `team` tag of its own. Team names are `a-z0-9`, with no `-`, or team `a` would own team `a-b`'s apps. |
+| — | The team's list | **`s3:ListBucket` on the app bucket, `StringLikeIfExists` on the team's two prefixes.** Without a list, S3 answers a missing key with a 403, which breaks a new app's first release (its `current` is missing) and `publish`'s wait (the deleted marker). A GET or HEAD carries no `s3:prefix`; `IfExists` is meant to let those count as holding the list while a list must still name the team's prefix. AWS documents neither half, so the session checks both first. **If either fails**, the choice is between an unconditioned list (teams then see every key name in the bucket, KV's included) and KV in a bucket of its own (Q88). |
+| — | Budget | **The whole account's monthly cost, $5 by default, alerting at 80% of actual spend to `alert_emails`**, which has no default. |
+| — | Logs | **One group per function, created by OpenTofu with 7 days' retention**; each role writes only its own. `RUST_LOG` is `warn` unless `log_filter` says otherwise (the session uses `info` for load times). |
+| — | Load times | **`serve` logs each app load (`loaded`, `ms`) and `compile` each native-code load (`loaded its native code`, `ms`) at info.** For M5's measurements; whether they stay is for after. |
+| — | State and destroy | **Local OpenTofu state, in `infra/aws`.** The buckets keep their objects on destroy unless `force_destroy` was applied first, so the session applies with it. |
+| — | The release build | **`release` runs on `linux/arm64`, in the AL2023 toolchain image**, so the binary fits Lambda's arm64 and its glibc (2.34). On an arm64 Mac this is native; elsewhere Docker emulates it. |
+| — | Ephemeral storage | **A variable, 512 MB by default** (Lambda's own default), for the native code a host keeps in `/tmp`. The session sees whether it suffices. |
+| — | The provider adds the URL's permissions | **None are declared:** from provider 6.28, a Function URL with auth `NONE` gets both `lambda:InvokeFunctionUrl` and `lambda:InvokeFunction` (with `InvokedViaFunctionUrl`). |
+| — | Not done | **No explicit S3 public-access block** (new buckets block public access by default), no versioning, no remote state, no alarms beyond the budget. |
+
 ## Deferred work and fast follows
 
 Kept here so nothing agreed in the grilling gets lost.
@@ -283,3 +306,5 @@ Kept here so nothing agreed in the grilling gets lost.
 | Hosts on more than one architecture | M4 | Hosts load only native code made on their own architecture. An install with hosts on two needs a compile function on each, both fired by the same markers. |
 | Per-team compile functions | M4 | The compile function compiles every team's components while it can write native code for every app, so a Cranelift exploit in one could reach all. One function per team, writing only its apps' native code, would contain it. |
 | Second short cloud session | Q51, Q56 | `deserialize_file` against `deserialize`, state read during start-up, 1024 MB, n = 100, compile-function timings. Needs its own explicit apply approval. |
+| CloudFront caching | M5 | A cache policy keyed on `X-Forwarded-Host` and the query string, so apps' `Cache-Control` is honoured. |
+| Streamed responses | M5 | The adapter's response-stream mode, past the Function URL's 6 MB buffered limit. |

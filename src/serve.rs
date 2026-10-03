@@ -13,6 +13,8 @@ use wasmtime::{Error, Result};
 use wasmtime_wasi_http::{handler::Response, io::TokioIo};
 
 const VAR_PREFIX: &str = "TORPOR_VAR_";
+/// The viewer's host, which a proxy in front passes on in this header when its origin needs its own `Host`.
+const FORWARDED_HOST: &str = "x-forwarded-host";
 /// How stale a host's view may get, so also how long a change takes to be live everywhere.
 const FRESH: Duration = Duration::from_secs(5);
 /// The longest a read of `current` may hold up a request. The S3 client on its own retries for up to 3 minutes.
@@ -55,11 +57,15 @@ impl Install {
         Ok(install)
     }
 
-    pub async fn handle<B>(self: Arc<Self>, req: Request<B>) -> Response
+    pub async fn handle<B>(self: Arc<Self>, mut req: Request<B>) -> Response
     where
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<wasmtime_wasi_http::Error>,
     {
+        // The viewer's host names the app, and is the one the app sees.
+        if let Some(host) = req.headers_mut().remove(FORWARDED_HOST) {
+            req.headers_mut().insert(HOST, host);
+        }
         let host = req.headers().get(HOST).and_then(|h| h.to_str().ok()).unwrap_or_default();
         let name = host.split(['.', ':']).next().unwrap_or_default().to_ascii_lowercase(); // the first label
         match self.app(&name).await.inspect_err(|e| tracing::warn!(app = name, "{e:#}")) {
@@ -114,12 +120,13 @@ impl Install {
     fn load(self: &Arc<Self>, name: &str, id: &str, secrets: &BTreeMap<String, String>) -> Load {
         let (install, name, id, secrets) = (self.clone(), name.to_owned(), id.to_owned(), secrets.clone());
         let task = tokio::spawn(async move {
-            let Install { store, native, engine, .. } = &*install;
+            let (Install { store, native, engine, .. }, start) = (&*install, Instant::now());
             let mut r = state::release(&**store, &name, &id).await?;
             r.config.extend(secrets);
             let code = compile::component(&**store, native.as_deref(), engine, &name, &r.component).await?;
             let kv = Arc::new(PrefixStore::new(store.clone(), state::kv(&name)));
-            engine.load(&name, kv, &code, r.config, &r.allowed_outbound_hosts)
+            let app = engine.load(&name, kv, &code, r.config, &r.allowed_outbound_hosts);
+            app.inspect(|_| tracing::info!(app = name, ms = start.elapsed().as_millis(), "loaded"))
         });
         task.map(|r| r.unwrap_or_else(|e| Err(e.into())).map_err(|e| format!("{e:#}"))).boxed().shared()
     }
@@ -205,6 +212,10 @@ mod tests {
         assert_eq!(ok(&install, "KV.example.com", "/config?key=token").await, r#"{"ok":"s3cret"}"#);
         ok(&install, "kv.localhost", "/kv?op=set&store=s&key=k&value=v").await;
         store.head(&"kv/kv/s/k".into()).await.unwrap();
+        let req = Request::get("/")
+            .header(HOST, "abc.lambda-url.us-west-2.on.aws")
+            .header(FORWARDED_HOST, "hello.tric.works");
+        assert_eq!(install.clone().handle(req.body(Empty::<Bytes>::new()).unwrap()).await.status(), 200);
         for host in ["nope.localhost", "localhost", "", "a/b.localhost"] {
             assert_eq!(get(&install, host, "/").await.0, 404);
         }

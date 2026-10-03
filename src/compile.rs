@@ -8,7 +8,8 @@ use hyper::body::{Body, Bytes};
 use hyper::{Method, Request, StatusCode};
 use object_store::{Error as E, ObjectStore, ObjectStoreExt, PutPayload};
 use serde_json::Value;
-use std::{error::Error as StdError, sync::Arc, time::Duration};
+use std::time::{Duration, Instant};
+use std::{error::Error as StdError, sync::Arc};
 use tempfile::NamedTempFile;
 use tokio::{task::spawn_blocking, time::timeout};
 use torpor::Engine;
@@ -62,7 +63,7 @@ async fn load(native: &dyn ObjectStore, engine: &Arc<Engine>, app: &str, hash: &
         Err(E::NotFound { .. }) => return Ok(None),
         r => r?.bytes().await?,
     };
-    let engine = engine.clone();
+    let (engine, start) = (engine.clone(), Instant::now());
     let code = spawn_blocking(move || {
         let mut file = NamedTempFile::new()?;
         zstd::stream::copy_decode(&*zst, &mut file)?;
@@ -70,7 +71,9 @@ async fn load(native: &dyn ObjectStore, engine: &Arc<Engine>, app: &str, hash: &
         // this host's own, and is deleted on return, which leaves the component's mapping of it in place.
         unsafe { engine.native(file.path()) }
     });
-    Ok(Some(code.await??))
+    let code = code.await??;
+    tracing::info!(app, ms = start.elapsed().as_millis(), "loaded its native code");
+    Ok(Some(code))
 }
 
 /// The compile function, which makes the native code that markers ask for.

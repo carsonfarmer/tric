@@ -2,6 +2,8 @@
 #   COMPOSE_PROJECT_NAME=torpor-<worktree> docker compose run --rm dev        (a shell in the toolchain)
 #   COMPOSE_PROJECT_NAME=torpor-<worktree> docker compose run --rm fixtures   (build tests/fixtures/*.wasm)
 #   COMPOSE_PROJECT_NAME=torpor-<worktree> docker compose run --rm test       (fixtures, then cargo test)
+#   COMPOSE_PROJECT_NAME=torpor-<worktree> docker compose run --rm release    (dist/torpor.zip, for Lambda's arm64)
+#   docker compose run --rm tofu plan -var domain=… -var 'alert_emails=[…]'    (OpenTofu in infra/aws, as AWS_PROFILE)
 name: ${COMPOSE_PROJECT_NAME:-torpor-main}
 
 x-toolchain: &toolchain
@@ -21,5 +23,14 @@ services:
     <<: *toolchain
     command: tests/components/build.sh
     environment: { CARGO_TARGET_DIR: /src/target/fixtures }
+  release:
+    <<: *toolchain
+    platform: linux/arm64
+    command: sh -c 'cargo build --release --bin torpor && rm -f dist/torpor.zip && mkdir -p dist && zip -j dist/torpor.zip infra/aws/bootstrap target/release/torpor'
+  tofu:
+    image: ghcr.io/opentofu/opentofu:latest
+    working_dir: /src/infra/aws
+    volumes: [".:/src", "${HOME}/.aws:/root/.aws"]
+    environment: [AWS_PROFILE]
 
 volumes: { cargo: {}, target: {} }

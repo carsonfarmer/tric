@@ -1,0 +1,3 @@
+#!/bin/sh
+# Lambda runs this, and the adapter's extension proxies requests to it. The handler names the subcommand.
+exec "$LAMBDA_TASK_ROOT/torpor" "$_HANDLER"
