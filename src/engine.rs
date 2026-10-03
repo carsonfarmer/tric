@@ -31,17 +31,15 @@ const MAX_INFLIGHT: usize = 64;
 const RESOURCES: usize = 256; // live resources per store; the default is a million
 const HOSTCALL_FUEL: usize = 32 << 20; // bytes one host call may copy out of the guest; the default is 128 MiB
 
-/// Compiles components, and holds the object store that all of their state lives in. Make one per process and load every
-/// app from it.
+/// Compiles components. Make one per process and load every app from it.
 pub struct Engine {
     engine: wasmtime::Engine,
     linker: Linker<Host>,
-    store: Arc<dyn ObjectStore>,
 }
 
 impl Engine {
     /// Configures Wasmtime and starts the thread that ticks its epoch until the engine and its apps are dropped.
-    pub fn new(store: Arc<dyn ObjectStore>) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let mut cfg = Config::new();
         cfg.wasm_component_model_async(true).wasm_component_model_async_stackful(true);
         cfg.wasm_component_model_more_async_builtins(true).epoch_interruption(true);
@@ -60,17 +58,17 @@ impl Engine {
         p3::add_to_linker(&mut linker)?;
         wasmtime_wasi_config::add_to_linker(&mut linker, |h: &mut Host| WasiConfig::from(&h.app.config))?;
         Imports::add_to_linker::<Host, HasSelf<Host>>(&mut linker, |h| h)?; // `wasi:keyvalue`
-        Ok(Self { engine, linker, store })
+        Ok(Self { engine, linker })
     }
 
-    /// Loads the component `wasm` (binary, or WAT text) as the app `name`, with `config` for its `wasi:config` and its
-    /// `wasi:keyvalue` data under the prefix `kv`, like `kv/app`. It exports either `wasi:http/handler` (p3) or
+    /// Loads the component `wasm` (binary, or WAT text) as the app `name`, with `config` for its `wasi:config` and `kv`,
+    /// which holds nothing else, for its `wasi:keyvalue` data. It exports either `wasi:http/handler` (p3) or
     /// `incoming-handler` (p2). Its outbound HTTP goes only to `allowed`, items like `https://api.example.com` or
     /// `https://*.example.com:8443`, and none at all if that is empty.
     pub fn load(
         &self,
         name: &str,
-        kv: &str,
+        kv: Arc<dyn ObjectStore>,
         wasm: impl AsRef<[u8]>,
         config: BTreeMap<String, String>,
         allowed: &[String],
@@ -81,8 +79,7 @@ impl Engine {
             Ok(_) => ProxyPre::P3(p3::bindings::ServicePre::new(pre)?),
             Err(_) => ProxyPre::P2(p2::bindings::ProxyPre::new(pre)?),
         };
-        let (kv, config) = (Kv::new(self.store.clone(), kv), config.into_iter().collect());
-        let app = Arc::new(Shared { name: name.into(), config, kv, allow });
+        let app = Arc::new(Shared { name: name.into(), config: config.into_iter().collect(), kv: Kv(kv), allow });
         let permits = Arc::new(Semaphore::new(MAX_INFLIGHT));
         Ok(App(ProxyHandler::new(State { engine: self.engine.clone(), pre, app, permits })))
     }
@@ -133,9 +130,6 @@ impl WasiHttpView for Host {
         WasiHttpCtxView { ctx: &mut self.http, table: &mut self.table, hooks: &mut self.hooks }
     }
 }
-
-/// The boxed futures `WasiHttpHooks` deals in.
-pub(crate) type Fut<T> = Box<dyn Future<Output = Result<T, Error>> + Send>;
 
 /// Expires the worker, which drops its store, at `TIMEOUT`, even if the guest is only waiting.
 struct Deadline(Pin<Box<Sleep>>);

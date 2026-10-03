@@ -3,7 +3,7 @@ use crate::cli;
 use crate::state::{self, BLOB_MAX, BLOBS, Current, FRESH};
 use hyper::body::{Body, Bytes, Incoming};
 use hyper::{Request, StatusCode, header::HOST, server::conn::http1, service::service_fn};
-use object_store::{ObjectStore, memory::InMemory};
+use object_store::{ObjectStore, memory::InMemory, prefix::PrefixStore};
 use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, collections::HashMap, convert::Infallible, env, path::Path, sync::Arc};
 use tokio::{net::TcpListener, sync::Mutex, task::spawn_blocking, time::timeout};
@@ -34,7 +34,7 @@ struct Served {
 impl Install {
     /// The install in `store`.
     pub fn new(store: Arc<dyn ObjectStore>) -> Result<Self> {
-        Ok(Self { engine: Engine::new(store.clone())?.into(), store, apps: Mutex::default() })
+        Ok(Self { engine: Engine::new()?.into(), store, apps: Mutex::default() })
     }
 
     /// An install in memory of just the app in `dir`, released, with `TORPOR_VAR_<KEY>` as its secret `key`, so secrets
@@ -100,8 +100,9 @@ impl Install {
         let mut r = state::release(&*self.store, name, id).await?;
         r.config.extend(secrets.clone());
         let wasm = state::fetch(&*self.store, &state::path(name, BLOBS), &r.component, BLOB_MAX).await?;
-        let (engine, name, kv) = (self.engine.clone(), name.to_owned(), state::kv(name));
-        spawn_blocking(move || engine.load(&name, &kv, wasm, r.config, &r.allowed_outbound_hosts)).await?
+        let kv = Arc::new(PrefixStore::new(self.store.clone(), state::kv(name)));
+        let (engine, name) = (self.engine.clone(), name.to_owned());
+        spawn_blocking(move || engine.load(&name, kv, wasm, r.config, &r.allowed_outbound_hosts)).await?
     }
 }
 

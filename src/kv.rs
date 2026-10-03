@@ -43,11 +43,8 @@ pub struct Cas {
     seen: Option<(Bytes, UpdateVersion)>,
 }
 
-/// One app's view of the object store: its buckets under `root`.
-pub(crate) struct Kv {
-    store: Arc<dyn ObjectStore>,
-    root: Path,
-}
+/// One app's own object store, its buckets at the top.
+pub(crate) struct Kv(pub(crate) Arc<dyn ObjectStore>);
 
 fn path(bucket: &Path, key: &str) -> R<Path> {
     if key.is_empty() || key.len() > KEY_MAX {
@@ -57,13 +54,9 @@ fn path(bucket: &Path, key: &str) -> R<Path> {
 }
 
 impl Kv {
-    pub(crate) fn new(store: Arc<dyn ObjectStore>, root: &str) -> Self {
-        Self { store, root: root.into() }
-    }
-
     /// The key as the store has it, with the version a conditional write needs.
     async fn read(&self, p: &Path) -> R<Option<(Bytes, UpdateVersion)>> {
-        match self.store.get(p).await {
+        match self.0.get(p).await {
             Ok(r) => {
                 let v = UpdateVersion { e_tag: r.meta.e_tag.clone(), version: r.meta.version.clone() };
                 Ok(Some((r.bytes().await.map_err(other)?, v)))
@@ -83,7 +76,7 @@ impl Kv {
             return Err(Error::Other(format!("a value is {VALUE_MAX} bytes or less")));
         }
         let conditional = mode != PutMode::Overwrite;
-        match self.store.put_opts(p, v.into(), mode.into()).await {
+        match self.0.put_opts(p, v.into(), mode.into()).await {
             Ok(_) => Ok(true),
             Err(E::Precondition { .. } | E::AlreadyExists { .. } | E::NotFound { .. }) if conditional => Ok(false),
             Err(e) => Err(other(e)),
@@ -96,7 +89,7 @@ impl Kv {
 
     /// A missing key is not an error, though GCS and Azure answer 404 for one.
     async fn delete(&self, b: &Path, key: &str) -> R<()> {
-        match self.store.delete(&path(b, key)?).await {
+        match self.0.delete(&path(b, key)?).await {
             Ok(()) | Err(E::NotFound { .. }) => Ok(()),
             Err(e) => Err(other(e)),
         }
@@ -119,7 +112,7 @@ impl Kv {
     /// One page of keys in order: the first `PAGE` after `cursor`, which is the last key of the page before.
     async fn list(&self, b: &Path, cursor: Option<String>) -> R<KeyResponse> {
         let after = cursor.map_or(Ok(b.clone()), |k| path(b, &k))?; // everything is after the prefix itself
-        let keys: Vec<String> = (self.store.list_with_offset(Some(b), &after).take(PAGE))
+        let keys: Vec<String> = (self.0.list_with_offset(Some(b), &after).take(PAGE))
             .map_ok(|m| percent_decode_str(m.location.filename().unwrap_or_default()).decode_utf8_lossy().into_owned())
             .map_err(other)
             .try_collect()
@@ -136,7 +129,7 @@ impl Host {
 
 impl store::Host for Host {
     async fn open(&mut self, name: String) -> R<Resource<Bucket>> {
-        let b = is_name(&name).then(|| Bucket(self.app.kv.root.clone().join(name))).ok_or(Error::NoSuchStore)?;
+        let b = is_name(&name).then(|| Bucket(name.into())).ok_or(Error::NoSuchStore)?;
         self.table.push(b).map_err(other)
     }
 }
@@ -230,7 +223,7 @@ mod tests {
     use object_store::memory::InMemory;
 
     fn kv() -> (Kv, Path) {
-        (Kv::new(Arc::new(InMemory::new()), "kv/app"), "kv/app/b".into())
+        (Kv(Arc::new(InMemory::new())), "b".into())
     }
 
     /// Too big for the guest tests, as a `Uri` of 64 KiB is the most their fixture can pass.

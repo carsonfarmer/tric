@@ -1,5 +1,5 @@
 //! Outbound HTTP: the allow list, then name lookup and TCP by hand, so only an address that passed the block check is dialled.
-use crate::engine::{Fut, Shared};
+use crate::engine::Shared;
 use http_body_util::BodyExt;
 use hyper::{Uri, client::conn::http1};
 use std::net::IpAddr;
@@ -38,8 +38,7 @@ impl Allow {
         }
     }
 
-    fn allows(&self, uri: &Uri) -> bool {
-        let Some(o) = origin(uri) else { return false };
+    fn allows(&self, o: &str) -> bool {
         self.0 == ANY
             || self.0.split_once('*').map_or(o == self.0, |(head, tail)| o.starts_with(head) && o.ends_with(tail))
     }
@@ -69,6 +68,7 @@ static TLS: LazyLock<TlsConnector> = LazyLock::new(|| {
 
 /// The hooks of one store.
 pub(crate) struct Outbound(pub(crate) Arc<Shared>);
+type Fut<T> = Box<dyn Future<Output = Result<T, Error>> + Send>; // the boxed futures `WasiHttpHooks` deals in
 type Sent = Result<(Response, Fut<()>), Error>;
 
 impl WasiHttpHooks for Outbound {
@@ -84,7 +84,7 @@ async fn send(app: Arc<Shared>, req: Request) -> Sent {
     if uri.authority().is_some_and(|a| a.as_str().contains('@')) {
         return Err(Error::HttpRequestUriInvalid);
     }
-    if !app.allow.iter().any(|a| a.allows(uri)) {
+    if !origin(uri).is_some_and(|o| app.allow.iter().any(|a| a.allows(&o))) {
         return Err(Error::HttpRequestDenied);
     }
     let tls = uri.scheme_str() == Some("https");
@@ -183,10 +183,10 @@ mod tests {
         let t = |item: &str, yes: &[&str], no: &[&str]| {
             let a = Allow::parse(item).unwrap();
             for u in yes {
-                assert!(a.allows(&u.parse().unwrap()), "{item} should allow {u}");
+                assert!(origin(&u.parse().unwrap()).is_some_and(|o| a.allows(&o)), "{item} should allow {u}");
             }
             for u in no {
-                assert!(!a.allows(&u.parse().unwrap()), "{item} should deny {u}");
+                assert!(!origin(&u.parse().unwrap()).is_some_and(|o| a.allows(&o)), "{item} should deny {u}");
             }
         };
         let https = "https://example.com";

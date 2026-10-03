@@ -7,7 +7,7 @@ use torpor::{App, Engine};
 
 fn load(name: &str) -> App {
     let wasm = fs::read(format!("tests/fixtures/{name}.wasm")).unwrap();
-    Engine::new(Arc::new(InMemory::new())).unwrap().load(name, "", wasm, Default::default(), &[]).unwrap()
+    Engine::new().unwrap().load(name, Arc::new(InMemory::new()), wasm, Default::default(), &[]).unwrap()
 }
 
 async fn get(app: &App, path: &str) -> (StatusCode, String) {
@@ -69,7 +69,7 @@ async fn spin(memories: &str) -> Duration {
             (instance $h (export "handle" (func $handle)))
             (export "wasi:http/incoming-handler@0.2.12" (instance $h)))"#
     );
-    let app = Engine::new(Arc::new(InMemory::new())).unwrap().load("wat", "", wat, Default::default(), &[]).unwrap();
+    let app = Engine::new().unwrap().load("wat", Arc::new(InMemory::new()), wat, Default::default(), &[]).unwrap();
     let start = Instant::now();
     assert_eq!(get(&app, "/").await.0, 500);
     start.elapsed()

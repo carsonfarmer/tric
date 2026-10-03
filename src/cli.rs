@@ -35,7 +35,7 @@ pub fn read(dir: &Path) -> Result<(Manifest, Vec<u8>)> {
 pub async fn publish(store: &dyn ObjectStore, dir: &Path, check: bool) -> Result<(String, String)> {
     let (Manifest { name, config, allowed_outbound_hosts, .. }, wasm) = read(dir)?;
     if check {
-        Engine::new(Arc::new(InMemory::new()))?.load(&name, "", &wasm, BTreeMap::new(), &allowed_outbound_hosts)?;
+        Engine::new()?.load(&name, Arc::new(InMemory::new()), &wasm, BTreeMap::new(), &allowed_outbound_hosts)?;
     }
     let component = state::add(store, &state::path(&name, BLOBS), wasm.into(), BLOB_MAX).await?;
     let release = serde_json::to_vec(&Release { component, config, allowed_outbound_hosts })?;

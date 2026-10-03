@@ -3,6 +3,7 @@ mod common;
 use common::*;
 use object_store::{ObjectStoreExt, path::Path};
 use serde_json::{Value, json};
+use std::sync::Arc;
 use torpor::App;
 
 async fn j(app: &App, path: &str) -> Value {
@@ -22,7 +23,7 @@ async fn keys(app: &App, path: &str) -> Value {
 #[tokio::test(flavor = "multi_thread")]
 async fn every_op_in_every_guest() {
     for name in ["kv-p2", "kv-p3", "spin"] {
-        let app = load(&engine().1, name, &[]);
+        let app = load(&Default::default(), name, &[]);
         for (path, want) in [
             ("/config?key=greeting", json!({"ok": "hi"})),
             ("/config?key=nope", json!({"ok": null})),
@@ -70,7 +71,7 @@ async fn every_op_in_every_guest() {
 /// Every failure comes back as a value the guest can handle, never as a trap (which would be a 500).
 #[tokio::test(flavor = "multi_thread")]
 async fn errors_are_values() {
-    let app = load(&engine().1, "kv-p3", &[]);
+    let app = load(&Default::default(), "kv-p3", &[]);
     let (no_store, bad_key) =
         (json!({"err": "Error::NoSuchStore"}), json!({"err": r#"Error::Other("a key is 1 to 256 bytes")"#}));
     for (path, want) in [
@@ -93,7 +94,7 @@ async fn errors_are_values() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn paging() {
-    let app = load(&engine().1, "kv-p2", &[]);
+    let app = load(&Default::default(), "kv-p2", &[]);
     let names: Vec<_> = (0..1500).map(|i| format!("k{i:04}")).collect();
     j(&app, &format!("/kv?op=set-many&store=big&value=v&keys={}", names.join(","))).await;
     let first = j(&app, "/kv?op=list&store=big").await["ok"].clone();
@@ -108,7 +109,7 @@ async fn paging() {
 /// A guest cannot make the host copy one cached value into the reply as often as it likes.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_many_is_capped() {
-    let app = load(&engine().1, "kv-p2", &[]);
+    let app = load(&Default::default(), "kv-p2", &[]);
     j(&app, &format!("/kv?op=set&store=s&key=k&value={}", "v".repeat(60_000))).await;
     let err = j(&app, &format!("/kv?op=get-many&store=s&keys={}", ["k"; 300].join(","))).await;
     assert!(err["err"].as_str().is_some_and(|e| e.contains("get-many")), "{err}");
@@ -117,8 +118,8 @@ async fn get_many_is_capped() {
 /// Eight guests on two apps and one store: no increment is lost, whichever way they interleave.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn racing_writers_lose_nothing() {
-    let (store, engine) = engine();
-    let (a, b) = (load(&engine, "kv-p3", &[]), load(&engine, "kv-p2", &[]));
+    let store = Arc::default();
+    let (a, b) = (load(&store, "kv-p3", &[]), load(&store, "kv-p2", &[]));
     let tasks = [&a, &b].repeat(4).into_iter().cloned().map(|app| {
         tokio::spawn(async move {
             for _ in 0..10 {
@@ -135,8 +136,8 @@ async fn racing_writers_lose_nothing() {
 /// Nothing is cached, so each call is one request to the store, and another host sees a write at once.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_call_is_the_stores() {
-    let (store, engine) = engine();
-    let (a, b) = (load(&engine, "kv-p3", &[]), load(&engine, "kv-p3", &[]));
+    let store = Arc::default();
+    let (a, b) = (load(&store, "kv-p3", &[]), load(&store, "kv-p3", &[]));
     j(&a, "/kv?op=set&store=s&key=k&value=1").await;
     assert_eq!(j(&b, "/kv?op=get&store=s&key=k").await["ok"], "1");
     assert_eq!(keys(&b, "/kv?op=list&store=s").await, json!(["k"]));
@@ -146,11 +147,11 @@ async fn every_call_is_the_stores() {
 /// The allow list is checked before any lookup, and every address a name resolves to is checked after it.
 #[tokio::test(flavor = "multi_thread")]
 async fn outbound_is_allow_listed_and_public_only() {
-    let (_, engine) = engine();
+    let store = Arc::default();
     for fixture in ["probe-p2", "probe-p3"] {
         let fetch = |app: App, url: &'static str| async move { get(&app, &format!("/fetch?url={url}")).await.1 };
-        let none = load(&engine, fixture, &[]);
-        let some = load(&engine, fixture, &["https://example.com", "https://*.example.org:8443"]);
+        let none = load(&store, fixture, &[]);
+        let some = load(&store, fixture, &["https://example.com", "https://*.example.org:8443"]);
         for url in
             ["http://example.com/", "https://example.com:444/", "https://example.org:8443/", "https://x.example.net/"]
         {
@@ -163,7 +164,7 @@ async fn outbound_is_allow_listed_and_public_only() {
             "ErrorCode::HttpRequestUriInvalid",
             "{fixture}"
         );
-        let any = load(&engine, fixture, &["*://*:*"]);
+        let any = load(&store, fixture, &["*://*:*"]);
         for url in [
             "http://127.0.0.1/",
             "http://127.1/",
@@ -175,7 +176,7 @@ async fn outbound_is_allow_listed_and_public_only() {
             assert_eq!(fetch(any.clone(), url).await, "ErrorCode::DestinationIpProhibited", "{fixture} {url}");
         }
         // an allowed name that resolves, by the hosts file here, to a loopback address
-        let named = load(&engine, fixture, &["http://localhost:8080"]);
+        let named = load(&store, fixture, &["http://localhost:8080"]);
         assert_eq!(fetch(named, "http://localhost:8080/").await, "ErrorCode::DestinationIpProhibited", "{fixture}");
     }
 }
