@@ -42,7 +42,7 @@ An operator installs torpor into their own AWS account with one OpenTofu module,
 | `serve` | hyper server, routing, logs | ~170 (raised in M3 from ~100, which was the router alone, then in the M3 review from ~140 for a pointer recheck per app; 144 after the trim and review passes, 156 after M5's routing by `X-Forwarded-Host` and load timings) |
 | `compile` | The compile worker and compile-request markers, and a host's load of native code with its fallback compile | ~150 (raised in M4 from ~70, as it took the host's side from `engine`; 147 after the review pass, 150 with M5's load timing) |
 | `cli` | `publish`, `release`, `releases`, `secret`, `secrets`, `gc`, and `main`'s arguments | ~350 (146 after the trim and review passes, before `gc` and `compile`) |
-| `infra/aws` | OpenTofu module | ~250 HCL (418 written in M5. The budget predates CloudFront, its certificate and DNS (Q71, about 75 lines), the teams' roles (about 40) and the budget alert (about 15); the variables, with their docs and checks, are another 83) |
+| `infra/aws` | OpenTofu module | ~250 HCL (379 after M5's trim (Q91), from 418 as first written. The budget predates CloudFront, its certificate and DNS (Q71, about 75 lines), the teams' roles (about 35) and the budget alert (about 15); the variables, with their docs and checks, are another 60) |
 
 ### Bucket layout
 
@@ -192,11 +192,11 @@ All of these are covered, plus another app's native code and corrupt native code
 **Prepared (2026-10-03), not applied.** The module, the release build (`docker compose run --rm release` makes `dist/torpor.zip`, 11 MB: aarch64, glibc 2.34 at most), and `tofu validate` are done. `serve` now routes by `X-Forwarded-Host` and logs each load's time at info. The choices are in decisions.md, "M5 preparation".
 
 **The cloud session, in order** (each step needs the AWS profile; `apply` needs your approval):
-1. **Checks before applying:** `aws lambda get-account-settings` shows unreserved concurrency of at least 122 (20 + 2 reserved, plus the 100 Lambda keeps), or apply with `-var concurrency=-1`. The `tric.works` zone is public in this account, and no other distribution holds `*.tric.works`. Layer `LambdaAdapterLayerArm64:30` exists in us-west-2. `aws sso login` on the host, as the `tofu` service mounts `~/.aws`.
-2. **Apply** with `-var domain=tric.works -var 'alert_emails=[…]' -var 'teams=["t1"]' -var log_filter=info -var force_destroy=true`, so destroy can empty the buckets and the load times are logged. CloudFront takes about 5 minutes.
-3. **The team role's 404s first**, as role `t1`: a HEAD of a missing `apps/t1-x/current` and of a missing `compile/t1-x/<hex>` must be 404, and a list with no prefix (and one of `apps/t2-`) must be refused. If either fails, see decisions.md "M5 preparation", the team list.
+1. **Checks before applying:** `aws lambda get-account-settings` shows unreserved concurrency of at least 122 (20 + 2 reserved, plus the 100 Lambda keeps), or apply with `-var 'serve={concurrency=-1}'`. The `tric.works` zone is public in this account, and no other distribution holds `*.tric.works`. Layer `LambdaAdapterLayerArm64:30` exists in us-west-2. `aws sso login` on the host, as the `tofu` service mounts `~/.aws`.
+2. **Apply** with `-var domain=tric.works -var 'budget={emails=[…]}' -var 'teams=["t1"]' -var 'logs={filter="info"}' -var force_destroy=true`, so destroy can empty the buckets and the load times are logged. CloudFront takes about 5 minutes.
+3. **The team role's 404s first**, as role `t1`: a HEAD of a missing `apps/t1-x/current` and of a missing `compile/t1-x/<hex>` must be 404, and a list with no prefix (and one of `apps/t2-`) must be refused. If either fails, KV moves to a bucket of its own (Q88).
 4. **End to end:** as `t1`, publish and release a fixture as `t1-hello`; `https://t1-hello.tric.works` serves it; `publish` saw the marker deleted (the compile function ran); a request straight to the Function URL with a made-up `X-Forwarded-Host` reaches only that app; a viewer's own `X-Forwarded-Host` is replaced.
-5. **The measurements above**, from the info logs with Logs Insights: `loaded` (`ms`, a whole load) and `loaded its native code` (`ms`, the deserialize), plus Lambda's `Init Duration`. Then `-var memory=1024` and again.
+5. **The measurements above**, from the info logs with Logs Insights: `loaded` (`ms`, a whole load) and `loaded its native code` (`ms`, the deserialize), plus Lambda's `Init Duration`. Then `memory=1024` in `serve`, and again.
 6. **Destroy the same day**, then list what is tagged `torpor` (`aws resourcegroupstaggingapi get-resources`) in both regions; Lambda's own log groups, if a function logged after its group was deleted, are the likely leftover.
 
 ### M6: First release

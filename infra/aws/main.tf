@@ -13,11 +13,12 @@ locals {
   native  = aws_s3_bucket.this["native"].arn
   # The Lambda Web Adapter, published by AWS: an extension that turns invocations into HTTP requests to the function.
   adapter = "arn:aws:lambda:${var.region}:753240598075:layer:LambdaAdapterLayerArm64:30"
-  zip     = "../../dist/torpor.zip" # as `docker compose run --rm release` builds it
+  zip     = "../../dist/torpor.zip"     # as `docker compose run --rm release` builds it
+  team    = "$${aws:PrincipalTag/team}" # for IAM to fill in: the `team` tag of the role
   env = {
     TORPOR_STORE                     = "s3://${aws_s3_bucket.this["app"].bucket}"
     TORPOR_NATIVE                    = "s3://${aws_s3_bucket.this["native"].bucket}"
-    RUST_LOG                         = var.log_filter
+    RUST_LOG                         = var.logs.filter
     AWS_LWA_READINESS_CHECK_PROTOCOL = "tcp" # as an HTTP check would cost `serve` a bucket read
   }
   # What each function may do, besides write its logs.
@@ -67,7 +68,7 @@ resource "aws_s3_bucket_notification" "markers" {
 resource "aws_cloudwatch_log_group" "fn" {
   for_each          = local.grants
   name              = "/aws/lambda/${var.name}-${each.key}"
-  retention_in_days = var.log_days
+  retention_in_days = var.logs.days
 }
 
 resource "aws_iam_role" "fn" {
@@ -120,10 +121,10 @@ resource "aws_lambda_function" "serve" {
   layers                         = [local.adapter]
   filename                       = local.zip
   source_code_hash               = filebase64sha256(local.zip)
-  memory_size                    = var.memory
+  memory_size                    = var.serve.memory
   timeout                        = 30
-  reserved_concurrent_executions = var.concurrency
-  ephemeral_storage { size = var.storage }
+  reserved_concurrent_executions = var.serve.concurrency
+  ephemeral_storage { size = var.serve.storage }
   environment { variables = merge(local.env, { AWS_LWA_PORT = "3000" }) }
   # After the compile function, so a new build's hosts ask for native code from a compile function of the same build.
   depends_on = [aws_iam_role_policy.fn, aws_lambda_function.compile]
@@ -236,24 +237,15 @@ resource "aws_iam_policy" "team" {
   name = "${var.name}-team"
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = [for s in [
+      { Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"], Resource = ["${local.app}/apps/${local.team}-*"] },
+      { Action = ["s3:GetObject", "s3:PutObject"], Resource = ["${local.app}/compile/${local.team}-*"] },
       {
-        Effect   = "Allow"
-        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
-        Resource = ["${local.app}/apps/$${aws:PrincipalTag/team}-*"]
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["s3:GetObject", "s3:PutObject"]
-        Resource = ["${local.app}/compile/$${aws:PrincipalTag/team}-*"]
-      },
-      {
-        Effect    = "Allow"
         Action    = ["s3:ListBucket"]
         Resource  = [local.app]
-        Condition = { StringLikeIfExists = { "s3:prefix" = ["apps/$${aws:PrincipalTag/team}-*", "compile/$${aws:PrincipalTag/team}-*"] } }
+        Condition = { StringLikeIfExists = { "s3:prefix" = ["apps/${local.team}-*", "compile/${local.team}-*"] } }
       },
-    ]
+    ] : merge(s, { Effect = "Allow" })]
   })
 }
 
@@ -277,7 +269,7 @@ resource "aws_iam_role_policy_attachment" "team" {
 resource "aws_budgets_budget" "this" {
   name         = var.name
   budget_type  = "COST"
-  limit_amount = var.budget
+  limit_amount = var.budget.usd
   limit_unit   = "USD"
   time_unit    = "MONTHLY"
   notification {
@@ -285,6 +277,6 @@ resource "aws_budgets_budget" "this" {
     threshold                  = 80
     threshold_type             = "PERCENTAGE"
     notification_type          = "ACTUAL"
-    subscriber_email_addresses = var.alert_emails
+    subscriber_email_addresses = var.budget.emails
   }
 }

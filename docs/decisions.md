@@ -258,15 +258,25 @@ Nothing here has been applied. The cloud session (plan.md, M5) needs your approv
 | — | Response size | **Buffered, so a response is at most 6 MB**, the Function URL's limit. Streaming would need the adapter's response-stream mode; deferred. |
 | — | The adapter | **Layer `LambdaAdapterLayerArm64:30`, pinned.** Readiness over TCP for both functions; `serve` on 3000, `compile-worker` on the adapter's default 8080; the compile function's 5xx counts as a failed invocation (`AWS_LWA_ERROR_STATUS_CODES=500-599`), so S3's async event is retried twice. |
 | — | Team roles | **Each trusts the account root and has a `team` tag; the policy is one, on `${aws:PrincipalTag/team}`.** So `teams` is just a set of names, and who may assume each role is the account's own IAM to say. The roles allow `sts:AssumeRole` only, not `sts:TagSession`, so a session cannot bring a `team` tag of its own. Team names are `a-z0-9`, with no `-`, or team `a` would own team `a-b`'s apps. |
-| — | The team's list | **`s3:ListBucket` on the app bucket, `StringLikeIfExists` on the team's two prefixes.** Without a list, S3 answers a missing key with a 403, which breaks a new app's first release (its `current` is missing) and `publish`'s wait (the deleted marker). A GET or HEAD carries no `s3:prefix`; `IfExists` is meant to let those count as holding the list while a list must still name the team's prefix. AWS documents neither half, so the session checks both first. **If either fails**, the choice is between an unconditioned list (teams then see every key name in the bucket, KV's included) and KV in a bucket of its own (Q88). |
-| — | Budget | **The whole account's monthly cost, $5 by default, alerting at 80% of actual spend to `alert_emails`**, which has no default. |
-| — | Logs | **One group per function, created by OpenTofu with 7 days' retention**; each role writes only its own. `RUST_LOG` is `warn` unless `log_filter` says otherwise (the session uses `info` for load times). |
+| — | The team's list | **`s3:ListBucket` on the app bucket, `StringLikeIfExists` on the team's two prefixes.** Without a list, S3 answers a missing key with a 403, which breaks a new app's first release (its `current` is missing) and `publish`'s wait (the deleted marker). A GET or HEAD carries no `s3:prefix`; `IfExists` is meant to let those count as holding the list while a list must still name the team's prefix. AWS documents neither half, so the session checks both first. **If either fails**, KV moves to a bucket of its own and the team's list loses its condition (Q88). |
+| — | Budget | **The whole account's monthly cost, $5 by default, alerting at 80% of actual spend to `budget.emails`**, which has no default. |
+| — | Logs | **One group per function, created by OpenTofu with 7 days' retention**; each role writes only its own. `RUST_LOG` is `warn` unless `logs.filter` says otherwise (the session uses `info` for load times). |
 | — | Load times | **`serve` logs each app load (`loaded`, `ms`) and `compile` each native-code load (`loaded its native code`, `ms`) at info.** For M5's measurements; whether they stay is for after. |
 | — | State and destroy | **Local OpenTofu state, in `infra/aws`.** The buckets keep their objects on destroy unless `force_destroy` was applied first, so the session applies with it. |
 | — | The release build | **`release` runs on `linux/arm64`, in the AL2023 toolchain image**, so the binary fits Lambda's arm64 and its glibc (2.34). On an arm64 Mac this is native; elsewhere Docker emulates it. |
-| — | Ephemeral storage | **A variable, 512 MB by default** (Lambda's own default), for the native code a host keeps in `/tmp`. The session sees whether it suffices. |
+| — | Ephemeral storage | **`serve.storage`, 512 MB by default** (Lambda's own default), for the native code a host keeps in `/tmp`. The session sees whether it suffices. |
 | — | The provider adds the URL's permissions | **None are declared:** from provider 6.28, a Function URL with auth `NONE` gets both `lambda:InvokeFunctionUrl` and `lambda:InvokeFunction` (with `InvokedViaFunctionUrl`). |
 | — | Not done | **No explicit S3 public-access block** (new buckets block public access by default), no versioning, no remote state, no alarms beyond the budget. |
+
+## M5 session (2026-10-03)
+
+| # | Topic | Decision |
+|---|---|---|
+| Q88 | If S3 still answers a team's missing key with a 403 | **KV moves to a bucket of its own (`TORPOR_KV`), and teams may list the app bucket without a condition.** Teams would then see each other's app names, release ids and blob hashes, but never contents or KV key names. A list that also shows KV key names is not accepted: no reduced security for fewer lines. The session checks the conditioned list first. |
+| Q89 | Inputs for the apply | **Domain `tric.works`, teams `["t1"]`, and the budget alert to an address the user gave**, passed with `-var` at apply and kept out of the repository. |
+| Q90 | Reserved concurrency | **20 for `serve`, and no cap (`-1`) if the account's quota is under 122**, leaving the budget alert as the only guard. |
+| Q91 | The module's length | **Trimmed without fixing values in place: the variables are grouped by what they configure**, `serve` (memory, storage, concurrency), `budget` (amount, emails) and `logs` (days, filter), each field with its default. The team policy's statements share one `Effect`, like the functions', and two outputs that only restated names are gone. 418 lines to 379. |
+| Q92 | The cloud session | **Approved: apply, checks, end to end and measurements.** Destroy waits until the user has tried the live install. |
 
 ## Deferred work and fast follows
 

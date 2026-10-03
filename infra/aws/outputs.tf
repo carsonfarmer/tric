@@ -8,17 +8,9 @@ output "native" {
   value       = "s3://${aws_s3_bucket.this["native"].bucket}"
 }
 
-output "apps" {
-  value = "https://<app>.${var.domain}"
-}
-
 output "function_url" {
   description = "The serving function without CloudFront, which routes by `X-Forwarded-Host`."
   value       = aws_lambda_function_url.serve.function_url
-}
-
-output "functions" {
-  value = [aws_lambda_function.serve.function_name, aws_lambda_function.compile.function_name]
 }
 
 output "team_roles" {

@@ -28,52 +28,29 @@ variable "teams" {
   }
 }
 
-variable "memory" {
-  description = "The serving function's memory in MB. 1769 is one full vCPU."
-  type        = number
-  default     = 1769
+variable "serve" {
+  description = "The serving function."
+  type = object({
+    memory      = optional(number, 1769) # MB, where 1769 is one full vCPU
+    storage     = optional(number, 512)  # MB of /tmp, which holds the native code of every app a host has loaded
+    concurrency = optional(number, 20)   # how many run at once, which caps what a flood of requests can cost; -1 for no cap
+  })
+  default = {}
   validation {
-    condition     = var.memory >= 512
-    error_message = "At least 512 MB, so an app's 256 MiB store always fits."
+    condition     = var.serve.memory >= 512
+    error_message = "At least 512 MB of memory, so an app's 256 MiB store always fits."
   }
-}
-
-variable "storage" {
-  description = "The serving function's /tmp in MB, which holds the native code of every app a host has loaded."
-  type        = number
-  default     = 512
-}
-
-variable "concurrency" {
-  description = "The most serving functions that run at once, which caps what a flood of requests can cost. -1 for no cap."
-  type        = number
-  default     = 20
 }
 
 variable "budget" {
-  description = "The account's monthly budget in USD, which alerts at 80%."
-  type        = number
-  default     = 5
+  description = "The account's monthly budget in USD, and who is alerted at 80% of it."
+  type        = object({ usd = optional(number, 5), emails = list(string) })
 }
 
-variable "alert_emails" {
-  description = "Who the budget alerts."
-  type        = list(string)
-  validation {
-    condition     = length(var.alert_emails) > 0
-    error_message = "A budget alert needs someone to alert."
-  }
-}
-
-variable "log_days" {
-  type    = number
-  default = 7
-}
-
-variable "log_filter" {
-  description = "RUST_LOG for both functions, like `info` or `warn,[request{app=NAME}]=info`."
-  type        = string
-  default     = "warn"
+variable "logs" {
+  description = "How many days both functions' logs are kept, and their RUST_LOG, like `info` or `warn,[request{app=NAME}]=info`."
+  type        = object({ days = optional(number, 7), filter = optional(string, "warn") })
+  default     = {}
 }
 
 variable "force_destroy" {
