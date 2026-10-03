@@ -2,13 +2,16 @@
 //! writes only the apps named `<team>-…`.
 use crate::state::{self, BLOBS, RELEASES, Release};
 use futures_util::TryStreamExt;
-use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory};
+use object_store::{Error as E, ObjectStore, ObjectStoreExt, PutPayload, memory::InMemory};
 use serde::Deserialize;
-use std::{cmp::Reverse, collections::BTreeMap, fs, path::Path, sync::Arc};
+use std::{cmp::Reverse, collections::BTreeMap, fs, path::Path, sync::Arc, time::Duration};
+use tokio::time::{sleep, timeout};
 use torpor::Engine;
-use wasmtime::Result;
+use wasmtime::{Result, error::Context};
 
 const MANIFEST: &str = "torpor.toml";
+const COMPILE_POLL: Duration = Duration::from_secs(1);
+const COMPILE_WAIT: Duration = Duration::from_secs(180); // longer than the compile function may run
 
 /// An app's `MANIFEST`.
 #[derive(Deserialize)]
@@ -34,12 +37,32 @@ pub fn read(dir: &Path) -> Result<(Manifest, Vec<u8>)> {
 pub async fn publish(store: &dyn ObjectStore, dir: &Path, check: bool) -> Result<(String, String)> {
     let (Manifest { name, config, allowed_outbound_hosts, .. }, wasm) = read(dir)?;
     if check {
-        Engine::new()?.load(&name, Arc::new(InMemory::new()), &wasm, BTreeMap::new(), &allowed_outbound_hosts)?;
+        let (engine, kv) = (Engine::new()?, Arc::new(InMemory::new()));
+        engine.load(&name, kv, &engine.compile(&wasm)?, BTreeMap::new(), &allowed_outbound_hosts)?;
     }
     let component = state::add(store, &name, BLOBS, wasm.into()).await?;
     let release = serde_json::to_vec(&Release { component, config, allowed_outbound_hosts })?;
     let id = state::add(store, &name, RELEASES, release.into()).await?;
     Ok((name, id))
+}
+
+/// Asks the compile function for the native code of `app`'s release `id`, and waits until it has made it.
+pub async fn precompile(store: &dyn ObjectStore, app: &str, id: &str) -> Result<()> {
+    let marker = state::marker(app, &state::release(store, app, id).await?.component)?.into();
+    store.put(&marker, PutPayload::new()).await?;
+    let made = async {
+        loop {
+            match store.head(&marker).await {
+                Ok(_) => sleep(COMPILE_POLL).await,
+                Err(E::NotFound { .. }) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    let late =
+        || format!("{app}'s release {id} has no native code after {COMPILE_WAIT:?}: see the compile function's logs");
+    timeout(COMPILE_WAIT, made).await.with_context(late)??;
+    Ok(())
 }
 
 /// Serves `app` from its release `id`.

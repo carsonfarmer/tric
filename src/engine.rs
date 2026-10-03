@@ -5,8 +5,9 @@ use crate::outbound::{Allow, Outbound};
 use http_body_util::BodyExt;
 use hyper::body::{Body, Bytes};
 use object_store::ObjectStore;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::task::{Context, Poll};
-use std::{collections::BTreeMap, pin::Pin, sync::Arc, thread, time::Duration, time::Instant};
+use std::{collections::BTreeMap, path::Path, pin::Pin, sync::Arc, thread, time::Duration, time::Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Sleep, sleep, timeout_at};
 use tracing::Instrument;
@@ -31,7 +32,7 @@ const MAX_INFLIGHT: usize = 64;
 const RESOURCES: usize = 256; // live resources per store; the default is a million
 const HOSTCALL_FUEL: usize = 32 << 20; // bytes one host call may copy out of the guest; the default is 128 MiB
 
-/// Compiles components. Make one per process and load every app from it.
+/// Compiles components, and loads them as apps. Make one per process and load every app from it.
 pub struct Engine {
     engine: wasmtime::Engine,
     linker: Linker<Host>,
@@ -41,6 +42,9 @@ impl Engine {
     /// Configures Wasmtime and starts the thread that ticks its epoch until the engine and its apps are dropped.
     pub fn new() -> Result<Self> {
         let mut cfg = Config::new();
+        // The architecture's baseline rather than this CPU's features, so every host of this build and architecture
+        // makes the same native code and can load any other's.
+        cfg.target(&target_lexicon::HOST.to_string())?;
         cfg.wasm_component_model_async(true).wasm_component_model_async_stackful(true);
         cfg.wasm_component_model_more_async_builtins(true).epoch_interruption(true);
         let engine = wasmtime::Engine::new(&cfg)?;
@@ -61,20 +65,47 @@ impl Engine {
         Ok(Self { engine, linker })
     }
 
-    /// Loads the component `wasm` (binary, or WAT text) as the app `name`, with `config` for its `wasi:config` and `kv`,
-    /// which holds nothing else, for its `wasi:keyvalue` data. It exports either `wasi:http/handler` (p3) or
-    /// `incoming-handler` (p2). Its outbound HTTP goes only to `allowed`, items like `https://api.example.com` or
-    /// `https://*.example.com:8443`, and none at all if that is empty.
+    /// Compiles the component `wasm`, binary or WAT text.
+    pub fn compile(&self, wasm: &[u8]) -> Result<Component> {
+        Component::new(&self.engine, wasm)
+    }
+
+    /// Compiles the component `wasm` to native code, which any engine of the same `compat` loads with `native`.
+    pub fn precompile(&self, wasm: &[u8]) -> Result<Vec<u8>> {
+        self.engine.precompile_component(wasm)
+    }
+
+    /// Which native code this engine loads: what an engine of the same build and architecture made.
+    pub fn compat(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        self.engine.precompile_compatibility_hash().hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+
+    /// Loads the native code in the file at `path`, which it maps rather than reads.
+    ///
+    /// # Safety
+    ///
+    /// Loading native code runs it, so the file must hold what `precompile` made, and must not change while the
+    /// component lives.
+    pub unsafe fn native(&self, path: &Path) -> Result<Component> {
+        unsafe { Component::deserialize_file(&self.engine, path) }
+    }
+
+    /// Loads `code` as the app `name`, with `config` for its `wasi:config` and `kv`, which holds nothing else, for its
+    /// `wasi:keyvalue` data. It exports either `wasi:http/handler` (p3) or `incoming-handler` (p2). Its outbound HTTP
+    /// goes only to `allowed`, items like `https://api.example.com` or `https://*.example.com:8443`, and none at all if
+    /// that is empty.
     pub fn load(
         &self,
         name: &str,
         kv: Arc<dyn ObjectStore>,
-        wasm: impl AsRef<[u8]>,
+        code: &Component,
         config: BTreeMap<String, String>,
         allowed: &[String],
     ) -> Result<App> {
         let allow = allowed.iter().map(|a| Allow::parse(a)).collect::<Result<_, _>>().map_err(wasmtime::Error::msg)?;
-        let pre = self.linker.instantiate_pre(&Component::new(&self.engine, wasm)?)?;
+        let pre = self.linker.instantiate_pre(code)?;
         let pre = match p3::bindings::ServiceIndices::new(&pre) {
             Ok(_) => ProxyPre::P3(p3::bindings::ServicePre::new(pre)?),
             Err(_) => ProxyPre::P2(p2::bindings::ProxyPre::new(pre)?),
@@ -158,7 +189,7 @@ impl WorkerState for Worker {
     /// Runs once the worker is done, also after a trap or a timeout, when `result` is the cause.
     fn drop(&self, store: Store<Host>, result: Result<()>) {
         let (app, out, err) = (&store.data().app.name, self.out.contents(), self.err.contents());
-        _ = result.inspect_err(|e| tracing::warn!(app, "guest failed: {e}"));
+        _ = result.inspect_err(|e| tracing::warn!(app, "guest failed: {e:#}"));
         if !out.is_empty() {
             tracing::info!(app, stream = "stdout", "{}", String::from_utf8_lossy(&out).trim_end());
         }
@@ -185,7 +216,7 @@ impl App {
         span.in_scope(|| tracing::info!(method = %req.method(), path = req.uri().path()));
         let res = self.0.handle((), req.map(|b| b.map_err(Into::into).boxed_unsync())).instrument(span.clone()).await;
         res.unwrap_or_else(|e| {
-            span.in_scope(|| tracing::warn!("request failed: {e}"));
+            span.in_scope(|| tracing::warn!("request failed: {e:#}"));
             hyper::Response::builder().status(500).body(Default::default()).unwrap() // an empty body
         })
     }
