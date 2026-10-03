@@ -6,8 +6,8 @@ use std::{fs, sync::Arc, time::Duration, time::Instant};
 use torpor::{App, Engine};
 
 fn load(name: &str) -> App {
-    let wasm = fs::read(format!("tests/fixtures/{name}.wasm")).unwrap();
-    Engine::new().unwrap().load(name, Arc::new(InMemory::new()), wasm, Default::default(), &[]).unwrap()
+    let (engine, wasm) = (Engine::new().unwrap(), fs::read(format!("tests/fixtures/{name}.wasm")).unwrap());
+    engine.load(name, Arc::new(InMemory::new()), &engine.compile(&wasm).unwrap(), Default::default(), &[]).unwrap()
 }
 
 async fn get(app: &App, path: &str) -> (StatusCode, String) {
@@ -69,7 +69,9 @@ async fn spin(memories: &str) -> Duration {
             (instance $h (export "handle" (func $handle)))
             (export "wasi:http/incoming-handler@0.2.12" (instance $h)))"#
     );
-    let app = Engine::new().unwrap().load("wat", Arc::new(InMemory::new()), wat, Default::default(), &[]).unwrap();
+    let engine = Engine::new().unwrap();
+    let code = engine.compile(wat.as_bytes()).unwrap();
+    let app = engine.load("wat", Arc::new(InMemory::new()), &code, Default::default(), &[]).unwrap();
     let start = Instant::now();
     assert_eq!(get(&app, "/").await.0, 500);
     start.elapsed()

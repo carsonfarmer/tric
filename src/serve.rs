@@ -1,13 +1,13 @@
 //! `torpor serve`: runs every app of an install, or the app in a directory as an install of one, over HTTP/1.
-use crate::cli;
-use crate::state::{self, BLOBS, Current};
+use crate::state::{self, Current};
+use crate::{cli, compile};
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use hyper::body::{Body, Bytes, Incoming};
 use hyper::{Request, StatusCode, header::HOST, server::conn::http1, service::service_fn};
 use object_store::{ObjectStore, memory::InMemory, prefix::PrefixStore};
 use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, collections::HashMap, convert::Infallible, env, path::Path, sync::Arc};
-use tokio::{net::TcpListener, sync::Mutex, task::spawn_blocking, time::timeout};
+use tokio::{net::TcpListener, sync::Mutex, time::timeout};
 use torpor::{App, Engine, is_name};
 use wasmtime::{Error, Result};
 use wasmtime_wasi_http::{handler::Response, io::TokioIo};
@@ -21,6 +21,7 @@ const RECHECK_MAX: Duration = Duration::from_secs(1);
 /// Every app of an install, each served at `<app>.<any domain>`, and loaded at its first request.
 pub struct Install {
     store: Arc<dyn ObjectStore>,
+    native: Option<Arc<dyn ObjectStore>>,
     engine: Arc<Engine>,
     apps: Mutex<HashMap<String, Arc<Mutex<Served>>>>, // by name, each once it has had a release
 }
@@ -37,24 +38,24 @@ struct Served {
 type Load = Shared<BoxFuture<'static, Result<App, String>>>;
 
 impl Install {
-    /// The install in `store`.
-    pub fn new(store: Arc<dyn ObjectStore>) -> Result<Self> {
-        Ok(Self { engine: Engine::new()?.into(), store, apps: Mutex::default() })
+    /// The install in `store`, with its bucket of native code, if it has one.
+    pub fn new(store: Arc<dyn ObjectStore>, native: Option<Arc<dyn ObjectStore>>) -> Result<Self> {
+        Ok(Self { engine: Engine::new()?.into(), store, native, apps: Mutex::default() })
     }
 
     /// An install in memory of just the app in `dir`, released, with `TORPOR_VAR_<KEY>` as its secret `key`, so secrets
     /// stay out of files. It loads the app before returning, so one that a host would refuse fails here.
-    pub async fn dev(dir: &Path) -> Result<Self> {
+    pub async fn dev(dir: &Path) -> Result<Arc<Self>> {
         let store = Arc::new(InMemory::new());
         let (app, id) = cli::publish(&*store, dir, false).await?; // unchecked, as the load below checks it
         let secrets = env::vars().filter_map(|(k, v)| Some((k.strip_prefix(VAR_PREFIX)?.to_lowercase(), v))).collect();
         state::update(&*store, &app, |c| *c = Current { release: Some(id), secrets }).await?;
-        let install = Self::new(store)?;
+        let install = Arc::new(Self::new(store, None)?);
         install.app(&app).await?;
         Ok(install)
     }
 
-    async fn handle<B>(&self, req: Request<B>) -> Response
+    pub async fn handle<B>(self: Arc<Self>, req: Request<B>) -> Response
     where
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<wasmtime_wasi_http::Error>,
@@ -70,7 +71,7 @@ impl Install {
 
     /// The app `name`, loading it if it is new or its `current` changed. A name is kept only once it has had a release,
     /// so a made-up name costs a read each, and no memory.
-    async fn app(&self, name: &str) -> Result<Option<App>> {
+    async fn app(self: &Arc<Self>, name: &str) -> Result<Option<App>> {
         if !is_name(name) {
             return Ok(None);
         }
@@ -109,17 +110,16 @@ impl Install {
     }
 
     /// Loads the app `name` from its release `id`, with `secrets` over its config. The load is a task of its own, so it
-    /// runs to its end even if every request waiting for it goes away, and it compiles on a blocking thread, so a
-    /// compile never holds up the requests of apps that are already loaded.
-    fn load(&self, name: &str, id: &str, secrets: &BTreeMap<String, String>) -> Load {
-        let (store, engine, name, id, secrets) =
-            (self.store.clone(), self.engine.clone(), name.to_owned(), id.to_owned(), secrets.clone());
+    /// runs to its end even if every request waiting for it goes away.
+    fn load(self: &Arc<Self>, name: &str, id: &str, secrets: &BTreeMap<String, String>) -> Load {
+        let (install, name, id, secrets) = (self.clone(), name.to_owned(), id.to_owned(), secrets.clone());
         let task = tokio::spawn(async move {
-            let mut r = state::release(&*store, &name, &id).await?;
+            let (store, engine) = (&install.store, &install.engine);
+            let mut r = state::release(&**store, &name, &id).await?;
             r.config.extend(secrets);
-            let wasm = state::fetch(&*store, &name, BLOBS, &r.component).await?;
-            let kv = Arc::new(PrefixStore::new(store, state::kv(&name)));
-            spawn_blocking(move || engine.load(&name, kv, wasm, r.config, &r.allowed_outbound_hosts)).await?
+            let code = compile::component(&**store, install.native.as_deref(), engine, &name, &r.component).await?;
+            let kv = Arc::new(PrefixStore::new(store.clone(), state::kv(&name)));
+            engine.load(&name, kv, &code, r.config, &r.allowed_outbound_hosts)
         });
         task.map(|r| r.unwrap_or_else(|e| Err(e.into())).map_err(|e| e.to_string())).boxed().shared()
     }
@@ -129,14 +129,18 @@ fn status(code: StatusCode) -> Response {
     hyper::Response::builder().status(code).body(Default::default()).unwrap()
 }
 
-pub async fn run(install: Install, listener: TcpListener) -> Result<()> {
-    let install = Arc::new(install);
+/// Serves HTTP/1 on `listener`, each request with `handle`.
+pub async fn run<H, F>(listener: TcpListener, handle: H) -> Result<()>
+where
+    H: Fn(Request<Incoming>) -> F + Clone + Send + 'static,
+    F: Future<Output = Response> + Send + 'static,
+{
     loop {
         let (stream, _) = listener.accept().await?;
         _ = stream.set_nodelay(true); // best effort; otherwise Nagle plus delayed ACK stalls a response by ~40 ms
-        let install = install.clone();
+        let handle = handle.clone();
         tokio::spawn(async move {
-            let svc = service_fn(|req: Request<Incoming>| async { Ok::<_, Infallible>(install.handle(req).await) });
+            let svc = service_fn(move |req| handle(req).map(Ok::<_, Infallible>));
             http1::Builder::new().serve_connection(TokioIo::new(stream), svc).await.ok();
         });
     }
@@ -151,12 +155,13 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::sleep;
 
-    async fn get(install: &Install, host: &str, uri: &str) -> (StatusCode, String) {
-        let res = install.handle(Request::get(uri).header(HOST, host).body(Empty::<Bytes>::new()).unwrap()).await;
+    async fn get(install: &Arc<Install>, host: &str, uri: &str) -> (StatusCode, String) {
+        let res =
+            install.clone().handle(Request::get(uri).header(HOST, host).body(Empty::<Bytes>::new()).unwrap()).await;
         (res.status(), String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().into()).unwrap())
     }
 
-    async fn ok(install: &Install, host: &str, uri: &str) -> String {
+    async fn ok(install: &Arc<Install>, host: &str, uri: &str) -> String {
         let (status, body) = get(install, host, uri).await;
         assert_eq!(status, 200, "{host}{uri}: {body}");
         body
@@ -174,7 +179,8 @@ mod tests {
     async fn serves_a_dir() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut conn = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
-        tokio::spawn(run(Install::dev("tests/app".as_ref()).await.unwrap(), listener));
+        let install = Install::dev("tests/app".as_ref()).await.unwrap();
+        tokio::spawn(run(listener, move |req| install.clone().handle(req)));
         conn.write_all(b"GET / HTTP/1.1\r\nHost: hello.localhost\r\nConnection: close\r\n\r\n").await.unwrap();
         let mut res = String::new();
         conn.read_to_string(&mut res).await.unwrap();
@@ -193,7 +199,7 @@ mod tests {
         }
         assert_eq!(cli::secrets(&*store, "kv").await.unwrap(), ["token"]);
 
-        let install = Install::new(store.clone()).unwrap();
+        let install = Arc::new(Install::new(store.clone(), None).unwrap());
         assert_eq!(ok(&install, "hello.localhost:3000", "/").await, "hello");
         assert_eq!(ok(&install, "KV.example.com", "/config?key=token").await, r#"{"ok":"s3cret"}"#);
         ok(&install, "kv.localhost", "/kv?op=set&store=s&key=k&value=v").await;
@@ -229,7 +235,7 @@ mod tests {
         let blob = format!("apps/hello/blobs/sha256/{component}").as_str().into();
         let good = store.get(&blob).await.unwrap().bytes().await.unwrap();
         store.put(&blob, std::fs::read("tests/fixtures/hello-p2.wasm").unwrap().into()).await.unwrap();
-        let install = Install::new(store.clone()).unwrap();
+        let install = Arc::new(Install::new(store.clone(), None).unwrap());
         let e = install.app("hello").await.err().unwrap();
         assert!(e.to_string().contains("does not match its hash"), "{e}");
         store.put(&blob, good.into()).await.unwrap();
@@ -243,7 +249,7 @@ mod tests {
     async fn a_hung_recheck_serves_the_last_read() {
         let store = Arc::new(ThrottledStore::new(InMemory::new(), ThrottleConfig::default()));
         ship(&*store, "tests/app").await;
-        let install = Install::new(store.clone()).unwrap();
+        let install = Arc::new(Install::new(store.clone(), None).unwrap());
         assert_eq!(ok(&install, "hello.localhost", "/").await, "hello");
         store.config_mut(|c| c.wait_get_per_call = Duration::from_secs(60));
         sleep(FRESH).await;
@@ -257,7 +263,7 @@ mod tests {
     async fn a_load_outlives_its_requests() {
         let store = Arc::new(ThrottledStore::new(InMemory::new(), ThrottleConfig::default()));
         ship(&*store, "tests/app").await;
-        let install = Install::new(store.clone()).unwrap();
+        let install = Arc::new(Install::new(store.clone(), None).unwrap());
         store.config_mut(|c| c.wait_get_per_call = Duration::from_millis(200));
         assert!(timeout(Duration::from_millis(300), install.app("hello")).await.is_err()); // gone while it fetches
         sleep(Duration::from_secs(2)).await; // the load's fetches finish meanwhile

@@ -64,7 +64,7 @@ pub fn load(store: &Arc<Counting>, fixture: &str, allow: &[&str]) -> App {
     let config = [("greeting".to_string(), "hi".to_string()), ("empty".to_string(), String::new())];
     let allow: Vec<String> = allow.iter().map(|a| a.to_string()).collect();
     let (kv, wasm) = (PrefixStore::new(store.clone(), "kv/app"), fs::read(format!("tests/fixtures/{fixture}.wasm")));
-    ENGINE.load("app", Arc::new(kv), wasm.unwrap(), config.into(), &allow).unwrap()
+    ENGINE.load("app", Arc::new(kv), &ENGINE.compile(&wasm.unwrap()).unwrap(), config.into(), &allow).unwrap()
 }
 
 pub async fn get(app: &App, path: &str) -> (u16, String) {

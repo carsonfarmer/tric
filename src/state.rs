@@ -4,10 +4,14 @@
 //! - `apps/<app>/blobs/sha256/<hash>`: components, in the OCI image layout, so a registry copy is a byte copy;
 //! - `apps/<app>/releases/<hash>`: the app's releases;
 //! - `apps/<app>/current`: the release it runs, and its secrets;
-//! - `kv/<app>/<bucket>/<key>`: its `wasi:keyvalue` data, which only hosts write.
+//! - `kv/<app>/<bucket>/<key>`: its `wasi:keyvalue` data, which only hosts write;
+//! - `compile/<app>/<hash>`: a marker that asks the compile function for the component's native code.
 //!
 //! Nothing read back is trusted: every read is capped, parsed strictly, and content-addressed objects are checked
 //! against their hash. Writes have the same caps, so nothing is written that a read would refuse.
+//!
+//! An install may also have a bucket of native code, which only the compile function writes, at
+//! `<app>/<hash>/<compat>.zst`. It is under the app, so an app loads only native code made from its own component.
 use hyper::body::Bytes;
 use object_store::{Error as E, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
 use serde::{Deserialize, Serialize};
@@ -17,6 +21,7 @@ use torpor::{NAME_MAX, is_name};
 use wasmtime::{Result, bail, ensure, error::Context};
 
 const CURRENT: &str = "current";
+const MARKERS: &str = "compile/";
 const JSON_MAX: u64 = 64 << 10; // a release id, config and secrets, so a host keeping one per app stays small
 pub const BLOBS: Kind = Kind { dir: "blobs/sha256", max: 128 << 20 };
 pub const RELEASES: Kind = Kind { dir: "releases", max: JSON_MAX };
@@ -45,14 +50,34 @@ pub struct Release {
     pub allowed_outbound_hosts: Vec<String>,
 }
 
-/// `app`'s `object`, if `app` is a name a host would serve.
-pub fn path(app: &str, object: &str) -> Result<String> {
+/// `app`, if it is a name a host would serve.
+fn checked(app: &str) -> Result<&str> {
     ensure!(is_name(app), "an app name is 1 to {NAME_MAX} of a-z, 0-9 and -, not {app:?}");
-    Ok(format!("apps/{app}/{object}"))
+    Ok(app)
+}
+
+/// `app`'s `object`.
+pub fn path(app: &str, object: &str) -> Result<String> {
+    Ok(format!("apps/{}/{object}", checked(app)?))
 }
 
 pub fn kv(app: &str) -> String {
     format!("kv/{app}")
+}
+
+/// The marker that asks for the native code of `app`'s component `hash`.
+pub fn marker(app: &str, hash: &str) -> Result<String> {
+    Ok(format!("{MARKERS}{}/{hash}", checked(app)?))
+}
+
+/// The app and the hash that the marker `key` names.
+pub fn marked(key: &str) -> Option<(&str, &str)> {
+    key.strip_prefix(MARKERS)?.split_once('/')
+}
+
+/// Where the native code of `app`'s component `hash` is in the bucket of native code, for engines of `compat`.
+pub fn native(app: &str, hash: &str, compat: &str) -> Result<String> {
+    Ok(format!("{}/{hash}/{compat}.zst", checked(app)?))
 }
 
 /// The object at `path` and its version, or `None` if there is none.
