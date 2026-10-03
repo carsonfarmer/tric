@@ -9,7 +9,7 @@ use wasmtime::component::Resource;
 
 const KEY_MAX: usize = 256; // bytes, before percent-encoding
 const VALUE_MAX: usize = 1 << 20;
-pub const NAME_MAX: usize = 63; // bytes in a bucket, app or team name: a DNS label, as an app's is
+pub const NAME_MAX: usize = 63; // bytes in a bucket or app name: a DNS label, as an app's is
 const PAGE: usize = 1000; // keys per `list-keys`, the most S3 gives for one LIST
 const BATCH_MAX: usize = 16 << 20; // bytes of values in one `get-many` reply
 const RETRIES: usize = 16; // CAS attempts for one `increment`
@@ -28,8 +28,7 @@ fn other(e: impl ToString) -> Error {
     Error::Other(e.to_string())
 }
 
-/// Whether `s` can name a bucket, an app or a team, which all become one segment of a key: 1 to 63 of `a-z`, `0-9` and
-/// `-`.
+/// Whether `s` can name a bucket or an app, which both become one segment of a key: 1 to 63 of `a-z`, `0-9` and `-`.
 pub fn is_name(s: &str) -> bool {
     (1..=NAME_MAX).contains(&s.len()) && s.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
 }

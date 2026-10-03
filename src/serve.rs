@@ -1,43 +1,37 @@
 //! `torpor serve`: runs the app in a directory, or every app of an install, over HTTP/1.
 use crate::cli;
-use crate::state::{self, BLOB_MAX, Current, FRESH, INDEX, Index};
-use age::x25519::Identity;
+use crate::state::{self, BLOB_MAX, BLOBS, Current, FRESH};
 use hyper::body::{Body, Bytes, Incoming};
 use hyper::{Request, StatusCode, header::HOST, server::conn::http1, service::service_fn};
 use object_store::{ObjectStore, memory::InMemory};
-use serde::de::DeserializeOwned;
 use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, collections::HashMap, convert::Infallible, env, path::Path, sync::Arc};
 use tokio::{net::TcpListener, sync::Mutex, task::spawn_blocking, time::timeout};
-use torpor::{App, Engine};
-use wasmtime::{Error, Result, bail};
+use torpor::{App, Engine, is_name};
+use wasmtime::{Error, Result};
 use wasmtime_wasi_http::{handler::Response, io::TokioIo};
 
 const VAR_PREFIX: &str = "TORPOR_VAR_";
-/// The longest one recheck may hold up requests, and a request can meet two: the index's and its app's. The S3 client
-/// on its own retries for up to 3 minutes.
+/// The longest a recheck may hold up a request. The S3 client on its own retries for up to 3 minutes.
 const RECHECK_MAX: Duration = Duration::from_secs(1);
 
 /// What a host serves.
 pub enum Apps {
     Dir(App),
-    Install(Box<Install>),
+    Install(Install),
 }
 
 /// Every app of an install, each served at `<app>.<any domain>`, and loaded at its first request.
 pub struct Install {
     store: Arc<dyn ObjectStore>,
     engine: Arc<Engine>,
-    identity: Option<Identity>,                       // decrypts secrets
-    index: Mutex<(Index, Option<String>, Instant)>,   // with its ETag and when it was read
-    apps: Mutex<HashMap<String, Arc<Mutex<Served>>>>, // by name
+    apps: Mutex<HashMap<String, Arc<Mutex<Served>>>>, // by name, each with a release
 }
 
 /// One app as a host last read it, and the app loaded from its release or why that failed. A failure stands until the
 /// next recheck, so a broken release costs one load per `FRESH`, not one per request.
 #[derive(Default)]
 struct Served {
-    team: String,
     current: Current,
     etag: Option<String>,
     read: Option<Instant>,
@@ -53,12 +47,10 @@ impl Apps {
         Ok(Self::Dir(engine.load(&m.name, "", wasm, m.config, &m.allowed_outbound_hosts)?))
     }
 
-    /// The install in `store`. Its index is read now, so a host that can't read it never starts.
-    pub async fn install(store: Arc<dyn ObjectStore>, identity: Option<Identity>) -> Result<Self> {
-        let (i, etag) = state::read(&*store, INDEX, None).await?.map_or_else(Default::default, |(i, v)| (i, v.e_tag));
-        let (index, apps) = (Mutex::new((i, etag, Instant::now())), Mutex::default());
+    /// The install in `store`.
+    pub fn install(store: Arc<dyn ObjectStore>) -> Result<Self> {
         let engine = Engine::new(store.clone())?.into();
-        Ok(Self::Install(Box::new(Install { engine, store, identity, index, apps })))
+        Ok(Self::Install(Install { engine, store, apps: Mutex::default() }))
     }
 
     async fn handle<B>(&self, req: Request<B>) -> Response
@@ -79,63 +71,52 @@ impl Apps {
 }
 
 impl Install {
-    /// The app `req` is for, named by the first label of its host, loading it if it is new or its release changed.
+    /// The app `req` is for, named by the first label of its host, loading it if it is new or its release changed. A
+    /// name with nothing released is not kept, so made-up names cost a read each, and no memory.
     async fn route<B>(&self, req: &Request<B>) -> Result<Option<App>> {
         let host = req.headers().get(HOST).and_then(|h| h.to_str().ok()).unwrap_or_default();
         let name = host.split(['.', ':']).next().unwrap_or_default().to_ascii_lowercase();
-        let team = {
-            let mut i = self.index.lock().await;
-            if i.2.elapsed() >= FRESH {
-                match self.recheck(INDEX, i.1.clone()).await {
-                    Ok(Some((index, v))) => (i.0, i.1) = (index, v.e_tag),
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!("serving the last index read: {e}"), // and trying again at `FRESH`
-                }
-                i.2 = Instant::now();
-                self.apps.lock().await.retain(|app, _| i.0.contains_key(app));
-            }
-            let Some(team) = i.0.get(&name) else { return Ok(None) };
-            team.clone()
-        };
+        if !is_name(&name) {
+            return Ok(None);
+        }
         let served = self.apps.lock().await.entry(name.clone()).or_default().clone();
         let s = &mut *served.lock().await;
-        if s.team != team {
-            *s = Served { team, ..Default::default() }; // new, or moved to another team
-        }
         if s.read.is_none_or(|r| r.elapsed() >= FRESH) {
-            match self.recheck(&state::current(&s.team, &name), s.etag.clone()).await {
-                Ok(Some((current, v))) => (s.current, s.etag, s.app) = (current, v.e_tag, None),
+            match self.recheck(&name, s.etag.clone()).await {
+                Ok(Some((current, v))) => (s.current, s.etag, s.app) = (current, v.and_then(|v| v.e_tag), None),
                 Ok(None) => {}
                 Err(e) if s.read.is_some() => tracing::warn!("serving {name} as last read: {e}"),
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.apps.lock().await.remove(&name); // never read, so not kept
+                    return Err(e);
+                }
             }
             s.read = Some(Instant::now());
             s.app.take_if(|a| a.is_err());
         }
-        let Some(release) = &s.current.release else { return Ok(None) };
+        let Some(release) = &s.current.release else {
+            self.apps.lock().await.remove(&name);
+            return Ok(None);
+        };
         if s.app.is_none() {
-            s.app = Some(self.load(&name, &s.team, release, &s.current.secrets).await.map_err(|e| e.to_string()));
+            s.app = Some(self.load(&name, release, &s.current.secrets).await.map_err(|e| e.to_string()));
         }
         Ok(Some(s.app.clone().expect("loaded above").map_err(Error::msg)?))
     }
 
-    /// The app `name` of `team` from its release `id`, with `secrets` decrypted over its config, and its component
-    /// compiled on a blocking thread, so a compile never holds up the requests of apps that are already loaded.
-    async fn load(&self, name: &str, team: &str, id: &str, secrets: &BTreeMap<String, String>) -> Result<App> {
-        let r = state::release(&*self.store, &state::releases(team, name), id).await?;
-        let mut config = r.config;
-        for (key, sealed) in secrets {
-            let Some(identity) = &self.identity else { bail!("{name} has secrets, and there is no identity") };
-            config.insert(key.clone(), String::from_utf8(age::decrypt(identity, sealed.as_bytes())?)?);
-        }
-        let wasm = state::fetch(&*self.store, &state::blobs(team), &r.component, BLOB_MAX).await?;
-        let (engine, name, kv) = (self.engine.clone(), name.to_owned(), state::kv(team, name));
-        spawn_blocking(move || engine.load(&name, &kv, wasm, config, &r.allowed_outbound_hosts)).await?
+    /// The app `name` from its release `id`, with `secrets` over its config, and its component compiled on a blocking
+    /// thread, so a compile never holds up the requests of apps that are already loaded.
+    async fn load(&self, name: &str, id: &str, secrets: &BTreeMap<String, String>) -> Result<App> {
+        let mut r = state::release(&*self.store, name, id).await?;
+        r.config.extend(secrets.clone());
+        let wasm = state::fetch(&*self.store, &state::path(name, BLOBS), &r.component, BLOB_MAX).await?;
+        let (engine, name, kv) = (self.engine.clone(), name.to_owned(), state::kv(name));
+        spawn_blocking(move || engine.load(&name, &kv, wasm, r.config, &r.allowed_outbound_hosts)).await?
     }
 
-    /// `state::read`, given up at `RECHECK_MAX`.
-    async fn recheck<T: DeserializeOwned>(&self, path: &str, etag: Option<String>) -> state::Read<T> {
-        timeout(RECHECK_MAX, state::read(&*self.store, path, etag)).await.unwrap_or_else(|e| Err(e.into()))
+    /// `state::current`, given up at `RECHECK_MAX`.
+    async fn recheck(&self, name: &str, etag: Option<String>) -> state::Read {
+        timeout(RECHECK_MAX, state::current(&*self.store, name, etag)).await.unwrap_or_else(|e| Err(e.into()))
     }
 }
 
@@ -176,9 +157,8 @@ mod tests {
         body
     }
 
-    /// Puts the app in `dir` in `team`, then publishes and releases it, and returns the release's id.
-    async fn ship(store: &dyn ObjectStore, team: &str, dir: &str) -> String {
-        cli::assign(store, &cli::read(dir.as_ref()).unwrap().0.name, Some(team)).await.unwrap();
+    /// Publishes and releases the app in `dir`, and returns the release's id.
+    async fn ship(store: &dyn ObjectStore, dir: &str) -> String {
         let (app, id) = cli::publish(store, dir.as_ref()).await.unwrap();
         cli::release(store, &app, &id).await.unwrap();
         id
@@ -196,44 +176,44 @@ mod tests {
         assert!(res.starts_with("HTTP/1.1 200") && res.contains("hello"), "{res}");
     }
 
-    /// Two apps of two teams, served by subdomain, one with a secret. Then one gets a new release and the other a new
-    /// team, and then the first goes back to its old release and the second out of the install.
+    /// Two apps served by subdomain, one with a secret. Then one gets a new release and the other is taken offline, and
+    /// then the first goes back to its old release.
     #[tokio::test]
     async fn publishes_releases_and_serves() {
         let store = Arc::new(InMemory::new());
-        assert!(cli::publish(&*store, "tests/app".as_ref()).await.is_err()); // not in the index
-        ship(&*store, "a", "tests/app").await;
-        let first = ship(&*store, "b", "tests/kv").await;
-        let identity = Identity::generate();
-        cli::set_secret(&*store, "kv", "token", "s3cret", &identity.to_public().to_string()).await.unwrap();
-        assert_eq!(cli::secrets(&*store, "kv").await.unwrap(), ["token"]); // with no identity at all
+        ship(&*store, "tests/app").await;
+        let first = ship(&*store, "tests/kv").await;
+        for (name, value) in [("token", "s3cret"), ("gone", "x"), ("gone", "")] {
+            cli::set_secret(&*store, "kv", name, value).await.unwrap();
+        }
+        assert_eq!(cli::secrets(&*store, "kv").await.unwrap(), ["token"]);
 
-        let apps = Apps::install(store.clone(), Some(identity)).await.unwrap();
-        let etag = state::read::<Index>(&*store, INDEX, None).await.unwrap().unwrap().1.e_tag;
-        assert!(state::read::<Index>(&*store, INDEX, etag).await.unwrap().is_none()); // a recheck of no change reads nothing
+        let apps = Apps::install(store.clone()).unwrap();
+        let etag = state::current(&*store, "kv", None).await.unwrap().unwrap().1.unwrap().e_tag;
+        assert!(state::current(&*store, "kv", etag).await.unwrap().is_none()); // a recheck of no change reads nothing
         assert_eq!(ok(&apps, "hello.localhost:3000", "/").await, "hello");
         assert_eq!(ok(&apps, "KV.example.com", "/config?key=token").await, r#"{"ok":"s3cret"}"#);
         ok(&apps, "kv.localhost", "/kv?op=set&store=s&key=k&value=v").await;
-        store.head(&"kv/b/kv/s/k".into()).await.unwrap();
-        for host in ["nope.localhost", "localhost", ""] {
+        store.head(&"kv/kv/s/k".into()).await.unwrap();
+        for host in ["nope.localhost", "localhost", "", "a/b.localhost"] {
             assert_eq!(get(&apps, host, "/").await.0, 404);
         }
+        let Apps::Install(install) = &apps else { unreachable!() };
+        assert_eq!(install.apps.lock().await.len(), 2); // the names with nothing released are not kept
 
-        let dir = state::releases("b", "kv");
-        let mut r = state::release(&*store, &dir, &first).await.unwrap();
+        let dir = state::path("kv", state::RELEASES);
+        let mut r = state::release(&*store, "kv", &first).await.unwrap();
         r.config.insert("greeting".into(), "bye".into());
         let second = state::add(&*store, &dir, serde_json::to_vec(&r).unwrap().into(), state::JSON_MAX).await.unwrap();
         cli::release(&*store, "kv", &second).await.unwrap();
-        cli::assign(&*store, "hello", Some("c")).await.unwrap();
+        store.delete(&state::path("hello", state::CURRENT).into()).await.unwrap();
         sleep(FRESH).await;
         assert_eq!(ok(&apps, "kv.localhost", "/config?key=greeting").await, r#"{"ok":"bye"}"#);
         assert_eq!(ok(&apps, "kv.localhost", "/config?key=token").await, r#"{"ok":"s3cret"}"#);
-        assert_eq!(get(&apps, "hello.localhost", "/").await.0, 404); // team c has published nothing
+        assert_eq!(get(&apps, "hello.localhost", "/").await.0, 404);
 
         cli::release(&*store, "kv", &first).await.unwrap();
         assert!(cli::release(&*store, "kv", "nope").await.is_err());
-        cli::assign(&*store, "hello", None).await.unwrap();
-        assert!(cli::secrets(&*store, "hello").await.is_err());
         sleep(FRESH).await;
         assert_eq!(ok(&apps, "kv.localhost", "/config?key=greeting").await, r#"{"ok":"hi"}"#);
         let releases = cli::releases(&*store, "kv").await.unwrap();
@@ -243,12 +223,12 @@ mod tests {
     #[tokio::test]
     async fn refuses_a_blob_that_does_not_match_its_hash() {
         let store = Arc::new(InMemory::new());
-        let id = ship(&*store, "a", "tests/app").await;
-        let component = state::release(&*store, &state::releases("a", "hello"), &id).await.unwrap().component;
-        let blob = format!("{}/{component}", state::blobs("a")).as_str().into();
+        let id = ship(&*store, "tests/app").await;
+        let component = state::release(&*store, "hello", &id).await.unwrap().component;
+        let blob = format!("{}/{component}", state::path("hello", BLOBS)).as_str().into();
         let good = store.get(&blob).await.unwrap().bytes().await.unwrap();
         store.put(&blob, std::fs::read("tests/fixtures/hello-p2.wasm").unwrap().into()).await.unwrap();
-        let apps = Apps::install(store.clone(), None).await.unwrap();
+        let apps = Apps::install(store.clone()).unwrap();
         let Apps::Install(install) = &apps else { unreachable!() };
         let e =
             install.route(&Request::get("/").header(HOST, "hello.localhost").body(()).unwrap()).await.err().unwrap();
@@ -263,25 +243,24 @@ mod tests {
     #[tokio::test]
     async fn a_hung_recheck_serves_the_last_read() {
         let store = Arc::new(ThrottledStore::new(InMemory::new(), ThrottleConfig::default()));
-        ship(&*store, "a", "tests/app").await;
-        let apps = Apps::install(store.clone(), None).await.unwrap();
+        ship(&*store, "tests/app").await;
+        let apps = Apps::install(store.clone()).unwrap();
         assert_eq!(ok(&apps, "hello.localhost", "/").await, "hello");
         store.config_mut(|c| c.wait_get_per_call = Duration::from_secs(60));
         sleep(FRESH).await;
         let start = Instant::now();
         assert_eq!(ok(&apps, "hello.localhost", "/").await, "hello");
-        assert!(start.elapsed() < 3 * RECHECK_MAX); // the index's recheck, then the app's
+        assert!(start.elapsed() < 2 * RECHECK_MAX);
     }
 
-    /// Calls that wait let both changes read the index before either writes it, so one loses the swap and retries.
+    /// Calls that wait let both changes read `current` before either writes it, so one loses the swap and retries.
     #[tokio::test]
     async fn concurrent_changes_both_land() {
         let ms = Duration::from_millis(10);
         let config = ThrottleConfig { wait_get_per_call: ms, wait_put_per_call: ms, ..Default::default() };
         let store = ThrottledStore::new(InMemory::new(), config);
-        cli::assign(&store, "a", Some("t")).await.unwrap(); // so the race is over a conditional update, not a create
-        tokio::try_join!(cli::assign(&store, "b", Some("t")), cli::assign(&store, "c", Some("t"))).unwrap();
-        let index: Index = state::read(&store, INDEX, None).await.unwrap().unwrap().0;
-        assert_eq!(index.keys().collect::<Vec<_>>(), ["a", "b", "c"]);
+        cli::set_secret(&store, "app", "a", "1").await.unwrap(); // so the race is over a conditional update, not a create
+        tokio::try_join!(cli::set_secret(&store, "app", "b", "2"), cli::set_secret(&store, "app", "c", "3")).unwrap();
+        assert_eq!(cli::secrets(&store, "app").await.unwrap(), ["a", "b", "c"]);
     }
 }

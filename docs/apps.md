@@ -25,31 +25,29 @@ greeting = "hi"
 | `[config]` | Keys and values the app reads through `wasi:config`. Values must be strings. |
 
 - **Typos:** an unknown field is an error, so a misspelled `allowed_outbound_hosts` stops `torpor serve` at start-up instead of leaving the app with no outbound access. So does a bad allow-list entry.
-- **Secrets** never go in the manifest. In an install they come from [`torpor secrets set`](#releasing). In a directory, `torpor serve` turns each environment variable `TORPOR_VAR_<KEY>` into the config key `<key>`, lowercased: `TORPOR_VAR_API_KEY=s3cret` gives the app `api_key`. A variable overrides the same key in `[config]`. Either way the app reads config and secrets through `wasi:config` as one flat set. Use lowercase keys in `[config]`, or an override will not match.
+- **Secrets** never go in the manifest. In an install they come from [`torpor secret`](#releasing). In a directory, `torpor serve` turns each environment variable `TORPOR_VAR_<KEY>` into the config key `<key>`, lowercased: `TORPOR_VAR_API_KEY=s3cret` gives the app `api_key`. A variable overrides the same key in `[config]`. Either way the app reads config and secrets through `wasi:config` as one flat set. Use lowercase keys in `[config]`, or an override will not match.
 
 ## Releasing
 
 An install is one bucket. Name it with `--store s3://BUCKET` or `TORPOR_STORE`. Credentials, the region and an endpoint (for MinIO and the like) come from the usual `AWS_` variables. There is no other auth: the bucket's IAM decides who may change what.
 
-- **Teams.** Each app belongs to a team, and everything of an app's sits under its team's prefix in the bucket, so one IAM policy can keep each team to its own apps. Only the admin, who writes the install's `index`, can add apps or move them between teams.
+- **Teams.** App names are global, and a team owns the apps named `<team>-…`: its IAM role can reach only those, so team `acme` publishes `acme-blog`, served at `acme-blog.<domain>`. There is nothing to create first: publishing an app creates it.
 - **Releases.** A release is the component, `[config]` and `allowed_outbound_hosts` of one `torpor.toml`, and its id is the hash of those. Releases never change. An app serves at most one of them, which `torpor release` picks.
 
 | Command | Who | What it does |
 |---|---|---|
-| `torpor apps add APP TEAM` | admin | Adds APP to TEAM. Run on an app already in a team, it moves the app, which starts in its new team with nothing released, no secrets and no KV data. |
-| `torpor apps remove APP` | admin | Stops serving APP. Its objects stay in the bucket. |
 | `torpor publish [DIR]` | team | Uploads the app in DIR (default `.`) as a release, without serving it, and prints `APP ID`. It refuses a component that would not load. |
 | `torpor release APP ID` | team | Serves APP from its release ID. To roll back, release an older ID. |
 | `torpor releases APP` | team | Lists APP's release IDs, newest first, each with when it was first published. |
-| `torpor secrets set APP NAME` | team | Sets APP's secret NAME to stdin, less one trailing newline. The value is encrypted to the age recipient in `--recipient` or `TORPOR_RECIPIENT`. |
-| `torpor secrets list APP` | team | Prints the names of APP's secrets. It never decrypts anything. |
-| `torpor serve --store ...` | host | Serves every app. Secrets are decrypted with the age identity in `--identity` or `TORPOR_IDENTITY`. |
+| `torpor secret APP NAME` | team | Sets APP's secret NAME to stdin, less one trailing newline. An empty value removes it. |
+| `torpor secrets APP` | team | Prints the names of APP's secrets. |
+| `torpor serve --store ...` | host | Serves every app. |
 
 Publishing and releasing in one go is `torpor release $(torpor publish DIR)`.
 
-- **Propagation:** a host rechecks the index and each app it serves when its view is 5 s old, so a change is live everywhere within 5 s. `release`, `apps` and `secrets set` wait that long before they return. If a recheck fails or takes over a second, the host goes on serving what it last read.
-- **Secrets** belong to the app, not to a release: `secrets set` takes effect without a release, and releasing an older ID keeps today's secrets, so rolling back never brings back a rotated one. A secret overrides the `[config]` key of the same name.
-- **Routing:** an install serves each app at its own subdomain: the first label of `Host`, lowercased, names the app, and the request reaches it unchanged. Locally, `curl hello.localhost:3000` reaches `hello`. A host that names no app, or an app with nothing released, gets an empty `404`.
+- **Propagation:** a host rechecks an app when a request finds its view of it 5 s old, so a change is live everywhere within 5 s of the command returning. If a recheck fails or takes over a second, the host goes on serving what it last read.
+- **Secrets** belong to the app, not to a release: `secret` takes effect without a release, and releasing an older ID keeps today's secrets, so rolling back never brings back a rotated one. A secret overrides the `[config]` key of the same name. Values are stored as they are, so anyone who can read the app's objects can read them: its team, and the install's hosts.
+- **Routing:** an install serves each app at its own subdomain: the first label of `Host`, lowercased, names the app, and the request reaches it unchanged. Locally, `curl hello.localhost:3000` reaches `hello`. A host that names no app, or an app with nothing released, gets an empty `404`. To take an app offline, delete `apps/APP/current` from the bucket; that also drops its secrets.
 - **A release that fails to load** gets an empty `500`, and the host tries it again at its next recheck, not on every request.
 - **Logs:** each request is logged at `info` with its method and path, in a span tagged with the app. `RUST_LOG='warn,[request{app=hello}]=info'` turns on request lines for `hello` only.
 

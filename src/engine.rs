@@ -64,7 +64,7 @@ impl Engine {
     }
 
     /// Loads the component `wasm` (binary, or WAT text) as the app `name`, with `config` for its `wasi:config` and its
-    /// `wasi:keyvalue` data under the prefix `kv`, like `kv/team/app`. It exports either `wasi:http/handler` (p3) or
+    /// `wasi:keyvalue` data under the prefix `kv`, like `kv/app`. It exports either `wasi:http/handler` (p3) or
     /// `incoming-handler` (p2). Its outbound HTTP goes only to `allowed`, items like `https://api.example.com` or
     /// `https://*.example.com:8443`, and none at all if that is empty.
     pub fn load(

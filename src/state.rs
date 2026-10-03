@@ -1,37 +1,36 @@
-//! What an install keeps in its bucket. Only the admin writes the index, which names each app's team. Everything else
-//! sits under the team's name, so the store's IAM can keep each team to its own:
+//! What an install keeps in its bucket. Everything a team writes sits under the app's name, so the store's IAM can give
+//! each team the apps named `<team>-…`:
 //!
-//! - `blobs/<team>/sha256/<hash>`: components, in the OCI image layout, so a registry copy is a byte copy;
-//! - `apps/<team>/<app>/releases/<hash>`: the app's releases;
-//! - `apps/<team>/<app>/current`: the release it runs, and its secrets;
-//! - `kv/<team>/<app>/<bucket>/<key>`: its `wasi:keyvalue` data, which only hosts write.
+//! - `apps/<app>/blobs/sha256/<hash>`: components, in the OCI image layout, so a registry copy is a byte copy;
+//! - `apps/<app>/releases/<hash>`: the app's releases;
+//! - `apps/<app>/current`: the release it runs, and its secrets;
+//! - `kv/<app>/<bucket>/<key>`: its `wasi:keyvalue` data, which only hosts write.
 //!
 //! Nothing read back is trusted: every read is capped, parsed strictly, and content-addressed objects are checked
 //! against their hash.
 use hyper::body::Bytes;
 use object_store::{Error as E, GetOptions, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::hash::{BuildHasher, RandomState};
 use std::{collections::BTreeMap, time::Duration};
 use tokio::time::sleep;
 use wasmtime::{Result, bail, ensure};
 
-pub const INDEX: &str = "index";
+pub const BLOBS: &str = "blobs/sha256";
+pub const RELEASES: &str = "releases";
+pub const CURRENT: &str = "current";
 pub const BLOB_MAX: u64 = 128 << 20;
-pub const JSON_MAX: u64 = 8 << 20; // an index of about 100k apps
+pub const JSON_MAX: u64 = 8 << 20;
 const SWAPS: usize = 32; // attempts at one change before giving up
 const PAUSE_MAX: u64 = 1000; // ms, the longest wait after a lost swap
 /// How stale a host's view may get, so also how long a change takes to be live everywhere.
 pub const FRESH: Duration = Duration::from_secs(5);
 
-/// Each app's team.
-pub type Index = BTreeMap<String, String>;
-/// An object read back with its version, or `None` for no such object, or none newer.
-pub type Read<T> = Result<Option<(T, UpdateVersion)>>;
+/// An app's `current` and its version, which is `None` while there is no `current`, or `None` overall if it is unchanged.
+pub type Read = Result<Option<(Current, Option<UpdateVersion>)>>;
 
-/// The release an app runs, and its secrets. Each secret is age-encrypted on its own, so names show without decrypting.
-/// They outlive releases, and override config of the same name.
+/// The release an app runs, and its secrets, which outlive releases and override config of the same name.
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Current {
@@ -48,20 +47,13 @@ pub struct Release {
     pub allowed_outbound_hosts: Vec<String>,
 }
 
-pub fn blobs(team: &str) -> String {
-    format!("blobs/{team}/sha256")
+/// `app`'s `object`, one of the three above.
+pub fn path(app: &str, object: &str) -> String {
+    format!("apps/{app}/{object}")
 }
 
-pub fn releases(team: &str, app: &str) -> String {
-    format!("apps/{team}/{app}/releases")
-}
-
-pub fn current(team: &str, app: &str) -> String {
-    format!("apps/{team}/{app}/current")
-}
-
-pub fn kv(team: &str, app: &str) -> String {
-    format!("kv/{team}/{app}")
+pub fn kv(app: &str) -> String {
+    format!("kv/{app}")
 }
 
 /// The object `<dir>/<hash>`, refused if it is over `max` bytes or its hash is not `hash`.
@@ -84,36 +76,35 @@ pub async fn add(store: &dyn ObjectStore, dir: &str, bytes: Bytes, max: u64) -> 
     }
 }
 
-/// The release `id` in `dir`, one of `releases`.
-pub async fn release(store: &dyn ObjectStore, dir: &str, id: &str) -> Result<Release> {
-    Ok(serde_json::from_slice(&fetch(store, dir, id, JSON_MAX).await?)?)
+/// `app`'s release `id`.
+pub async fn release(store: &dyn ObjectStore, app: &str, id: &str) -> Result<Release> {
+    Ok(serde_json::from_slice(&fetch(store, &path(app, RELEASES), id, JSON_MAX).await?)?)
 }
 
-/// The object at `path` and its version, or `None` if there is none or its ETag is still `etag`.
-pub async fn read<T: DeserializeOwned>(store: &dyn ObjectStore, path: &str, etag: Option<String>) -> Read<T> {
-    match store.get_opts(&path.into(), GetOptions { if_none_match: etag, ..Default::default() }).await {
+/// `app`'s `current`, or `None` if its ETag is still `etag`. No `current` reads as the default.
+pub async fn current(store: &dyn ObjectStore, app: &str, etag: Option<String>) -> Read {
+    let path = path(app, CURRENT);
+    match store.get_opts(&path.as_str().into(), GetOptions { if_none_match: etag, ..Default::default() }).await {
         Ok(r) => {
             ensure!(r.meta.size <= JSON_MAX, "{path} is over {JSON_MAX} bytes");
             let version = UpdateVersion { e_tag: r.meta.e_tag.clone(), version: r.meta.version.clone() };
-            Ok(Some((serde_json::from_slice(&r.bytes().await?)?, version)))
+            Ok(Some((serde_json::from_slice(&r.bytes().await?)?, Some(version))))
         }
-        Err(E::NotFound { .. } | E::NotModified { .. }) => Ok(None),
+        Err(E::NotFound { .. }) => Ok(Some(Default::default())),
+        Err(E::NotModified { .. }) => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
 
-/// Applies `change` to the object at `path`, or to a default one, and swaps the result in with a conditional write.
-/// After losing a race it waits up to a second and starts again from the winner's, so `change` must be safe to repeat.
-pub async fn update<T: Default + Serialize + DeserializeOwned>(
-    store: &dyn ObjectStore,
-    path: &str,
-    mut change: impl FnMut(&mut T),
-) -> Result<()> {
+/// Applies `change` to `app`'s `current` and swaps the result in with a conditional write. After losing a race it
+/// waits up to a second and starts again from the winner's, so `change` must be safe to repeat.
+pub async fn update(store: &dyn ObjectStore, app: &str, mut change: impl FnMut(&mut Current)) -> Result<()> {
+    let path = path(app, CURRENT);
     for _ in 0..SWAPS {
-        let first = (T::default(), PutMode::Create);
-        let (mut value, mode) = read(store, path, None).await?.map_or(first, |(v, ver)| (v, PutMode::Update(ver)));
+        let (mut value, version) = current(store, app, None).await?.unwrap_or_default();
         change(&mut value);
-        match store.put_opts(&path.into(), serde_json::to_vec(&value)?.into(), mode.into()).await {
+        let mode = version.map_or(PutMode::Create, PutMode::Update);
+        match store.put_opts(&path.as_str().into(), serde_json::to_vec(&value)?.into(), mode.into()).await {
             Ok(_) => return Ok(()),
             Err(E::Precondition { .. } | E::AlreadyExists { .. }) => {
                 sleep(Duration::from_millis(RandomState::new().hash_one(()) % PAUSE_MAX)).await
