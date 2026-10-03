@@ -1,6 +1,7 @@
 //! `torpor serve`: runs every app of an install, or the app in a directory as an install of one, over HTTP/1.
 use crate::cli;
-use crate::state::{self, BLOB_MAX, BLOBS, Current, FRESH};
+use crate::state::{self, BLOBS, Current};
+use futures_util::future::{BoxFuture, FutureExt, Shared};
 use hyper::body::{Body, Bytes, Incoming};
 use hyper::{Request, StatusCode, header::HOST, server::conn::http1, service::service_fn};
 use object_store::{ObjectStore, memory::InMemory, prefix::PrefixStore};
@@ -12,6 +13,8 @@ use wasmtime::{Error, Result};
 use wasmtime_wasi_http::{handler::Response, io::TokioIo};
 
 const VAR_PREFIX: &str = "TORPOR_VAR_";
+/// How stale a host's view may get, so also how long a change takes to be live everywhere.
+const FRESH: Duration = Duration::from_secs(5);
 /// The longest a read of `current` may hold up a request. The S3 client on its own retries for up to 3 minutes.
 const RECHECK_MAX: Duration = Duration::from_secs(1);
 
@@ -22,13 +25,16 @@ pub struct Install {
     apps: Mutex<HashMap<String, Arc<Mutex<Served>>>>, // by name, each once it has had a release
 }
 
-/// One app as a host last read it, and the app loaded from its release or why that failed. A failure stands until the
-/// next recheck, so a broken release costs one load per `FRESH`, not one per request.
+/// One app as a host last read it, and the load of its release. A failed load stands until the next recheck, so a broken
+/// release costs one load per `FRESH`, not one per request.
 struct Served {
     current: Current,
     read: Instant,
-    app: Option<Result<App, String>>,
+    app: Option<Load>,
 }
+
+/// A load, shared by every request that waits for it.
+type Load = Shared<BoxFuture<'static, Result<App, String>>>;
 
 impl Install {
     /// The install in `store`.
@@ -80,21 +86,21 @@ impl Install {
                 self.apps.lock().await.entry(name.into()).or_insert(served).clone()
             }
         };
-        let s = &mut *served.lock().await;
-        if s.read.elapsed() >= FRESH {
-            match self.current(name).await {
-                Ok(current) if current != s.current => (s.current, s.app) = (current, None),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(app = name, "serving it as last read: {e}"),
+        let load = {
+            let s = &mut *served.lock().await;
+            if s.read.elapsed() >= FRESH {
+                match self.current(name).await {
+                    Ok(current) if current != s.current => (s.current, s.app) = (current, None),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(app = name, "serving it as last read: {e}"),
+                }
+                s.read = Instant::now();
+                s.app.take_if(|a| a.peek().is_some_and(Result::is_err));
             }
-            s.read = Instant::now();
-            s.app.take_if(|a| a.is_err());
-        }
-        let Some(release) = &s.current.release else { return Ok(None) };
-        if s.app.is_none() {
-            s.app = Some(self.load(name, release, &s.current.secrets).await.map_err(|e| e.to_string()));
-        }
-        Ok(Some(s.app.clone().expect("loaded above").map_err(Error::msg)?))
+            let Some(release) = &s.current.release else { return Ok(None) };
+            s.app.get_or_insert_with(|| self.load(name, release, &s.current.secrets)).clone()
+        };
+        Ok(Some(load.await.map_err(Error::msg)?))
     }
 
     /// `name`'s `current`, or an error once `RECHECK_MAX` has passed.
@@ -102,15 +108,20 @@ impl Install {
         Ok(timeout(RECHECK_MAX, state::current(&*self.store, name)).await??.0)
     }
 
-    /// The app `name` from its release `id`, with `secrets` over its config, and its component compiled on a blocking
-    /// thread, so a compile never holds up the requests of apps that are already loaded.
-    async fn load(&self, name: &str, id: &str, secrets: &BTreeMap<String, String>) -> Result<App> {
-        let mut r = state::release(&*self.store, name, id).await?;
-        r.config.extend(secrets.clone());
-        let wasm = state::fetch(&*self.store, &state::path(name, BLOBS), &r.component, BLOB_MAX).await?;
-        let kv = Arc::new(PrefixStore::new(self.store.clone(), state::kv(name)));
-        let (engine, name) = (self.engine.clone(), name.to_owned());
-        spawn_blocking(move || engine.load(&name, kv, wasm, r.config, &r.allowed_outbound_hosts)).await?
+    /// Loads the app `name` from its release `id`, with `secrets` over its config. The load is a task of its own, so it
+    /// runs to its end even if every request waiting for it goes away, and it compiles on a blocking thread, so a
+    /// compile never holds up the requests of apps that are already loaded.
+    fn load(&self, name: &str, id: &str, secrets: &BTreeMap<String, String>) -> Load {
+        let (store, engine, name, id, secrets) =
+            (self.store.clone(), self.engine.clone(), name.to_owned(), id.to_owned(), secrets.clone());
+        let task = tokio::spawn(async move {
+            let mut r = state::release(&*store, &name, &id).await?;
+            r.config.extend(secrets);
+            let wasm = state::fetch(&*store, &name, BLOBS, &r.component).await?;
+            let kv = Arc::new(PrefixStore::new(store, state::kv(&name)));
+            spawn_blocking(move || engine.load(&name, kv, wasm, r.config, &r.allowed_outbound_hosts)).await?
+        });
+        task.map(|r| r.unwrap_or_else(|e| Err(e.into())).map_err(|e| e.to_string())).boxed().shared()
     }
 }
 
@@ -192,12 +203,11 @@ mod tests {
         }
         assert_eq!(install.apps.lock().await.len(), 2); // the names with nothing released are not kept
 
-        let dir = state::path("kv", state::RELEASES);
         let mut r = state::release(&*store, "kv", &first).await.unwrap();
         r.config.insert("greeting".into(), "bye".into());
-        let second = state::add(&*store, &dir, serde_json::to_vec(&r).unwrap().into(), state::JSON_MAX).await.unwrap();
+        let second = state::add(&*store, "kv", state::RELEASES, serde_json::to_vec(&r).unwrap().into()).await.unwrap();
         cli::release(&*store, "kv", &second).await.unwrap();
-        store.delete(&state::path("hello", state::CURRENT).into()).await.unwrap();
+        store.delete(&"apps/hello/current".into()).await.unwrap();
         sleep(FRESH).await;
         assert_eq!(ok(&install, "kv.localhost", "/config?key=greeting").await, r#"{"ok":"bye"}"#);
         assert_eq!(ok(&install, "kv.localhost", "/config?key=token").await, r#"{"ok":"s3cret"}"#);
@@ -216,7 +226,7 @@ mod tests {
         let store = Arc::new(InMemory::new());
         let id = ship(&*store, "tests/app").await;
         let component = state::release(&*store, "hello", &id).await.unwrap().component;
-        let blob = format!("{}/{component}", state::path("hello", BLOBS)).as_str().into();
+        let blob = format!("apps/hello/blobs/sha256/{component}").as_str().into();
         let good = store.get(&blob).await.unwrap().bytes().await.unwrap();
         store.put(&blob, std::fs::read("tests/fixtures/hello-p2.wasm").unwrap().into()).await.unwrap();
         let install = Install::new(store.clone()).unwrap();
@@ -240,6 +250,19 @@ mod tests {
         let start = Instant::now();
         assert_eq!(ok(&install, "hello.localhost", "/").await, "hello");
         assert!(start.elapsed() < 2 * RECHECK_MAX);
+    }
+
+    /// A load runs to its end even if every request waiting for it goes away, so the next request does not start over.
+    #[tokio::test]
+    async fn a_load_outlives_its_requests() {
+        let store = Arc::new(ThrottledStore::new(InMemory::new(), ThrottleConfig::default()));
+        ship(&*store, "tests/app").await;
+        let install = Install::new(store.clone()).unwrap();
+        store.config_mut(|c| c.wait_get_per_call = Duration::from_millis(200));
+        assert!(timeout(Duration::from_millis(300), install.app("hello")).await.is_err()); // gone while it fetches
+        sleep(Duration::from_secs(2)).await; // the load's fetches finish meanwhile
+        store.config_mut(|c| c.wait_get_per_call = Duration::from_secs(60)); // so fetching again would hang
+        assert_eq!(timeout(Duration::from_secs(30), ok(&install, "hello.localhost", "/")).await.unwrap(), "hello");
     }
 
     /// Calls that wait let both changes read `current` before either writes it, so one loses the swap and fails.

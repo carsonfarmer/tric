@@ -66,6 +66,9 @@ impl Bucket {
     /// The key as the store has it, with the version a conditional write needs.
     async fn read(&self, p: &Path) -> R<Option<(Bytes, UpdateVersion)>> {
         let Some(r) = found(self.0.get(p).await)? else { return Ok(None) };
+        if r.meta.size > VALUE_MAX as u64 {
+            return Err(other(format!("the stored value is over {VALUE_MAX} bytes")));
+        }
         let v = UpdateVersion { e_tag: r.meta.e_tag.clone(), version: r.meta.version.clone() };
         Ok(Some((r.bytes().await.map_err(other)?, v)))
     }

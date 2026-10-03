@@ -1,12 +1,12 @@
 //! The commands that change an install. They write the bucket directly, so its IAM is the only auth: a team's role
 //! writes only the apps named `<team>-…`.
-use crate::state::{self, BLOB_MAX, BLOBS, JSON_MAX, RELEASES, Release};
+use crate::state::{self, BLOBS, RELEASES, Release};
 use futures_util::TryStreamExt;
-use object_store::{ObjectStore, memory::InMemory};
+use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory};
 use serde::Deserialize;
 use std::{cmp::Reverse, collections::BTreeMap, fs, path::Path, sync::Arc};
-use torpor::{Engine, NAME_MAX, is_name};
-use wasmtime::{Result, ensure};
+use torpor::Engine;
+use wasmtime::Result;
 
 const MANIFEST: &str = "torpor.toml";
 
@@ -25,7 +25,6 @@ pub struct Manifest {
 /// The manifest in `dir`, and its component.
 pub fn read(dir: &Path) -> Result<(Manifest, Vec<u8>)> {
     let m: Manifest = toml::from_str(&fs::read_to_string(dir.join(MANIFEST))?)?;
-    ensure!(is_name(&m.name), "a name is 1 to {NAME_MAX} of a-z, 0-9 and -, not {:?}", m.name);
     let wasm = fs::read(dir.join(&m.component))?;
     Ok((m, wasm))
 }
@@ -37,21 +36,22 @@ pub async fn publish(store: &dyn ObjectStore, dir: &Path, check: bool) -> Result
     if check {
         Engine::new()?.load(&name, Arc::new(InMemory::new()), &wasm, BTreeMap::new(), &allowed_outbound_hosts)?;
     }
-    let component = state::add(store, &state::path(&name, BLOBS), wasm.into(), BLOB_MAX).await?;
+    let component = state::add(store, &name, BLOBS, wasm.into()).await?;
     let release = serde_json::to_vec(&Release { component, config, allowed_outbound_hosts })?;
-    let id = state::add(store, &state::path(&name, RELEASES), release.into(), JSON_MAX).await?;
+    let id = state::add(store, &name, RELEASES, release.into()).await?;
     Ok((name, id))
 }
 
 /// Serves `app` from its release `id`.
 pub async fn release(store: &dyn ObjectStore, app: &str, id: &str) -> Result<()> {
-    state::release(store, app, id).await?; // it is there, and sound
+    let r = state::release(store, app, id).await?; // it is there, and sound
+    store.head(&state::object(app, BLOBS, &r.component)?.into()).await?; // as is its component
     state::update(store, app, |c| c.release = Some(id.into())).await
 }
 
 /// `app`'s releases, newest first, each as its id and when it was first published.
 pub async fn releases(store: &dyn ObjectStore, app: &str) -> Result<Vec<String>> {
-    let mut all: Vec<_> = store.list(Some(&state::path(app, RELEASES).into())).try_collect().await?;
+    let mut all: Vec<_> = store.list(Some(&state::path(app, RELEASES.dir)?.into())).try_collect().await?;
     all.sort_by_key(|m| Reverse(m.last_modified));
     Ok(all.iter().map(|m| format!("{} {}", m.location.filename().unwrap_or_default(), m.last_modified)).collect())
 }
