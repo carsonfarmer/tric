@@ -18,12 +18,11 @@ required-features = ["cli"]
 [features]
 default = ["cli"]
 cli = [
-    "dep:age", "dep:clap", "dep:serde", "dep:serde_json", "dep:sha2", "dep:toml", "dep:tracing-subscriber",
+    "dep:clap", "dep:serde", "dep:serde_json", "dep:sha2", "dep:toml", "dep:tracing-subscriber",
     "hyper/server", "object_store/aws", "tokio/macros", "tokio/rt-multi-thread",
 ]
 
 [dependencies]
-age = { version = "0.12", features = ["armor"], optional = true }
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"], optional = true }
 futures-util = "0.3"

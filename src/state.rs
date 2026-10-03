@@ -1,96 +1,141 @@
-//! What an install keeps in its bucket: components and releases, both stored under their SHA-256, and one state object
-//! naming each app's current release. Nothing read back is trusted: every read is capped, parsed strictly, and
-//! content-addressed objects are checked against their hash.
+//! What an install keeps in its bucket. Everything a team writes sits under the app's name, so the store's IAM can give
+//! each team the apps named `<team>-…`:
+//!
+//! - `apps/<app>/blobs/sha256/<hash>`: components, in the OCI image layout, so a registry copy is a byte copy;
+//! - `apps/<app>/releases/<hash>`: the app's releases;
+//! - `apps/<app>/current`: the release it runs, and its secrets;
+//! - `kv/<app>/<bucket>/<key>`: its `wasi:keyvalue` data, which only hosts write.
+//!
+//! Nothing read back is trusted: every read is capped, parsed strictly, and content-addressed objects are checked
+//! against their hash. Writes have the same caps, so nothing is written that a read would refuse.
 use hyper::body::Bytes;
-use object_store::{Error as E, GetOptions, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
+use object_store::{Error as E, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::hash::{BuildHasher, RandomState};
-use std::{collections::BTreeMap, time::Duration};
-use tokio::time::sleep;
-use wasmtime::{Result, bail, ensure};
+use std::collections::BTreeMap;
+use torpor::{NAME_MAX, is_name};
+use wasmtime::{Result, bail, ensure, error::Context};
 
-pub const BLOBS: &str = "blobs/sha256"; // the OCI image-layout path, so a registry copy is a byte copy
-pub const RELEASES: &str = "manifests";
-const STATE: &str = "state";
-pub const BLOB_MAX: u64 = 128 << 20;
-pub const RELEASE_MAX: u64 = 1 << 20;
-const STATE_MAX: u64 = 8 << 20; // about 100k apps
-const SWAPS: usize = 32; // attempts at one state change before giving up
-const PAUSE_MAX: u64 = 1000; // ms, the longest wait after a lost swap
-/// How stale a host's state may get, so also how long a change takes to be live everywhere.
-pub const FRESH: Duration = Duration::from_secs(5);
+const CURRENT: &str = "current";
+const JSON_MAX: u64 = 64 << 10; // a release id, config and secrets, so a host keeping one per app stays small
+pub const BLOBS: Kind = Kind { dir: "blobs/sha256", max: 128 << 20 };
+pub const RELEASES: Kind = Kind { dir: "releases", max: JSON_MAX };
 
-/// Each app's current release, and the app that serves each domain.
-#[derive(Default, Serialize, Deserialize)]
+/// A kind of content-addressed object: the directory that holds an app's, and the most bytes one may hold.
+#[derive(Clone, Copy)]
+pub struct Kind {
+    pub dir: &'static str,
+    max: u64,
+}
+
+/// The release an app runs, and its secrets, which outlive releases and override config of the same name.
+#[derive(Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct State {
-    pub apps: BTreeMap<String, String>,
-    pub domains: BTreeMap<String, String>,
+pub struct Current {
+    pub release: Option<String>,
+    pub secrets: BTreeMap<String, String>,
 }
 
 /// One immutable release of an app.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Release {
     pub component: String,
-    pub parent: Option<String>, // the release this one replaced
     pub config: BTreeMap<String, String>,
-    pub secrets: BTreeMap<String, String>, // each value age-encrypted on its own, so names show without decrypting
     pub allowed_outbound_hosts: Vec<String>,
 }
 
-/// The object `<dir>/<hash>`, refused if it is over `max` bytes or its hash is not `hash`.
-pub async fn fetch(store: &dyn ObjectStore, dir: &str, hash: &str, max: u64) -> Result<Bytes> {
-    let r = store.get(&format!("{dir}/{hash}").into()).await?;
-    ensure!(r.meta.size <= max, "{dir}/{hash} is over {max} bytes");
-    let bytes = r.bytes().await?;
-    ensure!(format!("{:x}", Sha256::digest(&bytes)) == hash, "{dir}/{hash} does not match its hash");
+/// `app`'s `object`, if `app` is a name a host would serve.
+pub fn path(app: &str, object: &str) -> Result<String> {
+    ensure!(is_name(app), "an app name is 1 to {NAME_MAX} of a-z, 0-9 and -, not {app:?}");
+    Ok(format!("apps/{app}/{object}"))
+}
+
+pub fn kv(app: &str) -> String {
+    format!("kv/{app}")
+}
+
+/// The object at `path` and its version, or `None` if there is none.
+async fn read(store: &dyn ObjectStore, path: &str, max: u64) -> Result<Option<(Bytes, UpdateVersion)>> {
+    let mut r = match store.get(&path.into()).await {
+        Err(E::NotFound { .. }) => return Ok(None),
+        r => r?,
+    };
+    ensure!(r.meta.size <= max, "{path} is over {max} bytes");
+    let version = UpdateVersion { e_tag: r.meta.e_tag.take(), version: r.meta.version.take() };
+    Ok(Some((r.bytes().await?, version)))
+}
+
+/// Where `app`'s object `hash` of the kind `kind` is.
+pub fn object(app: &str, kind: Kind, hash: &str) -> Result<String> {
+    Ok(format!("{}/{hash}", path(app, kind.dir)?))
+}
+
+/// `app`'s object `hash` of the kind `kind`, refused if its hash is not `hash`.
+pub async fn fetch(store: &dyn ObjectStore, app: &str, kind: Kind, hash: &str) -> Result<Bytes> {
+    let path = object(app, kind, hash)?;
+    let (bytes, _) = read(store, &path, kind.max).await?.with_context(|| format!("there is no {path}"))?;
+    ensure!(format!("{:x}", Sha256::digest(&bytes)) == hash, "{path} does not match its hash");
     Ok(bytes)
 }
 
-/// Stores `bytes` at `<dir>/<hash>` unless they are there already, and returns the hash. Like `fetch`, it refuses more
-/// than `max` bytes, so nothing is written that a host would refuse to read.
-pub async fn add(store: &dyn ObjectStore, dir: &str, bytes: Bytes, max: u64) -> Result<String> {
-    ensure!(bytes.len() as u64 <= max, "a {dir} object is over {max} bytes");
+/// Stores `bytes` as an object of `app` of the kind `kind`, unless it is there already, and returns its hash.
+pub async fn add(store: &dyn ObjectStore, app: &str, kind: Kind, bytes: Bytes) -> Result<String> {
     let hash = format!("{:x}", Sha256::digest(&bytes));
-    match store.put_opts(&format!("{dir}/{hash}").into(), bytes.into(), PutMode::Create.into()).await {
+    let path = object(app, kind, &hash)?;
+    ensure!(bytes.len() as u64 <= kind.max, "{path} would be over {} bytes", kind.max);
+    match store.put_opts(&path.into(), bytes.into(), PutMode::Create.into()).await {
         Ok(_) | Err(E::AlreadyExists { .. }) => Ok(hash),
         Err(e) => Err(e.into()),
     }
 }
 
-pub async fn release(store: &dyn ObjectStore, hash: &str) -> Result<Release> {
-    Ok(serde_json::from_slice(&fetch(store, RELEASES, hash, RELEASE_MAX).await?)?)
+/// `app`'s release `id`.
+pub async fn release(store: &dyn ObjectStore, app: &str, id: &str) -> Result<Release> {
+    Ok(serde_json::from_slice(&fetch(store, app, RELEASES, id).await?)?)
 }
 
-/// The state and its version, or `None` before the first deploy or while the state's ETag is still `etag`.
-pub async fn read(store: &dyn ObjectStore, etag: Option<String>) -> Result<Option<(State, UpdateVersion)>> {
-    match store.get_opts(&STATE.into(), GetOptions { if_none_match: etag, ..Default::default() }).await {
-        Ok(r) => {
-            ensure!(r.meta.size <= STATE_MAX, "the state is over {STATE_MAX} bytes");
-            let version = UpdateVersion { e_tag: r.meta.e_tag.clone(), version: r.meta.version.clone() };
-            Ok(Some((serde_json::from_slice(&r.bytes().await?)?, version)))
+/// `app`'s `current` and its version, or the default and `None` if it has none.
+pub async fn current(store: &dyn ObjectStore, app: &str) -> Result<(Current, Option<UpdateVersion>)> {
+    match read(store, &path(app, CURRENT)?, JSON_MAX).await? {
+        Some((bytes, version)) => Ok((serde_json::from_slice(&bytes)?, Some(version))),
+        None => Ok(Default::default()),
+    }
+}
+
+/// Applies `change` to `app`'s `current` with a conditional write, which fails if another change landed in between, so
+/// neither is lost.
+pub async fn update(store: &dyn ObjectStore, app: &str, change: impl FnOnce(&mut Current)) -> Result<()> {
+    let (mut value, version) = current(store, app).await?;
+    change(&mut value);
+    let json = serde_json::to_vec(&value)?;
+    ensure!(json.len() as u64 <= JSON_MAX, "{app}'s {CURRENT} would be over {JSON_MAX} bytes");
+    let mode = version.map_or(PutMode::Create, PutMode::Update);
+    match store.put_opts(&path(app, CURRENT)?.into(), json.into(), mode.into()).await {
+        Ok(_) => Ok(()),
+        // a conditional write to a deleted `current` is refused with a 404
+        Err(E::Precondition { .. } | E::AlreadyExists { .. } | E::NotFound { .. }) => {
+            bail!("{app} changed while this ran: run it again")
         }
-        Err(E::NotFound { .. } | E::NotModified { .. }) => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
 
-/// Applies `change` to the current state and swaps the result in with a conditional write. After losing a race it waits
-/// up to a second and starts again from the winner's state, so `change` must be safe to repeat.
-pub async fn update(store: &dyn ObjectStore, mut change: impl AsyncFnMut(&mut State) -> Result<()>) -> Result<()> {
-    for _ in 0..SWAPS {
-        let first = (State::default(), PutMode::Create);
-        let (mut state, mode) = read(store, None).await?.map_or(first, |(s, v)| (s, PutMode::Update(v)));
-        change(&mut state).await?;
-        match store.put_opts(&STATE.into(), serde_json::to_vec(&state)?.into(), mode.into()).await {
-            Ok(_) => return Ok(()),
-            Err(E::Precondition { .. } | E::AlreadyExists { .. }) => {
-                sleep(Duration::from_millis(RandomState::new().hash_one(()) % PAUSE_MAX)).await
-            }
-            Err(e) => return Err(e.into()),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn refuses_what_a_host_would_not_serve() {
+        let store = InMemory::new();
+        for app in ["Acme-blog", "../x", "a/b", ""] {
+            assert!(update(&store, app, |_| {}).await.is_err(), "{app}");
+            assert!(add(&store, app, BLOBS, "x".into()).await.is_err(), "{app}");
         }
+        let big = "x".repeat(JSON_MAX as usize);
+        let e = update(&store, "app", |c| _ = c.secrets.insert("big".into(), big)).await.unwrap_err();
+        assert!(e.to_string().contains("would be over"), "{e}");
+        assert!(current(&store, "app").await.unwrap().0 == Current::default()); // and it still reads
     }
-    bail!("the state kept changing: gave up after {SWAPS} attempts")
 }

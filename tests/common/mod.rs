@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use http_body_util::{BodyExt, Empty};
-use object_store::{path::Path, *};
-use std::{fmt, fs, sync::Arc, sync::Mutex};
+use object_store::{path::Path, prefix::PrefixStore, *};
+use std::{fmt, fs, sync::Arc, sync::LazyLock, sync::Mutex};
 use torpor::{App, Engine};
 
 /// An `InMemory` store that logs its gets (`get kv/app/s/k`), puts and lists, and passes everything else through.
@@ -57,16 +57,14 @@ impl ObjectStore for Counting {
     }
 }
 
-/// The app `app` from `tests/fixtures`, with `wasi:config` of `greeting` and `empty`.
-pub fn load(engine: &Engine, fixture: &str, allow: &[&str]) -> App {
+/// The app `app` from `tests/fixtures`, with `wasi:config` of `greeting` and `empty`, and its `wasi:keyvalue` data in
+/// `store` under `kv/app`. Every app shares one engine, as they do in a host.
+pub fn load(store: &Arc<Counting>, fixture: &str, allow: &[&str]) -> App {
+    static ENGINE: LazyLock<Engine> = LazyLock::new(|| Engine::new().unwrap());
     let config = [("greeting".to_string(), "hi".to_string()), ("empty".to_string(), String::new())];
     let allow: Vec<String> = allow.iter().map(|a| a.to_string()).collect();
-    engine.load("app", fs::read(format!("tests/fixtures/{fixture}.wasm")).unwrap(), config.into(), &allow).unwrap()
-}
-
-pub fn engine() -> (Arc<Counting>, Engine) {
-    let store = Arc::new(Counting::default());
-    (store.clone(), Engine::new(store).unwrap())
+    let (kv, wasm) = (PrefixStore::new(store.clone(), "kv/app"), fs::read(format!("tests/fixtures/{fixture}.wasm")));
+    ENGINE.load("app", Arc::new(kv), wasm.unwrap(), config.into(), &allow).unwrap()
 }
 
 pub async fn get(app: &App, path: &str) -> (u16, String) {
