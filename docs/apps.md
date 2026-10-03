@@ -2,11 +2,11 @@
 
 This page is for someone writing an app that runs on torpor. torpor calls a WASI HTTP component once per request, in a fresh instance, so nothing in memory survives from one request to the next. All state goes in KV, which torpor keeps in object storage (S3 in production). Working examples are in [`tests/components/rust/`](../tests/components/rust/) (plain `wit-bindgen`) and [`tests/components/spin/`](../tests/components/spin/) (Spin SDK).
 
-**Two modes.** `torpor serve DIR` runs one app from a directory and keeps its KV data in memory, so the data is lost when the process stops. `torpor serve --store s3://BUCKET`, or `torpor serve` with `TORPOR_STORE` set, runs every app released to that bucket, with KV in the bucket. Everything below holds in both modes unless it says otherwise.
+**Two modes.** `torpor serve DIR` runs one app from a directory, as an install of one in memory, so its KV data is lost when the process stops. `torpor serve --store s3://BUCKET`, or `torpor serve` with `TORPOR_STORE` set, runs every app released to that bucket, with KV in the bucket. Everything below holds in both modes unless it says otherwise.
 
 ## The manifest
 
-An app is a directory with a `torpor.toml` and a component. Run it with `torpor serve [DIR] [--listen ADDR]` (defaults: `.` and `127.0.0.1:3000`).
+An app is a directory with a `torpor.toml` and a component. Run it with `torpor serve [DIR] [--listen ADDR]` (defaults: `.` and `127.0.0.1:3000`), and reach it at its name, like `curl hello.localhost:3000`. A broken app stops `torpor serve` at start-up.
 
 ```toml
 name = "hello"
@@ -25,7 +25,7 @@ greeting = "hi"
 | `[config]` | Keys and values the app reads through `wasi:config`. Values must be strings. |
 
 - **Typos:** an unknown field is an error, so a misspelled `allowed_outbound_hosts` stops `torpor serve` at start-up instead of leaving the app with no outbound access. So does a bad allow-list entry.
-- **Secrets** never go in the manifest. In an install they come from [`torpor secret`](#releasing). In a directory, `torpor serve` turns each environment variable `TORPOR_VAR_<KEY>` into the config key `<key>`, lowercased: `TORPOR_VAR_API_KEY=s3cret` gives the app `api_key`. A variable overrides the same key in `[config]`. Either way the app reads config and secrets through `wasi:config` as one flat set. Use lowercase keys in `[config]`, or an override will not match.
+- **Secrets** never go in the manifest. In an install they come from [`torpor secret`](#releasing). In a directory, `torpor serve` turns each environment variable `TORPOR_VAR_<KEY>` into the secret `<key>`, lowercased: `TORPOR_VAR_API_KEY=s3cret` gives the app `api_key`. Like any secret, it overrides the same key in `[config]`. Either way the app reads config and secrets through `wasi:config` as one flat set. Use lowercase keys in `[config]`, or an override will not match.
 
 ## Releasing
 
@@ -46,6 +46,7 @@ An install is one bucket. Name it with `--store s3://BUCKET` or `TORPOR_STORE`. 
 Publishing and releasing in one go is `torpor release $(torpor publish DIR)`.
 
 - **Propagation:** a host rechecks an app when a request finds its view of it 5 s old, so a change is live everywhere within 5 s of the command returning. If a recheck fails or takes over a second, the host goes on serving what it last read.
+- **Two changes at once:** `release` and `secret` both rewrite the app's `current`, and only if nothing changed it since they read it. Of two at once on the same app, one fails with `APP changed while this ran: run it again`, so neither is silently lost.
 - **Secrets** belong to the app, not to a release: `secret` takes effect without a release, and releasing an older ID keeps today's secrets, so rolling back never brings back a rotated one. A secret overrides the `[config]` key of the same name. Values are stored as they are, so anyone who can read the app's objects can read them: its team, and the install's hosts.
 - **Routing:** an install serves each app at its own subdomain: the first label of `Host`, lowercased, names the app, and the request reaches it unchanged. Locally, `curl hello.localhost:3000` reaches `hello`. A host that names no app, or an app with nothing released, gets an empty `404`. To take an app offline, delete `apps/APP/current` from the bucket; that also drops its secrets.
 - **A release that fails to load** gets an empty `500`, and the host tries it again at its next recheck, not on every request.

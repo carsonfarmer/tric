@@ -30,11 +30,13 @@ pub fn read(dir: &Path) -> Result<(Manifest, Vec<u8>)> {
     Ok((m, wasm))
 }
 
-/// Uploads the app in `dir` as a release, without serving it, and returns the app's name and the release's id.
-pub async fn publish(store: &dyn ObjectStore, dir: &Path) -> Result<(String, String)> {
+/// Uploads the app in `dir` as a release, without serving it, and returns the app's name and the release's id. With
+/// `check`, it first compiles the app, to refuse now what a host would refuse.
+pub async fn publish(store: &dyn ObjectStore, dir: &Path, check: bool) -> Result<(String, String)> {
     let (Manifest { name, config, allowed_outbound_hosts, .. }, wasm) = read(dir)?;
-    let engine = Engine::new(Arc::new(InMemory::new()))?;
-    engine.load(&name, "", &wasm, BTreeMap::new(), &allowed_outbound_hosts)?; // refuse now what a host would refuse
+    if check {
+        Engine::new(Arc::new(InMemory::new()))?.load(&name, "", &wasm, BTreeMap::new(), &allowed_outbound_hosts)?;
+    }
     let component = state::add(store, &state::path(&name, BLOBS), wasm.into(), BLOB_MAX).await?;
     let release = serde_json::to_vec(&Release { component, config, allowed_outbound_hosts })?;
     let id = state::add(store, &state::path(&name, RELEASES), release.into(), JSON_MAX).await?;
@@ -67,5 +69,5 @@ pub async fn set_secret(store: &dyn ObjectStore, app: &str, name: &str, value: &
 
 /// The names of `app`'s secrets.
 pub async fn secrets(store: &dyn ObjectStore, app: &str) -> Result<Vec<String>> {
-    Ok(state::current(store, app, None).await?.unwrap_or_default().0.secrets.into_keys().collect())
+    Ok(state::current(store, app).await?.0.secrets.into_keys().collect())
 }

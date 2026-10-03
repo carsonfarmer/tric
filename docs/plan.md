@@ -30,7 +30,7 @@ An operator installs torpor into their own AWS account with one OpenTofu module,
   - tokio and hyper;
   - `zstd`, serde, `toml`, `clap` and `tracing`.
 
-**Line budget:** about 1,390 lines of Rust (1,200 before M2, 1,290 before M3 and its review raised `serve` and `state`; 982 written so far, after two trim passes) plus about 250 of HCL. A module that runs well past its budget is a design problem to raise, not to push through.
+**Line budget:** about 1,390 lines of Rust (1,200 before M2, 1,290 before M3 and its review raised `serve` and `state`; 955 written so far, after three trim passes) plus about 250 of HCL. A module that runs well past its budget is a design problem to raise, not to push through.
 
 | Module | Does | Budget |
 |---|---|---|
@@ -38,10 +38,10 @@ An operator installs torpor into their own AWS account with one OpenTofu module,
 | `outbound` | Allow list plus the resolved-address block, in the HTTP send hook | ~100 (raised in M2 from ~60: the matcher is hand-written, and the connect is our own) |
 | `kv` | `wasi:keyvalue` draft2 over the bucket: one object per key, CAS, no cache | ~250 (raised in M2 from ~200; 227 after the trim pass) |
 | `config` | `wasi:config` from the manifest, with secrets | 0 (Wasmtime's crate serves it, and `serve` adds secrets in 1 line) |
-| `state` | The bucket layout, releases, compare-and-swap updates, defensive reads | ~130 (raised in the M3 review from ~100; 116 once Q72 dropped the index) |
-| `serve` | hyper server, routing, logs | ~170 (raised in M3 from ~100, which was the router alone, then in the M3 review from ~140 for a pointer recheck per app; 139 once Q72 dropped the index) |
+| `state` | The bucket layout, releases, compare-and-swap updates, defensive reads | ~130 (raised in the M3 review from ~100; 102 after the trim passes) |
+| `serve` | hyper server, routing, logs | ~170 (raised in M3 from ~100, which was the router alone, then in the M3 review from ~140 for a pointer recheck per app; 124 after the trim passes) |
 | `compile` | The compile worker and compile-request markers | ~70 |
-| `cli` | `publish`, `release`, `releases`, `secret`, `secrets`, `gc`, and `main`'s arguments | ~350 (144 after the second trim pass, before `gc` and `compile`) |
+| `cli` | `publish`, `release`, `releases`, `secret`, `secrets`, `gc`, and `main`'s arguments | ~350 (146 after the trim passes, before `gc` and `compile`) |
 | `infra/aws` | OpenTofu module | ~250 HCL |
 
 ### Bucket layout
@@ -84,7 +84,7 @@ It is then merged locally into `main`.
 - **Each request:** a fresh store, and a WASI context that grants nothing: no environment, arguments, preopened files or sockets (Q55).
 - **Guest output:** stdout and stderr are captured into the host log, tagged with the app and capped per request **(choice)**.
 - **HTTP:** serves both p2 `incoming-handler` and p3 `handler` through `wasmtime-wasi-http` (Q31). The spike's `guest.rs` carries over.
-- **Dev mode:** `torpor serve` in an app directory reads `torpor.toml` (name, component, allowed outbound hosts, `[config]`) and runs that one app against the in-memory store. Secrets are never in `torpor.toml`; in dev mode they come from `TORPOR_VAR_<KEY>` environment variables **(choice)**.
+- **Dev mode:** `torpor serve` in an app directory reads `torpor.toml` (name, component, allowed outbound hosts, `[config]`) and runs that one app against the in-memory store. Secrets are never in `torpor.toml`; in dev mode they come from `TORPOR_VAR_<KEY>` environment variables **(choice)**. Since Q79, dev mode publishes and releases the directory into an in-memory install and serves that, at `<name>.localhost`.
 - **Logs:** JSON lines to stdout. Warnings and errors by default (Q14).
 
 **Done when:**
@@ -119,15 +119,15 @@ It is then merged locally into `main`.
 
 ### M3: State and releases (many apps, many teams, one host)
 
-The M3 review reshaped this milestone; decisions.md Q60–Q76 has the why.
+The M3 review reshaped this milestone; decisions.md Q60–Q79 has the why.
 
 - **`torpor publish [DIR]`:** checks that the component loads, puts it and a release put-if-absent under the app's name, and prints `APP ID` (Q61, Q70, Q72).
-- **`torpor release APP ID`:** checks the release, then swaps it into the app's `current` with CAS and randomized backoff (Q45). Rolling back is releasing an older id, and `torpor releases APP` lists them newest first (Q69).
+- **`torpor release APP ID`:** checks the release, then swaps it into the app's `current` with CAS, and fails if another change landed in between (Q77). Rolling back is releasing an older id, and `torpor releases APP` lists them newest first (Q69).
 - **`torpor secret APP NAME` and `secrets APP`:** set a secret from stdin into the app's `current`, or remove it with an empty value, so it takes effect without a release and outlives releases (Q65, Q73, Q76). A secret overrides config. `secrets` lists names only.
 - Commands return once their write lands; a change is live everywhere within 5 s (Q74).
 - **`torpor serve --store <url>`** (the install mode, which Lambda runs):
   - Routes by the first label of `Host` (Q67), then reads that app's `current`. A name with nothing released is not kept, so a made-up name costs a GET and no memory (Q72).
-  - Rechecks an app's `current` with a conditional GET once it is 5 s old (Q45, Q75), and gives up a recheck after 1 s, serving what it last read.
+  - Rereads an app's `current` once it is 5 s old, and reloads the app only if it changed (Q75, Q78). It gives up a recheck after 1 s, serving what it last read.
   - Loads each app once per release, compiling on tokio's blocking pool; a failed load stands until the next recheck (Q62, Q63).
 - **Bucket contents are never trusted (Q53):**
   - reads are size-capped and parsed strictly;
@@ -137,7 +137,7 @@ The M3 review reshaped this milestone; decisions.md Q60–Q76 has the why.
 **Done when:**
 - In-process tests publish and release two apps, serve them by subdomain, take one offline, roll one back, and list its releases, all on the in-memory store.
 - A blob with the wrong hash is refused.
-- Concurrent changes to one app's `current` all land.
+- Of two concurrent changes to one app's `current`, one lands and the other fails, so neither is lost (Q77).
 - A hung recheck serves the last read within its timeout.
 - Secrets round-trip, an empty value removes one, and `secrets` lists names only.
 
@@ -145,7 +145,7 @@ The M3 review reshaped this milestone; decisions.md Q60–Q76 has the why.
 
 This refines the trigger in Q58 **(choice)**; see [Choices to confirm](#choices-to-confirm).
 
-**Open for M4:** since Q72 a blob lives under its app, so a marker must name the app as well as the hash, like `compile/<app>/<hex>`.
+**Open for M4:** since Q72 a blob lives under its app, so a marker must name the app as well as the hash, like `compile/<app>/<hex>`, where `<hex>` is the component's SHA-256, as in `apps/<app>/blobs/sha256/<hex>`.
 
 - **`torpor compile-worker`** receives bucket events through the Lambda Web Adapter's pass-through path (`POST /events`). For each `compile/<hex>`:
   1. It fetches and hash-checks the blob.

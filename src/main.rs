@@ -23,7 +23,7 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Serve the install in --store, or else the app described by DIR/torpor.toml
+    /// Serve the install in --store, or else the app described by DIR/torpor.toml, each app at a host like APP.localhost
     Serve {
         #[arg(default_value = ".")]
         dir: PathBuf,
@@ -54,13 +54,13 @@ async fn main() -> Result<()> {
     let s = || store.as_ref().context(NO_STORE);
     match cmd {
         Cmd::Serve { dir, listen } => {
-            let apps = match store {
-                Some(store) => serve::Apps::install(Arc::new(store))?,
-                None => serve::Apps::dir(&dir)?,
+            let install = match store {
+                Some(store) => serve::Install::new(Arc::new(store))?,
+                None => serve::Install::dev(&dir).await?,
             };
-            serve::run(apps, TcpListener::bind(listen).await?).await?
+            serve::run(install, TcpListener::bind(listen).await?).await?
         }
-        Cmd::Publish { dir } => cli::publish(s()?, &dir).await.map(|(app, id)| println!("{app} {id}"))?,
+        Cmd::Publish { dir } => cli::publish(s()?, &dir, true).await.map(|(app, id)| println!("{app} {id}"))?,
         Cmd::Release { app, id } => cli::release(s()?, &app, &id).await?,
         Cmd::Releases { app } => cli::releases(s()?, &app).await?.iter().for_each(|r| println!("{r}")),
         Cmd::Secret { app, name } => {
