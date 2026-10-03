@@ -189,7 +189,7 @@ impl WorkerState for Worker {
     /// Runs once the worker is done, also after a trap or a timeout, when `result` is the cause.
     fn drop(&self, store: Store<Host>, result: Result<()>) {
         let (app, out, err) = (&store.data().app.name, self.out.contents(), self.err.contents());
-        _ = result.inspect_err(|e| tracing::warn!(app, "guest failed: {e}"));
+        _ = result.inspect_err(|e| tracing::warn!(app, "guest failed: {e:#}"));
         if !out.is_empty() {
             tracing::info!(app, stream = "stdout", "{}", String::from_utf8_lossy(&out).trim_end());
         }
@@ -216,7 +216,7 @@ impl App {
         span.in_scope(|| tracing::info!(method = %req.method(), path = req.uri().path()));
         let res = self.0.handle((), req.map(|b| b.map_err(Into::into).boxed_unsync())).instrument(span.clone()).await;
         res.unwrap_or_else(|e| {
-            span.in_scope(|| tracing::warn!("request failed: {e}"));
+            span.in_scope(|| tracing::warn!("request failed: {e:#}"));
             hyper::Response::builder().status(500).body(Default::default()).unwrap() // an empty body
         })
     }

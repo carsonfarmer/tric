@@ -62,7 +62,7 @@ impl Install {
     {
         let host = req.headers().get(HOST).and_then(|h| h.to_str().ok()).unwrap_or_default();
         let name = host.split(['.', ':']).next().unwrap_or_default().to_ascii_lowercase(); // the first label
-        match self.app(&name).await.inspect_err(|e| tracing::warn!(app = name, "{e}")) {
+        match self.app(&name).await.inspect_err(|e| tracing::warn!(app = name, "{e:#}")) {
             Ok(Some(app)) => app.handle(req).await,
             Ok(None) => status(StatusCode::NOT_FOUND),
             Err(_) => status(StatusCode::INTERNAL_SERVER_ERROR),
@@ -93,7 +93,7 @@ impl Install {
                 match self.current(name).await {
                     Ok(current) if current != s.current => (s.current, s.app) = (current, None),
                     Ok(_) => {}
-                    Err(e) => tracing::warn!(app = name, "serving it as last read: {e}"),
+                    Err(e) => tracing::warn!(app = name, "serving it as last read: {e:#}"),
                 }
                 s.read = Instant::now();
                 s.app.take_if(|a| a.peek().is_some_and(Result::is_err));
@@ -114,18 +114,19 @@ impl Install {
     fn load(self: &Arc<Self>, name: &str, id: &str, secrets: &BTreeMap<String, String>) -> Load {
         let (install, name, id, secrets) = (self.clone(), name.to_owned(), id.to_owned(), secrets.clone());
         let task = tokio::spawn(async move {
-            let (store, engine) = (&install.store, &install.engine);
+            let Install { store, native, engine, .. } = &*install;
             let mut r = state::release(&**store, &name, &id).await?;
             r.config.extend(secrets);
-            let code = compile::component(&**store, install.native.as_deref(), engine, &name, &r.component).await?;
+            let code = compile::component(&**store, native.as_deref(), engine, &name, &r.component).await?;
             let kv = Arc::new(PrefixStore::new(store.clone(), state::kv(&name)));
             engine.load(&name, kv, &code, r.config, &r.allowed_outbound_hosts)
         });
-        task.map(|r| r.unwrap_or_else(|e| Err(e.into())).map_err(|e| e.to_string())).boxed().shared()
+        task.map(|r| r.unwrap_or_else(|e| Err(e.into())).map_err(|e| format!("{e:#}"))).boxed().shared()
     }
 }
 
-fn status(code: StatusCode) -> Response {
+/// An empty response of `code`.
+pub fn status(code: StatusCode) -> Response {
     hyper::Response::builder().status(code).body(Default::default()).unwrap()
 }
 

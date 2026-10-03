@@ -1,15 +1,16 @@
 //! Native code: the compile function compiles each component once, and hosts load what it made rather than compile it
 //! themselves. The bucket of native code is trusted, as loading its code runs it: only the compile function writes it,
 //! and only from a component it checked against its hash.
+use crate::serve::status;
 use crate::state::{self, BLOBS};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::{Body, Bytes};
 use hyper::{Method, Request, StatusCode};
 use object_store::{Error as E, ObjectStore, ObjectStoreExt, PutPayload};
 use serde_json::Value;
-use std::{error::Error as StdError, sync::Arc};
+use std::{error::Error as StdError, sync::Arc, time::Duration};
 use tempfile::NamedTempFile;
-use tokio::task::spawn_blocking;
+use tokio::{task::spawn_blocking, time::timeout};
 use torpor::Engine;
 use wasmtime::component::Component;
 use wasmtime::{Error, Result, ensure, error::Context};
@@ -19,6 +20,7 @@ use wasmtime_wasi_http::handler::Response;
 pub const EVENTS: &str = "/events";
 const EVENT_MAX: usize = 1 << 20; // S3 sends a record of about 1 KiB per event
 const ZSTD_LEVEL: i32 = 3; // zstd's own default
+const ASK_MAX: Duration = Duration::from_secs(1); // as the load that asks waits for it
 
 /// The code of `app`'s component `hash`: its native code from `native`, or else a compile here, which then asks the
 /// compile function for native code, so the next host to load it need not compile it.
@@ -31,8 +33,9 @@ pub async fn component(
 ) -> Result<Component> {
     if let Some(native) = native {
         match load(native, engine, app, hash).await {
-            Ok(code) => return Ok(code),
-            Err(e) => tracing::warn!(app, "compiling it here, as its native code did not load: {e}"),
+            Ok(Some(code)) => return Ok(code),
+            Ok(None) => tracing::info!(app, "compiling it here, as it has no native code yet"),
+            Err(e) => tracing::warn!(app, "compiling it here, as its native code did not load: {e:#}"),
         }
     }
     let wasm = state::fetch(store, app, BLOBS, hash).await?;
@@ -40,25 +43,34 @@ pub async fn component(
     let code = spawn_blocking(move || engine.compile(&wasm)).await??;
     // Only once it compiles here, so the compile function is never asked for what cannot compile.
     if native.is_some()
-        && let Err(e) = store.put(&state::marker(app, hash)?.into(), PutPayload::new()).await
+        && let Err(e) = ask(store, app, hash).await
     {
-        tracing::warn!(app, "could not ask for its native code: {e}");
+        tracing::warn!(app, "could not ask for its native code: {e:#}");
     }
     Ok(code)
 }
 
-/// Loads the native code of `app`'s component `hash` from `native`.
-async fn load(native: &dyn ObjectStore, engine: &Arc<Engine>, app: &str, hash: &str) -> Result<Component> {
-    let zst = native.get(&state::native(app, hash, &engine.compat())?.into()).await?.bytes().await?;
+/// Asks the compile function for the native code of `app`'s component `hash`, giving up after `ASK_MAX`.
+async fn ask(store: &dyn ObjectStore, app: &str, hash: &str) -> Result<()> {
+    timeout(ASK_MAX, store.put(&state::marker(app, hash)?.into(), PutPayload::new())).await??;
+    Ok(())
+}
+
+/// The native code of `app`'s component `hash` in `native`, or `None` if it has none.
+async fn load(native: &dyn ObjectStore, engine: &Arc<Engine>, app: &str, hash: &str) -> Result<Option<Component>> {
+    let zst = match native.get(&state::native(app, hash, &engine.compat())?.into()).await {
+        Err(E::NotFound { .. }) => return Ok(None),
+        r => r?.bytes().await?,
+    };
     let engine = engine.clone();
-    spawn_blocking(move || {
+    let code = spawn_blocking(move || {
         let mut file = NamedTempFile::new()?;
         zstd::stream::copy_decode(&*zst, &mut file)?;
         // SAFETY: the code is what `precompile` made, as only the compile function writes `native`. The file is new and
         // this host's own, and is deleted on return, which leaves the component's mapping of it in place.
         unsafe { engine.native(file.path()) }
-    })
-    .await?
+    });
+    Ok(Some(code.await??))
 }
 
 /// The compile function, which makes the native code that markers ask for.
@@ -80,15 +92,14 @@ impl Worker {
         B: Body<Data = Bytes> + Send,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
-        let code = if req.method() != Method::POST || req.uri().path() != EVENTS {
+        status(if req.method() != Method::POST || req.uri().path() != EVENTS {
             StatusCode::NOT_FOUND
         } else if let Err(e) = self.events(req.into_body()).await {
-            tracing::warn!("{e}");
+            tracing::warn!("{e:#}");
             StatusCode::INTERNAL_SERVER_ERROR
         } else {
             StatusCode::OK
-        };
-        hyper::Response::builder().status(code).body(Default::default()).unwrap()
+        })
     }
 
     /// Works through each marker that the bucket event `body` names, and fails if any did.
@@ -104,7 +115,7 @@ impl Worker {
         for record in records {
             let key = record.pointer("/s3/object/key").and_then(Value::as_str).unwrap_or_default();
             if let Err(e) = self.work(key).await {
-                tracing::warn!(key, "{e}");
+                tracing::warn!(key, "{e:#}");
                 failed += 1;
             }
         }
@@ -141,18 +152,12 @@ mod tests {
     use futures_util::StreamExt;
     use http_body_util::Empty;
     use object_store::memory::InMemory;
-    use std::{collections::BTreeMap, fs, time::Duration};
+    use std::{collections::BTreeMap, fs};
     use tokio::time::sleep;
 
     /// What `app` answers at `/` when a host loads its component `hash`.
-    async fn serve(
-        store: &Arc<InMemory>,
-        native: &Arc<InMemory>,
-        engine: &Arc<Engine>,
-        app: &str,
-        hash: &str,
-    ) -> String {
-        let code = component(&**store, Some(&**native), engine, app, hash).await.unwrap();
+    async fn serve(store: &InMemory, native: &InMemory, engine: &Arc<Engine>, app: &str, hash: &str) -> String {
+        let code = component(store, Some(native), engine, app, hash).await.unwrap();
         let app = engine.load(app, Arc::new(InMemory::new()), &code, BTreeMap::new(), &[]).unwrap();
         let res = app.handle(Request::get("http://app/").body(Empty::<Bytes>::new()).unwrap()).await;
         String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().into()).unwrap()
@@ -165,8 +170,8 @@ mod tests {
         Request::post(EVENTS).body(serde_json::json!({ "Records": records }).to_string()).unwrap()
     }
 
-    /// A host loads only native code from the native bucket, made from the app's own component by an engine like its
-    /// own. Missing that, it compiles the component itself and asks for native code, which the next load uses.
+    /// A host loads only sound native code from the native bucket, made from the app's own component by an engine like
+    /// its own. Missing that, it compiles the component itself and asks for native code, which the next load uses.
     #[tokio::test]
     async fn loads_only_its_own_native_code() {
         let (store, native) = (Arc::new(InMemory::new()), Arc::new(InMemory::new()));
@@ -175,20 +180,33 @@ mod tests {
         let engine = Arc::new(Engine::new().unwrap());
         let probe = engine.precompile(&fs::read("tests/fixtures/probe-p3.wasm").unwrap()).unwrap();
         let probe = Bytes::from(zstd::encode_all(&*probe, ZSTD_LEVEL).unwrap());
-        let other = state::native(&app, &hash, "0000000000000000").unwrap(); // as an older engine's
-        native.put(&other.into(), probe.clone().into()).await.unwrap();
         let ours = state::native(&app, &hash, &engine.compat()).unwrap();
-        store.put(&ours.as_str().into(), probe.into()).await.unwrap(); // in the app bucket, which teams write
+        let planted = [
+            (&store, ours.clone()), // in the app bucket, which teams write
+            (&native, state::native(&app, &hash, "0000000000000000").unwrap()), // an older engine's
+            (&native, state::native("other", &hash, &engine.compat()).unwrap()), // another app's, of the same component
+        ];
+        for (bucket, key) in planted {
+            bucket.put(&key.into(), probe.clone().into()).await.unwrap();
+        }
         assert_eq!(serve(&store, &native, &engine, &app, &hash).await, "hello"); // not the probe's "ok"
+        native.put(&ours.as_str().into(), "not zstd".into()).await.unwrap();
+        assert_eq!(serve(&store, &native, &engine, &app, &hash).await, "hello");
+        native.delete(&ours.as_str().into()).await.unwrap(); // which is how bad native code is fixed
 
         let marker = state::marker(&app, &hash).unwrap();
         store.head(&marker.as_str().into()).await.unwrap();
-        Worker::new(store.clone(), native.clone()).unwrap().work(&marker).await.unwrap();
+        let worker = Worker::new(store.clone(), native.clone()).unwrap();
+        worker.work(&marker).await.unwrap();
         native.head(&ours.as_str().into()).await.unwrap();
         assert!(store.head(&marker.as_str().into()).await.is_err());
         store.delete(&state::object(&app, BLOBS, &hash).unwrap().into()).await.unwrap(); // so only native code serves it
         assert_eq!(serve(&store, &native, &engine, &app, &hash).await, "hello");
         assert!(store.head(&marker.as_str().into()).await.is_err()); // and it asks for nothing
+
+        store.put(&marker.as_str().into(), PutPayload::new()).await.unwrap(); // as a republish would
+        worker.work(&marker).await.unwrap(); // with no component to read, as the native code is there
+        assert!(store.head(&marker.as_str().into()).await.is_err());
     }
 
     /// `precompile` waits until the compile function has made the native code, which an event asked it for.
@@ -199,14 +217,15 @@ mod tests {
         let hash = state::release(&*store, &app, &id).await.unwrap().component;
         let marker = state::marker(&app, &hash).unwrap();
         let worker = Arc::new(Worker::new(store.clone(), native.clone()).unwrap());
-        let (s, m) = (store.clone(), marker.clone());
-        tokio::spawn(async move {
-            while s.head(&m.as_str().into()).await.is_err() {
+        let work = async {
+            while store.head(&marker.as_str().into()).await.is_err() {
                 sleep(Duration::from_millis(10)).await;
             }
-            assert_eq!(worker.handle(event(&[&m])).await.status(), StatusCode::OK);
-        });
-        cli::precompile(&*store, &app, &id).await.unwrap();
+            let status = worker.handle(event(&[&marker])).await.status();
+            ensure!(status == StatusCode::OK, "the event got a {status}"); // which ends the wait at once
+            Ok(())
+        };
+        tokio::try_join!(cli::precompile(&*store, &app, &id), work).unwrap();
         native.head(&state::native(&app, &hash, &Engine::new().unwrap().compat()).unwrap().into()).await.unwrap();
     }
 

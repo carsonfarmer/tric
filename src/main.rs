@@ -41,8 +41,8 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:8080")] // the adapter's default
         listen: SocketAddr,
     },
-    /// Upload the app described by DIR/torpor.toml as a release, without serving it, and print `APP ID` once its native
-    /// code is made
+    /// Upload the app described by DIR/torpor.toml as a release, without serving it, and print `APP ID`. With --native,
+    /// then wait until its native code is made
     Publish {
         #[arg(default_value = ".")]
         dir: PathBuf,
@@ -79,10 +79,10 @@ async fn main() -> Result<()> {
         }
         Cmd::Publish { dir } => {
             let (app, id) = cli::publish(s()?, &dir, true).await?;
+            println!("{app} {id}"); // first, as the release stands even if the wait fails
             if native.is_some() {
                 cli::precompile(s()?, &app, &id).await?;
             }
-            println!("{app} {id}")
         }
         Cmd::Release { app, id } => cli::release(s()?, &app, &id).await?,
         Cmd::Releases { app } => cli::releases(s()?, &app).await?.iter().for_each(|r| println!("{r}")),

@@ -70,9 +70,11 @@ pub fn marker(app: &str, hash: &str) -> Result<String> {
     Ok(format!("{MARKERS}{}/{hash}", checked(app)?))
 }
 
-/// The app and the hash that the marker `key` names.
+/// The app and the hash that the marker `key` names, if it is one: just what `marker` makes.
 pub fn marked(key: &str) -> Option<(&str, &str)> {
-    key.strip_prefix(MARKERS)?.split_once('/')
+    let (app, hash) = key.strip_prefix(MARKERS)?.split_once('/')?;
+    let hex = hash.len() == 2 * Sha256::output_size() && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    (is_name(app) && hex).then_some((app, hash))
 }
 
 /// Where the native code of `app`'s component `hash` is in the bucket of native code, for engines of `compat`.
@@ -162,5 +164,15 @@ mod tests {
         let e = update(&store, "app", |c| _ = c.secrets.insert("big".into(), big)).await.unwrap_err();
         assert!(e.to_string().contains("would be over"), "{e}");
         assert!(current(&store, "app").await.unwrap().0 == Current::default()); // and it still reads
+    }
+
+    #[test]
+    fn reads_only_the_markers_it_makes() {
+        let (hash, upper) = ("a".repeat(64), "A".repeat(64));
+        assert_eq!(marked(&marker("app", &hash).unwrap()), Some(("app", &*hash)));
+        let keys = [format!("compile/app//{hash}"), format!("compile/App/{hash}"), format!("compile/app/{upper}")];
+        for key in keys.into_iter().chain([format!("compile/app/{hash}0"), format!("kv/app/{hash}")]) {
+            assert!(marked(&key).is_none(), "{key}");
+        }
     }
 }

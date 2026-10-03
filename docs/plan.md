@@ -30,17 +30,17 @@ An operator installs torpor into their own AWS account with one OpenTofu module,
   - tokio and hyper;
   - `zstd`, serde, `toml`, `clap` and `tracing`.
 
-**Line budget:** about 1,390 lines of Rust (1,200 before M2, 1,290 before M3 and its review raised `serve` and `state`; 996 written so far, after four trim passes and three correctness passes) plus about 250 of HCL. A module that runs well past its budget is a design problem to raise, not to push through.
+**Line budget:** about 1,390 lines of Rust (1,200 before M2, 1,290 before M3 and its review raised `serve` and `state`; 1,250 written so far, through M4, after four trim passes and four correctness passes) plus about 250 of HCL. A module that runs well past its budget is a design problem to raise, not to push through.
 
 | Module | Does | Budget |
 |---|---|---|
-| `engine` | Wasmtime config, epoch ticker, limits, a fresh store per request with a WASI context that grants nothing, p2/p3 dispatch, loading native code, Cranelift fallback | ~210 (`engine` ~120 and `guest` ~90, merged in the trim pass; 225 after the trim passes, before native code) |
+| `engine` | Wasmtime config, epoch ticker, limits, a fresh store per request with a WASI context that grants nothing, p2/p3 dispatch, loading native code, Cranelift fallback | ~210 (`engine` ~120 and `guest` ~90, merged in the trim pass; 225 after the trim passes, 256 after M4, which moved loading native code to `compile`) |
 | `outbound` | Allow list plus the resolved-address block, in the HTTP send hook | ~100 (raised in M2 from ~60: the matcher is hand-written, and the connect is our own; 118 after the trim passes) |
 | `kv` | `wasi:keyvalue` draft2 over the app's own prefix of the bucket: one object per key, CAS, no cache | ~250 (raised in M2 from ~200; 230 after the trim and review passes) |
 | `config` | `wasi:config` from the manifest, with secrets | 0 (Wasmtime's crate serves it, and `serve` adds secrets in 1 line) |
 | `state` | The bucket layout, releases, compare-and-swap updates, defensive reads | ~130 (raised in the M3 review from ~100; 123 after the trim and review passes) |
 | `serve` | hyper server, routing, logs | ~170 (raised in M3 from ~100, which was the router alone, then in the M3 review from ~140 for a pointer recheck per app; 144 after the trim and review passes) |
-| `compile` | The compile worker and compile-request markers | ~70 |
+| `compile` | The compile worker and compile-request markers, and a host's load of native code with its fallback compile | ~150 (raised in M4 from ~70, as it took the host's side from `engine`; 147 after the review pass) |
 | `cli` | `publish`, `release`, `releases`, `secret`, `secrets`, `gc`, and `main`'s arguments | ~350 (146 after the trim and review passes, before `gc` and `compile`) |
 | `infra/aws` | OpenTofu module | ~250 HCL |
 
@@ -54,14 +54,14 @@ Q43 applies: no product name appears in any stored key or field, so a rename nev
 | app | `apps/<app>/releases/<hex>` | Immutable releases: component, config, allow list (Q69) | team (put-if-absent) |
 | app | `apps/<app>/current` | The release the app serves, and its secrets, in plain (Q65, Q73) | team (CAS) |
 | app | `kv/<app>/<store>/<key>` | KV values, percent-encoded keys (Q42) | serving function |
-| app | `compile/<hex>` | Compile requests | team, serving function; compile function deletes |
-| native | `<hex>/<compat hash>.zst` | Compiled native code (Q54) | **compile function only** |
+| app | `compile/<app>/<hex>` | Compile requests | team, serving function; compile function deletes |
+| native | `<app>/<hex>/<compat hash>.zst` | Compiled native code, under the app that owns the component (Q54) | **compile function only** |
 
 **IAM shape:**
-- The serving function reads the app bucket and may write only `kv/` and `compile/`. It can only read the native bucket.
-- Each team has a role tagged `team`, and one ABAC policy lets it read, write and list only `apps/${team}-*`, so a team owns the apps named `<team>-…`, plus write `compile/` (Q64, Q72). Team names have no hyphens. Nobody but the serving function writes `kv/`.
+- The serving function reads the app bucket and may write only `kv/` and `compile/`. It can only read the native bucket, and lists it too, so a miss is a 404 rather than a 403.
+- Each team has a role tagged `team`, and one ABAC policy lets it read, write and list only `apps/${team}-*`, so a team owns the apps named `<team>-…`, plus read, write and list `compile/${team}-*`, which `publish` waits on: without the list, S3 answers its check on a deleted marker with a 403 (Q64, Q72). Team names have no hyphens. Nobody but the serving function writes `kv/`.
 - The admin, who runs `gc`, gets delete but never put in the native bucket, so `gc` can prune **(choice)**.
-- The compile function reads `apps/*/blobs/`, deletes `compile/`, and writes the native bucket.
+- The compile function reads `apps/*/blobs/`, deletes `compile/`, and reads, lists and writes the native bucket.
 
 ## Milestones
 
@@ -143,20 +143,19 @@ The M3 review reshaped this milestone; decisions.md Q60–Q79 has the why.
 
 ### M4: Native code (compile once, run everywhere)
 
-This refines the trigger in Q58 **(choice)**; see [Choices to confirm](#choices-to-confirm).
+This refines the trigger in Q58 **(choice)**; see [Choices to confirm](#choices-to-confirm). decisions.md "M4" has the choices made while building it.
 
-**Open for M4:** since Q72 a blob lives under its app, so a marker must name the app as well as the hash, like `compile/<app>/<hex>`, where `<hex>` is the component's SHA-256, as in `apps/<app>/blobs/sha256/<hex>`.
+Everything here is on only with `--native` (`TORPOR_NATIVE`), the native bucket. A marker is `compile/<app>/<hex>`, where `<hex>` is the component's SHA-256, as in `apps/<app>/blobs/sha256/<hex>`, and native code is `<app>/<hex>/<compat>.zst`.
 
-- **`torpor compile-worker`** receives bucket events through the Lambda Web Adapter's pass-through path (`POST /events`). For each `compile/<hex>`:
-  1. It fetches and hash-checks the blob.
-  2. If `<hex>/<own compat hash>.zst` already exists, it skips to step 5.
-  3. It compiles with Cranelift.
-  4. It writes the zstd-compressed result to the native bucket.
-  5. It deletes the marker.
+- **`torpor compile-worker`** receives bucket events through the Lambda Web Adapter's pass-through path (`POST /events`). For each marker:
+  1. If `<app>/<hex>/<own compat hash>.zst` already exists, it skips to step 4.
+  2. It fetches and hash-checks the blob, and compiles it with Cranelift.
+  3. It writes the zstd-compressed result to the native bucket.
+  4. It deletes the marker.
 - **Serving:**
   - **Loading:** native code comes only from the native bucket. It is decompressed into `/tmp` and loaded with `deserialize_file`, which maps the file.
-  - **On a miss:** the host writes `compile/<hex>` once per environment, then compiles locally with Cranelift into `/tmp` (Q58).
-- **Publish:** writes `compile/<hex>` and waits until it is deleted. A timeout points at the compile logs. The CLI never reads the native bucket.
+  - **On a miss:** the host compiles locally with Cranelift, in memory, and once that succeeds writes the marker, giving up the write after 1 s (Q58). It loads each release once, so that is once per environment. Native code that is there but fails to load is compiled around the same way, with a warning, and stays until it is deleted.
+- **Publish:** prints `APP ID`, then writes the marker and waits until it is deleted. A timeout points at the compile logs. The CLI never reads the native bucket.
 
 **Done when:** tests over two in-memory stores (app and native) cover:
 - the normal path;
@@ -165,12 +164,15 @@ This refines the trigger in Q58 **(choice)**; see [Choices to confirm](#choices-
 - a changed compat hash, which recompiles lazily;
 - a failed compile, which leaves the marker so the next miss asks again.
 
+All of these are covered, plus another app's native code and corrupt native code, neither ever loaded, and the worker skipping native code that is already there.
+
 ### M5: AWS install and cloud validation (needs your explicit approval to apply)
 
 - **`infra/aws`** (latest OpenTofu, Q20) contains:
   - the app and native buckets;
   - the **serving function:** arm64 on `provided.al2023` with the Lambda Web Adapter layer. 1769 MB by default, rejecting anything under 512 MB (Q51). A public Function URL with a reserved-concurrency cap and a budget alert (Q50);
-  - the **compile function:** the same binary at 3008 MB with a 120 s timeout **(choice)**, fired by bucket events on `compile/`, and updated before the serving function;
+  - the **compile function:** the same binary at 3008 MB with a 120 s timeout **(choice)**, and updated before the serving function. It is fired by `s3:ObjectCreated:*` events on the prefix `compile/`, with `AWS_LWA_ERROR_STATUS_CODES` covering 500 so a failed marker counts as a failed invocation and is retried. A small reserved concurrency queues a burst of markers, so the later ones find the native code and skip;
+  - for the serving function, ephemeral storage that fits the native code of every app a host loads (512 MB by default), and the adapter's readiness check over TCP, as an HTTP one costs a bucket read;
   - **CloudFront in front of the Function URL**, with a wildcard certificate and wildcard DNS for `*.tric.works` in its Route 53 zone (Q71). It passes the viewer's `Host` on in a header, since the Function URL needs its own;
   - the IAM shape above, a log-retention variable (default 7 days) **(choice)**, and tags on everything.
 - **Build:** the release build runs in Docker against AL2023's glibc and produces the zip.
@@ -208,7 +210,8 @@ This refines the trigger in Q58 **(choice)**; see [Choices to confirm](#choices-
 | Deserialize takes 46–58 ms on Lambda | M5 measures `deserialize_file` |
 | Large JS components about 1 s cold | M5; dedicated functions are a deferred item |
 | The p3 outbound send hook in `wasmtime-wasi-http` may differ from p2's | Checked first in M2 |
-| The Lambda Web Adapter's event pass-through for the compile function | Checked first in M4, proven in M5 |
+| The Lambda Web Adapter's event pass-through for the compile function | Built to its documented contract in M4 (the raw event, posted to `/events`); proven in M5 |
+| The compile function compiles untrusted components while it can write native code that every host runs | Wasmtime's compiler is the boundary: a component that exploits Cranelift there could write native code for any app. Per-team compile functions would contain it (deferred) |
 
 ## Choices to confirm
 
@@ -216,7 +219,7 @@ These are small calls this plan makes. Say which, if any, to change.
 
 1. **Merge `spike/latency` into `main`** at the start of M1, so `prototypes/latency/` and its results stay on record (Q13).
 2. **One kind of compile marker** (refines Q58):
-   - **What:** `compile/<hex>`. Publish writes it, and so does a serving miss (once per environment). The compile worker deletes it when the native code exists, and publish waits for that deletion.
+   - **What:** `compile/<app>/<hex>`. Publish writes it, and so does a serving miss (once per environment). The compile worker deletes it when the native code exists, and publish waits for that deletion.
    - **Why:** compared with Q58's create-only `compile/<compat hash>/<hex>` plus a component-upload trigger, this needs one trigger instead of two. The CLI never needs the compat hash or the native bucket, a failed compile retries on the next miss, and republishing an already-uploaded component still works.
    - **Cost:** at most one tiny PUT per cold environment until the native code lands.
 3. **The admin gets delete-only on the native bucket** so `gc` can prune it. Deleting live native code only causes a recompile.
