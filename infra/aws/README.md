@@ -1,6 +1,6 @@
 # torpor on AWS
 
-An install: the app and native-code buckets, the serving and compile functions, CloudFront at `*.<domain>`, a role
+An install: the app, native-code and KV buckets, the serving and compile functions, CloudFront at `*.<domain>`, a role
 per team, and a budget alert. Everything it makes is tagged `torpor = <name>`. Every command below runs from the
 repository's root, with `AWS_PROFILE` set to a profile that may administer the account.
 
@@ -27,6 +27,9 @@ docker compose run --rm tofu apply -var domain=<domain> -var 'budget={emails=["<
 
 The outputs are the CLI's `TORPOR_STORE` and `TORPOR_NATIVE`, and each team's role. An account whose Lambda
 concurrency quota is under 122 has none to reserve: add `-var 'concurrency={serve=-1,compile=-1}'`.
+
+Apps are then at `https://<app>.<domain>`. A resolver that looked a name up before the apply made its records may
+keep that miss for up to 15 minutes, the zone's negative-caching time.
 
 ## Spin down
 

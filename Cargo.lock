@@ -2370,6 +2370,7 @@ dependencies = [
  "hyper",
  "object_store",
  "percent-encoding",
+ "rand",
  "serde",
  "serde_json",
  "sha2",

@@ -133,12 +133,12 @@ A **host** is one running torpor process. In production several hosts can serve 
 | `get`, `exists` | The value in the store when the call ran, whichever host wrote it. |
 | `cas::new`, then `current` | `new` reads the store and `current` returns what it read. |
 | `swap` | Succeeds only if the key is unchanged since `cas::new`, checked by the store with `If-Match`. Atomic across all hosts. A lost swap returns `cas-failed` with a new handle that holds the latest value. A swap on a missing key succeeds only if the key is still missing, and a swap on a key deleted since `cas::new` loses. |
-| `increment` | Atomic across hosts. A missing key counts as 0. It retries a lost race up to 16 times, then fails with `too much contention`. |
+| `increment` | Atomic across hosts. A missing key counts as 0. It retries a lost race until it wins, after a random wait that doubles up to 1 s, so under heavy contention it can use up the request's 10 s and end it with a `500`. |
 | `set`, `delete` | In the store before the call returns. The last writer wins. `delete` of a missing key is not an error. |
 
 - **Counters** are 8 bytes, a little-endian `i64`, as in Spin. `increment` on any other length fails with `not a counter`, and on overflow with `overflow`. Read a counter with `get` and decode the 8 bytes.
 - **`swap` compares content.** On S3 the ETag is normally a hash of the value, so if a value changes and changes back between your read and your swap, the swap still succeeds. Keep a version number inside the value if that matters.
-- **Batches are not atomic.** `get-many`, `set-many` and `delete-many` do one key at a time, so they save no round trips. If `set-many` fails part-way, the keys before the failure stay written, and other callers can see the partial result. Keys are checked before anything is written, but a value over 1 MiB is only found when its turn comes, after the earlier keys are already in the store.
+- **Batches are not atomic.** `get-many` and `set-many` make up to 32 store calls at once, and on S3 `delete-many` deletes up to 1,000 keys in one request. Every key, and every value `set-many` is given, is checked before anything is written. If a batch fails part-way, any of its keys may already be written or deleted, and other callers can see the partial result. A key given twice to `set-many` gets its last value.
 - **A write that fails** may still have reached the store, and so may part of a batch. After an error, treat the key as unknown and read it again.
 - **No transactions across keys.** Use `increment` or `cas` instead of `get` then `set`.
 - **Hot keys on GCS:** GCS takes about one write a second to any one object and throttles faster writes, which the host retries with backoff, so they slow down and can fail. Spread a busy counter over several keys. S3 and Azure have no such limit.
@@ -163,7 +163,7 @@ KV failures come back as error values, not traps.
 
 ## What KV costs
 
-On S3 every store call is billed. The prices below are us-east-1 list prices and vary by region: PUT, LIST and POST are $0.005 per 1,000 requests, and GET and HEAD are $0.0004 per 1,000. DELETE is free. Storage and data transfer are extra.
+On S3 every store call is billed. The prices below are us-east-1 list prices and vary by region: PUT, LIST and POST are $0.005 per 1,000 requests, and GET and HEAD are $0.0004 per 1,000. Deletes are free, including the bulk deletes (a POST) that torpor makes for every delete. Storage and data transfer are extra.
 
 | Operation | Store calls | Request cost per 1,000 operations |
 |---|---|---|
@@ -171,10 +171,11 @@ On S3 every store call is billed. The prices below are us-east-1 list prices and
 | `get`, `cas::new` | 1 GET | $0.0004 |
 | `exists` | 1 HEAD | $0.0004 |
 | `set` | 1 PUT | $0.005 |
-| `delete` | 1 DELETE | $0 |
+| `delete` | 1 bulk delete | $0 |
 | `increment` | GET, PUT, and both again for each lost race | $0.0054 |
 | `swap` | 1 PUT. A lost swap costs a PUT, then 1 GET for the new handle | $0.005 |
-| `get-many`, `set-many`, `delete-many`, N keys | N of the single call | N times the single call |
+| `get-many`, `set-many`, N keys | N of the single call | N times the single call |
+| `delete-many`, N keys | 1 bulk delete per 1,000 keys | $0 |
 | `list-keys` | 1 LIST per page | $0.005 |
 
 For scale, 100,000 `set`s a month is $0.50 in requests, and a million `get`s is $0.40. Reads add up on a hot key: one read 100 times a second all month is about 260 million GETs, or about $104.
@@ -242,4 +243,5 @@ Blocked: `10/8`, `172.16/12`, `192.168/16`, loopback, `169.254/16` (which holds 
 
 - **Failures** before the guest has responded (a trap, the deadline, a limit) give an empty `500`. The guest's own output is logged either way. The 10 s deadline also cuts a response body that is still streaming, so read request bodies and write responses promptly.
 - **Handles:** Rust drops them as they go out of scope. A garbage-collected guest may hold them until its collector runs, which is not yet tested.
+- **On AWS**, CloudFront refuses a URL over 8,192 bytes with a `414` of its own, before the request reaches the app, and a request or response body is at most 6 MB, Lambda's limit for one invocation.
 - **Logs:** each stream is logged once per request, when the request ends, as one JSON line tagged with the app. stdout is logged at `info` and stderr at `warn`. The default level is `warn`, so stdout shows only when the host runs with `RUST_LOG=info`.

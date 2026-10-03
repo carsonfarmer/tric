@@ -4,14 +4,31 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use http_body_util::{BodyExt, Empty};
 use object_store::{path::Path, prefix::PrefixStore, *};
-use std::{fmt, fs, sync::Arc, sync::LazyLock, sync::Mutex};
+use std::sync::{Arc, LazyLock, Mutex, atomic::AtomicUsize, atomic::Ordering::Relaxed};
+use std::{env, fmt, fs, time::SystemTime};
 use torpor::{App, Engine};
 
-/// An `InMemory` store that logs its gets (`get kv/app/s/k`), puts and lists, and passes everything else through.
-#[derive(Debug, Default)]
+/// A store that logs its gets (`get kv/app/s/k`), puts and lists, and passes everything else through: to an `InMemory`
+/// store or, with `TORPOR_TEST_STORE` set to a bucket like `s3://NAME`, to a prefix of that bucket that it alone uses.
+#[derive(Debug)]
 pub struct Counting {
-    pub inner: memory::InMemory,
+    pub inner: Arc<dyn ObjectStore>,
     log: Mutex<Vec<String>>,
+}
+
+impl Default for Counting {
+    fn default() -> Self {
+        static RUN: LazyLock<u128> = LazyLock::new(|| SystemTime::UNIX_EPOCH.elapsed().unwrap().as_nanos());
+        static STORES: AtomicUsize = AtomicUsize::new(0);
+        let inner: Arc<dyn ObjectStore> = match env::var("TORPOR_TEST_STORE") {
+            Ok(url) => Arc::new(PrefixStore::new(
+                aws::AmazonS3Builder::from_env().with_url(url).build().unwrap(),
+                format!("test/{}-{}", *RUN, STORES.fetch_add(1, Relaxed)),
+            )),
+            Err(_) => Arc::new(memory::InMemory::new()),
+        };
+        Self { inner, log: Mutex::default() }
+    }
 }
 
 impl Counting {
@@ -48,6 +65,11 @@ impl ObjectStore for Counting {
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         self.note(format!("list {}", prefix.map(Path::as_ref).unwrap_or_default()));
         self.inner.list(prefix)
+    }
+    // Passed through, rather than left to the default that lists from the start, so a bucket's own offset is tested.
+    fn list_with_offset(&self, prefix: Option<&Path>, offset: &Path) -> BoxStream<'static, Result<ObjectMeta>> {
+        self.note(format!("list {}", prefix.map(Path::as_ref).unwrap_or_default()));
+        self.inner.list_with_offset(prefix, offset)
     }
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
         self.inner.list_with_delimiter(prefix).await

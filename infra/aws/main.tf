@@ -260,8 +260,8 @@ resource "aws_iam_role" "team" {
 }
 
 resource "aws_iam_role_policy_attachment" "team" {
-  for_each   = aws_iam_role.team
-  role       = each.value.name
+  for_each   = var.teams
+  role       = aws_iam_role.team[each.key].name
   policy_arn = aws_iam_policy.team.arn
 }
 

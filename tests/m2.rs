@@ -123,7 +123,8 @@ async fn racing_writers_lose_nothing() {
     let tasks = [&a, &b].repeat(4).into_iter().cloned().map(|app| {
         tokio::spawn(async move {
             for _ in 0..10 {
-                j(&app, "/kv?op=incr&store=s&key=host").await;
+                let incr = j(&app, "/kv?op=incr&store=s&key=host").await;
+                assert!(incr["ok"].is_i64(), "{incr}");
             }
             j(&app, "/kv?op=rmw&store=s&key=guest&n=10").await["ok"].as_i64().unwrap() // the retries
         })
