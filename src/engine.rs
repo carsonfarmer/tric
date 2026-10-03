@@ -1,6 +1,6 @@
 //! The Wasmtime engine, and apps on it: a fresh store per request, under hard limits: 10 s, 256 MiB, 32 MiB copied in
 //! by one host call, nothing inherited, and outbound HTTP only to the hosts the app allows.
-use crate::kv::{Imports, Kv};
+use crate::kv::Imports;
 use crate::outbound::{Allow, Outbound};
 use http_body_util::BodyExt;
 use hyper::body::{Body, Bytes};
@@ -79,7 +79,7 @@ impl Engine {
             Ok(_) => ProxyPre::P3(p3::bindings::ServicePre::new(pre)?),
             Err(_) => ProxyPre::P2(p2::bindings::ProxyPre::new(pre)?),
         };
-        let app = Arc::new(Shared { name: name.into(), config: config.into_iter().collect(), kv: Kv(kv), allow });
+        let app = Arc::new(Shared { name: name.into(), config: config.into_iter().collect(), kv, allow });
         let permits = Arc::new(Semaphore::new(MAX_INFLIGHT));
         Ok(App(ProxyHandler::new(State { engine: self.engine.clone(), pre, app, permits })))
     }
@@ -89,7 +89,7 @@ impl Engine {
 pub(crate) struct Shared {
     name: String,
     config: WasiConfigVariables,
-    pub(crate) kv: Kv,
+    pub(crate) kv: Arc<dyn ObjectStore>,
     pub(crate) allow: Vec<Allow>,
 }
 

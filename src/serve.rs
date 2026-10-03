@@ -12,22 +12,21 @@ use wasmtime::{Error, Result};
 use wasmtime_wasi_http::{handler::Response, io::TokioIo};
 
 const VAR_PREFIX: &str = "TORPOR_VAR_";
-/// The longest a recheck may hold up a request. The S3 client on its own retries for up to 3 minutes.
+/// The longest a read of `current` may hold up a request. The S3 client on its own retries for up to 3 minutes.
 const RECHECK_MAX: Duration = Duration::from_secs(1);
 
 /// Every app of an install, each served at `<app>.<any domain>`, and loaded at its first request.
 pub struct Install {
     store: Arc<dyn ObjectStore>,
     engine: Arc<Engine>,
-    apps: Mutex<HashMap<String, Arc<Mutex<Served>>>>, // by name, each with a release
+    apps: Mutex<HashMap<String, Arc<Mutex<Served>>>>, // by name, each once it has had a release
 }
 
 /// One app as a host last read it, and the app loaded from its release or why that failed. A failure stands until the
 /// next recheck, so a broken release costs one load per `FRESH`, not one per request.
-#[derive(Default)]
 struct Served {
     current: Current,
-    read: Option<Instant>,
+    read: Instant,
     app: Option<Result<App, String>>,
 }
 
@@ -45,7 +44,7 @@ impl Install {
         let secrets = env::vars().filter_map(|(k, v)| Some((k.strip_prefix(VAR_PREFIX)?.to_lowercase(), v))).collect();
         state::update(&*store, &app, |c| *c = Current { release: Some(id), secrets }).await?;
         let install = Self::new(store)?;
-        install.route(&app).await?;
+        install.app(&app).await?;
         Ok(install)
     }
 
@@ -55,43 +54,52 @@ impl Install {
         B::Error: Into<wasmtime_wasi_http::Error>,
     {
         let host = req.headers().get(HOST).and_then(|h| h.to_str().ok()).unwrap_or_default();
-        match self.route(host).await.inspect_err(|e| tracing::warn!("{e}")) {
+        let name = host.split(['.', ':']).next().unwrap_or_default().to_ascii_lowercase(); // the first label
+        match self.app(&name).await.inspect_err(|e| tracing::warn!(app = name, "{e}")) {
             Ok(Some(app)) => app.handle(req).await,
             Ok(None) => status(StatusCode::NOT_FOUND),
             Err(_) => status(StatusCode::INTERNAL_SERVER_ERROR),
         }
     }
 
-    /// The app named by the first label of `host`, loading it if it is new or its `current` changed. A name with
-    /// nothing released is not kept, so made-up names cost a read each, and no memory.
-    async fn route(&self, host: &str) -> Result<Option<App>> {
-        let name = host.split(['.', ':']).next().unwrap_or_default().to_ascii_lowercase();
-        if !is_name(&name) {
+    /// The app `name`, loading it if it is new or its `current` changed. A name is kept only once it has had a release,
+    /// so a made-up name costs a read each, and no memory.
+    async fn app(&self, name: &str) -> Result<Option<App>> {
+        if !is_name(name) {
             return Ok(None);
         }
-        let served = self.apps.lock().await.entry(name.clone()).or_default().clone();
-        let s = &mut *served.lock().await;
-        if s.read.is_none_or(|r| r.elapsed() >= FRESH) {
-            match timeout(RECHECK_MAX, state::current(&*self.store, &name)).await.unwrap_or_else(|e| Err(e.into())) {
-                Ok((current, _)) if current != s.current => (s.current, s.app) = (current, None),
-                Ok(_) => {}
-                Err(e) if s.read.is_some() => tracing::warn!("serving {name} as last read: {e}"),
-                Err(e) => {
-                    self.apps.lock().await.remove(&name); // never read, so not kept
-                    return Err(e);
+        let known = self.apps.lock().await.get(name).cloned(); // apart, as the `match` would hold the lock into its arms
+        let served = match known {
+            Some(served) => served,
+            None => {
+                let current = self.current(name).await?;
+                if current.release.is_none() {
+                    return Ok(None);
                 }
+                let served = Arc::new(Mutex::new(Served { current, read: Instant::now(), app: None }));
+                self.apps.lock().await.entry(name.into()).or_insert(served).clone()
             }
-            s.read = Some(Instant::now());
+        };
+        let s = &mut *served.lock().await;
+        if s.read.elapsed() >= FRESH {
+            match self.current(name).await {
+                Ok(current) if current != s.current => (s.current, s.app) = (current, None),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(app = name, "serving it as last read: {e}"),
+            }
+            s.read = Instant::now();
             s.app.take_if(|a| a.is_err());
         }
-        let Some(release) = &s.current.release else {
-            self.apps.lock().await.remove(&name);
-            return Ok(None);
-        };
+        let Some(release) = &s.current.release else { return Ok(None) };
         if s.app.is_none() {
-            s.app = Some(self.load(&name, release, &s.current.secrets).await.map_err(|e| e.to_string()));
+            s.app = Some(self.load(name, release, &s.current.secrets).await.map_err(|e| e.to_string()));
         }
         Ok(Some(s.app.clone().expect("loaded above").map_err(Error::msg)?))
+    }
+
+    /// `name`'s `current`, or an error once `RECHECK_MAX` has passed.
+    async fn current(&self, name: &str) -> Result<Current> {
+        Ok(timeout(RECHECK_MAX, state::current(&*self.store, name)).await??.0)
     }
 
     /// The app `name` from its release `id`, with `secrets` over its config, and its component compiled on a blocking
@@ -114,7 +122,7 @@ pub async fn run(install: Install, listener: TcpListener) -> Result<()> {
     let install = Arc::new(install);
     loop {
         let (stream, _) = listener.accept().await?;
-        stream.set_nodelay(true)?; // otherwise Nagle plus delayed ACK stalls a response by ~40 ms
+        _ = stream.set_nodelay(true); // best effort; otherwise Nagle plus delayed ACK stalls a response by ~40 ms
         let install = install.clone();
         tokio::spawn(async move {
             let svc = service_fn(|req: Request<Incoming>| async { Ok::<_, Infallible>(install.handle(req).await) });
@@ -212,7 +220,7 @@ mod tests {
         let good = store.get(&blob).await.unwrap().bytes().await.unwrap();
         store.put(&blob, std::fs::read("tests/fixtures/hello-p2.wasm").unwrap().into()).await.unwrap();
         let install = Install::new(store.clone()).unwrap();
-        let e = install.route("hello.localhost").await.err().unwrap();
+        let e = install.app("hello").await.err().unwrap();
         assert!(e.to_string().contains("does not match its hash"), "{e}");
         store.put(&blob, good.into()).await.unwrap();
         assert_eq!(get(&install, "hello.localhost", "/").await.0, 500); // the failure is remembered, not fetched again

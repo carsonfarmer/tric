@@ -163,12 +163,13 @@ KV failures come back as error values, not traps.
 
 ## What KV costs
 
-On S3 every store call is billed. The prices below are us-east-1 list prices and vary by region: PUT, LIST and POST are $0.005 per 1,000 requests, and GET is $0.0004 per 1,000. DELETE is free. Storage and data transfer are extra.
+On S3 every store call is billed. The prices below are us-east-1 list prices and vary by region: PUT, LIST and POST are $0.005 per 1,000 requests, and GET and HEAD are $0.0004 per 1,000. DELETE is free. Storage and data transfer are extra.
 
 | Operation | Store calls | Request cost per 1,000 operations |
 |---|---|---|
 | `open`, `current` | none | $0 |
-| `get`, `exists`, `cas::new` | 1 GET | $0.0004 |
+| `get`, `cas::new` | 1 GET | $0.0004 |
+| `exists` | 1 HEAD | $0.0004 |
 | `set` | 1 PUT | $0.005 |
 | `delete` | 1 DELETE | $0 |
 | `increment` | GET, PUT, and both again for each lost race | $0.0054 |

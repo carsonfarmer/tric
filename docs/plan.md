@@ -30,16 +30,16 @@ An operator installs torpor into their own AWS account with one OpenTofu module,
   - tokio and hyper;
   - `zstd`, serde, `toml`, `clap` and `tracing`.
 
-**Line budget:** about 1,390 lines of Rust (1,200 before M2, 1,290 before M3 and its review raised `serve` and `state`; 943 written so far, after four trim passes) plus about 250 of HCL. A module that runs well past its budget is a design problem to raise, not to push through.
+**Line budget:** about 1,390 lines of Rust (1,200 before M2, 1,290 before M3 and its review raised `serve` and `state`; 959 written so far, after four trim passes and a correctness pass) plus about 250 of HCL. A module that runs well past its budget is a design problem to raise, not to push through.
 
 | Module | Does | Budget |
 |---|---|---|
 | `engine` | Wasmtime config, epoch ticker, limits, a fresh store per request with a WASI context that grants nothing, p2/p3 dispatch, loading native code, Cranelift fallback | ~210 (`engine` ~120 and `guest` ~90, merged in the trim pass; 225 after the trim passes, before native code) |
 | `outbound` | Allow list plus the resolved-address block, in the HTTP send hook | ~100 (raised in M2 from ~60: the matcher is hand-written, and the connect is our own; 118 after the trim passes) |
-| `kv` | `wasi:keyvalue` draft2 over the app's own prefix of the bucket: one object per key, CAS, no cache | ~250 (raised in M2 from ~200; 219 after the trim passes) |
+| `kv` | `wasi:keyvalue` draft2 over the app's own prefix of the bucket: one object per key, CAS, no cache | ~250 (raised in M2 from ~200; 227 after the trim passes) |
 | `config` | `wasi:config` from the manifest, with secrets | 0 (Wasmtime's crate serves it, and `serve` adds secrets in 1 line) |
 | `state` | The bucket layout, releases, compare-and-swap updates, defensive reads | ~130 (raised in the M3 review from ~100; 102 after the trim passes) |
-| `serve` | hyper server, routing, logs | ~170 (raised in M3 from ~100, which was the router alone, then in the M3 review from ~140 for a pointer recheck per app; 125 after the trim passes) |
+| `serve` | hyper server, routing, logs | ~170 (raised in M3 from ~100, which was the router alone, then in the M3 review from ~140 for a pointer recheck per app; 133 after the trim passes) |
 | `compile` | The compile worker and compile-request markers | ~70 |
 | `cli` | `publish`, `release`, `releases`, `secret`, `secrets`, `gc`, and `main`'s arguments | ~350 (146 after the trim passes, before `gc` and `compile`) |
 | `infra/aws` | OpenTofu module | ~250 HCL |
@@ -126,7 +126,7 @@ The M3 review reshaped this milestone; decisions.md Q60–Q79 has the why.
 - **`torpor secret APP NAME` and `secrets APP`:** set a secret from stdin into the app's `current`, or remove it with an empty value, so it takes effect without a release and outlives releases (Q65, Q73, Q76). A secret overrides config. `secrets` lists names only.
 - Commands return once their write lands; a change is live everywhere within 5 s (Q74).
 - **`torpor serve --store <url>`** (the install mode, which Lambda runs):
-  - Routes by the first label of `Host` (Q67), then reads that app's `current`. A name with nothing released is not kept, so a made-up name costs a GET and no memory (Q72).
+  - Routes by the first label of `Host` (Q67), then reads that app's `current`. A name is kept only once it has had a release, so a made-up name costs a GET and no memory (Q72, Q84).
   - Rereads an app's `current` once it is 5 s old, and reloads the app only if it changed (Q75, Q78). It gives up a recheck after 1 s, serving what it last read.
   - Loads each app once per release, compiling on tokio's blocking pool; a failed load stands until the next recheck (Q62, Q63).
 - **Bucket contents are never trusted (Q53):**
