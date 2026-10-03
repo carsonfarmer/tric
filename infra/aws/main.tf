@@ -104,7 +104,7 @@ resource "aws_lambda_function" "compile" {
   source_code_hash               = filebase64sha256(local.zip)
   memory_size                    = 3008
   timeout                        = 120
-  reserved_concurrent_executions = 2 # so a burst of markers queues, and the later ones find the native code made
+  reserved_concurrent_executions = var.concurrency.compile
   environment {
     # A 5xx fails the invocation, so Lambda retries the event.
     variables = merge(local.env, { AWS_LWA_ERROR_STATUS_CODES = "500-599" })
@@ -123,7 +123,7 @@ resource "aws_lambda_function" "serve" {
   source_code_hash               = filebase64sha256(local.zip)
   memory_size                    = var.serve.memory
   timeout                        = 30
-  reserved_concurrent_executions = var.serve.concurrency
+  reserved_concurrent_executions = var.concurrency.serve
   ephemeral_storage { size = var.serve.storage }
   environment { variables = merge(local.env, { AWS_LWA_PORT = "3000" }) }
   # After the compile function, so a new build's hosts ask for native code from a compile function of the same build.
