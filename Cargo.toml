@@ -2,9 +2,14 @@
 name = "tric"
 version = "0.0.0"
 edition = "2024"
+rust-version = "1.96" # Wasmtime 49's
 license = "Apache-2.0"
-description = "A scale-to-zero host for WASI components"
-publish = false
+description = "A scale-to-zero host for WASI components, with its state in object storage"
+repository = "https://github.com/carsonfarmer/tric"
+readme = "README.md"
+keywords = ["wasm", "wasi", "component-model", "serverless", "lambda"]
+categories = ["wasm", "web-programming::http-server", "command-line-utilities"]
+include = ["/src", "/wit", "/README.md", "/LICENSE"]
 
 [[bin]]
 name = "tric"

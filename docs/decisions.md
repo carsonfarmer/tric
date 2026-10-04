@@ -305,6 +305,16 @@ Nothing here has been applied. The cloud session (plan.md, M5) needs your approv
 | Q99 | The GitHub repo | **Public from the start, under the user's own account, `carsonfarmer`.** |
 | Q100 | The history made public | **Pushed as it is**, the author's email and all: that is standard. |
 
+## M6 (2026-10-03)
+
+| # | Topic | Decision |
+|---|---|---|
+| — | Who runs `gc` | **The operator, with the credentials that installed tric**, not a role of its own. A role with delete but no put in the native bucket would guard only against the operator, who can already do anything. It waits for automated gc, which will need one. This replaces the plan's choice of an admin role. |
+| — | What `gc` deletes | **Q48's rule, per app:** it keeps the current release and the 10 newest by last publish, the components they use, and the newest native code of each, and deletes the rest of the app's releases, components, markers and native code. Anything under an hour old stays, and KV data is never touched. Apps are found in `apps/`, `compile/` and the native bucket, so a deleted app's markers and native code go too. It deletes only keys shaped as the compile function writes them from the native bucket, so pointing `--native` at the app bucket loses nothing. An app it cannot read in full, or whose `current` changes while it runs, is left as it is. A rollback to a release it is deleting, between its last check and its deletes, breaks the app until that release is published again. A publish stores each object again even if it is there, so republishing what gc would delete makes it new, and safe for an hour. A key `object_store` cannot parse, such as one with a control character, which a team's role can write in its own prefix, fails the list it is in: in an app's own, gc leaves that app; at the top of `apps/` or `compile/`, gc stops, naming the key, until the operator deletes it. |
+| — | CI | **GitHub Actions runs the Docker gate** on every push to `main` and every pull request: the test components, `fmt`, `clippy` for both feature sets, the tests, and `cargo publish --dry-run`. The suite against a real bucket stays a manual run, as it needs AWS credentials. |
+| — | Publishing the CLI | **A workflow publishes the crate from a tag `v<version>`, off until the repository variable `PUBLISH` is `true`**, with a crates.io token in the secret `CARGO_REGISTRY_TOKEN`: crates.io's trusted publishing works only for a crate that already exists. `publish = false` is gone, and the package holds only `src`, `wit`, the README and the licence. `rust-version` is Wasmtime 49's, 1.96. |
+| — | Docs | **The README is the quick start**, from nothing to `https://hello.<domain>`, with a Rust app written from scratch. `docs/apps.md` is the app author's guide, now with composition, and `infra/aws/README.md` the operator's, now with teams, upgrades, `gc`, trust and costs. |
+
 ## Deferred work and fast follows
 
 Kept here so nothing agreed in the grilling gets lost.

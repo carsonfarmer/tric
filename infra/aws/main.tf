@@ -15,12 +15,12 @@ locals {
   # The Lambda Web Adapter, published by AWS: an extension that turns invocations into HTTP requests to the function.
   adapter = "arn:aws:lambda:${var.region}:753240598075:layer:LambdaAdapterLayerArm64:30"
   zip     = "${path.module}/../../dist/tric.zip" # as `docker compose run --rm release` builds it
-  team    = "$${aws:PrincipalTag/team}"            # for IAM to fill in: the `team` tag of the role
+  team    = "$${aws:PrincipalTag/team}"          # for IAM to fill in: the `team` tag of the role
   # The one record that proves the domain is ours, as the certificate is for one name.
   validation = one(aws_acm_certificate.this.domain_validation_options)
   env = {
-    TRIC_STORE                     = "s3://${aws_s3_bucket.this["app"].bucket}"
-    TRIC_NATIVE                    = "s3://${aws_s3_bucket.this["native"].bucket}"
+    TRIC_STORE                       = "s3://${aws_s3_bucket.this["app"].bucket}"
+    TRIC_NATIVE                      = "s3://${aws_s3_bucket.this["native"].bucket}"
     RUST_LOG                         = var.logs.filter
     AWS_LWA_READINESS_CHECK_PROTOCOL = "tcp" # as an HTTP check would cost `serve` a bucket read
   }

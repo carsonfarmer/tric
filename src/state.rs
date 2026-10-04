@@ -74,21 +74,37 @@ pub fn kv(app: &str) -> String {
     format!("kv/{app}")
 }
 
+/// Where the markers of `app`'s components are.
+pub fn markers(app: &str) -> Result<String> {
+    Ok(format!("{MARKERS}{}", checked(app)?))
+}
+
 /// The marker that asks for the native code of `app`'s component `hash`.
 pub fn marker(app: &str, hash: &str) -> Result<String> {
-    Ok(format!("{MARKERS}{}/{hash}", checked(app)?))
+    Ok(format!("{}/{hash}", markers(app)?))
 }
 
 /// The app and the hash that the marker `key` names, if it is one: just what `marker` makes.
 pub fn marked(key: &str) -> Option<(&str, &str)> {
     let (app, hash) = key.strip_prefix(MARKERS)?.split_once('/')?;
-    let hex = hash.len() == 2 * Sha256::output_size() && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    (is_name(app) && hex).then_some((app, hash))
+    (is_name(app) && is_hash(hash)).then_some((app, hash))
 }
 
 /// Where the native code of `app`'s component `hash` is in the bucket of native code, for engines of `compat`.
 pub fn native(app: &str, hash: &str, compat: &str) -> Result<String> {
     Ok(format!("{}/{hash}/{compat}.zst", checked(app)?))
+}
+
+/// The hash of the component whose native code is at `key`, if it is such a key: just what `native` makes.
+pub fn compiled(key: &str) -> Option<&str> {
+    match *key.split('/').collect::<Vec<_>>() {
+        [app, hash, file] if is_name(app) && is_hash(hash) && file.ends_with(".zst") => Some(hash),
+        _ => None,
+    }
+}
+
+fn is_hash(s: &str) -> bool {
+    s.len() == 2 * Sha256::output_size() && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// The object at `path` and its version, or `None` if there is none.
@@ -115,15 +131,14 @@ pub async fn fetch(store: &dyn ObjectStore, app: &str, kind: Kind, hash: &str) -
     Ok(bytes)
 }
 
-/// Stores `bytes` as an object of `app` of the kind `kind`, unless it is there already, and returns its hash.
+/// Stores `bytes` as an object of `app` of the kind `kind`, and returns its hash. Storing it again, as a publish of what
+/// was published before does, makes it new again, so `gc` keeps it.
 pub async fn add(store: &dyn ObjectStore, app: &str, kind: Kind, bytes: Bytes) -> Result<String> {
     let hash = format!("{:x}", Sha256::digest(&bytes));
     let path = object(app, kind, &hash)?;
     ensure!(bytes.len() as u64 <= kind.max, "{path} would be over {} bytes", kind.max);
-    match store.put_opts(&path.into(), bytes.into(), PutMode::Create.into()).await {
-        Ok(_) | Err(E::AlreadyExists { .. }) => Ok(hash),
-        Err(e) => Err(e.into()),
-    }
+    store.put(&path.into(), bytes.into()).await?;
+    Ok(hash)
 }
 
 /// `app`'s release `id`.
@@ -175,13 +190,31 @@ mod tests {
         assert!(current(&store, "app").await.unwrap().0 == Current::default()); // and it still reads
     }
 
+    #[tokio::test]
+    async fn adding_again_makes_it_new() {
+        let store = InMemory::new();
+        let mut times = vec![];
+        for _ in 0..2 {
+            let key = object("app", BLOBS, &add(&store, "app", BLOBS, "x".into()).await.unwrap()).unwrap();
+            times.push(store.head(&key.into()).await.unwrap().last_modified);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(times[1] > times[0]); // so `gc` keeps it
+    }
+
     #[test]
-    fn reads_only_the_markers_it_makes() {
+    fn reads_only_the_keys_it_makes() {
         let (hash, upper) = ("a".repeat(64), "A".repeat(64));
         assert_eq!(marked(&marker("app", &hash).unwrap()), Some(("app", &*hash)));
         let keys = [format!("compile/app//{hash}"), format!("compile/App/{hash}"), format!("compile/app/{upper}")];
         for key in keys.into_iter().chain([format!("compile/app/{hash}0"), format!("kv/app/{hash}")]) {
             assert!(marked(&key).is_none(), "{key}");
+        }
+        assert_eq!(compiled(&native("app", &hash, "0123").unwrap()), Some(&*hash));
+        let keys = [format!("app/{hash}/0123"), format!("app/{upper}/0.zst"), format!("apps/app/{hash}/0.zst")];
+        let keys = keys.into_iter().chain([format!("app/{hash}/0.zst/x")]);
+        for key in keys.chain([marker("app", &hash).unwrap(), object("app", BLOBS, &hash).unwrap()]) {
+            assert!(compiled(&key).is_none(), "{key}"); // so a bucket of native code that is the app bucket loses nothing
         }
     }
 }

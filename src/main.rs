@@ -55,12 +55,15 @@ enum Cmd {
     },
     /// Serve APP from its release ID
     Release { app: String, id: String },
-    /// List APP's releases, newest first, each with when it was first published
+    /// List APP's releases, newest first, each with when it was last published
     Releases { app: String },
     /// Set APP's secret NAME to stdin, less a trailing newline, whichever release it runs. An empty value removes it
     Secret { app: String, name: String },
     /// List the names of APP's secrets
     Secrets { app: String },
+    /// Delete, and print, what no app needs: of each, its releases but the one it runs and its 10 newest, and what only
+    /// those used. Anything under an hour old stays, as a publish may still be writing it
+    Gc,
 }
 
 #[tokio::main]
@@ -104,6 +107,7 @@ async fn main() -> Result<()> {
             cli::set_secret(s()?, &app, &name, value.strip_suffix('\n').unwrap_or(&value)).await?
         }
         Cmd::Secrets { app } => cli::secrets(s()?, &app).await?.iter().for_each(|n| println!("{n}")),
+        Cmd::Gc => cli::gc(s()?, native.as_deref(), cli::GRACE).await?,
     }
     Ok(())
 }

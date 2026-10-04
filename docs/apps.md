@@ -38,7 +38,7 @@ An install is one bucket. Name it with `--store s3://BUCKET` or `TRIC_STORE`. Cr
 |---|---|---|
 | `tric publish [DIR]` | team | Uploads the app in DIR (default `.`) as a release, without serving it, and prints `APP ID`. It refuses a component that would not load. |
 | `tric release APP ID` | team | Serves APP from its release ID. To roll back, release an older ID. |
-| `tric releases APP` | team | Lists APP's release IDs, newest first, each with when it was first published. |
+| `tric releases APP` | team | Lists APP's release IDs, newest first, each with when it was last published. |
 | `tric secret APP NAME` | team | Sets APP's secret NAME to stdin, less one trailing newline. An empty value removes it. |
 | `tric secrets APP` | team | Prints the names of APP's secrets. |
 | `tric serve --store ...` | host | Serves every app. |
@@ -119,6 +119,26 @@ async fn handle(request: Request) -> impl IntoResponse { /* wasi::keyvalue::stor
 ```
 
 JavaScript components built with `jco` serve HTTP. KV and outbound requests from JavaScript have not been tested yet.
+
+### Composing components
+
+An app is exactly one component, so an app of several parts is composed into one before it is published, with
+[`wac`](https://github.com/bytecodealliance/wac). `wac plug` fills a component's imports from the exports of others.
+With a `wasi:http` 0.3 middleware (the `middleware` world, which imports `handler` and exports it) in front of an app:
+
+```bash
+wac plug middleware.wasm --plug app.wasm -o composed.wasm
+```
+
+Point `component` in `tric.toml` at `composed.wasm`. A chain of several middlewares is one `wac plug` per link, each
+result plugged into the next middleware.
+
+- **The parts share the app's capabilities.** tric sees one component with the imports of all its parts, so every part
+  reads the same config and secrets, opens the same KV stores, and may call every host on the allow list. Compose only
+  parts you would trust with all of that.
+- **The parts share the app's limits:** one request's time and memory, and the counts of instances, tables and
+  memories in [Limits](#limits), where each part usually brings a memory of its own. Load time grows with the composed
+  size, not the app's alone.
 
 ## KV consistency
 

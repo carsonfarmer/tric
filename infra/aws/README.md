@@ -38,15 +38,75 @@ keep that miss for up to 15 minutes, the zone's negative-caching time. The apps 
 can set a cookie that the browser sends to all of them: teams that should not trust each other need installs of their
 own.
 
-## Using a team's role
+## Teams
 
-The CLI takes its credentials from the `AWS_` variables, not from a profile. With a profile for the role in
-`~/.aws/config` (its `role_arn` from the `team_roles` output, and a `source_profile`), a team member runs:
+A team owns the apps named `<team>-…`: its role may publish, release and set the secrets of those, and otherwise only
+list the app bucket's keys. To add one, add its name to `teams` in `terraform.tfvars` and apply again. A team's name is
+1 to 38 of `a-z` and `0-9`, with no `-`, so no team's prefix is another's. Removing a name deletes the role, not the
+team's apps.
+
+The roles trust the account, so the account's own IAM policies say who may assume each: give the team's members
+`sts:AssumeRole` on its ARN, from the `team_roles` output. The CLI takes its credentials from the `AWS_` variables, not
+from a profile. With a profile for the role in `~/.aws/config` (its `role_arn`, and a `source_profile`), a team member
+runs:
 
 ```sh
 eval "$(aws configure export-credentials --profile <team> --format env)"
 export AWS_REGION=<region> TRIC_STORE=<store> TRIC_NATIVE=<native>   # from the outputs
 ```
+
+## Upgrading
+
+Pull the new tric, then build and apply as at install. The compile function is updated first. Native code is keyed by
+a hash of Wasmtime's version and settings, so after an upgrade that changes either, the hosts find none for any app:
+each compiles an app itself the first time it loads it, which makes that request slow (a large JavaScript component
+takes seconds), and asks the compile function for the new native code, which every later host loads. Publishing an app
+again asks for it ahead of any request. The old native code stays until `tric gc`.
+
+## Garbage
+
+Nothing is deleted on its own: every release, component and piece of native code stays until `tric gc`, run by hand,
+with the credentials that installed tric:
+
+```sh
+eval "$(aws configure export-credentials --format env)"
+export AWS_REGION=<region> TRIC_STORE=<store> TRIC_NATIVE=<native>   # from the outputs
+tric gc
+```
+
+Of each app, it keeps the release it serves and the 10 newest, the components those use, and the newest native code of
+each such component, and it deletes the rest, printing each key. Anything under an hour old stays, as a publish may
+still be writing it, and KV data is never touched. An app whose `current` changes while it runs is left as it is, and so
+is one it cannot read all of: it logs why for each, and fails once it has done the rest. Running it again finishes an
+app that only changed. A key it cannot parse, such as one with a control character, stops it with an error that names
+the key: delete that key and run it again. A rollback to a release older than the 10 newest is possible only until
+`gc` deletes it, and publishing a release again makes it the newest.
+
+## Trust
+
+- **Apps** run in a sandbox: no files, environment, sockets or private addresses, outbound HTTP only to the hosts their
+  manifest lists, and limits on time and memory ([docs/apps.md](../../docs/apps.md#limits)). An app's KV stores are its
+  own, and only the serving function reaches the KV bucket.
+- **Teams** reach only their own apps, but can list every key in the app bucket, and so see other teams' app names and
+  release ids. An app's secrets are stored as they are, readable by its team and by the hosts.
+- **The apps share `<domain>`** as one site, so one can set a cookie that the browser sends to all of them. Teams that
+  should not trust each other need installs of their own.
+- **The hosts trust nothing in the buckets:** every read is size-capped and parsed strictly, and every component and
+  release is checked against its hash. Native code is loaded only from the native bucket, which only the compile
+  function writes.
+- **The compile function** compiles every team's components, and can write native code for any app, so Wasmtime's
+  compiler is the boundary: a component that exploited it there could run its code in every app.
+- **The operator**, with the account, can do anything.
+
+## Costs
+
+An idle install costs its storage and nothing else, plus $0.50 a month for the zone. A million requests cost about $0.83
+on Lambda if each takes 27 ms, as a KV read did at 1769 MB, and its free tier covers about 8 million such requests a
+month; $1 on CloudFront, past its free 10 million a month; and the S3 requests they make. A host reads an app's
+`current` at most once every 5 s, and the KV calls' costs are in [docs/apps.md](../../docs/apps.md#what-kv-costs).
+Prices are AWS's list prices for us-east-1, which vary by region. The reserved concurrency of `serve` caps what a flood
+of requests can cost, at about $40 a day by default, and the budget alert emails at 80% of $5 a month of the account's
+spend.
 
 ## Spin down
 

@@ -30,18 +30,18 @@ An operator installs tric into their own AWS account with one OpenTofu module, t
   - tokio and hyper;
   - `zstd`, serde, `toml`, `clap` and `tracing`.
 
-**Line budget:** about 1,390 lines of Rust (1,200 before M2, 1,290 before M3 and its review raised `serve` and `state`; 1,325 written so far, through M5, after four trim passes and four correctness passes) plus about 250 of HCL (384 written: see M5). A module that runs well past its budget is a design problem to raise, not to push through.
+**Line budget:** about 1,390 lines of Rust (1,200 before M2, 1,290 before M3 and its review raised `serve` and `state`; 1,325 through M5, after four trim passes and four correctness passes; 1,455 with M6's `gc`, which the trim pass after M6 is to bring back under) plus about 250 of HCL (384 written: see M5). A module that runs well past its budget is a design problem to raise, not to push through.
 
 | Module | Does | Budget |
 |---|---|---|
 | `engine` | Wasmtime config, epoch ticker, limits, a fresh store per request with a WASI context that grants nothing, p2/p3 dispatch, loading native code, Cranelift fallback | ~210 (`engine` ~120 and `guest` ~90, merged in the trim pass; 225 after the trim passes, 256 after M4, which moved loading native code to `compile`) |
 | `outbound` | Allow list plus the resolved-address block, in the HTTP send hook | ~100 (raised in M2 from ~60: the matcher is hand-written, and the connect is our own; 118 after the trim passes) |
-| `kv` | `wasi:keyvalue` draft2 over the app's own prefix of the bucket: one object per key, CAS, no cache | ~250 (raised in M2 from ~200; 230 after the trim and review passes, 263 after M5 made batches concurrent and `increment` back off) |
+| `kv` | `wasi:keyvalue` draft2 over the app's own prefix of the bucket: one object per key, CAS, no cache | ~250 (raised in M2 from ~200; 230 after the trim and review passes, 263 after M5 made batches concurrent and `increment` back off, 270 after the KV rethink) |
 | `config` | `wasi:config` from the manifest, with secrets | 0 (Wasmtime's crate serves it, and `serve` adds secrets in 1 line) |
-| `state` | The bucket layout, releases, compare-and-swap updates, defensive reads | ~130 (raised in the M3 review from ~100; 123 after the trim and review passes) |
+| `state` | The bucket layout, releases, compare-and-swap updates, defensive reads | ~130 (raised in the M3 review from ~100; 123 after the trim and review passes, 159 after the state rethink, 174 with `gc`'s strict reads of keys) |
 | `serve` | hyper server, routing, logs | ~170 (raised in M3 from ~100, which was the router alone, then in the M3 review from ~140 for a pointer recheck per app; 144 after the trim and review passes, 156 after M5's routing by `X-Forwarded-Host` and load timings, 161 with M5's KV bucket) |
 | `compile` | The compile worker and compile-request markers, and a host's load of native code with its fallback compile | ~150 (raised in M4 from ~70, as it took the host's side from `engine`; 147 after the review pass, 150 with M5's load timing) |
-| `cli` | `publish`, `release`, `releases`, `secret`, `secrets`, `gc`, and `main`'s arguments | ~350 (146 after the trim and review passes, before `gc` and `compile`; 219 after M5, `cli` 96 and `main` 123, which builds the buckets on one HTTP client) |
+| `cli` | `publish`, `release`, `releases`, `secret`, `secrets`, `gc`, and `main`'s arguments | ~350 (146 after the trim and review passes, before `gc` and `compile`; 219 after M5, `cli` 96 and `main` 123, which builds the buckets on one HTTP client; 313 with `gc`, `cli` 175 and `main` 138) |
 | `infra/aws` | OpenTofu module | ~250 HCL (384 after M5's trim (Q91), from 418 as first written. The budget predates CloudFront, its certificate and DNS (Q71, about 75 lines), the teams' roles (about 35) and the budget alert (about 15); the variables, with their docs and checks, are another 60) |
 
 ### Bucket layout
@@ -60,7 +60,7 @@ Q43 applies: no product name appears in any stored key or field, so a rename nev
 **IAM shape:**
 - The serving function reads the app bucket and may write only its `compile/`, reads and writes the KV bucket, and can only read the native bucket. It lists all three, so a miss is a 404 rather than a 403.
 - Each team has a role tagged `team`, and one ABAC policy lets it read and write only `apps/${team}-*`, so a team owns the apps named `<team>-…`, plus read and write `compile/${team}-*`, which `publish` waits on. It lists the whole app bucket: without the list, S3 answers a missing key (a new app's `current`, a deleted marker) with a 403, and a list can't be held to the team's prefixes (Q64, Q72, Q88). Team names have no hyphens. Nobody but the serving function reaches the KV bucket.
-- The admin, who runs `gc`, gets delete but never put in the native bucket, so `gc` can prune **(choice)**.
+- The operator runs `gc` with the credentials that installed tric. A role of its own, with delete but no put in the native bucket, waits for automated gc.
 - The compile function reads `apps/*/blobs/`, deletes `compile/`, and reads, lists and writes the native bucket.
 
 ## Milestones
@@ -223,15 +223,15 @@ All of these are covered, plus another app's native code and corrupt native code
 
 ### M6: First release
 
-- **`tric gc` (Q48):** keeps each app's current release and its last 10 by `releases`, with a 1 h grace period. It prunes unreachable blobs, releases and native code, and keeps only the newest compat hash per component.
-- **Docs:**
+- **Done: `tric gc` (Q48)** keeps each app's current release and its last 10 by `releases`, with a 1 h grace period. It prunes unreachable blobs, releases, markers and native code, and keeps only the newest compat hash per component.
+- **Done: docs:**
   - a README quick start;
   - an app-author guide: the contract, consistency, limits, and composition with `wac plug`, including that composed parts share capabilities;
   - an operator guide: install, lazy recompiles on upgrade, adding teams and their roles, the trust model, and costs.
-- **Release:**
+- **Done: release:**
   - **Done:** the project is renamed to `tric` (Q98), crate and binary both, across the code and docs, after a trademark check (Q43).
-  - Create the GitHub repo, public under `carsonfarmer` (Q99), with Actions running the Docker tests (the real-bucket suite is run by hand).
-  - A workflow that publishes the CLI to crates.io from a tag, ready but not turned on: the CLI is not published yet.
+  - **Done:** the GitHub repo, [carsonfarmer/tric](https://github.com/carsonfarmer/tric), public (Q99), with Actions running the Docker gate (the real-bucket suite is run by hand).
+  - **Done:** a workflow that publishes the CLI to crates.io from a tag, ready but not turned on: the CLI is not published yet.
 
 **Done when:** a new user can get from nothing to a released app using only the README.
 
@@ -256,7 +256,7 @@ These are small calls this plan makes. Say which, if any, to change.
    - **What:** `compile/<app>/<hex>`. Publish writes it, and so does a serving miss (once per environment). The compile worker deletes it when the native code exists, and publish waits for that deletion.
    - **Why:** compared with Q58's create-only `compile/<compat hash>/<hex>` plus a component-upload trigger, this needs one trigger instead of two. The CLI never needs the compat hash or the native bucket, a failed compile retries on the next miss, and republishing an already-uploaded component still works.
    - **Cost:** at most one tiny PUT per cold environment until the native code lands.
-3. **The admin gets delete-only on the native bucket** so `gc` can prune it. Deleting live native code only causes a recompile.
+3. ~~**The admin gets delete-only on the native bucket**~~ **The operator runs `gc` with their own credentials** (M6) until gc is automated. Deleting live native code only causes a recompile.
 4. **KV store names:** any `[a-z0-9-]{1,63}`, scoped to the app, with no manifest field.
 5. **CLI settings from the environment:** `TRIC_STORE` (bucket URL). `TRIC_RECIPIENT` went with age (Q73).
 6. **Dev-mode secrets:** `TRIC_VAR_<KEY>` environment variables. `tric.toml` never holds secrets.
