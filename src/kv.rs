@@ -76,11 +76,11 @@ fn found<T>(r: object_store::Result<T>) -> R<Option<T>> {
 impl Bucket {
     /// The key as the store has it, with the version a conditional write needs.
     async fn read(&self, p: &Path) -> R<Option<(Bytes, UpdateVersion)>> {
-        let Some(r) = found(self.0.get(p).await)? else { return Ok(None) };
+        let Some(mut r) = found(self.0.get(p).await)? else { return Ok(None) };
         if r.meta.size > VALUE_MAX as u64 {
             return Err(other(format!("the stored value is over {VALUE_MAX} bytes")));
         }
-        let v = UpdateVersion { e_tag: r.meta.e_tag.clone(), version: r.meta.version.clone() };
+        let v = UpdateVersion { e_tag: r.meta.e_tag.take(), version: r.meta.version.take() };
         Ok(Some((r.bytes().await.map_err(other)?, v)))
     }
 
@@ -92,12 +92,13 @@ impl Bucket {
         Ok(found(self.0.head(&path(key)?).await)?.is_some())
     }
 
-    /// `false` when the condition in `mode` failed, which includes a key deleted since it was read.
+    /// `false` when the condition in `mode` failed, which includes a key deleted since it was read: `object_store` has
+    /// S3's 404 for that as a failed precondition, so a 404 here is a missing bucket, which no retry would get past.
     async fn put(&self, p: &Path, v: Bytes, mode: PutMode) -> R<bool> {
         let conditional = mode != PutMode::Overwrite;
         match self.0.put_opts(p, v.into(), mode.into()).await {
             Ok(_) => Ok(true),
-            Err(E::Precondition { .. } | E::AlreadyExists { .. } | E::NotFound { .. }) if conditional => Ok(false),
+            Err(E::Precondition { .. } | E::AlreadyExists { .. }) if conditional => Ok(false),
             Err(e) => Err(other(e)),
         }
     }
@@ -113,6 +114,24 @@ impl Bucket {
 
     async fn cas(&self, key: &str) -> R<Cas> {
         Cas { bucket: self.clone(), key: path(key)?, seen: None }.fresh().await
+    }
+
+    /// Retries a lost race until it wins or the request's deadline ends it, after a random wait below a bound that
+    /// doubles, so writers that lost together do not try again together.
+    async fn increment(&self, key: &str, delta: i64) -> R<i64> {
+        let mut cas = self.cas(key).await?;
+        let mut bound = BACKOFF;
+        loop {
+            let now = cas.seen.as_ref().map_or(Ok(0), |(v, _)| v.as_ref().try_into().map(i64::from_le_bytes));
+            let now = now.map_err(|_| other("not a counter"))?; // 8 bytes, little-endian, as Spin stores it
+            let next = now.checked_add(delta).ok_or_else(|| other("overflow"))?;
+            if cas.swap(next.to_le_bytes().into()).await? {
+                return Ok(next);
+            }
+            sleep(bound.mul_f64(rand::random())).await;
+            cas = cas.fresh().await?;
+            bound = (bound * 2).min(BACKOFF_MAX);
+        }
     }
 
     /// One page of keys in order: the first `PAGE` after `cursor`, which is the last key of the page before.
@@ -146,8 +165,8 @@ impl Bucket {
     async fn set_many(&self, items: Vec<(String, Vec<u8>)>) -> R<()> {
         let items: HashMap<Path, Bytes> =
             items.into_iter().map(|(k, v)| Ok((path(&k)?, value(v)?))).collect::<R<_>>()?;
-        let puts = stream::iter(items).map(|(p, v)| async move { self.put(&p, v, PutMode::Overwrite).await });
-        puts.buffer_unordered(IN_FLIGHT).try_for_each(|_| async { Ok(()) }).await
+        let put = |(p, v): (Path, Bytes)| async move { self.put(&p, v, PutMode::Overwrite).await.map(drop) };
+        stream::iter(items).map(Ok).try_for_each_concurrent(IN_FLIGHT, put).await
     }
 
     /// One request per 1,000 keys on S3, after every key is checked.
@@ -223,20 +242,8 @@ impl wasi::keyvalue::batch::Host for Host {
 }
 
 impl atomics::Host for Host {
-    /// Retries a lost race until it wins or the request's deadline ends it, after a random wait below a bound that
-    /// doubles, so writers that lost together do not try again together.
     async fn increment(&mut self, b: Resource<Bucket>, key: String, delta: i64) -> R<i64> {
-        let (mut cas, mut bound) = (self.bucket(&b)?.cas(&key).await?, BACKOFF);
-        loop {
-            let now = cas.seen.as_ref().map_or(Ok(0), |(v, _)| v.as_ref().try_into().map(i64::from_le_bytes));
-            let now = now.map_err(|_| other("not a counter"))?; // 8 bytes, little-endian, as Spin stores it
-            let next = now.checked_add(delta).ok_or_else(|| other("overflow"))?;
-            if cas.swap(next.to_le_bytes().into()).await? {
-                return Ok(next);
-            }
-            sleep(bound.mul_f64(rand::random())).await;
-            (cas, bound) = (cas.fresh().await?, (bound * 2).min(BACKOFF_MAX));
-        }
+        self.bucket(&b)?.increment(&key, delta).await
     }
     async fn swap(&mut self, c: Resource<Cas>, value: Vec<u8>) -> Result<(), CasError> {
         let cas = self.table.delete(c).map_err(|e| CasError::StoreError(other(e)))?;
@@ -307,5 +314,30 @@ mod tests {
         let stale = b.cas("k").await.unwrap();
         b.delete("k").await.unwrap();
         assert!(!stale.swap("3".into()).await.unwrap(), "a swap on a deleted key loses");
+    }
+
+    /// An app's name and a bucket's are each a whole segment of a key, so neither sees the keys of one it is the start of.
+    #[tokio::test]
+    async fn names_are_whole_segments() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let open =
+            |app: &str, name: &str| Bucket(Arc::new(PrefixStore::new(PrefixStore::new(store.clone(), app), name)));
+        open("kv/t1-ab", "s").set("k", "v".into()).await.unwrap();
+        open("kv/t1-a", "st").set("k", "v".into()).await.unwrap();
+        let b = open("kv/t1-a", "s");
+        assert!(b.list(None).await.unwrap().keys.is_empty());
+        assert!(!b.exists("k").await.unwrap());
+    }
+
+    /// A counter is 8 bytes, little-endian, from 0 for a missing key; a sum past `i64`, or any other value, is an error.
+    #[tokio::test]
+    async fn increment() {
+        let b = bucket();
+        assert_eq!(b.increment("n", 2).await.unwrap(), 2);
+        assert_eq!(b.increment("n", -5).await.unwrap(), -3);
+        assert!(b.increment("n", i64::MIN).await.is_err());
+        assert_eq!(b.get("n").await.unwrap(), Some((-3i64).to_le_bytes().into()), "the overflow wrote nothing");
+        b.set("s", "seven".into()).await.unwrap();
+        assert!(b.increment("s", 1).await.is_err());
     }
 }

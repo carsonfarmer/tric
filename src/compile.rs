@@ -63,7 +63,8 @@ async fn load(native: &dyn ObjectStore, engine: &Arc<Engine>, app: &str, hash: &
         Err(E::NotFound { .. }) => return Ok(None),
         r => r?.bytes().await?,
     };
-    let (engine, start) = (engine.clone(), Instant::now());
+    let engine = engine.clone();
+    let start = Instant::now();
     let code = spawn_blocking(move || {
         let mut file = NamedTempFile::new()?;
         zstd::stream::copy_decode(&*zst, &mut file)?;

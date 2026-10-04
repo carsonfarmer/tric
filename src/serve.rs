@@ -46,8 +46,8 @@ impl Install {
         store: Arc<dyn ObjectStore>,
         native: Option<Arc<dyn ObjectStore>>,
         kv: Arc<dyn ObjectStore>,
-    ) -> Result<Self> {
-        Ok(Self { engine: Engine::new()?.into(), store, native, kv, apps: Mutex::default() })
+    ) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self { engine: Engine::new()?.into(), store, native, kv, apps: Mutex::default() }))
     }
 
     /// An install in memory of just the app in `dir`, released, with `TORPOR_VAR_<KEY>` as its secret `key`, so secrets
@@ -57,7 +57,7 @@ impl Install {
         let (app, id) = cli::publish(&*store, dir, false).await?; // unchecked, as the load below checks it
         let secrets = env::vars().filter_map(|(k, v)| Some((k.strip_prefix(VAR_PREFIX)?.to_lowercase(), v))).collect();
         state::update(&*store, &app, |c| *c = Current { release: Some(id), secrets }).await?;
-        let install = Arc::new(Self::new(store.clone(), None, store)?);
+        let install = Self::new(store.clone(), None, store)?;
         install.app(&app).await?;
         Ok(install)
     }
@@ -125,7 +125,8 @@ impl Install {
     fn load(self: &Arc<Self>, name: &str, id: &str, secrets: &BTreeMap<String, String>) -> Load {
         let (install, name, id, secrets) = (self.clone(), name.to_owned(), id.to_owned(), secrets.clone());
         let task = tokio::spawn(async move {
-            let (Install { store, native, kv, engine, .. }, start) = (&*install, Instant::now());
+            let Install { store, native, kv, engine, .. } = &*install;
+            let start = Instant::now();
             let mut r = state::release(&**store, &name, &id).await?;
             r.config.extend(secrets);
             let code = compile::component(&**store, native.as_deref(), engine, &name, &r.component).await?;
@@ -213,7 +214,7 @@ mod tests {
         assert_eq!(cli::secrets(&*store, "kv").await.unwrap(), ["token"]);
 
         let kv = Arc::new(InMemory::new());
-        let install = Arc::new(Install::new(store.clone(), None, kv.clone()).unwrap());
+        let install = Install::new(store.clone(), None, kv.clone()).unwrap();
         assert_eq!(ok(&install, "hello.localhost:3000", "/").await, "hello");
         assert_eq!(ok(&install, "KV.example.com", "/config?key=token").await, r#"{"ok":"s3cret"}"#);
         ok(&install, "kv.localhost", "/kv?op=set&store=s&key=k&value=v").await;
@@ -254,7 +255,7 @@ mod tests {
         let blob = format!("apps/hello/blobs/sha256/{component}").as_str().into();
         let good = store.get(&blob).await.unwrap().bytes().await.unwrap();
         store.put(&blob, std::fs::read("tests/fixtures/hello-p2.wasm").unwrap().into()).await.unwrap();
-        let install = Arc::new(Install::new(store.clone(), None, store.clone()).unwrap());
+        let install = Install::new(store.clone(), None, store.clone()).unwrap();
         let e = install.app("hello").await.err().unwrap();
         assert!(e.to_string().contains("does not match its hash"), "{e}");
         store.put(&blob, good.into()).await.unwrap();
@@ -268,7 +269,7 @@ mod tests {
     async fn a_hung_recheck_serves_the_last_read() {
         let store = Arc::new(ThrottledStore::new(InMemory::new(), ThrottleConfig::default()));
         ship(&*store, "tests/app").await;
-        let install = Arc::new(Install::new(store.clone(), None, store.clone()).unwrap());
+        let install = Install::new(store.clone(), None, store.clone()).unwrap();
         assert_eq!(ok(&install, "hello.localhost", "/").await, "hello");
         store.config_mut(|c| c.wait_get_per_call = Duration::from_secs(60));
         sleep(FRESH).await;
@@ -282,7 +283,7 @@ mod tests {
     async fn a_load_outlives_its_requests() {
         let store = Arc::new(ThrottledStore::new(InMemory::new(), ThrottleConfig::default()));
         ship(&*store, "tests/app").await;
-        let install = Arc::new(Install::new(store.clone(), None, store.clone()).unwrap());
+        let install = Install::new(store.clone(), None, store.clone()).unwrap();
         store.config_mut(|c| c.wait_get_per_call = Duration::from_millis(200));
         assert!(timeout(Duration::from_millis(300), install.app("hello")).await.is_err()); // gone while it fetches
         sleep(Duration::from_secs(2)).await; // the load's fetches finish meanwhile

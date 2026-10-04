@@ -1,4 +1,4 @@
-# An install of torpor: the app and native-code buckets, the serving and compile functions, CloudFront in front of
+# An install of torpor: the app, native-code and KV buckets, the serving and compile functions, CloudFront in front of
 # the serving function at *.<domain>, the teams' roles, and a budget alert.
 
 data "aws_caller_identity" "current" {}
@@ -235,8 +235,8 @@ resource "aws_route53_record" "apps" {
 # A team owns the apps named `<team>-…`: it may read and write them, and the markers that ask for their native code.
 # The `team` tag of its role says which; the roles allow no session tags, which could otherwise claim another team.
 # It may list the whole app bucket, as S3 answers a missing key with a 403 to a caller that may not list. A condition
-# that held lists to the team's prefixes but let a GET's 404 through would also let through a list of no prefix (as
-# M5's session found), so teams see each other's app names and release ids; KV's keys are in a bucket of their own.
+# that held lists to the team's prefixes but let a GET's 404 through would also let through a list of no prefix, so
+# teams see each other's app names and release ids; KV's keys are in a bucket of their own.
 resource "aws_iam_policy" "team" {
   name = "${var.name}-team"
   policy = jsonencode({

@@ -1,11 +1,11 @@
 output "store" {
   description = "TORPOR_STORE for the CLI."
-  value       = "s3://${aws_s3_bucket.this["app"].bucket}"
+  value       = local.env.TORPOR_STORE
 }
 
 output "native" {
   description = "TORPOR_NATIVE for the CLI, so `publish` waits for native code."
-  value       = "s3://${aws_s3_bucket.this["native"].bucket}"
+  value       = local.env.TORPOR_NATIVE
 }
 
 output "function_url" {

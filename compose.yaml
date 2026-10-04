@@ -3,7 +3,7 @@
 #   COMPOSE_PROJECT_NAME=torpor-<worktree> docker compose run --rm fixtures   (build tests/fixtures/*.wasm)
 #   COMPOSE_PROJECT_NAME=torpor-<worktree> docker compose run --rm test       (fixtures, then cargo test)
 #   COMPOSE_PROJECT_NAME=torpor-<worktree> docker compose run --rm release    (dist/torpor.zip, for Lambda's arm64)
-#   docker compose run --rm tofu plan -var domain=… -var 'budget={emails=[…]}'  (OpenTofu in infra/aws, as AWS_PROFILE: see its README)
+#   COMPOSE_PROJECT_NAME=torpor-<worktree> docker compose run --rm tofu …     (OpenTofu in infra/aws: see its README)
 name: ${COMPOSE_PROJECT_NAME:-torpor-main}
 
 x-toolchain: &toolchain

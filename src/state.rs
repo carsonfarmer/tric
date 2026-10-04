@@ -4,7 +4,7 @@
 //! - `apps/<app>/blobs/sha256/<hash>`: components, in the OCI image layout, so a registry copy is a byte copy;
 //! - `apps/<app>/releases/<hash>`: the app's releases;
 //! - `apps/<app>/current`: the release it runs, and its secrets;
-//! - `kv/<app>/<bucket>/<key>`: its `wasi:keyvalue` data, which only hosts write;
+//! - `kv/<app>/<bucket>/<key>`: its `wasi:keyvalue` data, which only hosts write, unless `--kv` gives it a bucket;
 //! - `compile/<app>/<hash>`: a marker that asks the compile function for the component's native code.
 //!
 //! Nothing read back is trusted: every read is capped, parsed strictly, and content-addressed objects are checked

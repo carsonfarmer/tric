@@ -7,8 +7,8 @@ mod state;
 use clap::{Parser, Subcommand};
 use object_store::client::{HttpClient, HttpConnector, ReqwestConnector};
 use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder};
-use std::sync::{Arc, OnceLock};
-use std::{net::SocketAddr, path::PathBuf};
+use std::sync::{Arc, Mutex};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 use wasmtime::{Result, error::Context};
@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into());
     tracing_subscriber::fmt().json().with_env_filter(filter).init();
     let Args { store, native, cmd } = Args::parse();
-    let http = OneClient::default();
+    let http = SharedClients::default();
     let bucket = |url| {
         let s = AmazonS3Builder::from_env().with_url(url).with_http_connector(http.clone()).build();
         s.map(|s| Arc::new(s) as Arc<dyn ObjectStore>)
@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
             let install = match store {
                 Some(store) => {
                     let kv = kv.map(bucket).transpose()?.unwrap_or_else(|| store.clone());
-                    Arc::new(serve::Install::new(store, native, kv)?)
+                    serve::Install::new(store, native, kv)?
                 }
                 None => serve::Install::dev(&dir).await?,
             };
@@ -107,17 +107,22 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// One HTTP client for every bucket, as each client loads and parses the system's root certificates, about 18 ms of a
-/// cold start apiece on Lambda. It is made with the first bucket's options, which all come from the `AWS_` variables.
+/// One HTTP client for each set of options, as each client loads and parses the system's root certificates, about 18 ms
+/// of a cold start apiece on Lambda. Every bucket's options come from the `AWS_` variables and so are the same, though off
+/// Lambda a credential provider connects with its own. `ClientOptions` has no `Eq`, so its `Debug` is the key: that has
+/// every field but a certificate added in code, which none here are.
 #[derive(Debug, Clone, Default)]
-struct OneClient(Arc<OnceLock<HttpClient>>);
+struct SharedClients(Arc<Mutex<HashMap<String, HttpClient>>>);
 
-impl HttpConnector for OneClient {
+impl HttpConnector for SharedClients {
     fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
-        if let Some(client) = self.0.get() {
+        let key = format!("{options:?}");
+        let mut clients = self.0.lock().unwrap();
+        if let Some(client) = clients.get(&key) {
             return Ok(client.clone());
         }
         let client = ReqwestConnector::default().connect(options)?;
-        Ok(self.0.get_or_init(|| client).clone())
+        clients.insert(key, client.clone());
+        Ok(client)
     }
 }
