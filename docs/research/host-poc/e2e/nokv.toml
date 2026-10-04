@@ -1,9 +1,0 @@
-spin_manifest_version = 2
-[[trigger.http]]
-route = "/..."
-component = "s"
-[component.s]
-source = "../../apps/app-sink7/target/wasm32-wasip2/release/app_sink7.wasm"
-allowed_outbound_hosts = []
-key_value_stores = []
-variables = {}

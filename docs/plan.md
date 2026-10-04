@@ -231,7 +231,7 @@ All of these are covered, plus another app's native code and corrupt native code
 - **Done: release:**
   - **Done:** the project is renamed to `tric` (Q98), crate and binary both, across the code and docs, after a trademark check (Q43).
   - **Done:** the GitHub repo, [carsonfarmer/tric](https://github.com/carsonfarmer/tric), public (Q99), with Actions running the Docker gate (the real-bucket suite is run by hand).
-  - **Done:** a workflow that publishes the CLI to crates.io from a tag, ready but not turned on: the CLI is not published yet.
+  - **Done:** a workflow that publishes the CLI to crates.io from a tag, through trusted publishing once the first version is published by hand.
 
 **Done when:** a new user can get from nothing to a released app using only the README.
 

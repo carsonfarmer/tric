@@ -1,18 +1,21 @@
-# Publishes the CLI to crates.io from a tag like v0.1.0, whose version must be Cargo.toml's. Off until the repository
-# variable PUBLISH is `true`, with the secret CARGO_REGISTRY_TOKEN set to a token that may publish `tric`.
+# Publishes the CLI to crates.io from a tag like v0.1.0, whose version must be Cargo.toml's, through crates.io's trusted
+# publishing: GitHub's OIDC token buys a token that lasts the job, so no token is stored. It works once the crate has a
+# trusted publisher for this repository and this workflow, which needs a first publish by hand.
 name: publish
 on:
   push: { tags: ["v*"] }
 permissions: { contents: read }
 jobs:
   crate:
-    if: vars.PUBLISH == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions: { contents: read, id-token: write }
     env: { COMPOSE_PROJECT_NAME: tric-publish }
     steps:
       - uses: actions/checkout@v7
       - run: test "${GITHUB_REF_NAME#v}" = "$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
       - run: docker compose build dev
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
       - run: docker compose run --rm -T -e CARGO_REGISTRY_TOKEN dev cargo publish --locked
-        env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+        env: { CARGO_REGISTRY_TOKEN: "${{ steps.auth.outputs.token }}" }

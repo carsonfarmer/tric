@@ -1,8 +1,0 @@
-[package]
-name = "p3-hello"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-wasip3 = { version = "0.9", features = ["http-compat"] }
-http = "1"

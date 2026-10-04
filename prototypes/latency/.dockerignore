@@ -1,6 +1,0 @@
-host
-components
-infra
-bench
-out/*
-!out/spinit-host
