@@ -30,18 +30,18 @@ An operator installs torpor into their own AWS account with one OpenTofu module,
   - tokio and hyper;
   - `zstd`, serde, `toml`, `clap` and `tracing`.
 
-**Line budget:** about 1,390 lines of Rust (1,200 before M2, 1,290 before M3 and its review raised `serve` and `state`; 1,260 written so far, through M5's preparation, after four trim passes and four correctness passes) plus about 250 of HCL (418 written: see M5). A module that runs well past its budget is a design problem to raise, not to push through.
+**Line budget:** about 1,390 lines of Rust (1,200 before M2, 1,290 before M3 and its review raised `serve` and `state`; 1,325 written so far, through M5, after four trim passes and four correctness passes) plus about 250 of HCL (384 written: see M5). A module that runs well past its budget is a design problem to raise, not to push through.
 
 | Module | Does | Budget |
 |---|---|---|
 | `engine` | Wasmtime config, epoch ticker, limits, a fresh store per request with a WASI context that grants nothing, p2/p3 dispatch, loading native code, Cranelift fallback | ~210 (`engine` ~120 and `guest` ~90, merged in the trim pass; 225 after the trim passes, 256 after M4, which moved loading native code to `compile`) |
 | `outbound` | Allow list plus the resolved-address block, in the HTTP send hook | ~100 (raised in M2 from ~60: the matcher is hand-written, and the connect is our own; 118 after the trim passes) |
-| `kv` | `wasi:keyvalue` draft2 over the app's own prefix of the bucket: one object per key, CAS, no cache | ~250 (raised in M2 from ~200; 230 after the trim and review passes) |
+| `kv` | `wasi:keyvalue` draft2 over the app's own prefix of the bucket: one object per key, CAS, no cache | ~250 (raised in M2 from ~200; 230 after the trim and review passes, 263 after M5 made batches concurrent and `increment` back off) |
 | `config` | `wasi:config` from the manifest, with secrets | 0 (Wasmtime's crate serves it, and `serve` adds secrets in 1 line) |
 | `state` | The bucket layout, releases, compare-and-swap updates, defensive reads | ~130 (raised in the M3 review from ~100; 123 after the trim and review passes) |
-| `serve` | hyper server, routing, logs | ~170 (raised in M3 from ~100, which was the router alone, then in the M3 review from ~140 for a pointer recheck per app; 144 after the trim and review passes, 156 after M5's routing by `X-Forwarded-Host` and load timings) |
+| `serve` | hyper server, routing, logs | ~170 (raised in M3 from ~100, which was the router alone, then in the M3 review from ~140 for a pointer recheck per app; 144 after the trim and review passes, 156 after M5's routing by `X-Forwarded-Host` and load timings, 161 with M5's KV bucket) |
 | `compile` | The compile worker and compile-request markers, and a host's load of native code with its fallback compile | ~150 (raised in M4 from ~70, as it took the host's side from `engine`; 147 after the review pass, 150 with M5's load timing) |
-| `cli` | `publish`, `release`, `releases`, `secret`, `secrets`, `gc`, and `main`'s arguments | ~350 (146 after the trim and review passes, before `gc` and `compile`) |
+| `cli` | `publish`, `release`, `releases`, `secret`, `secrets`, `gc`, and `main`'s arguments | ~350 (146 after the trim and review passes, before `gc` and `compile`; 219 after M5, `cli` 96 and `main` 123, which builds the buckets on one HTTP client) |
 | `infra/aws` | OpenTofu module | ~250 HCL (384 after M5's trim (Q91), from 418 as first written. The budget predates CloudFront, its certificate and DNS (Q71, about 75 lines), the teams' roles (about 35) and the budget alert (about 15); the variables, with their docs and checks, are another 60) |
 
 ### Bucket layout
@@ -189,7 +189,26 @@ All of these are covered, plus another app's native code and corrupt native code
 - The targets are met, or each gap is written up with options.
 - After destroy, nothing tagged is left.
 
-**Prepared (2026-10-03), not applied.** The module, the release build (`docker compose run --rm release` makes `dist/torpor.zip`, 11 MB: aarch64, glibc 2.34 at most), and `tofu validate` are done. `serve` now routes by `X-Forwarded-Host` and logs each load's time at info. The choices are in decisions.md, "M5 preparation".
+**Applied (2026-10-03); destroy waits for the user's try of it (Q92).** The release build (`docker compose run --rm release` makes `dist/torpor.zip`, 11 MB: aarch64, glibc 2.34 at most) runs as a fresh install at `*.tric.works`. The choices are in decisions.md, "M5 preparation" and "M5 session"; the results:
+- **End to end:** as team `t1`, five apps are published and released (Rust p2 and p3, JS, KV, and a probe), each at `https://<app>.tric.works`. Every `publish` saw its marker deleted, so the adapter's event pass-through works.
+- **The targets**, at 1769 MB. Cold starts are 100 sequential ones per app, each in a new environment, as Lambda's Init + Duration:
+
+  | Target | Measured | |
+  |---|---|---|
+  | Cold p99 ≤ 500 ms, Rust (`hello-p3`) | 515 ms (p50 367, p90 422) | Missed by the slowest of 100 |
+  | Cold p99 about 1 s, JS (`hello-js`) | 1,048 ms (p50 546, p90 965) | Met, as Q47 set it |
+  | Warm read p50 ≤ 30 ms (a KV `get`, the whole request) | 27.5 ms | Met |
+  | Acknowledged write p99 ≤ 200 ms (a KV `set`) | 61 ms | Met |
+  | Idle ≤ $0.05/month | Storage only: nothing runs while idle | Met (the zone's $0.50 is outside the module) |
+
+- **At 1024 MB:** Rust 406 / 482 / 661 ms (p50 / p90 / p99), JS 637 / 1,324 / 1,725. Init is 155 ms at both sizes, and the rest scales with the CPU, so 1769 MB stays the default (Q51).
+- **The Rust gap.** At p50, a cold start is about 75 ms before `main`, 54 ms for the HTTP client, 25–30 ms for the engine; then, in the request, 88 ms for the first `current` read (on a new TLS connection), and a 107 ms load, of which the native code takes 28 ms to fetch, 6 to decompress and 41 to deserialize. Options:
+  1. **Done:** one HTTP client for every bucket. A cold start's p50 fell from 416 to 367 ms and its p99 from 536 to 515.
+  2. **Measured, not done:** opening the buckets' connections during start-up moves the handshake rather than saving it (+11 ms at p50).
+  3. **Deferred:** loading hot apps during start-up (Q56 (c)), the one option that takes the reads out of the request; and a profile of deserialize on Lambda, 41 ms here against the spike's 5–11 locally.
+- **The JS tail is the environment.** About one environment in seven starts slowly (Init about 185 ms rather than 155), and in those JS's deserialize took 388–534 ms rather than about 50. In memory (`deserialize`) it was no faster, so `deserialize_file` stays. At p50, JS's native code takes 111 ms to fetch and 94 to decompress, one after the other; overlapping the two is a deferred option, as are dedicated functions.
+- **The compile function** (3008 MB): `hello-p3` compiles in 385 ms, `hello-p2` in 284, and JS in 9.4 s using 411 MB, well inside its 120 s. `publish` took 2.8 s end to end with the compile function cold.
+- **The storage suite** passes against S3 (decisions.md, "M5 session").
 
 **The cloud session, in order** (each step needs the AWS profile; `apply` needs your approval):
 1. **Checks before applying:** `aws lambda get-account-settings` shows unreserved concurrency of at least 122 (20 + 2 reserved, plus the 100 Lambda keeps), or apply with `-var 'concurrency={serve=-1,compile=-1}'`. The `tric.works` zone is public in this account, and no other distribution holds `*.tric.works`. Layer `LambdaAdapterLayerArm64:30` exists in us-west-2. `aws sso login` on the host, as the `tofu` service mounts `~/.aws`.
@@ -197,7 +216,7 @@ All of these are covered, plus another app's native code and corrupt native code
 3. **The team role's 404s first**, as role `t1`: a HEAD of a missing `apps/t1-x/current` and of a missing `compile/t1-x/<hex>` must be 404, and a list with no prefix (and one of `apps/t2-`) must be refused. If either fails, KV moves to a bucket of its own (Q88).
 4. **End to end:** as `t1`, publish and release a fixture as `t1-hello`; `https://t1-hello.tric.works` serves it; `publish` saw the marker deleted (the compile function ran); a request straight to the Function URL with a made-up `X-Forwarded-Host` reaches only that app; a viewer's own `X-Forwarded-Host` is replaced.
 5. **The measurements above**, from the info logs with Logs Insights: `loaded` (`ms`, a whole load) and `loaded its native code` (`ms`, the deserialize), plus Lambda's `Init Duration`. Then `memory=1024` in `serve`, and again.
-6. **Destroy the same day**, then list what is tagged `torpor` (`aws resourcegroupstaggingapi get-resources`) in both regions; Lambda's own log groups, if a function logged after its group was deleted, are the likely leftover.
+6. **Destroy once the user has tried the live install** (Q92), as `infra/aws/README.md`'s "Spin down" says, then list what is tagged `torpor` (`aws resourcegroupstaggingapi get-resources`) in both regions; Lambda's own log groups, if a function logged after its group was deleted, are the likely leftover.
 
 ### M6: First release
 
@@ -217,10 +236,10 @@ All of these are covered, plus another app's native code and corrupt native code
 
 | Risk | Where it's settled |
 |---|---|
-| Deserialize takes 46–58 ms on Lambda | M5 measures `deserialize_file` |
-| Large JS components about 1 s cold | M5; dedicated functions are a deferred item |
+| Deserialize takes 46–58 ms on Lambda | Settled in M5: 41 ms at p50 for `hello-p3`, no faster in memory, so `deserialize_file` stays. Where the time goes is a deferred profile |
+| Large JS components about 1 s cold | M5 measured 1,048 ms p99 at 1769 MB and 1,725 at 1024; its tail is the slower environments. Dedicated functions are a deferred item |
 | The p3 outbound send hook in `wasmtime-wasi-http` may differ from p2's | Checked first in M2 |
-| The Lambda Web Adapter's event pass-through for the compile function | Built to its documented contract in M4 (the raw event, posted to `/events`); proven in M5 |
+| The Lambda Web Adapter's event pass-through for the compile function | Built to its documented contract in M4 (the raw event, posted to `/events`); proven in M5, where every `publish` saw its marker deleted |
 | The compile function compiles untrusted components while it can write native code that every host runs | Wasmtime's compiler is the boundary: a component that exploits Cranelift there could write native code for any app. Per-team compile functions would contain it (deferred) |
 
 ## Choices to confirm
