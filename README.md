@@ -12,7 +12,7 @@ signed in to it, and a domain to serve the apps under.
 **1. Install the CLI.**
 
 ```bash
-cargo install --locked --git https://github.com/carsonfarmer/tric
+cargo install --locked --git https://github.com/carsonfarmer/tric tric
 ```
 
 **2. Write an app.** Any component that exports `wasi:http` will do; this one is Rust.
