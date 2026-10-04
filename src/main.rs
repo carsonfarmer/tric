@@ -6,12 +6,13 @@ mod state;
 
 use clap::{Parser, Subcommand};
 use object_store::client::{HttpClient, HttpConnector, ReqwestConnector};
-use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder};
+use object_store::{Certificate, ClientOptions, ObjectStore, aws::AmazonS3Builder};
 use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 use wasmtime::{Result, error::Context};
+use webpki_root_certs::TLS_SERVER_ROOT_CERTS;
 
 const NO_STORE: &str = "there is no --store or TORPOR_STORE";
 const NO_NATIVE: &str = "there is no --native or TORPOR_NATIVE";
@@ -107,10 +108,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// One HTTP client for each set of options, as each client loads and parses the system's root certificates, about 18 ms
-/// of a cold start apiece on Lambda. Every bucket's options come from the `AWS_` variables and so are the same, though off
-/// Lambda a credential provider connects with its own. `ClientOptions` has no `Eq`, so its `Debug` is the key: that has
-/// every field but a certificate added in code, which none here are.
+/// One HTTP client for each set of options, so the buckets, all at one S3 endpoint, share its connections, and the
+/// roots are loaded once. Every bucket's options come from the `AWS_` variables and so are the same, though off Lambda
+/// a credential provider connects with its own. `ClientOptions` has no `Eq`, so its `Debug` is the key: that has every
+/// field but a certificate added in code, and the roots are added after.
 #[derive(Debug, Clone, Default)]
 struct SharedClients(Arc<Mutex<HashMap<String, HttpClient>>>);
 
@@ -121,7 +122,12 @@ impl HttpConnector for SharedClients {
         if let Some(client) = clients.get(&key) {
             return Ok(client.clone());
         }
-        let client = ReqwestConnector::default().connect(options)?;
+        // Mozilla's roots, as `outbound` trusts, not the system's: those took ~30 ms more of a cold start on Lambda.
+        let mut tls = options.clone().with_no_system_certificates(true);
+        for der in TLS_SERVER_ROOT_CERTS {
+            tls = tls.with_root_certificate(Certificate::from_der(der)?);
+        }
+        let client = ReqwestConnector::default().connect(&tls)?;
         clients.insert(key, client.clone());
         Ok(client)
     }

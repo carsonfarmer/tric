@@ -3,7 +3,8 @@
 //!
 //! - `apps/<app>/blobs/sha256/<hash>`: components, in the OCI image layout, so a registry copy is a byte copy;
 //! - `apps/<app>/releases/<hash>`: the app's releases;
-//! - `apps/<app>/current`: the release it runs, and its secrets;
+//! - `apps/<app>/current`: the release it runs and that release's component, so a host fetches both at once, and its
+//!   secrets;
 //! - `kv/<app>/<bucket>/<key>`: its `wasi:keyvalue` data, which only hosts write, unless `--kv` gives it a bucket;
 //! - `compile/<app>/<hash>`: a marker that asks the compile function for the component's native code.
 //!
@@ -37,8 +38,16 @@ pub struct Kind {
 #[derive(Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Current {
-    pub release: Option<String>,
+    pub release: Option<Live>,
     pub secrets: BTreeMap<String, String>,
+}
+
+/// The id of the release an app runs, and its component's hash.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Live {
+    pub id: String,
+    pub component: String,
 }
 
 /// One immutable release of an app.

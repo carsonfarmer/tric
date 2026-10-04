@@ -1,6 +1,6 @@
 //! The commands that change an install. They write the bucket directly, so its IAM is the only auth: a team's role
 //! writes only the apps named `<team>-…`.
-use crate::state::{self, BLOBS, RELEASES, Release};
+use crate::state::{self, BLOBS, Live, RELEASES, Release};
 use futures_util::TryStreamExt;
 use object_store::{Error as E, ObjectStore, ObjectStoreExt, PutPayload, memory::InMemory};
 use serde::Deserialize;
@@ -67,9 +67,9 @@ pub async fn precompile(store: &dyn ObjectStore, app: &str, id: &str) -> Result<
 
 /// Serves `app` from its release `id`.
 pub async fn release(store: &dyn ObjectStore, app: &str, id: &str) -> Result<()> {
-    let r = state::release(store, app, id).await?; // it is there, and sound
-    store.head(&state::object(app, BLOBS, &r.component)?.into()).await?; // as is its component
-    state::update(store, app, |c| c.release = Some(id.into())).await
+    let component = state::release(store, app, id).await?.component; // it is there, and sound
+    store.head(&state::object(app, BLOBS, &component)?.into()).await?; // as is its component
+    state::update(store, app, |c| c.release = Some(Live { id: id.into(), component })).await
 }
 
 /// `app`'s releases, newest first, each as its id and when it was first published.

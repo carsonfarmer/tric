@@ -18,8 +18,9 @@ required-features = ["cli"]
 [features]
 default = ["cli"]
 cli = [
-    "dep:clap", "dep:serde", "dep:serde_json", "dep:sha2", "dep:tempfile", "dep:toml", "dep:tracing-subscriber", "dep:zstd",
-    "hyper/server", "object_store/aws", "tokio/macros", "tokio/rt-multi-thread",
+    "dep:clap", "dep:serde", "dep:serde_json", "dep:sha2", "dep:tempfile", "dep:tokio-util", "dep:toml",
+    "dep:tracing-subscriber", "dep:webpki-root-certs", "dep:zstd", "hyper/server", "object_store/aws", "tokio/macros",
+    "tokio/rt-multi-thread",
 ]
 
 [dependencies]
@@ -39,9 +40,12 @@ tempfile = { version = "3", optional = true }
 tokio = { version = "1", features = ["net", "sync", "time"] }
 # aws-lc-rs, as object_store's S3 client uses, so one TLS provider is linked, not two.
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
+tokio-util = { version = "0.7", features = ["io-util"], optional = true }
 toml = { version = "1", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
+# webpki-roots' roots as whole certificates, which is how the S3 client takes them.
+webpki-root-certs = { version = "1", optional = true }
 webpki-roots = "1"
 # The defaults minus what torpor never uses: cache, profiling, coredump, debug, stack-switching, gc-copying and
 # compile-time-builtins (so no wit-parser either).

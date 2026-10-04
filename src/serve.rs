@@ -1,5 +1,5 @@
 //! `torpor serve`: runs every app of an install, or the app in a directory as an install of one, over HTTP/1.
-use crate::state::{self, Current};
+use crate::state::{self, Current, Live};
 use crate::{cli, compile};
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use hyper::body::{Body, Bytes, Incoming};
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, collections::HashMap, convert::Infallible, env, path::Path, sync::Arc};
 use tokio::{net::TcpListener, sync::Mutex, time::timeout};
 use torpor::{App, Engine, is_name};
-use wasmtime::{Error, Result};
+use wasmtime::{Error, Result, ensure};
 use wasmtime_wasi_http::{handler::Response, io::TokioIo};
 
 const VAR_PREFIX: &str = "TORPOR_VAR_";
@@ -56,7 +56,8 @@ impl Install {
         let store = Arc::new(InMemory::new());
         let (app, id) = cli::publish(&*store, dir, false).await?; // unchecked, as the load below checks it
         let secrets = env::vars().filter_map(|(k, v)| Some((k.strip_prefix(VAR_PREFIX)?.to_lowercase(), v))).collect();
-        state::update(&*store, &app, |c| *c = Current { release: Some(id), secrets }).await?;
+        cli::release(&*store, &app, &id).await?;
+        state::update(&*store, &app, |c| c.secrets = secrets).await?;
         let install = Self::new(store.clone(), None, store)?;
         install.app(&app).await?;
         Ok(install)
@@ -109,8 +110,8 @@ impl Install {
                 s.read = Instant::now();
                 s.app.take_if(|a| a.peek().is_some_and(Result::is_err));
             }
-            let Some(release) = &s.current.release else { return Ok(None) };
-            s.app.get_or_insert_with(|| self.load(name, release, &s.current.secrets)).clone()
+            let Some(live) = &s.current.release else { return Ok(None) };
+            s.app.get_or_insert_with(|| self.load(name, live, &s.current.secrets)).clone()
         };
         Ok(Some(load.await.map_err(Error::msg)?))
     }
@@ -120,16 +121,19 @@ impl Install {
         Ok(timeout(RECHECK_MAX, state::current(&*self.store, name)).await??.0)
     }
 
-    /// Loads the app `name` from its release `id`, with `secrets` over its config. The load is a task of its own, so it
+    /// Loads the app `name` from its `live` release, with `secrets` over its config. The load is a task of its own, so it
     /// runs to its end even if every request waiting for it goes away.
-    fn load(self: &Arc<Self>, name: &str, id: &str, secrets: &BTreeMap<String, String>) -> Load {
-        let (install, name, id, secrets) = (self.clone(), name.to_owned(), id.to_owned(), secrets.clone());
+    fn load(self: &Arc<Self>, name: &str, live: &Live, secrets: &BTreeMap<String, String>) -> Load {
+        let (install, name, live, secrets) = (self.clone(), name.to_owned(), live.clone(), secrets.clone());
         let task = tokio::spawn(async move {
             let Install { store, native, kv, engine, .. } = &*install;
             let start = Instant::now();
-            let mut r = state::release(&**store, &name, &id).await?;
+            let (mut r, code) = tokio::try_join!(
+                state::release(&**store, &name, &live.id),
+                compile::component(&**store, native.as_deref(), engine, &name, &live.component),
+            )?;
+            ensure!(r.component == live.component, "{name}'s current has a component that is not its release's");
             r.config.extend(secrets);
-            let code = compile::component(&**store, native.as_deref(), engine, &name, &r.component).await?;
             let kv = Arc::new(PrefixStore::new(kv.clone(), state::kv(&name)));
             let app = engine.load(&name, kv, &code, r.config, &r.allowed_outbound_hosts);
             app.inspect(|_| tracing::info!(app = name, ms = start.elapsed().as_millis(), "loaded"))
@@ -247,14 +251,16 @@ mod tests {
         assert_eq!(releases.iter().map(|r| r.split(' ').next().unwrap()).collect::<Vec<_>>(), [&second, &first]);
     }
 
+    /// A blob that does not match its hash is refused, as is a `current` whose component is not its release's.
     #[tokio::test]
-    async fn refuses_a_blob_that_does_not_match_its_hash() {
+    async fn refuses_what_does_not_match() {
         let store = Arc::new(InMemory::new());
         let id = ship(&*store, "tests/app").await;
         let component = state::release(&*store, "hello", &id).await.unwrap().component;
         let blob = format!("apps/hello/blobs/sha256/{component}").as_str().into();
         let good = store.get(&blob).await.unwrap().bytes().await.unwrap();
-        store.put(&blob, std::fs::read("tests/fixtures/hello-p2.wasm").unwrap().into()).await.unwrap();
+        let other = std::fs::read("tests/fixtures/hello-p2.wasm").unwrap();
+        store.put(&blob, other.clone().into()).await.unwrap();
         let install = Install::new(store.clone(), None, store.clone()).unwrap();
         let e = install.app("hello").await.err().unwrap();
         assert!(e.to_string().contains("does not match its hash"), "{e}");
@@ -262,6 +268,12 @@ mod tests {
         assert_eq!(get(&install, "hello.localhost", "/").await.0, 500); // the failure is remembered, not fetched again
         sleep(FRESH).await;
         assert_eq!(ok(&install, "hello.localhost", "/").await, "hello"); // until the next recheck
+
+        let other = state::add(&*store, "hello", state::BLOBS, other.into()).await.unwrap();
+        state::update(&*store, "hello", |c| c.release.as_mut().unwrap().component = other).await.unwrap();
+        sleep(FRESH).await;
+        let e = install.app("hello").await.err().unwrap();
+        assert!(e.to_string().contains("not its release's"), "{e}");
     }
 
     /// A recheck that hangs gives up at `RECHECK_MAX`, and the host serves what it last read.

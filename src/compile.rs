@@ -3,15 +3,17 @@
 //! and only from a component it checked against its hash.
 use crate::serve::status;
 use crate::state::{self, BLOBS};
+use futures_util::TryStreamExt;
 use http_body_util::{BodyExt, Limited};
 use hyper::body::{Body, Bytes};
 use hyper::{Method, Request, StatusCode};
 use object_store::{Error as E, ObjectStore, ObjectStoreExt, PutPayload};
 use serde_json::Value;
 use std::time::{Duration, Instant};
-use std::{error::Error as StdError, sync::Arc};
+use std::{error::Error as StdError, io, sync::Arc};
 use tempfile::NamedTempFile;
 use tokio::{task::spawn_blocking, time::timeout};
+use tokio_util::io::{StreamReader, SyncIoBridge};
 use torpor::Engine;
 use wasmtime::component::Component;
 use wasmtime::{Error, Result, ensure, error::Context};
@@ -57,17 +59,18 @@ async fn ask(store: &dyn ObjectStore, app: &str, hash: &str) -> Result<()> {
     Ok(())
 }
 
-/// The native code of `app`'s component `hash` in `native`, or `None` if it has none.
+/// The native code of `app`'s component `hash` in `native`, or `None` if it has none. It is decoded as it arrives.
 async fn load(native: &dyn ObjectStore, engine: &Arc<Engine>, app: &str, hash: &str) -> Result<Option<Component>> {
+    let start = Instant::now();
     let zst = match native.get(&state::native(app, hash, &engine.compat())?.into()).await {
         Err(E::NotFound { .. }) => return Ok(None),
-        r => r?.bytes().await?,
+        r => r?.into_stream().map_err(io::Error::other),
     };
+    let mut zst = SyncIoBridge::new(StreamReader::new(zst));
     let engine = engine.clone();
-    let start = Instant::now();
     let code = spawn_blocking(move || {
         let mut file = NamedTempFile::new()?;
-        zstd::stream::copy_decode(&*zst, &mut file)?;
+        zstd::stream::copy_decode(&mut zst, &mut file)?;
         // SAFETY: the code is what `precompile` made, as only the compile function writes `native`. The file is new and
         // this host's own, and is deleted on return, which leaves the component's mapping of it in place.
         unsafe { engine.native(file.path()) }

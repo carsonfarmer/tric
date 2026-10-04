@@ -229,17 +229,19 @@ All of these are covered, plus another app's native code and corrupt native code
   - an app-author guide: the contract, consistency, limits, and composition with `wac plug`, including that composed parts share capabilities;
   - an operator guide: install, lazy recompiles on upgrade, adding teams and their roles, the trust model, and costs.
 - **Release:**
-  - Rename `spinit` to `torpor` across the docs, and run a trademark and domain check (Q43).
+  - Rename the project to the name the M6 grilling settles, across the code and docs, after a trademark and domain check (Q43).
   - Create the GitHub repo, with Actions running the Docker tests (the real-bucket suite is run by hand).
-  - Publish `torpor-cli`.
+  - A workflow that publishes the CLI to crates.io from a tag, ready but not turned on: the CLI is not published yet.
 
 **Done when:** a new user can get from nothing to a released app using only the README.
+
+**Then:** a whole-codebase trim pass, as aggressive as the earlier ones, before anything new.
 
 ## Risks being watched
 
 | Risk | Where it's settled |
 |---|---|
-| Deserialize takes 46–58 ms on Lambda | Settled in M5: 41 ms at p50 for `hello-p3`, no faster in memory, so `deserialize_file` stays. Where the time goes is a deferred profile |
+| Deserialize takes 46–58 ms on Lambda | Settled in M5: 41 ms at p50 for `hello-p3`, no faster in memory, so `deserialize_file` stays. The time is the first touch of each page; a second deserialize takes about 1 ms |
 | Large JS components about 1 s cold | M5 measured 1,048 ms p99 at 1769 MB and 1,725 at 1024; its tail is the slower environments. Dedicated functions are a deferred item |
 | The p3 outbound send hook in `wasmtime-wasi-http` may differ from p2's | Checked first in M2 |
 | The Lambda Web Adapter's event pass-through for the compile function | Built to its documented contract in M4 (the raw event, posted to `/events`); proven in M5, where every `publish` saw its marker deleted |

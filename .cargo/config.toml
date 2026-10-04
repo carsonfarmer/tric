@@ -1,0 +1,4 @@
+[env]
+# aws-lc seeds its random numbers from the OS, as ring does, rather than from CPU jitter, which took ~50 ms of a cold
+# start on Lambda, at the first TLS handshake.
+AWS_LC_SYS_NO_JITTER_ENTROPY = "1"
