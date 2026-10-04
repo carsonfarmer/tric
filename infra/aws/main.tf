@@ -196,8 +196,6 @@ resource "aws_cloudfront_distribution" "this" {
       https_port             = 443
       origin_protocol_policy = "https-only"
       origin_ssl_protocols   = ["TLSv1.2"]
-      # The most without a quota increase, and free: a request within it skips a TLS handshake to the function URL.
-      origin_keepalive_timeout = 60
     }
   }
   default_cache_behavior {
