@@ -5,8 +5,10 @@ mod serve;
 mod state;
 
 use clap::{Parser, Subcommand};
-use object_store::{ObjectStore, aws::AmazonS3Builder};
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use object_store::client::{HttpClient, HttpConnector, ReqwestConnector};
+use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder};
+use std::sync::{Arc, OnceLock};
+use std::{net::SocketAddr, path::PathBuf};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 use wasmtime::{Result, error::Context};
@@ -65,7 +67,11 @@ async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into());
     tracing_subscriber::fmt().json().with_env_filter(filter).init();
     let Args { store, native, cmd } = Args::parse();
-    let bucket = |url| AmazonS3Builder::from_env().with_url(url).build().map(|s| Arc::new(s) as Arc<dyn ObjectStore>);
+    let http = OneClient::default();
+    let bucket = |url| {
+        let s = AmazonS3Builder::from_env().with_url(url).with_http_connector(http.clone()).build();
+        s.map(|s| Arc::new(s) as Arc<dyn ObjectStore>)
+    };
     let (store, native) = (store.map(bucket).transpose()?, native.map(bucket).transpose()?);
     let s = || store.as_deref().context(NO_STORE);
     match cmd {
@@ -99,4 +105,19 @@ async fn main() -> Result<()> {
         Cmd::Secrets { app } => cli::secrets(s()?, &app).await?.iter().for_each(|n| println!("{n}")),
     }
     Ok(())
+}
+
+/// One HTTP client for every bucket, as each client loads and parses the system's root certificates, about 18 ms of a
+/// cold start apiece on Lambda. It is made with the first bucket's options, which all come from the `AWS_` variables.
+#[derive(Debug, Clone, Default)]
+struct OneClient(Arc<OnceLock<HttpClient>>);
+
+impl HttpConnector for OneClient {
+    fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
+        if let Some(client) = self.0.get() {
+            return Ok(client.clone());
+        }
+        let client = ReqwestConnector::default().connect(options)?;
+        Ok(self.0.get_or_init(|| client).clone())
+    }
 }
