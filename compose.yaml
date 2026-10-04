@@ -28,7 +28,7 @@ services:
     platform: linux/arm64
     command: sh -c 'cargo build --release --bin torpor && rm -f dist/torpor.zip && mkdir -p dist && zip -j dist/torpor.zip infra/aws/bootstrap target/release/torpor'
   tofu:
-    image: ghcr.io/opentofu/opentofu:latest
+    image: ghcr.io/opentofu/opentofu:1.13
     working_dir: /src/infra/aws
     volumes: [".:/src", "${HOME}/.aws:/root/.aws"]
     environment: [AWS_PROFILE]

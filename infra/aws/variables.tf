@@ -1,5 +1,5 @@
 variable "name" {
-  description = "Prefix of every resource's name."
+  description = "Prefix of every resource's name, so an account has one install of each name."
   type        = string
   default     = "torpor"
   validation {
@@ -23,8 +23,8 @@ variable "teams" {
   type        = set(string)
   default     = []
   validation {
-    condition     = alltrue([for t in var.teams : can(regex("^[a-z0-9]+$", t))])
-    error_message = "Team names are a-z and 0-9, with no -, or team `a` would own team `a-b`'s apps."
+    condition     = alltrue([for t in var.teams : can(regex("^[a-z0-9]{1,38}$", t))])
+    error_message = "Team names are 1 to 38 of a-z and 0-9, so their roles' names fit, with no -, or team `a` would own team `a-b`'s apps."
   }
 }
 
@@ -42,7 +42,7 @@ variable "serve" {
 }
 
 variable "concurrency" {
-  description = "How many of each function may run at once, reserved from the account's quota, of which Lambda keeps 100 unreserved. `serve`'s caps what a flood of requests can cost; `compile`'s queues a burst of markers, so the later ones find the native code made. -1 reserves none, for an account whose quota is too small."
+  description = "How many of each function may run at once, reserved from the account's quota, of which Lambda keeps 100 unreserved. `serve`'s caps the compute a flood of requests can cost, at about $40 a day by default, besides the requests' own charges; `compile`'s queues a burst of markers, so the later ones find the native code made. -1 reserves none, for an account whose quota is too small."
   type        = object({ serve = optional(number, 20), compile = optional(number, 2) })
   default     = {}
 }

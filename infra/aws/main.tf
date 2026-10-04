@@ -14,8 +14,10 @@ locals {
   kv      = aws_s3_bucket.this["kv"].arn
   # The Lambda Web Adapter, published by AWS: an extension that turns invocations into HTTP requests to the function.
   adapter = "arn:aws:lambda:${var.region}:753240598075:layer:LambdaAdapterLayerArm64:30"
-  zip     = "../../dist/torpor.zip"     # as `docker compose run --rm release` builds it
-  team    = "$${aws:PrincipalTag/team}" # for IAM to fill in: the `team` tag of the role
+  zip     = "${path.module}/../../dist/torpor.zip" # as `docker compose run --rm release` builds it
+  team    = "$${aws:PrincipalTag/team}"            # for IAM to fill in: the `team` tag of the role
+  # The one record that proves the domain is ours, as the certificate is for one name.
+  validation = one(aws_acm_certificate.this.domain_validation_options)
   env = {
     TORPOR_STORE                     = "s3://${aws_s3_bucket.this["app"].bucket}"
     TORPOR_NATIVE                    = "s3://${aws_s3_bucket.this["native"].bucket}"
@@ -149,9 +151,9 @@ resource "aws_acm_certificate" "this" {
 
 resource "aws_route53_record" "validation" {
   zone_id         = data.aws_route53_zone.this.zone_id
-  name            = one(aws_acm_certificate.this.domain_validation_options).resource_record_name
-  type            = one(aws_acm_certificate.this.domain_validation_options).resource_record_type
-  records         = [one(aws_acm_certificate.this.domain_validation_options).resource_record_value]
+  name            = local.validation.resource_record_name
+  type            = local.validation.resource_record_type
+  records         = [local.validation.resource_record_value]
   ttl             = 300
   allow_overwrite = true
 }
@@ -272,6 +274,9 @@ resource "aws_budgets_budget" "this" {
   limit_amount = var.budget.usd
   limit_unit   = "USD"
   time_unit    = "MONTHLY"
+  cost_types {
+    include_credit = false # which would hide the spend until they ran out
+  }
   notification {
     comparison_operator        = "GREATER_THAN"
     threshold                  = 80
