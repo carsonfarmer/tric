@@ -3,7 +3,7 @@ use http_body_util::{BodyExt, Empty};
 use hyper::{StatusCode, body::Bytes};
 use object_store::memory::InMemory;
 use std::{fs, sync::Arc, time::Duration, time::Instant};
-use torpor::{App, Engine};
+use tric::{App, Engine};
 
 fn load(name: &str) -> App {
     let (engine, wasm) = (Engine::new().unwrap(), fs::read(format!("tests/fixtures/{name}.wasm")).unwrap());

@@ -1,14 +1,14 @@
 # Everything runs in Docker, one isolated stack per worktree:
-#   COMPOSE_PROJECT_NAME=torpor-<worktree> docker compose run --rm dev        (a shell in the toolchain)
-#   COMPOSE_PROJECT_NAME=torpor-<worktree> docker compose run --rm fixtures   (build tests/fixtures/*.wasm)
-#   COMPOSE_PROJECT_NAME=torpor-<worktree> docker compose run --rm test       (fixtures, then cargo test)
-#   COMPOSE_PROJECT_NAME=torpor-<worktree> docker compose run --rm release    (dist/torpor.zip, for Lambda's arm64)
-#   COMPOSE_PROJECT_NAME=torpor-<worktree> docker compose run --rm tofu …     (OpenTofu in infra/aws: see its README)
-name: ${COMPOSE_PROJECT_NAME:-torpor-main}
+#   COMPOSE_PROJECT_NAME=tric-<worktree> docker compose run --rm dev        (a shell in the toolchain)
+#   COMPOSE_PROJECT_NAME=tric-<worktree> docker compose run --rm fixtures   (build tests/fixtures/*.wasm)
+#   COMPOSE_PROJECT_NAME=tric-<worktree> docker compose run --rm test       (fixtures, then cargo test)
+#   COMPOSE_PROJECT_NAME=tric-<worktree> docker compose run --rm release    (dist/tric.zip, for Lambda's arm64)
+#   COMPOSE_PROJECT_NAME=tric-<worktree> docker compose run --rm tofu …     (OpenTofu in infra/aws: see its README)
+name: ${COMPOSE_PROJECT_NAME:-tric-main}
 
 x-toolchain: &toolchain
   build: { context: docker, dockerfile: build.Dockerfile }
-  image: ${COMPOSE_PROJECT_NAME:-torpor-main}-build
+  image: ${COMPOSE_PROJECT_NAME:-tric-main}-build
   working_dir: /src
   volumes: [".:/src", "cargo:/opt/cargo/registry", "target:/src/target"]
 
@@ -26,7 +26,7 @@ services:
   release:
     <<: *toolchain
     platform: linux/arm64
-    command: sh -c 'cargo build --release --bin torpor && rm -f dist/torpor.zip && mkdir -p dist && zip -j dist/torpor.zip infra/aws/bootstrap target/release/torpor'
+    command: sh -c 'cargo build --release --bin tric && rm -f dist/tric.zip && mkdir -p dist && zip -j dist/tric.zip infra/aws/bootstrap target/release/tric'
   tofu:
     image: ghcr.io/opentofu/opentofu:1.13
     working_dir: /src/infra/aws

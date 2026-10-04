@@ -4,7 +4,7 @@ use common::*;
 use object_store::{ObjectStoreExt, path::Path};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use torpor::App;
+use tric::App;
 
 async fn j(app: &App, path: &str) -> Value {
     let (status, body) = get(app, path).await;

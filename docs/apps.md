@@ -1,12 +1,12 @@
-# Writing a torpor app
+# Writing a tric app
 
-This page is for someone writing an app that runs on torpor. torpor calls a WASI HTTP component once per request, in a fresh instance, so nothing in memory survives from one request to the next. All state goes in KV, which torpor keeps in object storage (S3 in production). Working examples are in [`tests/components/rust/`](../tests/components/rust/) (plain `wit-bindgen`) and [`tests/components/spin/`](../tests/components/spin/) (Spin SDK).
+This page is for someone writing an app that runs on tric. tric calls a WASI HTTP component once per request, in a fresh instance, so nothing in memory survives from one request to the next. All state goes in KV, which tric keeps in object storage (S3 in production). Working examples are in [`tests/components/rust/`](../tests/components/rust/) (plain `wit-bindgen`) and [`tests/components/spin/`](../tests/components/spin/) (Spin SDK).
 
-**Two modes.** `torpor serve DIR` runs one app from a directory, as an install of one in memory, so its KV data is lost when the process stops. `torpor serve --store s3://BUCKET`, or `torpor serve` with `TORPOR_STORE` set, runs every app released to that bucket, with KV in the bucket. Everything below holds in both modes unless it says otherwise.
+**Two modes.** `tric serve DIR` runs one app from a directory, as an install of one in memory, so its KV data is lost when the process stops. `tric serve --store s3://BUCKET`, or `tric serve` with `TRIC_STORE` set, runs every app released to that bucket, with KV in the bucket. Everything below holds in both modes unless it says otherwise.
 
 ## The manifest
 
-An app is a directory with a `torpor.toml` and a component. Run it with `torpor serve [DIR] [--listen ADDR]` (defaults: `.` and `127.0.0.1:3000`), and reach it at its name, like `curl hello.localhost:3000`. A broken app stops `torpor serve` at start-up.
+An app is a directory with a `tric.toml` and a component. Run it with `tric serve [DIR] [--listen ADDR]` (defaults: `.` and `127.0.0.1:3000`), and reach it at its name, like `curl hello.localhost:3000`. A broken app stops `tric serve` at start-up.
 
 ```toml
 name = "hello"
@@ -24,26 +24,26 @@ greeting = "hi"
 | `allowed_outbound_hosts` | Hosts the app may call. Absent or empty means no outbound requests at all. See [Outbound HTTP](#outbound-http). |
 | `[config]` | Keys and values the app reads through `wasi:config`. Values must be strings. |
 
-- **Typos:** an unknown field is an error, so a misspelled `allowed_outbound_hosts` stops `torpor serve` at start-up instead of leaving the app with no outbound access. So does a bad allow-list entry.
-- **Secrets** never go in the manifest. In an install they come from [`torpor secret`](#releasing). In a directory, `torpor serve` turns each environment variable `TORPOR_VAR_<KEY>` into the secret `<key>`, lowercased: `TORPOR_VAR_API_KEY=s3cret` gives the app `api_key`. Like any secret, it overrides the same key in `[config]`. Either way the app reads config and secrets through `wasi:config` as one flat set. Use lowercase keys in `[config]`, or an override will not match.
+- **Typos:** an unknown field is an error, so a misspelled `allowed_outbound_hosts` stops `tric serve` at start-up instead of leaving the app with no outbound access. So does a bad allow-list entry.
+- **Secrets** never go in the manifest. In an install they come from [`tric secret`](#releasing). In a directory, `tric serve` turns each environment variable `TRIC_VAR_<KEY>` into the secret `<key>`, lowercased: `TRIC_VAR_API_KEY=s3cret` gives the app `api_key`. Like any secret, it overrides the same key in `[config]`. Either way the app reads config and secrets through `wasi:config` as one flat set. Use lowercase keys in `[config]`, or an override will not match.
 
 ## Releasing
 
-An install is one bucket. Name it with `--store s3://BUCKET` or `TORPOR_STORE`. Credentials, the region and an endpoint (for a store other than S3) come from the usual `AWS_` variables. There is no other auth: the bucket's IAM decides who may change what.
+An install is one bucket. Name it with `--store s3://BUCKET` or `TRIC_STORE`. Credentials, the region and an endpoint (for a store other than S3) come from the usual `AWS_` variables. There is no other auth: the bucket's IAM decides who may change what.
 
 - **Teams.** App names are global, and a team owns the apps named `<team>-…`: its IAM role can reach only those, so team `acme` publishes `acme-blog`, served at `acme-blog.<domain>`. There is nothing to create first: publishing an app creates it.
-- **Releases.** A release is the component, `[config]` and `allowed_outbound_hosts` of one `torpor.toml`, and its id is the hash of those. Releases never change. An app serves at most one of them, which `torpor release` picks.
+- **Releases.** A release is the component, `[config]` and `allowed_outbound_hosts` of one `tric.toml`, and its id is the hash of those. Releases never change. An app serves at most one of them, which `tric release` picks.
 
 | Command | Who | What it does |
 |---|---|---|
-| `torpor publish [DIR]` | team | Uploads the app in DIR (default `.`) as a release, without serving it, and prints `APP ID`. It refuses a component that would not load. |
-| `torpor release APP ID` | team | Serves APP from its release ID. To roll back, release an older ID. |
-| `torpor releases APP` | team | Lists APP's release IDs, newest first, each with when it was first published. |
-| `torpor secret APP NAME` | team | Sets APP's secret NAME to stdin, less one trailing newline. An empty value removes it. |
-| `torpor secrets APP` | team | Prints the names of APP's secrets. |
-| `torpor serve --store ...` | host | Serves every app. |
+| `tric publish [DIR]` | team | Uploads the app in DIR (default `.`) as a release, without serving it, and prints `APP ID`. It refuses a component that would not load. |
+| `tric release APP ID` | team | Serves APP from its release ID. To roll back, release an older ID. |
+| `tric releases APP` | team | Lists APP's release IDs, newest first, each with when it was first published. |
+| `tric secret APP NAME` | team | Sets APP's secret NAME to stdin, less one trailing newline. An empty value removes it. |
+| `tric secrets APP` | team | Prints the names of APP's secrets. |
+| `tric serve --store ...` | host | Serves every app. |
 
-Publishing and releasing in one go is `torpor release $(torpor publish DIR)`.
+Publishing and releasing in one go is `tric release $(tric publish DIR)`.
 
 - **Propagation:** a host rechecks an app when a request finds its view of it 5 s old, so a change is live everywhere within 5 s of the command returning. If a recheck fails or takes over a second, the host goes on serving what it last read.
 - **Two changes at once:** `release` and `secret` both rewrite the app's `current`, and only if nothing changed it since they read it. Of two at once on the same app, one fails with `APP changed while this ran: run it again`, so neither is silently lost.
@@ -56,11 +56,11 @@ Publishing and releasing in one go is `torpor release $(torpor publish DIR)`.
 
 | Interface | Version | What the app gets |
 |---|---|---|
-| `wasi:http` | p2 `incoming-handler` (0.2.x) or p3 `handler` (0.3.0) | Export one of them. torpor picks whichever the component exports. Outbound requests use the standard outgoing handler (see [Outbound HTTP](#outbound-http)). |
+| `wasi:http` | p2 `incoming-handler` (0.2.x) or p3 `handler` (0.3.0) | Export one of them. tric picks whichever the component exports. Outbound requests use the standard outgoing handler (see [Outbound HTTP](#outbound-http)). |
 | `wasi:keyvalue` | `0.2.0-draft2` | `store`, `atomics` and `batch`. There is no `watch`. |
-| `wasi:config` | `0.2.0-rc.1` | `get` and `get-all` over `[config]` plus the `TORPOR_VAR_` variables. |
+| `wasi:config` | `0.2.0-rc.1` | `get` and `get-all` over `[config]` plus the `TRIC_VAR_` variables. |
 
-The other standard WASI interfaces (clocks, random numbers, stdout and stderr) work, but the app sees an empty world: no environment variables, no arguments, no files and no sockets. Output goes to the host's log (see [Limits](#limits)). A component that imports an interface torpor does not provide, such as `wasi:keyvalue/watch` or any `spin:*` interface, is refused when it loads.
+The other standard WASI interfaces (clocks, random numbers, stdout and stderr) work, but the app sees an empty world: no environment variables, no arguments, no files and no sockets. Output goes to the host's log (see [Limits](#limits)). A component that imports an interface tric does not provide, such as `wasi:keyvalue/watch` or any `spin:*` interface, is refused when it loads.
 
 The WIT files for KV and config are in this repo's `wit/keyvalue/` and `wit/config/`. Copy them into your project.
 
@@ -98,7 +98,7 @@ impl wasip3::exports::http::handler::Guest for Component {
 
 ### Spin SDK
 
-Use the SDK for HTTP only. Its default features, its key-value module and its variables module import `spin:*` interfaces that torpor does not provide, and its own `wasi:config` import is a different draft (`0.2.0-draft-2024-09-27`) that does not link against `0.2.0-rc.1`. Bind KV and config with the SDK's re-exported `wit_bindgen`, as above but with `runtime_path`:
+Use the SDK for HTTP only. Its default features, its key-value module and its variables module import `spin:*` interfaces that tric does not provide, and its own `wasi:config` import is a different draft (`0.2.0-draft-2024-09-27`) that does not link against `0.2.0-rc.1`. Bind KV and config with the SDK's re-exported `wit_bindgen`, as above but with `runtime_path`:
 
 ```toml
 spin-sdk = { version = "7", default-features = false, features = ["http"] }
@@ -124,7 +124,7 @@ JavaScript components built with `jco` serve HTTP. KV and outbound requests from
 
 KV is one S3 object per key, and nothing is cached: every call goes to the store. Everything below follows from that.
 
-A **host** is one running torpor process. In production several hosts can serve the same app at once.
+A **host** is one running tric process. In production several hosts can serve the same app at once.
 
 ### One key
 
@@ -163,7 +163,7 @@ KV failures come back as error values, not traps.
 
 ## What KV costs
 
-On S3 every store call is billed. The prices below are us-east-1 list prices and vary by region: PUT, LIST and POST are $0.005 per 1,000 requests, and GET and HEAD are $0.0004 per 1,000. Deletes are free, including the bulk deletes (a POST) that torpor makes for every delete. Storage and data transfer are extra.
+On S3 every store call is billed. The prices below are us-east-1 list prices and vary by region: PUT, LIST and POST are $0.005 per 1,000 requests, and GET and HEAD are $0.0004 per 1,000. Deletes are free, including the bulk deletes (a POST) that tric makes for every delete. Storage and data transfer are extra.
 
 | Operation | Store calls | Request cost per 1,000 operations |
 |---|---|---|

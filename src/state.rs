@@ -18,7 +18,7 @@ use object_store::{Error as E, ObjectStore, ObjectStoreExt, PutMode, UpdateVersi
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use torpor::{NAME_MAX, is_name};
+use tric::{NAME_MAX, is_name};
 use wasmtime::{Result, bail, ensure, error::Context};
 
 const CURRENT: &str = "current";

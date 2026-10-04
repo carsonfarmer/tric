@@ -1,17 +1,13 @@
 [package]
-name = "torpor-cli"
+name = "tric"
 version = "0.0.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "A scale-to-zero host for WASI components"
 publish = false
 
-[lib]
-name = "torpor"
-
 [[bin]]
-name = "torpor"
-path = "src/main.rs"
+name = "tric"
 required-features = ["cli"]
 
 # Embedders use `default-features = false`: the runtime is the library, the platform is the binary.
@@ -47,7 +43,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optio
 # webpki-roots' roots as whole certificates, which is how the S3 client takes them.
 webpki-root-certs = { version = "1", optional = true }
 webpki-roots = "1"
-# The defaults minus what torpor never uses: cache, profiling, coredump, debug, stack-switching, gc-copying and
+# The defaults minus what tric never uses: cache, profiling, coredump, debug, stack-switching, gc-copying and
 # compile-time-builtins (so no wit-parser either).
 wasmtime = { version = "=49.0.1", default-features = false, features = [
     "addr2line", "anyhow", "async", "backtrace", "component-model", "component-model-async", "cranelift", "demangle",
@@ -61,7 +57,7 @@ zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
 async-trait = "0.1"
-object_store = { version = "=0.14.2", default-features = false, features = ["aws"] } # TORPOR_TEST_STORE
+object_store = { version = "=0.14.2", default-features = false, features = ["aws"] } # TRIC_TEST_STORE
 serde_json = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
 

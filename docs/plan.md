@@ -1,10 +1,10 @@
-# torpor build plan
+# tric build plan
 
 **Status:** draft for approval, 2026-10-01. This plan only puts the decisions in order. The decisions themselves live in [decisions.md](decisions.md), and that file wins if the two disagree. Items marked **(choice)** are small calls this plan makes that the grilling never settled; they're collected in [Choices to confirm](#choices-to-confirm).
 
 ## What v1 is
 
-An operator installs torpor into their own AWS account with one OpenTofu module, then its teams publish and release WASI components with `torpor publish` and `torpor release`.
+An operator installs tric into their own AWS account with one OpenTofu module, then its teams publish and release WASI components with `tric publish` and `tric release`.
 - One shared Lambda function serves every app, each at its own subdomain of one domain (Q11, Q67).
 - All platform state lives in buckets (Q1).
 - An idle install costs only its storage.
@@ -21,9 +21,9 @@ An operator installs torpor into their own AWS account with one OpenTofu module,
 
 ## Shape of the code
 
-- **Crate and binary (Q18, Q43):** one crate, `torpor-cli`, and one binary, `torpor`.
+- **Crate and binary (Q18, Q43):** one crate, `tric`, and one binary, `tric`.
 - **Subcommands:** `serve`, `compile-worker`, `publish`, `release`, `releases`, `secret`, `secrets` and `gc`.
-- **Lambda adapter:** Lambda runs `torpor serve` and `torpor compile-worker` behind the Lambda Web Adapter (Q29), so there is no Lambda crate.
+- **Lambda adapter:** Lambda runs `tric serve` and `tric compile-worker` behind the Lambda Web Adapter (Q29), so there is no Lambda crate.
 - **Libraries:**
   - Wasmtime (the latest release when M1 starts; 49.0.1 in the spike), with `wasmtime-wasi`, `wasmtime-wasi-http` and `wasmtime-wasi-config`;
   - `object_store` 0.14;
@@ -53,7 +53,7 @@ Q43 applies: no product name appears in any stored key or field, so a rename nev
 | app | `apps/<app>/blobs/sha256/<hex>` | Components, in the OCI layout under the app (Q40, Q72) | team (put-if-absent) |
 | app | `apps/<app>/releases/<hex>` | Immutable releases: component, config, allow list (Q69) | team (put-if-absent) |
 | app | `apps/<app>/current` | The release the app serves, and its secrets, in plain (Q65, Q73) | team (CAS) |
-| kv | `kv/<app>/<store>/<key>` | KV values, percent-encoded keys (Q42), in a bucket of their own (`TORPOR_KV`, Q88); without one, in the app bucket | serving function |
+| kv | `kv/<app>/<store>/<key>` | KV values, percent-encoded keys (Q42), in a bucket of their own (`TRIC_KV`, Q88); without one, in the app bucket | serving function |
 | app | `compile/<app>/<hex>` | Compile requests | team, serving function; compile function deletes |
 | native | `<app>/<hex>/<compat hash>.zst` | Compiled native code, under the app that owns the component (Q54) | **compile function only** |
 
@@ -72,7 +72,7 @@ Each milestone is a branch in its own worktree under `.worktrees/`. It ends with
 
 It is then merged locally into `main`.
 
-### M1: Runtime core (`torpor serve` runs one app locally)
+### M1: Runtime core (`tric serve` runs one app locally)
 
 - **Setup:**
   - Scaffold the crate (Apache-2.0, Q24).
@@ -84,7 +84,7 @@ It is then merged locally into `main`.
 - **Each request:** a fresh store, and a WASI context that grants nothing: no environment, arguments, preopened files or sockets (Q55).
 - **Guest output:** stdout and stderr are captured into the host log, tagged with the app and capped per request **(choice)**.
 - **HTTP:** serves both p2 `incoming-handler` and p3 `handler` through `wasmtime-wasi-http` (Q31). The spike's `guest.rs` carries over.
-- **Dev mode:** `torpor serve` in an app directory reads `torpor.toml` (name, component, allowed outbound hosts, `[config]`) and runs that one app against the in-memory store. Secrets are never in `torpor.toml`; in dev mode they come from `TORPOR_VAR_<KEY>` environment variables **(choice)**. Since Q79, dev mode publishes and releases the directory into an in-memory install and serves that, at `<name>.localhost`.
+- **Dev mode:** `tric serve` in an app directory reads `tric.toml` (name, component, allowed outbound hosts, `[config]`) and runs that one app against the in-memory store. Secrets are never in `tric.toml`; in dev mode they come from `TRIC_VAR_<KEY>` environment variables **(choice)**. Since Q79, dev mode publishes and releases the directory into an in-memory install and serves that, at `<name>.localhost`.
 - **Logs:** JSON lines to stdout. Warnings and errors by default (Q14).
 
 **Done when:**
@@ -121,11 +121,11 @@ It is then merged locally into `main`.
 
 The M3 review reshaped this milestone; decisions.md Q60–Q79 has the why.
 
-- **`torpor publish [DIR]`:** checks that the component loads, puts it and a release put-if-absent under the app's name, and prints `APP ID` (Q61, Q70, Q72).
-- **`torpor release APP ID`:** checks the release, then swaps it into the app's `current` with CAS, and fails if another change landed in between (Q77). Rolling back is releasing an older id, and `torpor releases APP` lists them newest first (Q69).
-- **`torpor secret APP NAME` and `secrets APP`:** set a secret from stdin into the app's `current`, or remove it with an empty value, so it takes effect without a release and outlives releases (Q65, Q73, Q76). A secret overrides config. `secrets` lists names only.
+- **`tric publish [DIR]`:** checks that the component loads, puts it and a release put-if-absent under the app's name, and prints `APP ID` (Q61, Q70, Q72).
+- **`tric release APP ID`:** checks the release, then swaps it into the app's `current` with CAS, and fails if another change landed in between (Q77). Rolling back is releasing an older id, and `tric releases APP` lists them newest first (Q69).
+- **`tric secret APP NAME` and `secrets APP`:** set a secret from stdin into the app's `current`, or remove it with an empty value, so it takes effect without a release and outlives releases (Q65, Q73, Q76). A secret overrides config. `secrets` lists names only.
 - Commands return once their write lands; a change is live everywhere within 5 s (Q74).
-- **`torpor serve --store <url>`** (the install mode, which Lambda runs):
+- **`tric serve --store <url>`** (the install mode, which Lambda runs):
   - Routes by the first label of `Host` (Q67), then reads that app's `current`. A name is kept only once it has had a release, so a made-up name costs a GET and no memory (Q72, Q84).
   - Rereads an app's `current` once it is 5 s old, and reloads the app only if it changed (Q75, Q78). It gives up a recheck after 1 s, serving what it last read.
   - Loads each app once per release, compiling on tokio's blocking pool; a failed load stands until the next recheck (Q62, Q63).
@@ -145,9 +145,9 @@ The M3 review reshaped this milestone; decisions.md Q60–Q79 has the why.
 
 This refines the trigger in Q58 **(choice)**; see [Choices to confirm](#choices-to-confirm). decisions.md "M4" has the choices made while building it.
 
-Everything here is on only with `--native` (`TORPOR_NATIVE`), the native bucket. A marker is `compile/<app>/<hex>`, where `<hex>` is the component's SHA-256, as in `apps/<app>/blobs/sha256/<hex>`, and native code is `<app>/<hex>/<compat>.zst`.
+Everything here is on only with `--native` (`TRIC_NATIVE`), the native bucket. A marker is `compile/<app>/<hex>`, where `<hex>` is the component's SHA-256, as in `apps/<app>/blobs/sha256/<hex>`, and native code is `<app>/<hex>/<compat>.zst`.
 
-- **`torpor compile-worker`** receives bucket events through the Lambda Web Adapter's pass-through path (`POST /events`). For each marker:
+- **`tric compile-worker`** receives bucket events through the Lambda Web Adapter's pass-through path (`POST /events`). For each marker:
   1. If `<app>/<hex>/<own compat hash>.zst` already exists, it skips to step 4.
   2. It fetches and hash-checks the blob, and compiles it with Cranelift.
   3. It writes the zstd-compressed result to the native bucket.
@@ -189,7 +189,7 @@ All of these are covered, plus another app's native code and corrupt native code
 - The targets are met, or each gap is written up with options.
 - After destroy, nothing tagged is left.
 
-**Applied (2026-10-03); destroy waits for the user's try of it (Q92).** The release build (`docker compose run --rm release` makes `dist/torpor.zip`, 11 MB: aarch64, glibc 2.34 at most) runs as a fresh install at `*.tric.works`. The choices are in decisions.md, "M5 preparation" and "M5 session"; the results:
+**Applied (2026-10-03); destroy waits for the user's try of it (Q92).** The release build (`docker compose run --rm release` makes `dist/tric.zip`, 11 MB: aarch64, glibc 2.34 at most) runs as a fresh install at `*.tric.works`. The choices are in decisions.md, "M5 preparation" and "M5 session"; the results:
 - **End to end:** as team `t1`, five apps are published and released (Rust p2 and p3, JS, KV, and a probe), each at `https://<app>.tric.works`. Every `publish` saw its marker deleted, so the adapter's event pass-through works.
 - **The targets**, at 1769 MB. Cold starts are 100 sequential ones per app, each in a new environment, as Lambda's Init + Duration:
 
@@ -219,17 +219,17 @@ All of these are covered, plus another app's native code and corrupt native code
 3. **The team role's 404s first**, as role `t1`: a HEAD of a missing `apps/t1-x/current` and of a missing `compile/t1-x/<hex>` must be 404, and a list with no prefix (and one of `apps/t2-`) must be refused. If either fails, KV moves to a bucket of its own (Q88).
 4. **End to end:** as `t1`, publish and release a fixture as `t1-hello`; `https://t1-hello.tric.works` serves it; `publish` saw the marker deleted (the compile function ran); a request straight to the Function URL with a made-up `X-Forwarded-Host` reaches only that app; a viewer's own `X-Forwarded-Host` is replaced.
 5. **The measurements above**, from the info logs with Logs Insights: `loaded` (`ms`, a whole load) and `loaded its native code` (`ms`, the deserialize), plus Lambda's `Init Duration`. Then `memory=1024` in `serve`, and again.
-6. **Destroy once the user has tried the live install** (Q92), as `infra/aws/README.md`'s "Spin down" says, then list what is tagged `torpor` (`aws resourcegroupstaggingapi get-resources`) in both regions; Lambda's own log groups, if a function logged after its group was deleted, are the likely leftover.
+6. **Destroy once the user has tried the live install** (Q92), as `infra/aws/README.md`'s "Spin down" says, then list what is tagged `tric` (`aws resourcegroupstaggingapi get-resources`) in both regions; Lambda's own log groups, if a function logged after its group was deleted, are the likely leftover.
 
 ### M6: First release
 
-- **`torpor gc` (Q48):** keeps each app's current release and its last 10 by `releases`, with a 1 h grace period. It prunes unreachable blobs, releases and native code, and keeps only the newest compat hash per component.
+- **`tric gc` (Q48):** keeps each app's current release and its last 10 by `releases`, with a 1 h grace period. It prunes unreachable blobs, releases and native code, and keeps only the newest compat hash per component.
 - **Docs:**
   - a README quick start;
   - an app-author guide: the contract, consistency, limits, and composition with `wac plug`, including that composed parts share capabilities;
   - an operator guide: install, lazy recompiles on upgrade, adding teams and their roles, the trust model, and costs.
 - **Release:**
-  - Rename the project to `tric` (Q98), crate and binary both, across the code and docs, after a trademark check (Q43).
+  - **Done:** the project is renamed to `tric` (Q98), crate and binary both, across the code and docs, after a trademark check (Q43).
   - Create the GitHub repo, public under `carsonfarmer` (Q99), with Actions running the Docker tests (the real-bucket suite is run by hand).
   - A workflow that publishes the CLI to crates.io from a tag, ready but not turned on: the CLI is not published yet.
 
@@ -258,8 +258,8 @@ These are small calls this plan makes. Say which, if any, to change.
    - **Cost:** at most one tiny PUT per cold environment until the native code lands.
 3. **The admin gets delete-only on the native bucket** so `gc` can prune it. Deleting live native code only causes a recompile.
 4. **KV store names:** any `[a-z0-9-]{1,63}`, scoped to the app, with no manifest field.
-5. **CLI settings from the environment:** `TORPOR_STORE` (bucket URL). `TORPOR_RECIPIENT` went with age (Q73).
-6. **Dev-mode secrets:** `TORPOR_VAR_<KEY>` environment variables. `torpor.toml` never holds secrets.
+5. **CLI settings from the environment:** `TRIC_STORE` (bucket URL). `TRIC_RECIPIENT` went with age (Q73).
+6. **Dev-mode secrets:** `TRIC_VAR_<KEY>` environment variables. `tric.toml` never holds secrets.
 7. **Guest stdout/stderr:** captured into the host log, tagged with the app and capped per request.
 8. **Defaults:** the compile function at 3008 MB with a 120 s timeout; log retention of 7 days.
 9. **"CI" is local Docker until M6** creates the GitHub repo. The real-bucket suite runs in M5's cloud session and by hand after that.

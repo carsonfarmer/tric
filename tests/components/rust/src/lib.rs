@@ -7,7 +7,7 @@ use std::{fmt::Debug, fs, hint::black_box, io};
 mod kv;
 #[cfg(feature = "kv")]
 wit_bindgen::generate!({
-    inline: "package torpor:fixture; world kv { include wasi:keyvalue/imports@0.2.0-draft2; include wasi:config/imports@0.2.0-rc.1; }",
+    inline: "package tric:fixture; world kv { include wasi:keyvalue/imports@0.2.0-draft2; include wasi:config/imports@0.2.0-rc.1; }",
     path: ["../../../wit/keyvalue", "../../../wit/config"],
     generate_all,
 });

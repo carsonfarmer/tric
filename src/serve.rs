@@ -1,4 +1,4 @@
-//! `torpor serve`: runs every app of an install, or the app in a directory as an install of one, over HTTP/1.
+//! `tric serve`: runs every app of an install, or the app in a directory as an install of one, over HTTP/1.
 use crate::state::{self, Current, Live};
 use crate::{cli, compile};
 use futures_util::future::{BoxFuture, FutureExt, Shared};
@@ -8,11 +8,11 @@ use object_store::{ObjectStore, memory::InMemory, prefix::PrefixStore};
 use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, collections::HashMap, convert::Infallible, env, path::Path, sync::Arc};
 use tokio::{net::TcpListener, sync::Mutex, time::timeout};
-use torpor::{App, Engine, is_name};
+use tric::{App, Engine, is_name};
 use wasmtime::{Error, Result, ensure};
 use wasmtime_wasi_http::{handler::Response, io::TokioIo};
 
-const VAR_PREFIX: &str = "TORPOR_VAR_";
+const VAR_PREFIX: &str = "TRIC_VAR_";
 /// The viewer's host, which a proxy in front passes on in this header when its origin needs its own `Host`.
 const FORWARDED_HOST: &str = "x-forwarded-host";
 /// How stale a host's view may get, so also how long a change takes to be live everywhere.
@@ -50,7 +50,7 @@ impl Install {
         Ok(Arc::new(Self { engine: Engine::new()?.into(), store, native, kv, apps: Mutex::default() }))
     }
 
-    /// An install in memory of just the app in `dir`, released, with `TORPOR_VAR_<KEY>` as its secret `key`, so secrets
+    /// An install in memory of just the app in `dir`, released, with `TRIC_VAR_<KEY>` as its secret `key`, so secrets
     /// stay out of files. It loads the app before returning, so one that a host would refuse fails here.
     pub async fn dev(dir: &Path) -> Result<Arc<Self>> {
         let store = Arc::new(InMemory::new());
@@ -192,7 +192,7 @@ mod tests {
         id
     }
 
-    /// One request over a real socket checks that `torpor serve DIR` serves the app in `DIR` at its name.
+    /// One request over a real socket checks that `tric serve DIR` serves the app in `DIR` at its name.
     #[tokio::test]
     async fn serves_a_dir() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -6,10 +6,10 @@ use object_store::{Error as E, ObjectStore, ObjectStoreExt, PutPayload, memory::
 use serde::Deserialize;
 use std::{cmp::Reverse, collections::BTreeMap, fs, path::Path, sync::Arc, time::Duration};
 use tokio::time::{sleep, timeout};
-use torpor::Engine;
+use tric::Engine;
 use wasmtime::{Result, error::Context};
 
-const MANIFEST: &str = "torpor.toml";
+const MANIFEST: &str = "tric.toml";
 const COMPILE_POLL: Duration = Duration::from_secs(1);
 const COMPILE_WAIT: Duration = Duration::from_secs(180); // longer than the compile function may run
 

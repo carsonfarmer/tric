@@ -13,7 +13,7 @@ use std::{error::Error as StdError, io, sync::Arc, time::Duration};
 use tempfile::NamedTempFile;
 use tokio::{task::spawn_blocking, time::timeout};
 use tokio_util::io::{StreamReader, SyncIoBridge};
-use torpor::Engine;
+use tric::Engine;
 use wasmtime::component::Component;
 use wasmtime::{Error, Result, ensure, error::Context};
 use wasmtime_wasi_http::handler::Response;

@@ -1,11 +1,11 @@
 output "store" {
-  description = "TORPOR_STORE for the CLI."
-  value       = local.env.TORPOR_STORE
+  description = "TRIC_STORE for the CLI."
+  value       = local.env.TRIC_STORE
 }
 
 output "native" {
-  description = "TORPOR_NATIVE for the CLI, so `publish` waits for native code."
-  value       = local.env.TORPOR_NATIVE
+  description = "TRIC_NATIVE for the CLI, so `publish` waits for native code."
+  value       = local.env.TRIC_NATIVE
 }
 
 output "function_url" {

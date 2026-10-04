@@ -1,7 +1,7 @@
-# torpor on AWS
+# tric on AWS
 
 An install: the app, native-code and KV buckets, the serving and compile functions, CloudFront at `*.<domain>`, a role
-per team, and a budget alert. Everything that can be tagged is tagged `torpor = <name>`. Every command below runs from
+per team, and a budget alert. Everything that can be tagged is tagged `tric = <name>`. Every command below runs from
 the repository's root, with `AWS_PROFILE` set to a profile that may administer the account.
 
 ## The zone, once per domain
@@ -25,7 +25,7 @@ reserve, so needs `concurrency = { serve = -1, compile = -1 }` too.
 
 ```sh
 printf '%s\n' 'domain = "<domain>"' 'budget = { emails = ["<you>"] }' 'teams = ["<team>"]' > infra/aws/terraform.tfvars
-docker compose run --rm release            # builds dist/torpor.zip
+docker compose run --rm release            # builds dist/tric.zip
 docker compose run --rm tofu init
 docker compose run --rm tofu apply
 ```
@@ -45,13 +45,13 @@ The CLI takes its credentials from the `AWS_` variables, not from a profile. Wit
 
 ```sh
 eval "$(aws configure export-credentials --profile <team> --format env)"
-export AWS_REGION=<region> TORPOR_STORE=<store> TORPOR_NATIVE=<native>   # from the outputs
+export AWS_REGION=<region> TRIC_STORE=<store> TRIC_NATIVE=<native>   # from the outputs
 ```
 
 ## Spin down
 
 1. **The install.** The buckets go only with everything in them, and only if `force_destroy` is applied first. Both
-   commands need `dist/torpor.zip`, as the plan reads it:
+   commands need `dist/tric.zip`, as the plan reads it:
 
    ```sh
    docker compose run --rm tofu apply -var force_destroy=true
@@ -63,7 +63,7 @@ export AWS_REGION=<region> TORPOR_STORE=<store> TORPOR_NATIVE=<native>   # from 
 2. **Check nothing is left**, in both the install's region and us-east-1 (the certificate's):
 
    ```sh
-   aws resourcegroupstaggingapi get-resources --region <region> --tag-filters Key=torpor
+   aws resourcegroupstaggingapi get-resources --region <region> --tag-filters Key=tric
    aws logs describe-log-groups --region <region> --log-group-name-prefix /aws/lambda/<name>-
    ```
 

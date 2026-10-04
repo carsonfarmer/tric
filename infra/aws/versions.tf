@@ -5,15 +5,15 @@ terraform {
   }
 }
 
-# Every resource is tagged `torpor = <name>`, so what an install left behind is easy to find.
+# Every resource is tagged `tric = <name>`, so what an install left behind is easy to find.
 provider "aws" {
   region = var.region
-  default_tags { tags = { torpor = var.name } }
+  default_tags { tags = { tric = var.name } }
 }
 
 # CloudFront takes certificates only from us-east-1.
 provider "aws" {
   alias  = "us_east_1"
   region = "us-east-1"
-  default_tags { tags = { torpor = var.name } }
+  default_tags { tags = { tric = var.name } }
 }

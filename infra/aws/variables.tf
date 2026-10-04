@@ -1,7 +1,7 @@
 variable "name" {
   description = "Prefix of every resource's name, so an account has one install of each name."
   type        = string
-  default     = "torpor"
+  default     = "tric"
   validation {
     condition     = can(regex("^[a-z][a-z0-9-]{0,19}$", var.name))
     error_message = "A name is 1 to 20 of a-z, 0-9 and -, so the buckets' names fit."

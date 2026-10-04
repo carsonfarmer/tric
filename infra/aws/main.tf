@@ -1,4 +1,4 @@
-# An install of torpor: the app, native-code and KV buckets, the serving and compile functions, CloudFront in front of
+# An install of tric: the app, native-code and KV buckets, the serving and compile functions, CloudFront in front of
 # the serving function at *.<domain>, the teams' roles, and a budget alert.
 
 data "aws_caller_identity" "current" {}
@@ -14,13 +14,13 @@ locals {
   kv      = aws_s3_bucket.this["kv"].arn
   # The Lambda Web Adapter, published by AWS: an extension that turns invocations into HTTP requests to the function.
   adapter = "arn:aws:lambda:${var.region}:753240598075:layer:LambdaAdapterLayerArm64:30"
-  zip     = "${path.module}/../../dist/torpor.zip" # as `docker compose run --rm release` builds it
+  zip     = "${path.module}/../../dist/tric.zip" # as `docker compose run --rm release` builds it
   team    = "$${aws:PrincipalTag/team}"            # for IAM to fill in: the `team` tag of the role
   # The one record that proves the domain is ours, as the certificate is for one name.
   validation = one(aws_acm_certificate.this.domain_validation_options)
   env = {
-    TORPOR_STORE                     = "s3://${aws_s3_bucket.this["app"].bucket}"
-    TORPOR_NATIVE                    = "s3://${aws_s3_bucket.this["native"].bucket}"
+    TRIC_STORE                     = "s3://${aws_s3_bucket.this["app"].bucket}"
+    TRIC_NATIVE                    = "s3://${aws_s3_bucket.this["native"].bucket}"
     RUST_LOG                         = var.logs.filter
     AWS_LWA_READINESS_CHECK_PROTOCOL = "tcp" # as an HTTP check would cost `serve` a bucket read
   }
@@ -129,7 +129,7 @@ resource "aws_lambda_function" "serve" {
   reserved_concurrent_executions = var.concurrency.serve
   ephemeral_storage { size = var.serve.storage }
   environment {
-    variables = merge(local.env, { AWS_LWA_PORT = "3000", TORPOR_KV = "s3://${aws_s3_bucket.this["kv"].bucket}" })
+    variables = merge(local.env, { AWS_LWA_PORT = "3000", TRIC_KV = "s3://${aws_s3_bucket.this["kv"].bucket}" })
   }
   # After the compile function, so a new build's hosts ask for native code from a compile function of the same build.
   depends_on = [aws_iam_role_policy.fn, aws_lambda_function.compile]

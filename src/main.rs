@@ -1,4 +1,4 @@
-//! torpor: a scale-to-zero host for WASI components.
+//! tric: a scale-to-zero host for WASI components.
 mod cli;
 mod compile;
 mod serve;
@@ -14,17 +14,17 @@ use tracing_subscriber::EnvFilter;
 use wasmtime::{Result, error::Context};
 use webpki_root_certs::TLS_SERVER_ROOT_CERTS;
 
-const NO_STORE: &str = "there is no --store or TORPOR_STORE";
-const NO_NATIVE: &str = "there is no --native or TORPOR_NATIVE";
+const NO_STORE: &str = "there is no --store or TRIC_STORE";
+const NO_NATIVE: &str = "there is no --native or TRIC_NATIVE";
 
 #[derive(Parser)]
 struct Args {
     /// The install's bucket, like `s3://NAME`. Credentials, region and endpoint come from the usual `AWS_` variables
-    #[arg(long, global = true, env = "TORPOR_STORE")]
+    #[arg(long, global = true, env = "TRIC_STORE")]
     store: Option<String>,
     /// The install's bucket of native code, if it has one, which hosts load apps from and `publish` waits for. Without
     /// it, a host compiles every app it loads
-    #[arg(long, global = true, env = "TORPOR_NATIVE")]
+    #[arg(long, global = true, env = "TRIC_NATIVE")]
     native: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
@@ -32,14 +32,14 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Serve the install in --store, or else the app described by DIR/torpor.toml, each app at a host like APP.localhost
+    /// Serve the install in --store, or else the app described by DIR/tric.toml, each app at a host like APP.localhost
     Serve {
         #[arg(default_value = ".")]
         dir: PathBuf,
         #[arg(long, default_value = "127.0.0.1:3000")]
         listen: SocketAddr,
         /// The bucket of the apps' KV data, if not --store: one of its own keeps KV's keys from whoever may list --store
-        #[arg(long, env = "TORPOR_KV")]
+        #[arg(long, env = "TRIC_KV")]
         kv: Option<String>,
     },
     /// Make the native code that the install's markers ask for, as the Lambda Web Adapter posts their events
@@ -47,7 +47,7 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:8080")] // the adapter's default
         listen: SocketAddr,
     },
-    /// Upload the app described by DIR/torpor.toml as a release, without serving it, and print `APP ID`. With --native,
+    /// Upload the app described by DIR/tric.toml as a release, without serving it, and print `APP ID`. With --native,
     /// then wait until its native code is made
     Publish {
         #[arg(default_value = ".")]

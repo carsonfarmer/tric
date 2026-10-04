@@ -2359,39 +2359,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
-name = "torpor-cli"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "bytes",
- "clap",
- "futures-util",
- "http-body-util",
- "hyper",
- "object_store",
- "percent-encoding",
- "rand",
- "serde",
- "serde_json",
- "sha2",
- "target-lexicon",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-subscriber",
- "wasmtime",
- "wasmtime-wasi",
- "wasmtime-wasi-config",
- "wasmtime-wasi-http",
- "webpki-root-certs",
- "webpki-roots",
- "zstd",
-]
-
-[[package]]
 name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2508,6 +2475,39 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
+]
+
+[[package]]
+name = "tric"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "clap",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "object_store",
+ "percent-encoding",
+ "rand",
+ "serde",
+ "serde_json",
+ "sha2",
+ "target-lexicon",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "wasmtime",
+ "wasmtime-wasi",
+ "wasmtime-wasi-config",
+ "wasmtime-wasi-http",
+ "webpki-root-certs",
+ "webpki-roots",
+ "zstd",
 ]
 
 [[package]]
