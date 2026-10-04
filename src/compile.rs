@@ -9,8 +9,7 @@ use hyper::body::{Body, Bytes};
 use hyper::{Method, Request, StatusCode};
 use object_store::{Error as E, ObjectStore, ObjectStoreExt, PutPayload};
 use serde_json::Value;
-use std::time::{Duration, Instant};
-use std::{error::Error as StdError, io, sync::Arc};
+use std::{error::Error as StdError, io, sync::Arc, time::Duration};
 use tempfile::NamedTempFile;
 use tokio::{task::spawn_blocking, time::timeout};
 use tokio_util::io::{StreamReader, SyncIoBridge};
@@ -61,7 +60,6 @@ async fn ask(store: &dyn ObjectStore, app: &str, hash: &str) -> Result<()> {
 
 /// The native code of `app`'s component `hash` in `native`, or `None` if it has none. It is decoded as it arrives.
 async fn load(native: &dyn ObjectStore, engine: &Arc<Engine>, app: &str, hash: &str) -> Result<Option<Component>> {
-    let start = Instant::now();
     let zst = match native.get(&state::native(app, hash, &engine.compat())?.into()).await {
         Err(E::NotFound { .. }) => return Ok(None),
         r => r?.into_stream().map_err(io::Error::other),
@@ -75,9 +73,7 @@ async fn load(native: &dyn ObjectStore, engine: &Arc<Engine>, app: &str, hash: &
         // this host's own, and is deleted on return, which leaves the component's mapping of it in place.
         unsafe { engine.native(file.path()) }
     });
-    let code = code.await??;
-    tracing::info!(app, ms = start.elapsed().as_millis(), "loaded its native code");
-    Ok(Some(code))
+    Ok(Some(code.await??))
 }
 
 /// The compile function, which makes the native code that markers ask for.

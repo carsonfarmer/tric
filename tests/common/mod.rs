@@ -9,7 +9,8 @@ use std::{env, fmt, fs, time::SystemTime};
 use torpor::{App, Engine};
 
 /// A store that logs its gets (`get kv/app/s/k`), puts and lists, and passes everything else through: to an `InMemory`
-/// store or, with `TORPOR_TEST_STORE` set to a bucket like `s3://NAME`, to a prefix of that bucket that it alone uses.
+/// store or, with `TORPOR_TEST_STORE` set to a bucket like `s3://NAME`, to a prefix of that bucket that it alone uses
+/// and leaves as it is.
 #[derive(Debug)]
 pub struct Counting {
     pub inner: Arc<dyn ObjectStore>,
