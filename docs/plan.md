@@ -201,6 +201,9 @@ All of these are covered, plus another app's native code and corrupt native code
   | Acknowledged write p99 ≤ 200 ms (a KV `set`) | 61 ms | Met |
   | Idle ≤ $0.05/month | Storage only: nothing runs while idle | Met (the zone's $0.50 is outside the module) |
 
+- **End to end**, from a client near Vancouver (CloudFront's YVR edge), to the first byte:
+  - Warm: `hello-p3` 55 ms (31 straight to the Function URL), and a KV `get` 81 (57).
+  - Cold, `hello-p3`: 610 ms at p50 (p90 777), against Lambda's own 383. Lambda's numbers leave out about 170 ms of making the environment and routing the Function URL, and CloudFront's hop to the origin adds about 50 more. That is 25 paired cold starts, each sent through CloudFront and straight to the Function URL at once.
 - **At 1024 MB:** Rust 406 / 482 / 661 ms (p50 / p90 / p99), JS 637 / 1,324 / 1,725. Init is 155 ms at both sizes, and the rest scales with the CPU, so 1769 MB stays the default (Q51).
 - **The Rust gap.** At p50, a cold start is about 75 ms before `main`, 54 ms for the HTTP client, 25–30 ms for the engine; then, in the request, 88 ms for the first `current` read (on a new TLS connection), and a 107 ms load, of which the native code takes 28 ms to fetch, 6 to decompress and 41 to deserialize. Options:
   1. **Done:** one HTTP client for every bucket. A cold start's p50 fell from 416 to 367 ms and its p99 from 536 to 515.
