@@ -229,7 +229,7 @@ All of these are covered, plus another app's native code and corrupt native code
   - an app-author guide: the contract, consistency, limits, and composition with `wac plug`, including that composed parts share capabilities;
   - an operator guide: install, lazy recompiles on upgrade, adding teams and their roles, the trust model, and costs.
 - **Release:**
-  - Rename the project to the name the M6 grilling settles, across the code and docs, after a trademark and domain check (Q43).
+  - Rename the project to `tric` (Q98), crate and binary both, across the code and docs, after a trademark check (Q43).
   - Create the GitHub repo, public under `carsonfarmer` (Q99), with Actions running the Docker tests (the real-bucket suite is run by hand).
   - A workflow that publishes the CLI to crates.io from a tag, ready but not turned on: the CLI is not published yet.
 

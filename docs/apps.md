@@ -29,7 +29,7 @@ greeting = "hi"
 
 ## Releasing
 
-An install is one bucket. Name it with `--store s3://BUCKET` or `TORPOR_STORE`. Credentials, the region and an endpoint (for MinIO and the like) come from the usual `AWS_` variables. There is no other auth: the bucket's IAM decides who may change what.
+An install is one bucket. Name it with `--store s3://BUCKET` or `TORPOR_STORE`. Credentials, the region and an endpoint (for a store other than S3) come from the usual `AWS_` variables. There is no other auth: the bucket's IAM decides who may change what.
 
 - **Teams.** App names are global, and a team owns the apps named `<team>-…`: its IAM role can reach only those, so team `acme` publishes `acme-blog`, served at `acme-blog.<domain>`. There is nothing to create first: publishing an app creates it.
 - **Releases.** A release is the component, `[config]` and `allowed_outbound_hosts` of one `torpor.toml`, and its id is the hash of those. Releases never change. An app serves at most one of them, which `torpor release` picks.
