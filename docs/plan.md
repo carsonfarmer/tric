@@ -230,7 +230,7 @@ All of these are covered, plus another app's native code and corrupt native code
   - an operator guide: install, lazy recompiles on upgrade, adding teams and their roles, the trust model, and costs.
 - **Release:**
   - Rename the project to the name the M6 grilling settles, across the code and docs, after a trademark and domain check (Q43).
-  - Create the GitHub repo, with Actions running the Docker tests (the real-bucket suite is run by hand).
+  - Create the GitHub repo, public under `carsonfarmer` (Q99), with Actions running the Docker tests (the real-bucket suite is run by hand).
   - A workflow that publishes the CLI to crates.io from a tag, ready but not turned on: the CLI is not published yet.
 
 **Done when:** a new user can get from nothing to a released app using only the README.

@@ -300,6 +300,8 @@ Nothing here has been applied. The cloud session (plan.md, M5) needs your approv
 | — | Where deserialize's time goes | **First touches of memory.** A second deserialize of the same code in the same environment took 0.3–1.2 ms, against 41 for the first, and first touches of new memory cost about 1 ms per MB on Lambda. This settles the deferred profile. Fetching every app's native code during start-up was tried once and not pursued: 28 MB took 209 ms, and slowed the first `current` read to 106 ms. A host can't know which apps it will serve. |
 | — | The release build, cold | **Its cold starts match the experiment's.** Twenty new environments, ten an app: Init + Duration at p50 was 269 ms for `hello-p3` and 376 for `hello-js`, against 261 and 374 in the experiment, and end to end through CloudFront 537 and 621 ms. |
 | — | CloudFront's keep-alive to the origin | **Left at the default, 5 s.** Raising it to 60, the most without a quota increase, changed nothing measurable: of 15 warm requests 20 s apart, CloudFront's part (time to the first byte, less the viewer's own TLS) was 100 ms at p50 before and 110 after. Requests that far apart don't seem to find an edge's connection still open, so the setting was taken out. |
+| — | Spin-down | **Everything but the `tric.works` zone destroyed**: 25 resources, leaving no tagged resources or log groups in us-west-2 or us-east-1. The zone keeps only its NS and SOA records. |
+| Q99 | The GitHub repo | **Public from the start, under the user's own account, `carsonfarmer`.** |
 
 ## Deferred work and fast follows
 
