@@ -25,7 +25,7 @@ An operator installs tric into their own AWS account with one OpenTofu module, t
 - **Subcommands:** `serve`, `compile-worker`, `publish`, `release`, `releases`, `secret` and `secrets`.
 - **Lambda adapter:** Lambda runs `tric serve` and `tric compile-worker` behind the Lambda Web Adapter (Q29), so there is no Lambda crate.
 - **Libraries:**
-  - Wasmtime (the latest release when M1 starts; 49.0.1 in the spike), with `wasmtime-wasi`, `wasmtime-wasi-http` and `wasmtime-wasi-config`;
+  - Wasmtime (the latest release when M1 starts; 49.0.1 in the spike, 49.0.2 since its advisories of 2026-10-02), with `wasmtime-wasi`, `wasmtime-wasi-http` and `wasmtime-wasi-config`;
   - `object_store` 0.14;
   - tokio and hyper;
   - `zstd`, serde, `toml`, `clap` and `tracing`.

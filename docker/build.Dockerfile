@@ -8,6 +8,6 @@ RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-to
 # Release binaries for wasm-tools and the wasmtime CLI. The CLI must match the Wasmtime version the host crate pins.
 RUN arch=$(uname -m) \
  && curl -fsSL https://github.com/bytecodealliance/wasm-tools/releases/download/v1.260.0/wasm-tools-1.260.0-$arch-linux.tar.gz | tar xz --strip-components=1 -C /usr/local/bin --wildcards '*/wasm-tools' \
- && curl -fsSL https://github.com/bytecodealliance/wasmtime/releases/download/v49.0.1/wasmtime-v49.0.1-$arch-linux.tar.xz | tar xJ --strip-components=1 -C /usr/local/bin --wildcards '*/wasmtime' \
+ && curl -fsSL https://github.com/bytecodealliance/wasmtime/releases/download/v49.0.2/wasmtime-v49.0.2-$arch-linux.tar.xz | tar xJ --strip-components=1 -C /usr/local/bin --wildcards '*/wasmtime' \
  && npm install -g @bytecodealliance/jco@1.35.0 \
  && wasm-tools --version && wasmtime --version && jco --version

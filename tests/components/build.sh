@@ -1,6 +1,6 @@
 #!/bin/sh
 # Builds every test fixture into tests/fixtures/<name>.wasm, in the toolchain image: docker compose run --rm fixtures
-# Wasmtime 49.0.1: wasi:http 0.2.12 and 0.3.0. The host crate and the wasmtime CLI in the image must stay on this version.
+# Wasmtime 49.0.2: wasi:http 0.2.12 and 0.3.0. The host crate and the wasmtime CLI in the image must stay on this version.
 set -eu
 cd "$(dirname "$0")"
 out=../fixtures

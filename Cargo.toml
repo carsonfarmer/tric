@@ -50,14 +50,14 @@ webpki-root-certs = { version = "1", optional = true }
 webpki-roots = "1"
 # The defaults minus what tric never uses: cache, profiling, coredump, debug, stack-switching, gc-copying and
 # compile-time-builtins (so no wit-parser either).
-wasmtime = { version = "=49.0.1", default-features = false, features = [
+wasmtime = { version = "=49.0.2", default-features = false, features = [
     "addr2line", "anyhow", "async", "backtrace", "component-model", "component-model-async", "cranelift", "demangle",
     "gc", "gc-drc", "gc-null", "parallel-compilation", "pooling-allocator", "runtime", "std", "threads", "wat",
 ] }
-wasmtime-wasi = { version = "=49.0.1", default-features = false, features = ["p2", "p3"] }
-wasmtime-wasi-config = "=49.0.1"
+wasmtime-wasi = { version = "=49.0.2", default-features = false, features = ["p2", "p3"] }
+wasmtime-wasi-config = "=49.0.2"
 # No `default-send-request`: that is the built-in outbound client, which resolves names after any check on them.
-wasmtime-wasi-http = { version = "=49.0.1", default-features = false, features = ["component-model-async", "p2", "p3"] }
+wasmtime-wasi-http = { version = "=49.0.2", default-features = false, features = ["component-model-async", "p2", "p3"] }
 zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
