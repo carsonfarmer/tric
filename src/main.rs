@@ -15,17 +15,16 @@ use wasmtime::{Result, error::Context};
 use webpki_root_certs::TLS_SERVER_ROOT_CERTS;
 
 const NO_STORE: &str = "there is no --store or TRIC_STORE";
-const NO_NATIVE: &str = "there is no --native or TRIC_NATIVE";
 
 #[derive(Parser)]
 struct Args {
     /// The install's bucket, like `s3://NAME`. Credentials, region and endpoint come from the usual `AWS_` variables
     #[arg(long, global = true, env = "TRIC_STORE")]
     store: Option<String>,
-    /// The install's bucket of native code, if it has one, which hosts load apps from and `publish` waits for. Without
-    /// it, a host compiles every app it loads
+    /// Whether the install has a compile function, so hosts load apps from its native code and `publish` waits for it.
+    /// Without it, a host compiles every app it loads
     #[arg(long, global = true, env = "TRIC_NATIVE")]
-    native: Option<String>,
+    native: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -55,15 +54,12 @@ enum Cmd {
     },
     /// Serve APP from its release ID
     Release { app: String, id: String },
-    /// List APP's releases, newest first, each with when it was last published
+    /// List APP's releases, newest first, marking the one it serves
     Releases { app: String },
     /// Set APP's secret NAME to stdin, less a trailing newline, whichever release it runs. An empty value removes it
     Secret { app: String, name: String },
     /// List the names of APP's secrets
     Secrets { app: String },
-    /// Delete, and print, what no app needs: of each, its releases but the one it runs and its 10 newest, and what only
-    /// those used. Anything under an hour old stays, as a publish may still be writing it
-    Gc,
 }
 
 #[tokio::main]
@@ -76,7 +72,7 @@ async fn main() -> Result<()> {
         let s = AmazonS3Builder::from_env().with_url(url).with_http_connector(http.clone()).build();
         s.map(|s| Arc::new(s) as Arc<dyn ObjectStore>)
     };
-    let (store, native) = (store.map(bucket).transpose()?, native.map(bucket).transpose()?);
+    let store = store.map(bucket).transpose()?;
     let s = || store.as_deref().context(NO_STORE);
     match cmd {
         Cmd::Serve { dir, listen, kv } => {
@@ -90,14 +86,14 @@ async fn main() -> Result<()> {
             serve::run(TcpListener::bind(listen).await?, move |req| install.clone().handle(req)).await?
         }
         Cmd::CompileWorker { listen } => {
-            let worker = Arc::new(compile::Worker::new(store.context(NO_STORE)?, native.context(NO_NATIVE)?)?);
+            let worker = Arc::new(compile::Worker::new(store.context(NO_STORE)?)?);
             serve::run(TcpListener::bind(listen).await?, move |req| worker.clone().handle(req)).await?
         }
         Cmd::Publish { dir } => {
-            let (app, id) = cli::publish(s()?, &dir, true).await?;
-            println!("{app} {id}"); // first, as the release stands even if the wait fails
-            if native.is_some() {
-                cli::precompile(s()?, &app, &id).await?;
+            let (app, e) = cli::publish(s()?, &dir, true).await?;
+            println!("{app} {}", e.id); // first, as the release stands even if the wait fails
+            if native {
+                cli::precompile(s()?, &app, &e).await?;
             }
         }
         Cmd::Release { app, id } => cli::release(s()?, &app, &id).await?,
@@ -107,7 +103,6 @@ async fn main() -> Result<()> {
             cli::set_secret(s()?, &app, &name, value.strip_suffix('\n').unwrap_or(&value)).await?
         }
         Cmd::Secrets { app } => cli::secrets(s()?, &app).await?.iter().for_each(|n| println!("{n}")),
-        Cmd::Gc => cli::gc(s()?, native.as_deref(), cli::GRACE).await?,
     }
     Ok(())
 }

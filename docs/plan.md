@@ -22,7 +22,7 @@ An operator installs tric into their own AWS account with one OpenTofu module, t
 ## Shape of the code
 
 - **Crate and binary (Q18, Q43):** one crate, `tric`, and one binary, `tric`.
-- **Subcommands:** `serve`, `compile-worker`, `publish`, `release`, `releases`, `secret`, `secrets` and `gc`.
+- **Subcommands:** `serve`, `compile-worker`, `publish`, `release`, `releases`, `secret` and `secrets`.
 - **Lambda adapter:** Lambda runs `tric serve` and `tric compile-worker` behind the Lambda Web Adapter (Q29), so there is no Lambda crate.
 - **Libraries:**
   - Wasmtime (the latest release when M1 starts; 49.0.1 in the spike), with `wasmtime-wasi`, `wasmtime-wasi-http` and `wasmtime-wasi-config`;
@@ -30,7 +30,7 @@ An operator installs tric into their own AWS account with one OpenTofu module, t
   - tokio and hyper;
   - `zstd`, serde, `toml`, `clap` and `tracing`.
 
-**Line budget:** about 1,390 lines of Rust (1,200 before M2, 1,290 before M3 and its review raised `serve` and `state`; 1,325 through M5, after four trim passes and four correctness passes; 1,455 with M6's `gc`, which the trim pass after M6 is to bring back under) plus about 250 of HCL (384 written: see M5). A module that runs well past its budget is a design problem to raise, not to push through.
+**Line budget:** about 1,390 lines of Rust (1,200 before M2, 1,290 before M3 and its review raised `serve` and `state`; 1,325 through M5, after four trim passes and four correctness passes; 1,455 with M6's `gc`; 1,440 after the rethink that replaced it (Q102 to Q113), which the trim pass after M6 is to bring back under) plus about 250 of HCL (384 written: see M5). A module that runs well past its budget is a design problem to raise, not to push through.
 
 | Module | Does | Budget |
 |---|---|---|
@@ -38,10 +38,10 @@ An operator installs tric into their own AWS account with one OpenTofu module, t
 | `outbound` | Allow list plus the resolved-address block, in the HTTP send hook | ~100 (raised in M2 from ~60: the matcher is hand-written, and the connect is our own; 118 after the trim passes) |
 | `kv` | `wasi:keyvalue` draft2 over the app's own prefix of the bucket: one object per key, CAS, no cache | ~250 (raised in M2 from ~200; 230 after the trim and review passes, 263 after M5 made batches concurrent and `increment` back off, 270 after the KV rethink) |
 | `config` | `wasi:config` from the manifest, with secrets | 0 (Wasmtime's crate serves it, and `serve` adds secrets in 1 line) |
-| `state` | The bucket layout, releases, compare-and-swap updates, defensive reads | ~130 (raised in the M3 review from ~100; 123 after the trim and review passes, 159 after the state rethink, 174 with `gc`'s strict reads of keys) |
+| `state` | The bucket layout, releases, compare-and-swap updates, defensive reads | ~130 (raised in the M3 review from ~100; 123 after the trim and review passes, 159 after the state rethink, 174 with `gc`'s strict reads of keys, 236 after Q102 to Q113 moved `publish` here and put each app's history in `current`) |
 | `serve` | hyper server, routing, logs | ~170 (raised in M3 from ~100, which was the router alone, then in the M3 review from ~140 for a pointer recheck per app; 144 after the trim and review passes, 156 after M5's routing by `X-Forwarded-Host` and load timings, 161 with M5's KV bucket) |
-| `compile` | The compile worker and compile-request markers, and a host's load of native code with its fallback compile | ~150 (raised in M4 from ~70, as it took the host's side from `engine`; 147 after the review pass, 150 with M5's load timing) |
-| `cli` | `publish`, `release`, `releases`, `secret`, `secrets`, `gc`, and `main`'s arguments | ~350 (146 after the trim and review passes, before `gc` and `compile`; 219 after M5, `cli` 96 and `main` 123, which builds the buckets on one HTTP client; 313 with `gc`, `cli` 175 and `main` 138) |
+| `compile` | The compile worker and compile-request markers, and a host's load of native code with its fallback compile | ~150 (raised in M4 from ~70, as it took the host's side from `engine`; 147 after the review pass, 150 with M5's load timing, 148 after the native bucket went (Q112)) |
+| `cli` | `publish`, `release`, `releases`, `secret`, `secrets`, and `main`'s arguments | ~350 (146 after the trim and review passes, before `gc` and `compile`; 219 after M5, `cli` 96 and `main` 123, which builds the buckets on one HTTP client; 313 with `gc`, `cli` 175 and `main` 138; 239 without it, `cli` 106 and `main` 133) |
 | `infra/aws` | OpenTofu module | ~250 HCL (384 after M5's trim (Q91), from 418 as first written. The budget predates CloudFront, its certificate and DNS (Q71, about 75 lines), the teams' roles (about 35) and the budget alert (about 15); the variables, with their docs and checks, are another 60) |
 
 ### Bucket layout
@@ -50,18 +50,20 @@ Q43 applies: no product name appears in any stored key or field, so a rename nev
 
 | Bucket | Key | What | Who writes |
 |---|---|---|---|
-| app | `apps/<app>/blobs/sha256/<hex>` | Components, in the OCI layout under the app (Q40, Q72) | team (put-if-absent) |
-| app | `apps/<app>/releases/<hex>` | Immutable releases: component, config, allow list (Q69) | team (put-if-absent) |
-| app | `apps/<app>/current` | The release the app serves, and its secrets, in plain (Q65, Q73) | team (CAS) |
+| app | `apps/<app>/current` | The release the app serves, its last 10 publishes, the next folder's number, and its secrets, in plain (Q65, Q73, Q102, Q108) | team (CAS) |
+| app | `apps/<app>/releases/<n>/release` | A release: its component's hash, config, allow list (Q69), in a folder never used again (Q108) | team |
+| app | `apps/<app>/releases/<n>/component` | The release's component | team |
+| app | `apps/<app>/releases/<n>/<compat hash>.zst` | Its native code (Q112) | **compile function only** (Q113) |
+| app | `compile/<app>/<n>` | Compile requests, deleted after a day if left | team, serving function; compile function deletes |
 | kv | `kv/<app>/<store>/<key>` | KV values, percent-encoded keys (Q42), in a bucket of their own (`TRIC_KV`, Q88); without one, in the app bucket | serving function |
-| app | `compile/<app>/<hex>` | Compile requests | team, serving function; compile function deletes |
-| native | `<app>/<hex>/<compat hash>.zst` | Compiled native code, under the app that owns the component (Q54) | **compile function only** |
+
+The app bucket is versioned, and its old versions expire after 7 days (Q105). Each change to an app's `current` first deletes the folders that the `current` it read had dropped (Q110), so nothing needs collecting.
 
 **IAM shape:**
-- The serving function reads the app bucket and may write only its `compile/`, reads and writes the KV bucket, and can only read the native bucket. It lists all three, so a miss is a 404 rather than a 403.
-- Each team has a role tagged `team`, and one ABAC policy lets it read and write only `apps/${team}-*`, so a team owns the apps named `<team>-…`, plus read and write `compile/${team}-*`, which `publish` waits on. It lists the whole app bucket: without the list, S3 answers a missing key (a new app's `current`, a deleted marker) with a 403, and a list can't be held to the team's prefixes (Q64, Q72, Q88). Team names have no hyphens. Nobody but the serving function reaches the KV bucket.
-- The operator runs `gc` with the credentials that installed tric. A role of its own, with delete but no put in the native bucket, waits for automated gc.
-- The compile function reads `apps/*/blobs/`, deletes `compile/`, and reads, lists and writes the native bucket.
+- The serving function reads the app bucket and may write only its `compile/`, and reads and writes the KV bucket. It lists both, so a miss is a 404 rather than a 403.
+- Each team has a role tagged `team`, and one ABAC policy lets it read and delete only `apps/${team}-*`, and write only an app's `current` and its folders' `release` and `component`, so a team owns the apps named `<team>-…` but can't write native code (Q113), plus read and write `compile/${team}-*`, which `publish` waits on. It lists the whole app bucket: without the list, S3 answers a missing key (a new app's `current`, a deleted marker) with a 403, and a list can't be held to the team's prefixes (Q64, Q72, Q88). Team names have no hyphens. Nobody but the serving function reaches the KV bucket.
+- Only the operator can read, restore or delete old versions (Q105).
+- The compile function reads the app bucket, deletes `compile/`, and writes only `apps/*/releases/*/*.zst`.
 
 ## Milestones
 
@@ -127,7 +129,7 @@ The M3 review reshaped this milestone; decisions.md Q60–Q79 has the why.
 - Commands return once their write lands; a change is live everywhere within 5 s (Q74).
 - **`tric serve --store <url>`** (the install mode, which Lambda runs):
   - Routes by the first label of `Host` (Q67), then reads that app's `current`. A name is kept only once it has had a release, so a made-up name costs a GET and no memory (Q72, Q84).
-  - Rereads an app's `current` once it is 5 s old, and reloads the app only if it changed (Q75, Q78). It gives up a recheck after 1 s, serving what it last read.
+  - Rereads an app's `current` once it is 5 s old, and reloads the app only if the release it serves or the secrets changed (Q75, Q78). It gives up a recheck after 1 s, serving what it last read.
   - Loads each app once per release, compiling on tokio's blocking pool; a failed load stands until the next recheck (Q62, Q63).
 - **Bucket contents are never trusted (Q53):**
   - reads are size-capped and parsed strictly;
@@ -145,7 +147,7 @@ The M3 review reshaped this milestone; decisions.md Q60–Q79 has the why.
 
 This refines the trigger in Q58 **(choice)**; see [Choices to confirm](#choices-to-confirm). decisions.md "M4" has the choices made while building it.
 
-Everything here is on only with `--native` (`TRIC_NATIVE`), the native bucket. A marker is `compile/<app>/<hex>`, where `<hex>` is the component's SHA-256, as in `apps/<app>/blobs/sha256/<hex>`, and native code is `<app>/<hex>/<compat>.zst`.
+Everything here is on only with `--native` (`TRIC_NATIVE`), the native bucket. A marker is `compile/<app>/<hex>`, where `<hex>` is the component's SHA-256, as in `apps/<app>/blobs/sha256/<hex>`, and native code is `<app>/<hex>/<compat>.zst`. **Since Q112** there is no native bucket: native code is in its release's folder, `apps/<app>/releases/<n>/<compat>.zst`, a marker is `compile/<app>/<n>`, and `--native` is a switch.
 
 - **`tric compile-worker`** receives bucket events through the Lambda Web Adapter's pass-through path (`POST /events`). For each marker:
   1. If `<app>/<hex>/<own compat hash>.zst` already exists, it skips to step 4.
@@ -223,11 +225,11 @@ All of these are covered, plus another app's native code and corrupt native code
 
 ### M6: First release
 
-- **Done: `tric gc` (Q48)** keeps each app's current release and its last 10 by `releases`, with a 1 h grace period. It prunes unreachable blobs, releases, markers and native code, and keeps only the newest compat hash per component.
+- **Done, then replaced: `tric gc` (Q48)** kept each app's current release and its last 10 by `releases`, with a 1 h grace period, and pruned the rest. After M6, Q102 to Q113 replaced it: `current` keeps each app's history, and each change deletes the release folders, native code included, that its app has dropped.
 - **Done: docs:**
   - a README quick start;
   - an app-author guide: the contract, consistency, limits, and composition with `wac plug`, including that composed parts share capabilities;
-  - an operator guide: install, lazy recompiles on upgrade, adding teams and their roles, the trust model, and costs.
+  - an operator guide: install, lazy recompiles on upgrade, adding teams and their roles, garbage and undoing deletes, the trust model, and costs.
 - **Done: release:**
   - **Done:** the project is renamed to `tric` (Q98), crate and binary both, across the code and docs, after a trademark check (Q43).
   - **Done:** the GitHub repo, [carsonfarmer/tric](https://github.com/carsonfarmer/tric), public (Q99), with Actions running the Docker gate (the real-bucket suite is run by hand).
@@ -256,7 +258,7 @@ These are small calls this plan makes. Say which, if any, to change.
    - **What:** `compile/<app>/<hex>`. Publish writes it, and so does a serving miss (once per environment). The compile worker deletes it when the native code exists, and publish waits for that deletion.
    - **Why:** compared with Q58's create-only `compile/<compat hash>/<hex>` plus a component-upload trigger, this needs one trigger instead of two. The CLI never needs the compat hash or the native bucket, a failed compile retries on the next miss, and republishing an already-uploaded component still works.
    - **Cost:** at most one tiny PUT per cold environment until the native code lands.
-3. ~~**The admin gets delete-only on the native bucket**~~ **The operator runs `gc` with their own credentials** (M6) until gc is automated. Deleting live native code only causes a recompile.
+3. ~~**The admin gets delete-only on the native bucket**~~ ~~**The operator runs `gc` with their own credentials** (M6)~~ **No gc** (Q102): each change deletes what its app has dropped. Deleting live native code only causes a recompile.
 4. **KV store names:** any `[a-z0-9-]{1,63}`, scoped to the app, with no manifest field.
 5. **CLI settings from the environment:** `TRIC_STORE` (bucket URL). `TRIC_RECIPIENT` went with age (Q73).
 6. **Dev-mode secrets:** `TRIC_VAR_<KEY>` environment variables. `tric.toml` never holds secrets.

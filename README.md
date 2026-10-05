@@ -87,7 +87,7 @@ most of them CloudFront's. [infra/aws/README.md](infra/aws/README.md) has the de
 then publish and release from the app's directory:
 
 ```bash
-export AWS_REGION=us-west-2 TRIC_STORE=$(docker compose run --rm -T tofu output -raw store) TRIC_NATIVE=$(docker compose run --rm -T tofu output -raw native)
+export AWS_REGION=us-west-2 TRIC_STORE=$(docker compose run --rm -T tofu output -raw store) TRIC_NATIVE=true
 eval "$(aws configure export-credentials --format env)"
 cd ../hello && tric release $(tric publish)
 curl https://hello.<domain>
@@ -99,7 +99,8 @@ curl https://hello.<domain>
 
 - [Writing apps](docs/apps.md): the manifest, releases and secrets, KV and its consistency, outbound HTTP, limits,
   and composing components.
-- [Running an install](infra/aws/README.md): teams, upgrades, `tric gc`, the trust model, costs, and spinning it down.
+- [Running an install](infra/aws/README.md): teams, upgrades, garbage and undoing deletes, the trust model, costs, and
+  spinning it down.
 - [The plan](docs/plan.md) and [the decisions](docs/decisions.md) behind it.
 
 ## Developing

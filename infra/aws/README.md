@@ -1,6 +1,6 @@
 # tric on AWS
 
-An install: the app, native-code and KV buckets, the serving and compile functions, CloudFront at `*.<domain>`, a role
+An install: the app and KV buckets, the serving and compile functions, CloudFront at `*.<domain>`, a role
 per team, and a budget alert. Everything that can be tagged is tagged `tric = <name>`. Every command below runs from
 the repository's root, with `AWS_PROFILE` set to a profile that may administer the account.
 
@@ -31,7 +31,8 @@ docker compose run --rm tofu apply
 ```
 
 The install's state is `infra/aws/terraform.tfstate`, which only this checkout has: keep it until the install is spun
-down, as without it tofu cannot.
+down, as without it tofu cannot. Before a second operator applies, move it to an S3 backend with `use_lockfile = true`,
+so that each has the latest state and two applies cannot run at once.
 
 Apps are then at `https://<app>.<domain>`. A resolver that looked a name up before the apply made its records may
 keep that miss for up to 15 minutes, the zone's negative-caching time. The apps share `<domain>` as one site, so one
@@ -52,7 +53,7 @@ runs:
 
 ```sh
 eval "$(aws configure export-credentials --profile <team> --format env)"
-export AWS_REGION=<region> TRIC_STORE=<store> TRIC_NATIVE=<native>   # from the outputs
+export AWS_REGION=<region> TRIC_STORE=<store> TRIC_NATIVE=true   # the region and store from the outputs
 ```
 
 ## Upgrading
@@ -61,26 +62,40 @@ Pull the new tric, then build and apply as at install. The compile function is u
 a hash of Wasmtime's version and settings, so after an upgrade that changes either, the hosts find none for any app:
 each compiles an app itself the first time it loads it, which makes that request slow (a large JavaScript component
 takes seconds), and asks the compile function for the new native code, which every later host loads. Publishing an app
-again asks for it ahead of any request. The old native code stays until `tric gc`.
+again asks for it ahead of any request. The old native code stays in each release's folder until the app drops that
+release.
 
 ## Garbage
 
-Nothing is deleted on its own: every release, component and piece of native code stays until `tric gc`, run by hand,
-with the credentials that installed tric:
+Nothing needs collecting. An app keeps the release it serves and its 10 latest publishes, each in a folder of its own
+with its component and native code, and each change to the app (a publish, a release or a secret) first deletes the
+folders of the releases it no longer keeps. A folder thus goes at the change after the one that dropped its release, by
+when hosts have mostly moved on, as each rechecks an app every 5 s. If the two changes land within 5 s, a host still
+serving the dropped release goes on serving it while it has it loaded, but fails with a `500` if it has to load it
+again, until its recheck. An app that never changes again keeps its last folders. A marker that asks for native code,
+which a failed compile leaves, goes after a day, and KV data is never touched.
+
+Deleting an app's `current` takes the app offline. The next change to the app starts its history again, in folders above
+the old ones, and the change after it deletes the old ones. Do it only while nothing publishes to the app: a publish
+that is still writing can leave its files in the next release's folder, which hosts then refuse, as they do not match
+its hashes.
+
+## Undoing a delete
+
+The app bucket keeps whatever is deleted or overwritten in it as an old version for 7 days, which the operator can
+bring back, though teams can neither read nor delete old versions. To bring back a key, list its versions and copy the
+one you want over it:
 
 ```sh
-eval "$(aws configure export-credentials --format env)"
-export AWS_REGION=<region> TRIC_STORE=<store> TRIC_NATIVE=<native>   # from the outputs
-tric gc
+aws s3api list-object-versions --bucket <store> --prefix apps/<app>/current
+aws s3api copy-object --bucket <store> --key apps/<app>/current \
+  --copy-source '<store>/apps/<app>/current?versionId=<version>'
 ```
 
-Of each app, it keeps the release it serves and the 10 newest, the components those use, and the newest native code of
-each such component, and it deletes the rest, printing each key. Anything under an hour old stays, as a publish may
-still be writing it, and KV data is never touched. An app whose `current` changes while it runs is left as it is, and so
-is one it cannot read all of: it logs why for each, and fails once it has done the rest. Running it again finishes an
-app that only changed. A key it cannot parse, such as one with a control character, stops it with an error that names
-the key: delete that key and run it again. A rollback to a release older than the 10 newest is possible only until
-`gc` deletes it, and publishing a release again makes it the newest.
+Bring back a deleted `current` before anything changes the app: a change makes a new `current`, which bringing back the
+old one undoes, and the change after it deletes the old folders. An older `current` brought back over a live one needs
+the files of the folders it keeps, which come back the same way; the folders it does not keep go at the change after the
+next. KV data has no old versions.
 
 ## Trust
 
@@ -88,12 +103,16 @@ the key: delete that key and run it again. A rollback to a release older than th
   manifest lists, and limits on time and memory ([docs/apps.md](../../docs/apps.md#limits)). An app's KV stores are its
   own, and only the serving function reaches the KV bucket.
 - **Teams** reach only their own apps, but can list every key in the app bucket, and so see other teams' app names and
-  release ids. An app's secrets are stored as they are, readable by its team and by the hosts.
+  release ids. An app's secrets are stored as they are, readable by its team and by the hosts, and one that is changed
+  or removed stays in an old version for 7 days, which only the operator can read.
 - **The apps share `<domain>`** as one site, so one can set a cookie that the browser sends to all of them. Teams that
   should not trust each other need installs of their own.
 - **The hosts trust nothing in the buckets:** every read is size-capped and parsed strictly, and every component and
-  release is checked against its hash. Native code is loaded only from the native bucket, which only the compile
-  function writes.
+  release is checked against its hash. Native code cannot be checked, and loading it runs it in the host, so only the
+  compile function may write it. A team may write only its apps' `current` and their folders' `release` and
+  `component`, while native code is always `<compat>.zst`, so a pattern in the teams' policy that matched a key ending
+  in `.zst` would let a team run its code in every host. A team may delete its apps' native code, which costs only a
+  compile.
 - **The compile function** compiles every team's components, and can write native code for any app, so Wasmtime's
   compiler is the boundary: a component that exploited it there could run its code in every app.
 - **The operator**, with the account, can do anything.

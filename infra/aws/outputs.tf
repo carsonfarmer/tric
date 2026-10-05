@@ -3,11 +3,6 @@ output "store" {
   value       = local.env.TRIC_STORE
 }
 
-output "native" {
-  description = "TRIC_NATIVE for the CLI, so `publish` waits for native code."
-  value       = local.env.TRIC_NATIVE
-}
-
 output "function_url" {
   description = "The serving function without CloudFront, which routes by `X-Forwarded-Host`."
   value       = aws_lambda_function_url.serve.function_url

@@ -1,4 +1,4 @@
-# An install of tric: the app, native-code and KV buckets, the serving and compile functions, CloudFront in front of
+# An install of tric: the app and KV buckets, the serving and compile functions, CloudFront in front of
 # the serving function at *.<domain>, the teams' roles, and a budget alert.
 
 data "aws_caller_identity" "current" {}
@@ -10,7 +10,6 @@ data "aws_route53_zone" "this" {
 locals {
   account = data.aws_caller_identity.current.account_id
   app     = aws_s3_bucket.this["app"].arn
-  native  = aws_s3_bucket.this["native"].arn
   kv      = aws_s3_bucket.this["kv"].arn
   # The Lambda Web Adapter, published by AWS: an extension that turns invocations into HTTP requests to the function.
   adapter = "arn:aws:lambda:${var.region}:753240598075:layer:LambdaAdapterLayerArm64:30"
@@ -20,33 +19,61 @@ locals {
   validation = one(aws_acm_certificate.this.domain_validation_options)
   env = {
     TRIC_STORE                       = "s3://${aws_s3_bucket.this["app"].bucket}"
-    TRIC_NATIVE                      = "s3://${aws_s3_bucket.this["native"].bucket}"
+    TRIC_NATIVE                      = "true"
     RUST_LOG                         = var.logs.filter
     AWS_LWA_READINESS_CHECK_PROTOCOL = "tcp" # as an HTTP check would cost `serve` a bucket read
   }
   # What each function may do, besides write its logs.
   grants = {
     serve = [
-      { Action = ["s3:GetObject"], Resource = ["${local.app}/apps/*", "${local.native}/*"] },
+      { Action = ["s3:GetObject"], Resource = ["${local.app}/apps/*"] },
       { Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"], Resource = ["${local.kv}/kv/*"] },
       { Action = ["s3:PutObject"], Resource = ["${local.app}/compile/*"] },
-      { Action = ["s3:ListBucket"], Resource = [local.app, local.native, local.kv] }, # so a missing key is a 404, not a 403
+      { Action = ["s3:ListBucket"], Resource = [local.app, local.kv] }, # so a missing key is a 404, not a 403
     ]
+    # The only writer of native code, which every host runs: see the teams' policy.
     compile = [
-      { Action = ["s3:GetObject"], Resource = ["${local.app}/apps/*/blobs/*"] },
+      { Action = ["s3:GetObject"], Resource = ["${local.app}/apps/*/releases/*"] },
+      { Action = ["s3:PutObject"], Resource = ["${local.app}/apps/*/releases/*/*.zst"] },
       { Action = ["s3:DeleteObject"], Resource = ["${local.app}/compile/*"] },
-      { Action = ["s3:GetObject", "s3:PutObject"], Resource = ["${local.native}/*"] },
-      { Action = ["s3:ListBucket"], Resource = [local.native] },
+      { Action = ["s3:ListBucket"], Resource = [local.app] },
     ]
   }
 }
 
-# The app bucket holds what teams publish; the native bucket, what only the compile function writes and every host
-# runs; the KV bucket, the apps' data, which only `serve` reaches.
+# The app bucket holds what teams publish, and the native code made of it; the KV bucket, the apps' data, which only
+# `serve` reaches.
 resource "aws_s3_bucket" "this" {
-  for_each      = toset(["app", "native", "kv"])
+  for_each      = toset(["app", "kv"])
   bucket        = "${var.name}-${local.account}-${var.region}-${each.key}"
   force_destroy = var.force_destroy
+}
+
+# Every change to an app bucket's object keeps the old version for a week, so whatever a team or tric deletes or
+# overwrites by mistake can be put back. KV data has no versions: its writes are many and small.
+resource "aws_s3_bucket_versioning" "app" {
+  bucket = aws_s3_bucket.this["app"].id
+  versioning_configuration { status = "Enabled" }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "app" {
+  bucket = aws_s3_bucket.this["app"].id
+  rule {
+    id     = "versions"
+    status = "Enabled"
+    filter {}
+    noncurrent_version_expiration { noncurrent_days = 7 }
+    expiration { expired_object_delete_marker = true }
+    abort_incomplete_multipart_upload { days_after_initiation = 1 }
+  }
+  # A marker that a failed compile leaves, so that a host asks again a day later.
+  rule {
+    id     = "markers"
+    status = "Enabled"
+    filter { prefix = "compile/" }
+    expiration { days = 1 }
+  }
+  depends_on = [aws_s3_bucket_versioning.app]
 }
 
 resource "aws_lambda_permission" "compile" {
@@ -234,8 +261,14 @@ resource "aws_route53_record" "apps" {
   }
 }
 
-# A team owns the apps named `<team>-…`: it may read and write them, and the markers that ask for their native code.
-# The `team` tag of its role says which; the roles allow no session tags, which could otherwise claim another team.
+# A team owns the apps named `<team>-…`: it may read and delete them, write their `current`, releases and components,
+# and the markers that ask for their native code. The `team` tag of its role says which; the roles allow no session
+# tags, which could otherwise claim another team.
+#
+# A team may not write native code, which every host runs unchecked, so it could run anything. IAM's `*` matches `/`,
+# so what keeps it out is that a native key ends in `.zst` and none of the keys a team may write does. Any key added
+# here must keep it so. Deleting native code costs only a compile.
+#
 # It may list the whole app bucket, as S3 answers a missing key with a 403 to a caller that may not list. A condition
 # that held lists to the team's prefixes but let a GET's 404 through would also let through a list of no prefix, so
 # teams see each other's app names and release ids; KV's keys are in a bucket of their own.
@@ -244,7 +277,12 @@ resource "aws_iam_policy" "team" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [for s in [
-      { Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"], Resource = ["${local.app}/apps/${local.team}-*"] },
+      { Action = ["s3:GetObject", "s3:DeleteObject"], Resource = ["${local.app}/apps/${local.team}-*"] },
+      {
+        Action = ["s3:PutObject"]
+        Resource = [for key in ["current", "releases/*/release", "releases/*/component"] :
+        "${local.app}/apps/${local.team}-*/${key}"]
+      },
       { Action = ["s3:GetObject", "s3:PutObject"], Resource = ["${local.app}/compile/${local.team}-*"] },
       { Action = ["s3:ListBucket"], Resource = [local.app] },
     ] : merge(s, { Effect = "Allow" })]

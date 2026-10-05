@@ -1,5 +1,5 @@
 //! `tric serve`: runs every app of an install, or the app in a directory as an install of one, over HTTP/1.
-use crate::state::{self, Current, Live};
+use crate::state::{self, Current, Entry};
 use crate::{cli, compile};
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use hyper::body::{Body, Bytes, Incoming};
@@ -23,7 +23,7 @@ const RECHECK_MAX: Duration = Duration::from_secs(1);
 /// Every app of an install, each served at `<app>.<any domain>`, and loaded at its first request.
 pub struct Install {
     store: Arc<dyn ObjectStore>,
-    native: Option<Arc<dyn ObjectStore>>,
+    native: bool,
     kv: Arc<dyn ObjectStore>,
     engine: Arc<Engine>,
     apps: Mutex<HashMap<String, Arc<Mutex<Served>>>>, // by name, each once it has had a release
@@ -41,12 +41,8 @@ struct Served {
 type Load = Shared<BoxFuture<'static, Result<App, String>>>;
 
 impl Install {
-    /// The install in `store`, with its bucket of native code, if it has one, and the bucket of its apps' KV data.
-    pub fn new(
-        store: Arc<dyn ObjectStore>,
-        native: Option<Arc<dyn ObjectStore>>,
-        kv: Arc<dyn ObjectStore>,
-    ) -> Result<Arc<Self>> {
+    /// The install in `store`, which has a compile function if `native`, with the bucket of its apps' KV data.
+    pub fn new(store: Arc<dyn ObjectStore>, native: bool, kv: Arc<dyn ObjectStore>) -> Result<Arc<Self>> {
         Ok(Arc::new(Self { engine: Engine::new()?.into(), store, native, kv, apps: Mutex::default() }))
     }
 
@@ -54,11 +50,14 @@ impl Install {
     /// stay out of files. It loads the app before returning, so one that a host would refuse fails here.
     pub async fn dev(dir: &Path) -> Result<Arc<Self>> {
         let store = Arc::new(InMemory::new());
-        let (app, id) = cli::publish(&*store, dir, false).await?; // unchecked, as the load below checks it
-        let secrets = env::vars().filter_map(|(k, v)| Some((k.strip_prefix(VAR_PREFIX)?.to_lowercase(), v))).collect();
-        cli::release(&*store, &app, &id).await?;
-        state::update(&*store, &app, |c| c.secrets = secrets).await?;
-        let install = Self::new(store.clone(), None, store)?;
+        let (app, e) = cli::publish(&*store, dir, false).await?; // unchecked, as the load below checks it
+        cli::release(&*store, &app, &e.id).await?;
+        let secrets: Vec<_> =
+            env::vars().filter_map(|(k, v)| Some((k.strip_prefix(VAR_PREFIX)?.to_lowercase(), v))).collect();
+        for (name, value) in secrets {
+            cli::set_secret(&*store, &app, &name, &value).await?;
+        }
+        let install = Self::new(store.clone(), false, store)?;
         install.app(&app).await?;
         Ok(install)
     }
@@ -116,21 +115,23 @@ impl Install {
         Ok(Some(load.await.map_err(Error::msg)?))
     }
 
-    /// `name`'s `current`, or an error once `RECHECK_MAX` has passed.
+    /// What `name`'s `current` serves, without the history, which every publish changes; or an error once `RECHECK_MAX`
+    /// has passed.
     async fn current(&self, name: &str) -> Result<Current> {
-        Ok(timeout(RECHECK_MAX, state::current(&*self.store, name)).await??.0)
+        let Current { release, secrets, .. } = timeout(RECHECK_MAX, state::current(&*self.store, name)).await??.0;
+        Ok(Current { release, secrets, ..Default::default() })
     }
 
     /// Loads the app `name` from its `live` release, with `secrets` over its config. The load is a task of its own, so it
     /// runs to its end even if every request waiting for it goes away.
-    fn load(self: &Arc<Self>, name: &str, live: &Live, secrets: &BTreeMap<String, String>) -> Load {
+    fn load(self: &Arc<Self>, name: &str, live: &Entry, secrets: &BTreeMap<String, String>) -> Load {
         let (install, name, live, secrets) = (self.clone(), name.to_owned(), live.clone(), secrets.clone());
         let task = tokio::spawn(async move {
             let Install { store, native, kv, engine, .. } = &*install;
             let start = Instant::now();
             let (mut r, code) = tokio::try_join!(
-                state::release(&**store, &name, &live.id),
-                compile::component(&**store, native.as_deref(), engine, &name, &live.component),
+                state::release(&**store, &name, &live),
+                compile::component(&**store, *native, engine, &name, &live),
             )?;
             ensure!(r.component == live.component, "{name}'s current has a component that is not its release's");
             r.config.extend(secrets);
@@ -185,11 +186,11 @@ mod tests {
         body
     }
 
-    /// Publishes and releases the app in `dir`, and returns the release's id.
-    async fn ship(store: &dyn ObjectStore, dir: &str) -> String {
-        let (app, id) = cli::publish(store, dir.as_ref(), true).await.unwrap();
-        cli::release(store, &app, &id).await.unwrap();
-        id
+    /// Publishes and releases the app in `dir`, and returns the release.
+    async fn ship(store: &dyn ObjectStore, dir: &str) -> Entry {
+        let (app, e) = cli::publish(store, dir.as_ref(), true).await.unwrap();
+        cli::release(store, &app, &e.id).await.unwrap();
+        e
     }
 
     /// One request over a real socket checks that `tric serve DIR` serves the app in `DIR` at its name.
@@ -218,7 +219,7 @@ mod tests {
         assert_eq!(cli::secrets(&*store, "kv").await.unwrap(), ["token"]);
 
         let kv = Arc::new(InMemory::new());
-        let install = Install::new(store.clone(), None, kv.clone()).unwrap();
+        let install = Install::new(store.clone(), false, kv.clone()).unwrap();
         assert_eq!(ok(&install, "hello.localhost:3000", "/").await, "hello");
         assert_eq!(ok(&install, "KV.example.com", "/config?key=token").await, r#"{"ok":"s3cret"}"#);
         ok(&install, "kv.localhost", "/kv?op=set&store=s&key=k&value=v").await;
@@ -235,42 +236,52 @@ mod tests {
 
         let mut r = state::release(&*store, "kv", &first).await.unwrap();
         r.config.insert("greeting".into(), "bye".into());
-        let second = state::add(&*store, "kv", state::RELEASES, serde_json::to_vec(&r).unwrap().into()).await.unwrap();
-        cli::release(&*store, "kv", &second).await.unwrap();
+        let wasm = state::component(&*store, "kv", &first).await.unwrap();
+        let second = state::publish(&*store, "kv", wasm, r.config, r.allowed_outbound_hosts).await.unwrap();
+        cli::release(&*store, "kv", &second.id).await.unwrap();
         store.delete(&"apps/hello/current".into()).await.unwrap();
         sleep(FRESH).await;
         assert_eq!(ok(&install, "kv.localhost", "/config?key=greeting").await, r#"{"ok":"bye"}"#);
         assert_eq!(ok(&install, "kv.localhost", "/config?key=token").await, r#"{"ok":"s3cret"}"#);
         assert_eq!(get(&install, "hello.localhost", "/").await.0, 404);
 
-        cli::release(&*store, "kv", &first).await.unwrap();
+        cli::release(&*store, "kv", &first.id).await.unwrap();
         assert!(cli::release(&*store, "kv", "nope").await.is_err());
         sleep(FRESH).await;
         assert_eq!(ok(&install, "kv.localhost", "/config?key=greeting").await, r#"{"ok":"hi"}"#);
-        let releases = cli::releases(&*store, "kv").await.unwrap();
-        assert_eq!(releases.iter().map(|r| r.split(' ').next().unwrap()).collect::<Vec<_>>(), [&second, &first]);
+        assert_eq!(cli::releases(&*store, "kv").await.unwrap(), [second.id, format!("{} live", first.id)]);
+
+        let load = async || install.apps.lock().await["kv"].lock().await.app.clone().unwrap();
+        let loaded = load().await;
+        cli::publish(&*store, "tests/kv".as_ref(), false).await.unwrap(); // which changes only the history
+        sleep(FRESH).await;
+        assert_eq!(ok(&install, "kv.localhost", "/config?key=greeting").await, r#"{"ok":"hi"}"#);
+        assert!(load().await.ptr_eq(&loaded)); // so it is not loaded again
     }
 
-    /// A blob that does not match its hash is refused, as is a `current` whose component is not its release's.
+    /// A component that does not match its hash is refused, as is a `current` whose component is not its release's.
     #[tokio::test]
     async fn refuses_what_does_not_match() {
         let store = Arc::new(InMemory::new());
-        let id = ship(&*store, "tests/app").await;
-        let component = state::release(&*store, "hello", &id).await.unwrap().component;
-        let blob = format!("apps/hello/blobs/sha256/{component}").as_str().into();
+        let e = ship(&*store, "tests/app").await;
+        let blob = state::file("hello", e.n, state::COMPONENT).unwrap().into();
         let good = store.get(&blob).await.unwrap().bytes().await.unwrap();
         let other = std::fs::read("tests/fixtures/hello-p2.wasm").unwrap();
         store.put(&blob, other.clone().into()).await.unwrap();
-        let install = Install::new(store.clone(), None, store.clone()).unwrap();
-        let e = install.app("hello").await.err().unwrap();
-        assert!(e.to_string().contains("does not match its hash"), "{e}");
+        let install = Install::new(store.clone(), false, store.clone()).unwrap();
+        let err = install.app("hello").await.err().unwrap();
+        assert!(err.to_string().contains("does not match its hash"), "{err}");
         store.put(&blob, good.into()).await.unwrap();
         assert_eq!(get(&install, "hello.localhost", "/").await.0, 500); // the failure is remembered, not fetched again
         sleep(FRESH).await;
         assert_eq!(ok(&install, "hello.localhost", "/").await, "hello"); // until the next recheck
 
-        let other = state::add(&*store, "hello", state::BLOBS, other.into()).await.unwrap();
-        state::update(&*store, "hello", |c| c.release.as_mut().unwrap().component = other).await.unwrap();
+        // a folder with the release, and another component, which `current` names
+        let other = state::publish(&*store, "hello", other.into(), BTreeMap::new(), vec![]).await.unwrap();
+        let release = |n| state::file("hello", n, state::RELEASE).unwrap().into();
+        store.copy(&release(e.n), &release(other.n)).await.unwrap();
+        let swapped = Entry { id: e.id.clone(), ..other };
+        state::update(&*store, "hello", |c| Ok(_ = c.release.replace(swapped.clone()))).await.unwrap();
         sleep(FRESH).await;
         let e = install.app("hello").await.err().unwrap();
         assert!(e.to_string().contains("not its release's"), "{e}");
@@ -281,7 +292,7 @@ mod tests {
     async fn a_hung_recheck_serves_the_last_read() {
         let store = Arc::new(ThrottledStore::new(InMemory::new(), ThrottleConfig::default()));
         ship(&*store, "tests/app").await;
-        let install = Install::new(store.clone(), None, store.clone()).unwrap();
+        let install = Install::new(store.clone(), false, store.clone()).unwrap();
         assert_eq!(ok(&install, "hello.localhost", "/").await, "hello");
         store.config_mut(|c| c.wait_get_per_call = Duration::from_secs(60));
         sleep(FRESH).await;
@@ -295,7 +306,7 @@ mod tests {
     async fn a_load_outlives_its_requests() {
         let store = Arc::new(ThrottledStore::new(InMemory::new(), ThrottleConfig::default()));
         ship(&*store, "tests/app").await;
-        let install = Install::new(store.clone(), None, store.clone()).unwrap();
+        let install = Install::new(store.clone(), false, store.clone()).unwrap();
         store.config_mut(|c| c.wait_get_per_call = Duration::from_millis(200));
         assert!(timeout(Duration::from_millis(300), install.app("hello")).await.is_err()); // gone while it fetches
         sleep(Duration::from_secs(2)).await; // the load's fetches finish meanwhile
@@ -303,16 +314,17 @@ mod tests {
         assert_eq!(timeout(Duration::from_secs(30), ok(&install, "hello.localhost", "/")).await.unwrap(), "hello");
     }
 
-    /// Calls that wait let both changes read `current` before either writes it, so one loses the swap and fails.
+    /// Calls that wait let every change read `current` before any writes it, so all but one lose the swap, and try
+    /// again.
     #[tokio::test]
-    async fn concurrent_changes_one_lands() {
+    async fn concurrent_changes_all_land() {
         let ms = Duration::from_millis(10);
         let config = ThrottleConfig { wait_get_per_call: ms, wait_put_per_call: ms, ..Default::default() };
         let store = ThrottledStore::new(InMemory::new(), config);
         cli::set_secret(&store, "app", "a", "1").await.unwrap(); // so the race is over a conditional update, not a create
-        let (b, c) = tokio::join!(cli::set_secret(&store, "app", "b", "2"), cli::set_secret(&store, "app", "c", "3"));
-        assert_ne!(b.is_ok(), c.is_ok());
-        assert!(b.and(c).unwrap_err().to_string().contains("app changed while this ran"));
-        assert_eq!(cli::secrets(&store, "app").await.unwrap().len(), 2);
+        let set = |name| cli::set_secret(&store, "app", name, "x");
+        let (b, c, d) = tokio::join!(set("b"), set("c"), set("d"));
+        b.and(c).and(d).unwrap();
+        assert_eq!(cli::secrets(&store, "app").await.unwrap(), ["a", "b", "c", "d"]);
     }
 }

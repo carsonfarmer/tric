@@ -25,20 +25,20 @@ greeting = "hi"
 | `[config]` | Keys and values the app reads through `wasi:config`. Values must be strings. |
 
 - **Typos:** an unknown field is an error, so a misspelled `allowed_outbound_hosts` stops `tric serve` at start-up instead of leaving the app with no outbound access. So does a bad allow-list entry.
-- **Secrets** never go in the manifest. In an install they come from [`tric secret`](#releasing). In a directory, `tric serve` turns each environment variable `TRIC_VAR_<KEY>` into the secret `<key>`, lowercased: `TRIC_VAR_API_KEY=s3cret` gives the app `api_key`. Like any secret, it overrides the same key in `[config]`. Either way the app reads config and secrets through `wasi:config` as one flat set. Use lowercase keys in `[config]`, or an override will not match.
+- **Secrets** never go in the manifest. In an install they come from [`tric secret`](#releasing). In a directory, `tric serve` turns each environment variable `TRIC_VAR_<KEY>` into the secret `<key>`, lowercased: `TRIC_VAR_API_KEY=s3cret` gives the app `api_key`, and an empty one gives nothing. Like any secret, it overrides the same key in `[config]`. Either way the app reads config and secrets through `wasi:config` as one flat set. Use lowercase keys in `[config]`, or an override will not match.
 
 ## Releasing
 
 An install is one bucket. Name it with `--store s3://BUCKET` or `TRIC_STORE`. Credentials, the region and an endpoint (for a store other than S3) come from the usual `AWS_` variables. There is no other auth: the bucket's IAM decides who may change what.
 
 - **Teams.** App names are global, and a team owns the apps named `<team>-…`: its IAM role can reach only those, so team `acme` publishes `acme-blog`, served at `acme-blog.<domain>`. There is nothing to create first: publishing an app creates it.
-- **Releases.** A release is the component, `[config]` and `allowed_outbound_hosts` of one `tric.toml`, and its id is the hash of those. Releases never change. An app serves at most one of them, which `tric release` picks.
+- **Releases.** A release is the component, `[config]` and `allowed_outbound_hosts` of one `tric.toml`, and its id is the hash of those. Releases never change. An app serves at most one of them, which `tric release` picks, and keeps it and its 10 latest publishes, any of which it can go back to. Publishing a kept release again makes it the latest, and uploads nothing it has.
 
 | Command | Who | What it does |
 |---|---|---|
 | `tric publish [DIR]` | team | Uploads the app in DIR (default `.`) as a release, without serving it, and prints `APP ID`. It refuses a component that would not load. |
-| `tric release APP ID` | team | Serves APP from its release ID. To roll back, release an older ID. |
-| `tric releases APP` | team | Lists APP's release IDs, newest first, each with when it was last published. |
+| `tric release APP ID` | team | Serves APP from its release ID, one that `tric releases` lists. To roll back, release an older ID. |
+| `tric releases APP` | team | Lists APP's release IDs, newest first, marking the one it serves `live`. |
 | `tric secret APP NAME` | team | Sets APP's secret NAME to stdin, less one trailing newline. An empty value removes it. |
 | `tric secrets APP` | team | Prints the names of APP's secrets. |
 | `tric serve --store ...` | host | Serves every app. |
@@ -46,9 +46,9 @@ An install is one bucket. Name it with `--store s3://BUCKET` or `TRIC_STORE`. Cr
 Publishing and releasing in one go is `tric release $(tric publish DIR)`.
 
 - **Propagation:** a host rechecks an app when a request finds its view of it 5 s old, so a change is live everywhere within 5 s of the command returning. If a recheck fails or takes over a second, the host goes on serving what it last read.
-- **Two changes at once:** `release` and `secret` both rewrite the app's `current`, and only if nothing changed it since they read it. Of two at once on the same app, one fails with `APP changed while this ran: run it again`, so neither is silently lost.
+- **Changes at once:** `publish`, `release` and `secret` each rewrite the app's `current`, and only if nothing changed it since they read it, so none is silently lost. One that finds it changed reads it again and tries again, and after three tries fails with `APP kept changing while this ran: run it again`.
 - **Secrets** belong to the app, not to a release: `secret` takes effect without a release, and releasing an older ID keeps today's secrets, so rolling back never brings back a rotated one. A secret overrides the `[config]` key of the same name. Values are stored as they are, so anyone who can read the app's objects can read them: its team, and the install's hosts.
-- **Routing:** an install serves each app at its own subdomain: the first label of `Host`, lowercased, names the app, and the request reaches it unchanged. Locally, `curl hello.localhost:3000` reaches `hello`. A host that names no app, or an app with nothing released, gets an empty `404`. To take an app offline, delete `apps/APP/current` from the bucket; that also drops its secrets.
+- **Routing:** an install serves each app at its own subdomain: the first label of `Host`, lowercased, names the app, and the request reaches it unchanged. Locally, `curl hello.localhost:3000` reaches `hello`. A host that names no app, or an app with nothing released, gets an empty `404`. To take an app offline, delete `apps/APP/current` from the bucket, while nothing publishes to it; that also drops its secrets and releases (see [Garbage](../infra/aws/README.md#garbage)).
 - **A release that fails to load** gets an empty `500`, and the host tries it again at its next recheck, not on every request.
 - **Logs:** each request is logged at `info` with its method and path, in a span tagged with the app. `RUST_LOG='warn,[request{app=hello}]=info'` turns on request lines for `hello` only.
 
@@ -134,11 +134,22 @@ Point `component` in `tric.toml` at `composed.wasm`. A chain of several middlewa
 result plugged into the next middleware.
 
 - **The parts share the app's capabilities.** tric sees one component with the imports of all its parts, so every part
-  reads the same config and secrets, opens the same KV stores, and may call every host on the allow list. Compose only
-  parts you would trust with all of that.
+  reads the same config and secrets, opens the same KV stores, and may call every host on the allow list, unless it is
+  walled off as below.
 - **The parts share the app's limits:** one request's time and memory, and the counts of instances, tables and
   memories in [Limits](#limits), where each part usually brings a memory of its own. Load time grows with the composed
   size, not the app's alone.
+
+To wall a part off from some of the app's capabilities, plug a *deny adapter* into it first: a small component of
+your own that exports the interfaces the part should not reach, and answers every call with nothing or a refusal, such
+as `wasi:config` with no keys, `wasi:keyvalue` with `access-denied` and the outgoing handler with `HttpRequestDenied`.
+`wac plug` fills the part's imports of those interfaces from the adapter, so only its other imports reach tric:
+
+```bash
+wac plug part.wasm --plug deny.wasm -o walled.wasm
+```
+
+Then plug `walled.wasm` in where `part.wasm` was. Spin does the same for a component's dependencies, as it loads them.
 
 ## KV consistency
 
