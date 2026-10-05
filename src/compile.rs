@@ -1,6 +1,7 @@
 //! Native code: the compile function compiles each release's component once, into the release's folder, and hosts load
 //! what it made rather than compile it themselves. Loading native code runs it, so only the compile function may write
-//! it, and an app loads only what was made from its own folder: its own code, run in the sandbox it was compiled with.
+//! it, and an app loads only what was made of the component its `current` names, in its own folder: its own code, run
+//! in the sandbox it was compiled with.
 use crate::serve::status;
 use crate::state::{self, COMPONENT, COMPONENT_MAX, Entry};
 use futures_util::TryStreamExt;
@@ -34,7 +35,7 @@ pub async fn component(
     live: &Entry,
 ) -> Result<Component> {
     if native {
-        match load(store, engine, app, live.n).await {
+        match load(store, engine, app, live).await {
             Ok(Some(code)) => return Ok(code),
             Ok(None) => tracing::info!(app, "compiling it here, as it has no native code yet"),
             Err(e) => tracing::warn!(app, "compiling it here, as its native code did not load: {e:#}"),
@@ -56,9 +57,9 @@ async fn ask(store: &dyn ObjectStore, app: &str, n: u64) -> Result<()> {
     Ok(())
 }
 
-/// The native code of `app`'s folder `n`, or `None` if it has none. It is decoded as it arrives.
-async fn load(store: &dyn ObjectStore, engine: &Arc<Engine>, app: &str, n: u64) -> Result<Option<Component>> {
-    let zst = match store.get(&state::native(app, n, &engine.compat())?.into()).await {
+/// The native code of `app`'s release `live`, or `None` if it has none. It is decoded as it arrives.
+async fn load(store: &dyn ObjectStore, engine: &Arc<Engine>, app: &str, live: &Entry) -> Result<Option<Component>> {
+    let zst = match store.get(&state::native(app, live.n, &live.component, &engine.compat())?.into()).await {
         Err(E::NotFound { .. }) => return Ok(None),
         r => r?.into_stream().map_err(io::Error::other),
     };
@@ -119,20 +120,25 @@ impl Worker {
                 failed += 1;
             }
         }
-        ensure!(failed == 0, "{failed} of {} markers failed", records.len());
+        ensure!(failed == 0, "{failed} of {} records failed", records.len());
         Ok(())
     }
 
-    /// Makes the native code that the marker `key` asks for, unless it is there already or its folder is gone, then
-    /// deletes the marker. A failure leaves the marker, so the next host that compiles the component asks again. The
-    /// component is not checked against its hash: any Wasm is safe to compile, and what it makes runs only as its app.
+    /// Makes the native code that the marker `key` asks for, unless its folder is gone or it is there already, then
+    /// deletes the marker. A failure leaves the marker, so the next host that compiles the component asks again. A key
+    /// that is not a marker is skipped, as trying again would not change it. The component is not checked, as there is
+    /// no `current` here to check it against: the native code is named by the hash of what was compiled, and a host
+    /// loads only what is named by the component its `current` names.
     async fn work(&self, key: &str) -> Result<()> {
-        let (app, n) = state::marked(key).with_context(|| format!("{key:?} is not a marker"))?;
-        let path = state::native(app, n, &self.engine.compat())?.into();
-        if !state::exists(&*self.store, &path).await? {
-            match state::read(&*self.store, &state::file(app, n, COMPONENT)?, COMPONENT_MAX).await? {
-                None => tracing::info!(app, n, "made nothing, as its folder is gone"),
-                Some((wasm, _)) => {
+        let Some((app, n)) = state::marked(key) else {
+            tracing::warn!(key, "skipped, as it is not a marker");
+            return Ok(());
+        };
+        match state::read(&*self.store, &state::file(app, n, COMPONENT)?, COMPONENT_MAX).await? {
+            None => tracing::info!(app, n, "made nothing, as its folder is gone"),
+            Some((wasm, _)) => {
+                let path = state::native(app, n, &state::hash(&wasm), &self.engine.compat())?.into();
+                if !state::exists(&*self.store, &path).await? {
                     let engine = self.engine.clone();
                     let zst = spawn_blocking(move || {
                         Ok::<_, Error>(zstd::encode_all(&*engine.precompile(&wasm)?, ZSTD_LEVEL)?)
@@ -171,8 +177,8 @@ mod tests {
         Request::post(EVENTS).body(serde_json::json!({ "Records": records }).to_string()).unwrap()
     }
 
-    /// A host loads only sound native code, made by an engine like its own in its own release's folder. Missing that,
-    /// it compiles the component itself and asks for native code, which the next load uses.
+    /// A host loads only sound native code, made by an engine like its own of its own component, in its own release's
+    /// folder. Missing that, it compiles the component itself and asks for native code, which the next load uses.
     #[tokio::test]
     async fn loads_only_its_own_native_code() {
         let store = Arc::new(InMemory::new());
@@ -180,12 +186,14 @@ mod tests {
         let engine = Arc::new(Engine::new().unwrap());
         let probe = engine.precompile(&fs::read("tests/fixtures/probe-p3.wasm").unwrap()).unwrap();
         let probe = Bytes::from(zstd::encode_all(&*probe, ZSTD_LEVEL).unwrap());
-        let native = |app, n, compat: &str| state::native(app, n, compat).unwrap();
-        let ours = native(&app, live.n, &engine.compat());
+        let (compat, component) = (&engine.compat(), &live.component);
+        let native = |app, n, component: &str, compat: &str| state::native(app, n, component, compat).unwrap();
+        let ours = native(&app, live.n, component, compat);
         let planted = [
-            native(&app, live.n, "0000000000000000"),   // an older engine's
-            native(&app, live.n + 1, &engine.compat()), // another release's
-            native("other", live.n, &engine.compat()),  // another app's
+            native(&app, live.n, component, "0000000000000000"), // an older engine's
+            native(&app, live.n, &state::hash(b"other"), compat), // another component's
+            native(&app, live.n + 1, component, compat),         // another release's
+            native("other", live.n, component, compat),          // another app's
         ];
         for key in planted {
             store.put(&key.into(), probe.clone().into()).await.unwrap();
@@ -196,22 +204,21 @@ mod tests {
         store.delete(&ours.as_str().into()).await.unwrap(); // which is how bad native code is fixed
 
         let marker = state::marker(&app, live.n).unwrap();
-        store.head(&marker.as_str().into()).await.unwrap();
+        store.head(&marker.as_str().into()).await.unwrap(); // as the host asked
         let worker = Worker::new(store.clone()).unwrap();
+        let made = async || store.head(&ours.as_str().into()).await.unwrap().e_tag;
         worker.work(&marker).await.unwrap();
-        store.head(&ours.as_str().into()).await.unwrap();
-        assert!(store.head(&marker.as_str().into()).await.is_err());
+        let first = made().await;
+        // as a publish again would ask, and as a marker of a folder that is gone does
+        for marker in [marker.clone(), state::marker(&app, live.n + 2).unwrap()] {
+            store.put(&marker.as_str().into(), PutPayload::new()).await.unwrap();
+            worker.work(&marker).await.unwrap();
+            assert!(store.head(&marker.as_str().into()).await.is_err());
+        }
+        assert_eq!(made().await, first); // not made again
         store.delete(&state::file(&app, live.n, COMPONENT).unwrap().into()).await.unwrap(); // leaving only native code
         assert_eq!(serve(&store, &engine, &app, &live).await, "hello");
         assert!(store.head(&marker.as_str().into()).await.is_err()); // and it asks for nothing
-
-        // as a publish again would ask, and as a marker of a folder that is gone does
-        for marker in [marker, state::marker(&app, live.n + 2).unwrap()] {
-            store.put(&marker.as_str().into(), PutPayload::new()).await.unwrap();
-            worker.work(&marker).await.unwrap(); // with no component to read
-            assert!(store.head(&marker.as_str().into()).await.is_err());
-        }
-        assert!(store.head(&native(&app, live.n + 2, &engine.compat()).into()).await.is_err());
     }
 
     /// `precompile` waits until the compile function has made the native code, which an event asked it for.
@@ -230,7 +237,8 @@ mod tests {
             Ok(())
         };
         tokio::try_join!(cli::precompile(&*store, &app, &live), work).unwrap();
-        store.head(&state::native(&app, live.n, &Engine::new().unwrap().compat()).unwrap().into()).await.unwrap();
+        let native = state::native(&app, live.n, &live.component, &Engine::new().unwrap().compat()).unwrap();
+        store.head(&native.into()).await.unwrap();
     }
 
     /// A failed compile leaves its marker, so the next host to compile the component asks again, and makes nothing.
@@ -241,9 +249,9 @@ mod tests {
         let marker = state::marker("app", 0).unwrap();
         store.put(&marker.as_str().into(), PutPayload::new()).await.unwrap();
         let worker = Arc::new(Worker::new(store.clone()).unwrap());
-        for keys in [&[marker.as_str()][..], &["compile/app"], &["apps/app/current"]] {
-            assert_eq!(worker.clone().handle(event(keys)).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        }
+        assert_eq!(worker.clone().handle(event(&[&marker])).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // and a key that is not a marker is skipped, as trying again would not change it
+        assert_eq!(worker.clone().handle(event(&["compile/app", "apps/app/current"])).await.status(), StatusCode::OK);
         store.head(&marker.as_str().into()).await.unwrap();
         assert_eq!(store.list(None).count().await, 2); // the component and the marker
         assert_eq!(worker.handle(Request::get("/").body(String::new()).unwrap()).await.status(), StatusCode::NOT_FOUND);

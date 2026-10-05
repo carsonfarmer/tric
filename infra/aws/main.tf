@@ -31,7 +31,7 @@ locals {
       { Action = ["s3:PutObject"], Resource = ["${local.app}/compile/*"] },
       { Action = ["s3:ListBucket"], Resource = [local.app, local.kv] }, # so a missing key is a 404, not a 403
     ]
-    # The only writer of native code, which every host runs: see the teams' policy.
+    # The only writer of native code, which every host runs: see the buckets' policies and the teams'.
     compile = [
       { Action = ["s3:GetObject"], Resource = ["${local.app}/apps/*/releases/*"] },
       { Action = ["s3:PutObject"], Resource = ["${local.app}/apps/*/releases/*/*.zst"] },
@@ -54,6 +54,31 @@ resource "aws_s3_bucket" "this" {
 resource "aws_s3_bucket_versioning" "app" {
   bucket = aws_s3_bucket.this["app"].id
   versioning_configuration { status = "Enabled" }
+}
+
+# The buckets' own policies bind every principal in the account, admins too, until someone changes them: they take only
+# TLS, and only the compile function may write native code into the app bucket, however the policies above are loosened.
+# S3's defaults already block public access, turn off ACLs and encrypt at rest.
+resource "aws_s3_bucket_policy" "this" {
+  for_each = aws_s3_bucket.this
+  bucket   = each.value.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [for s in [
+      {
+        Sid       = "TLSOnly"
+        Action    = ["s3:*"]
+        Resource  = [each.value.arn, "${each.value.arn}/*"]
+        Condition = { Bool = { "aws:SecureTransport" = "false" } }
+      },
+      {
+        Sid       = "NativeCodeOnlyFromCompile"
+        Action    = ["s3:PutObject"] # which a copy, a multipart upload and a restored version all need
+        Resource  = ["${each.value.arn}/apps/*.zst"]
+        Condition = { ArnNotEquals = { "aws:PrincipalArn" = aws_iam_role.fn["compile"].arn } }
+      },
+    ] : merge(s, { Effect = "Deny", Principal = "*" }) if s.Sid == "TLSOnly" || each.key == "app"]
+  })
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "app" {
@@ -266,8 +291,9 @@ resource "aws_route53_record" "apps" {
 # tags, which could otherwise claim another team.
 #
 # A team may not write native code, which every host runs unchecked, so it could run anything. IAM's `*` matches `/`,
-# so what keeps it out is that a native key ends in `.zst` and none of the keys a team may write does. Any key added
-# here must keep it so. Deleting native code costs only a compile.
+# so what keeps it out is that a native key ends in `.zst` and none of the keys a team may write does, and the app
+# bucket's policy, which lets only the compile function write such a key. Any key added here must keep it so. Deleting
+# native code costs only a compile.
 #
 # It may list the whole app bucket, as S3 answers a missing key with a 403 to a caller that may not list. A condition
 # that held lists to the team's prefixes but let a GET's 404 through would also let through a list of no prefix, so

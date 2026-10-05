@@ -30,7 +30,7 @@ An operator installs tric into their own AWS account with one OpenTofu module, t
   - tokio and hyper;
   - `zstd`, serde, `toml`, `clap` and `tracing`.
 
-**Line budget:** about 1,390 lines of Rust (1,200 before M2, 1,290 before M3 and its review raised `serve` and `state`; 1,325 through M5, after four trim passes and four correctness passes; 1,455 with M6's `gc`; 1,440 after the rethink that replaced it (Q102 to Q113), which the trim pass after M6 is to bring back under) plus about 250 of HCL (384 written: see M5). A module that runs well past its budget is a design problem to raise, not to push through.
+**Line budget:** about 1,390 lines of Rust (1,200 before M2, 1,290 before M3 and its review raised `serve` and `state`; 1,325 through M5, after four trim passes and four correctness passes; 1,455 with M6's `gc`; 1,440 after the rethink that replaced it (Q102 to Q113), 1,450 after Q115 to Q117, which the trim pass after M6 is to bring back under) plus about 250 of HCL (384 written: see M5). A module that runs well past its budget is a design problem to raise, not to push through.
 
 | Module | Does | Budget |
 |---|---|---|
@@ -38,11 +38,11 @@ An operator installs tric into their own AWS account with one OpenTofu module, t
 | `outbound` | Allow list plus the resolved-address block, in the HTTP send hook | ~100 (raised in M2 from ~60: the matcher is hand-written, and the connect is our own; 118 after the trim passes) |
 | `kv` | `wasi:keyvalue` draft2 over the app's own prefix of the bucket: one object per key, CAS, no cache | ~250 (raised in M2 from ~200; 230 after the trim and review passes, 263 after M5 made batches concurrent and `increment` back off, 270 after the KV rethink) |
 | `config` | `wasi:config` from the manifest, with secrets | 0 (Wasmtime's crate serves it, and `serve` adds secrets in 1 line) |
-| `state` | The bucket layout, releases, compare-and-swap updates, defensive reads | ~130 (raised in the M3 review from ~100; 123 after the trim and review passes, 159 after the state rethink, 174 with `gc`'s strict reads of keys, 236 after Q102 to Q113 moved `publish` here and put each app's history in `current`) |
-| `serve` | hyper server, routing, logs | ~170 (raised in M3 from ~100, which was the router alone, then in the M3 review from ~140 for a pointer recheck per app; 144 after the trim and review passes, 156 after M5's routing by `X-Forwarded-Host` and load timings, 161 with M5's KV bucket) |
-| `compile` | The compile worker and compile-request markers, and a host's load of native code with its fallback compile | ~150 (raised in M4 from ~70, as it took the host's side from `engine`; 147 after the review pass, 150 with M5's load timing, 148 after the native bucket went (Q112)) |
+| `state` | The bucket layout, releases, compare-and-swap updates, defensive reads | ~130 (raised in the M3 review from ~100; 123 after the trim and review passes, 159 after the state rethink, 174 with `gc`'s strict reads of keys, 238 after Q102 to Q117 moved `publish` here and put each app's history in `current`) |
+| `serve` | hyper server, routing, logs | ~170 (raised in M3 from ~100, which was the router alone, then in the M3 review from ~140 for a pointer recheck per app; 144 after the trim and review passes, 156 after M5's routing by `X-Forwarded-Host` and load timings, 161 with M5's KV bucket, 167 after Q102's fixes) |
+| `compile` | The compile worker and compile-request markers, and a host's load of native code with its fallback compile | ~150 (raised in M4 from ~70, as it took the host's side from `engine`; 147 after the review pass, 150 with M5's load timing, 148 after the native bucket went (Q112), 154 after Q116 and Q117) |
 | `cli` | `publish`, `release`, `releases`, `secret`, `secrets`, and `main`'s arguments | ~350 (146 after the trim and review passes, before `gc` and `compile`; 219 after M5, `cli` 96 and `main` 123, which builds the buckets on one HTTP client; 313 with `gc`, `cli` 175 and `main` 138; 239 without it, `cli` 106 and `main` 133) |
-| `infra/aws` | OpenTofu module | ~250 HCL (384 after M5's trim (Q91), from 418 as first written. The budget predates CloudFront, its certificate and DNS (Q71, about 75 lines), the teams' roles (about 35) and the budget alert (about 15); the variables, with their docs and checks, are another 60) |
+| `infra/aws` | OpenTofu module | ~250 HCL (384 after M5's trim (Q91), from 418 as first written. The budget predates CloudFront, its certificate and DNS (Q71, about 75 lines), the teams' roles (about 35) and the budget alert (about 15); the variables, with their docs and checks, are another 60; 448 with Q105's versioning and Q115's bucket policies) |
 
 ### Bucket layout
 
@@ -53,7 +53,7 @@ Q43 applies: no product name appears in any stored key or field, so a rename nev
 | app | `apps/<app>/current` | The release the app serves, its last 10 publishes, the next folder's number, and its secrets, in plain (Q65, Q73, Q102, Q108) | team (CAS) |
 | app | `apps/<app>/releases/<n>/release` | A release: its component's hash, config, allow list (Q69), in a folder never used again (Q108) | team |
 | app | `apps/<app>/releases/<n>/component` | The release's component | team |
-| app | `apps/<app>/releases/<n>/<compat hash>.zst` | Its native code (Q112) | **compile function only** (Q113) |
+| app | `apps/<app>/releases/<n>/<compat hash>-<component hash>.zst` | Its native code (Q112, Q116) | **compile function only** (Q113, Q115) |
 | app | `compile/<app>/<n>` | Compile requests, deleted after a day if left | team, serving function; compile function deletes |
 | kv | `kv/<app>/<store>/<key>` | KV values, percent-encoded keys (Q42), in a bucket of their own (`TRIC_KV`, Q88); without one, in the app bucket | serving function |
 
@@ -64,6 +64,7 @@ The app bucket is versioned, and its old versions expire after 7 days (Q105). Ea
 - Each team has a role tagged `team`, and one ABAC policy lets it read and delete only `apps/${team}-*`, and write only an app's `current` and its folders' `release` and `component`, so a team owns the apps named `<team>-…` but can't write native code (Q113), plus read and write `compile/${team}-*`, which `publish` waits on. It lists the whole app bucket: without the list, S3 answers a missing key (a new app's `current`, a deleted marker) with a 403, and a list can't be held to the team's prefixes (Q64, Q72, Q88). Team names have no hyphens. Nobody but the serving function reaches the KV bucket.
 - Only the operator can read, restore or delete old versions (Q105).
 - The compile function reads the app bucket, deletes `compile/`, and writes only `apps/*/releases/*/*.zst`.
+- The app bucket's policy lets no one but the compile function write `apps/*.zst`, admins included, and both buckets' policies refuse requests not over TLS (Q115).
 
 ## Milestones
 

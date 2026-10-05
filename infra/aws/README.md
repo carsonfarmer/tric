@@ -107,15 +107,21 @@ next. KV data has no old versions.
   or removed stays in an old version for 7 days, which only the operator can read.
 - **The apps share `<domain>`** as one site, so one can set a cookie that the browser sends to all of them. Teams that
   should not trust each other need installs of their own.
-- **The hosts trust nothing in the buckets:** every read is size-capped and parsed strictly, and every component and
-  release is checked against its hash. Native code cannot be checked, and loading it runs it in the host, so only the
-  compile function may write it. A team may write only its apps' `current` and their folders' `release` and
-  `component`, while native code is always `<compat>.zst`, so a pattern in the teams' policy that matched a key ending
-  in `.zst` would let a team run its code in every host. A team may delete its apps' native code, which costs only a
-  compile.
+- **The hosts trust nothing in the buckets but native code:** every other read is size-capped and parsed strictly, and
+  every component and release is checked against its hash. Native code cannot be checked, and loading it runs it in the
+  host, so only the compile function may write it. A team may write only its apps' `current` and their folders'
+  `release` and `component`, while native code always ends in `.zst`, and the app bucket's policy refuses a key ending
+  in `.zst` from anyone but the compile function, the operator included. The compile function names native code by the
+  hash of the component it compiled, and a host loads only what is named by the component its app's `current` names. A
+  team may delete its apps' native code, which costs only a compile.
+- **The buckets** take requests only over TLS. The module relies on S3's defaults for new buckets: public access
+  blocked, ACLs off, and encryption at rest with keys S3 manages.
 - **The compile function** compiles every team's components, and can write native code for any app, so Wasmtime's
-  compiler is the boundary: a component that exploited it there could run its code in every app.
-- **The operator**, with the account, can do anything.
+  compiler is the boundary: a component that exploited it there could run its code in every app. It also makes every
+  team's native code in a few slots at a time, so a team that publishes many large components can delay the others',
+  whose hosts compile their apps meanwhile: slower cold starts, but nothing breaks.
+- **The operator**, with the account, can do anything, though writing native code takes changing the app bucket's
+  policy first, which CloudTrail records.
 
 ## Costs
 

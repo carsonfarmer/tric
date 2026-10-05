@@ -3,7 +3,8 @@
 //!
 //! - `apps/<app>/current`: the release the app runs, the releases it keeps, which it can go back to, and its secrets;
 //! - `apps/<app>/releases/<n>/`: the folder of a release it keeps, with the release, its component, and the native code
-//!   that the compile function made of it for engines of `compat`, at `release`, `component` and `<compat>.zst`;
+//!   that the compile function made of the component for engines of `compat`, at `release`, `component` and
+//!   `<compat>-<component's hash>.zst`;
 //! - `kv/<app>/<bucket>/<key>`: its `wasi:keyvalue` data, which only hosts write, unless `--kv` gives it a bucket;
 //! - `compile/<app>/<n>`: a marker that asks the compile function for the native code of folder `n`.
 //!
@@ -11,7 +12,8 @@
 //! dropped, and nothing else has to. Nothing read back is trusted but native code: every other read is capped, parsed
 //! strictly, and a release and its component are checked against their hashes. Writes have the same caps, so nothing is
 //! written that a read would refuse. Native code can't be checked, and loading it runs it, so only the compile function
-//! may write it: the store's IAM lets teams write only keys ending in `current`, `release` and `component`.
+//! may write it: the store's IAM lets teams write only keys ending in `current`, `release` and `component`, and no one
+//! else a key ending in `.zst`.
 use futures_util::{StreamExt, TryStreamExt, stream};
 use hyper::body::Bytes;
 use object_store::{Error as E, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion, path::Path};
@@ -82,10 +84,11 @@ pub fn file(app: &str, n: u64, name: &str) -> Result<String> {
     path(app, &format!("releases/{n}/{name}"))
 }
 
-/// Where the native code of `app`'s folder `n` is, for engines of `compat`. It ends in `.zst`, never in what a team may
-/// write, which is how the store's IAM keeps teams from writing native code.
-pub fn native(app: &str, n: u64, compat: &str) -> Result<String> {
-    file(app, n, &format!("{compat}.zst"))
+/// Where the native code made of the component with the hash `component`, in `app`'s folder `n`, is for engines of
+/// `compat`. It ends in `.zst`, never in what a team may write, which is how the store's IAM keeps teams from writing
+/// native code; so the compile function, which hashes what it compiles, vouches that it was made of `component`.
+pub fn native(app: &str, n: u64, component: &str, compat: &str) -> Result<String> {
+    file(app, n, &format!("{compat}-{component}.zst"))
 }
 
 pub fn kv(app: &str) -> String {
@@ -104,7 +107,7 @@ pub fn marked(key: &str) -> Option<(&str, u64)> {
     (marker(app, n).ok()? == key).then_some((app, n))
 }
 
-fn hash(bytes: &[u8]) -> String {
+pub fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -290,7 +293,7 @@ mod tests {
         };
         assert_eq!(update(&store, "app", |c| Ok(c.releases.pop().map(|_| c.next))).await.unwrap(), Some(4));
         assert_eq!(left().await.len(), 5); // as a host may still be loading 2
-        store.put(&native("app", 2, "0123").unwrap().into(), PutPayload::new()).await.unwrap(); // a late compile's
+        store.put(&native("app", 2, "c", "0123").unwrap().into(), PutPayload::new()).await.unwrap(); // a late compile's
         update(&store, "app", |_| Ok(())).await.unwrap();
         assert_eq!(left().await, ["0/release", "1/component", "x/release"]);
 
