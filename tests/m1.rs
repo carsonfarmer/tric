@@ -44,9 +44,11 @@ async fn probe(name: &str) {
     assert_eq!(ok(&app, "/fs").await.matches(r#""err""#).count(), 3);
 }
 
-#[tokio::test(flavor = "multi_thread")] // each probe compiles its app while the other is timing
+// Each probe is a task of its own, on a worker of its own, so one compiling its app can't stall the other's timing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn probes() {
-    tokio::join!(probe("probe-p2"), probe("probe-p3"));
+    let (p2, p3) = tokio::join!(tokio::spawn(probe("probe-p2")), tokio::spawn(probe("probe-p3")));
+    p2.and(p3).unwrap();
 }
 
 /// How long a proxy component takes to give a 500 when its start function spins forever. Its handler returns at once,
