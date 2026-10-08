@@ -1,11 +1,12 @@
 //! Cron: POSIX expressions, five fields in UTC, each naming a path that gets a `POST` with `Forwarded: for=_cron` in
-//! every minute it matches.
+//! every minute it matches. One may restrict the day of the month or of the week, not both: POSIX takes that as either,
+//! which EventBridge Scheduler, cron on AWS, has no way to say.
 use crate::tric::Tric;
 use http_body_util::BodyExt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
-use wasmtime::{Result, format_err};
+use wasmtime::{Result, ensure, format_err};
 
 /// Each field's range: minute, hour, day of the month, month, day of the week (Sunday is 0 and 7).
 const FIELDS: [(u32, u32); 5] = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)];
@@ -62,12 +63,11 @@ impl Cron {
             sets[i] = set(field, FIELDS[i]).ok_or_else(bad)?;
         }
         sets[4] = (sets[4] | sets[4] >> 7) & 0x7f; // 7 is Sunday
+        ensure!(
+            text[2] == "*" || text[4] == "*",
+            "cron expression {expr:?} restricts both the day of the month and of the week"
+        );
         Ok(Self { sets, text })
-    }
-
-    /// Whether a day field is restricted: anything but `*`. When both are, a day matches if either does.
-    fn restricted(&self, i: usize) -> bool {
-        self.text[i] != "*"
     }
 
     /// Whether it fires in the minute that holds the Unix second `t`.
@@ -75,9 +75,32 @@ impl Cron {
         let days = t / 86_400;
         let (_, month, day) = civil(days);
         let has = |i: usize, v: u64| self.sets[i] >> v & 1 == 1;
-        let (dom, dow) = (has(2, day), has(4, (days + 4) % 7)); // 1970-01-01 was a Thursday
-        let day = if self.restricted(2) && self.restricted(4) { dom || dow } else { dom && dow };
-        has(0, t / 60 % 60) && has(1, t / 3600 % 24) && has(3, month) && day
+        let dow = (days + 4) % 7; // 1970-01-01 was a Thursday
+        has(0, t / 60 % 60) && has(1, t / 3600 % 24) && has(2, day) && has(3, month) && has(4, dow)
+    }
+
+    /// As EventBridge Scheduler's `cron(...)`: the same values, with Sunday as 1, and `?` for whichever day field isn't
+    /// restricted.
+    pub fn eventbridge(&self) -> String {
+        let field = |i: usize| {
+            let ((lo, hi), shift) = if i == 4 { ((0, 6), 1) } else { (FIELDS[i], 0) };
+            let mut runs: Vec<(u32, u32)> = vec![];
+            for v in (lo..=hi).filter(|v| self.sets[i] >> v & 1 == 1) {
+                match runs.last_mut() {
+                    Some((_, b)) if *b + 1 == v => *b = v,
+                    _ => runs.push((v, v)),
+                }
+            }
+            if runs == [(lo, hi)] {
+                return "*".into();
+            }
+            let run = |&(a, b): &(u32, u32)| {
+                if a == b { format!("{}", a + shift) } else { format!("{}-{}", a + shift, b + shift) }
+            };
+            runs.iter().map(run).collect::<Vec<_>>().join(",")
+        };
+        let (dom, dow) = if self.text[4] == "*" { (field(2), "?".into()) } else { ("?".into(), field(4)) };
+        format!("cron({} {} {dom} {} {dow} *)", field(0), field(1), field(3))
     }
 }
 
@@ -120,38 +143,43 @@ mod tests {
     #[test]
     fn matching() {
         let m = |e: &str| Cron::parse(e).unwrap().matches(T);
-        for yes in [
-            "* * * * *",
-            "34 12 * * *",
-            "*/2 * * * *",
-            "30-40/2 * 8 10 *",
-            "34 12 * * 4",
-            "34 12 1 * 4",
-            "0,34 * * * *",
-        ] {
+        for yes in ["* * * * *", "34 12 * * *", "*/2 * * * *", "30-40/2 * 8 10 *", "34 12 * * 4", "0,34 * * * *"] {
             assert!(m(yes), "{yes}");
         }
-        for no in [
-            "35 * * * *",
-            "*/5 * * * *",
-            "34 13 * * *",
-            "* * 9 * *",
-            "* * * 11 *",
-            "* * * * 5",
-            "* * 9 * 5",
-            "* * */2 * *",
-        ] {
+        for no in ["35 * * * *", "*/5 * * * *", "34 13 * * *", "* * 9 * *", "* * * 11 *", "* * * * 5", "* * */2 * *"] {
             assert!(!m(no), "{no}");
         }
-        assert!(m("* * 1 * 4"), "either day field, when both are restricted");
-        assert!(m("* * 8 * 0"));
         assert!(Cron::parse("* * * * 7").unwrap().matches(T + 3 * 86_400), "7 is Sunday");
-        for bad in ["", "* * * *", "* * * * * *", "60 * * * *", "* 24 * * *", "* * 0 * *", "* * * 13 *", "* * * * 8"] {
+        for bad in [
+            "",
+            "* * * *",
+            "* * * * * *",
+            "60 * * * *",
+            "* 24 * * *",
+            "* * 0 * *",
+            "* * * 13 *",
+            "* * * * 8",
+            "* * 1 * 4",
+        ] {
             assert!(Cron::parse(bad).is_err(), "{bad:?}");
         }
         for bad in ["5/2 * * * *", "*/0 * * * *", "a * * * *", "1- * * * *", "5-1 * * * *", "-1 * * * *", "* * * JAN *"]
         {
             assert!(Cron::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn eventbridge() {
+        for (posix, eventbridge) in [
+            ("* * * * *", "cron(* * * * ? *)"),
+            ("*/15 * * * *", "cron(0,15,30,45 * * * ? *)"),
+            ("0 9 * * 1-5", "cron(0 9 ? * 2-6 *)"),
+            ("0 0 * * 0,7", "cron(0 0 ? * 1 *)"),
+            ("30 2 1,15 */3 *", "cron(30 2 1,15 1,4,7,10 ? *)"),
+            ("0-4,6,7-9 0-23 * * 0-6", "cron(0-4,6-9 * ? * * *)"),
+        ] {
+            assert_eq!(Cron::parse(posix).unwrap().eventbridge(), eventbridge, "{posix}");
         }
     }
 }

@@ -5,6 +5,7 @@ mod deploy;
 mod dev;
 mod engine;
 mod kv;
+mod lambda;
 mod manifest;
 mod name;
 mod outbound;
@@ -35,6 +36,15 @@ enum Cmd {
         app: App,
         #[arg(long, env = "TRIC_BUCKET")]
         bucket: String,
+        /// On AWS, the EventBridge Scheduler group the app's cron goes in
+        #[arg(long, env = "TRIC_SCHEDULES", requires_all = ["events", "scheduler_role"])]
+        schedules: Option<String>,
+        /// On AWS, the router's events function, by its ARN, which the app's schedules invoke
+        #[arg(long, env = "TRIC_EVENTS", requires = "schedules")]
+        events: Option<String>,
+        /// On AWS, the role the app's schedules invoke the router as
+        #[arg(long, env = "TRIC_SCHEDULER_ROLE", requires = "schedules")]
+        scheduler_role: Option<String>,
     },
     /// Run apps, for the router: each request with the app's tenant id and storage credentials
     Serve {
@@ -45,7 +55,7 @@ enum Cmd {
         domain: String,
         #[arg(long, env = "TRIC_BUCKET")]
         bucket: String,
-        /// The router's outbox, as `host:port`
+        /// The router's outbox: its function's `outbox` alias, by its ARN, or `host:port`
         #[arg(long, env = "TRIC_OUTBOX")]
         outbox: String,
     },
@@ -61,12 +71,16 @@ enum Cmd {
         domain: String,
         #[arg(long, env = "TRIC_BUCKET")]
         bucket: String,
-        /// serve, as `host:port`
+        /// serve: a Lambda function, by its ARN, which runs this router as Lambda's, or `host:port`
         #[arg(long, env = "TRIC_SERVE")]
         serve: String,
         /// The role whose sessions are the apps' credentials; none where STS has no roles, as MinIO's
         #[arg(long, env = "TRIC_ROLE")]
         role: Option<String>,
+        /// On Lambda, the secret CloudFront sends as `X-Tric-Origin`, without which a request is refused; a router
+        /// without one takes only events
+        #[arg(long, env = "TRIC_ORIGIN", hide_env_values = true)]
+        origin: Option<String>,
     },
 }
 
@@ -99,10 +113,14 @@ async fn main() -> Result<()> {
     }
     match Cmd::parse() {
         Cmd::Dev { app, listen } => dev::run(&app.path, &app.allow, app.e, listen).await,
-        Cmd::Deploy { app, bucket } => deploy::run(&app.path, &app.allow, app.e, &bucket).await,
+        Cmd::Deploy { app, bucket, schedules, events, scheduler_role } => {
+            let scheduler = schedules.zip(events.zip(scheduler_role));
+            let scheduler = scheduler.map(|(group, (target, role))| deploy::Scheduler { group, target, role });
+            deploy::run(&app.path, &app.allow, app.e, &bucket, scheduler).await
+        }
         Cmd::Serve { listen, domain, bucket, outbox } => serve::run(listen, domain, bucket, outbox).await,
-        Cmd::Route { listen, outbox_listen, domain, bucket, serve, role } => {
-            route::run(listen, outbox_listen, domain, bucket, serve, role).await
+        Cmd::Route { listen, outbox_listen, domain, bucket, serve, role, origin } => {
+            route::run(listen, outbox_listen, domain, bucket, serve, role, origin).await
         }
     }
 }

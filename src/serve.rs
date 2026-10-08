@@ -1,8 +1,9 @@
 //! `tric serve`: the runtime. Each request comes from the router, for the app its `Host` names, as that app's tenant and
 //! with that app's storage credentials, which are the only ones serve has: its own role has no storage access.
-use crate::aws::Credentials;
+use crate::aws::{Aws, Credentials};
 use crate::deploy::{RELEASE_MAX, Release};
 use crate::engine::Engine;
+use crate::lambda;
 use crate::outbound::{self, Allow};
 use crate::outbox::{self, Delivered, Sink};
 use crate::store::{self, Store};
@@ -35,7 +36,7 @@ struct Serve {
     engine: Engine,
     domain: String,
     bucket: String,
-    outbox: String,
+    sink: Sink,
     apps: Mutex<HashMap<String, Loaded>>,
 }
 
@@ -48,9 +49,19 @@ struct Loaded {
 }
 
 /// Serves the apps at `<app>.<domain>` on `listen`, from `bucket`, handing delivery events to the router's outbox at
-/// `outbox`.
+/// `outbox`: the `outbox` alias of the router's function, by its ARN, or `host:port`.
 pub async fn run(listen: SocketAddr, domain: String, bucket: String, outbox: String) -> Result<()> {
-    let serve = Arc::new(Serve { engine: Engine::new()?, domain, bucket, outbox, apps: Mutex::default() });
+    let sink: Sink = match outbox.starts_with("arn:") {
+        true => {
+            let aws = Arc::new(Aws::new(&store::s3(&bucket, None)?)?);
+            Arc::new(move |event| {
+                let (aws, outbox) = (aws.clone(), outbox.clone());
+                async move { timeout(HAND, lambda::hand(&aws, &outbox, event)).await? }.boxed()
+            })
+        }
+        false => Arc::new(move |event| hand(outbox.clone(), event).boxed()),
+    };
+    let serve = Arc::new(Serve { engine: Engine::new()?, domain, bucket, sink, apps: Mutex::default() });
     let listener = TcpListener::bind(listen).await?;
     eprintln!("serving at http://{}", listener.local_addr()?);
     tric::listen(listener, move |_, req| serve.clone().handle(req)).await
@@ -114,9 +125,7 @@ impl Serve {
                 (Arc::new(self.engine.load(&component, r.env.into_iter().collect())?), allow)
             }
         };
-        let outbox = self.outbox.clone();
-        let sink: Sink = Arc::new(move |event| hand(outbox.clone(), event).boxed());
-        let tric = Arc::new(Tric { app: app.into(), store, code, allow, sink });
+        let tric = Arc::new(Tric { app: app.into(), store, code, allow, sink: self.sink.clone() });
         apps.insert(app.into(), Loaded { creds, release, tric: tric.clone(), read: Instant::now() });
         Ok(Some(tric))
     }
@@ -145,7 +154,7 @@ impl Serve {
     }
 }
 
-/// Hands a commit's delivery event to the router's outbox at `outbox`, which must take it.
+/// Hands a commit's delivery event to the router's outbox at `outbox`, which must take it within `HAND`.
 async fn hand(outbox: String, event: Bytes) -> Result<()> {
     let body = Full::new(event).map_err(|n| match n {}).boxed_unsync();
     let req = http::Request::post("/").header(HOST, &outbox).body(body)?;

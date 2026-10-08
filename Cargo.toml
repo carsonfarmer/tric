@@ -15,6 +15,7 @@ include = ["/src", "/wit", "/README.md", "/LICENSE"]
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
+crc32fast = "1" # as flate2 has it, for event streams
 futures-util = "0.3"
 http = "1"
 http-body-util = "0.1"

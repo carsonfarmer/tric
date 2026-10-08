@@ -1,12 +1,11 @@
 //! The AWS APIs tric calls besides S3, signed with the environment's credentials: STS, which mints an app's storage
-//! credentials. Each service is at `AWS_ENDPOINT_URL_<SERVICE>`, or `AWS_ENDPOINT_URL`, or AWS's own endpoint.
+//! credentials, and Lambda. Each service is at `AWS_ENDPOINT_URL_<SERVICE>`, or `AWS_ENDPOINT_URL`, or AWS's own endpoint.
 use crate::store::Shared;
-use bytes::Bytes;
+use http::Method;
 use http::header::CONTENT_TYPE;
-use http::{Method, StatusCode};
 use object_store::ClientOptions;
 use object_store::aws::{AmazonS3, AwsAuthorizer, AwsCredential, AwsCredentialProvider};
-use object_store::client::{HttpClient, HttpConnector, HttpRequest};
+use object_store::client::{HttpClient, HttpConnector, HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
 use wasmtime::{Result, ensure};
 
@@ -69,6 +68,7 @@ impl Aws {
         let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         let region = var("AWS_REGION").or_else(|| var("AWS_DEFAULT_REGION")).unwrap_or_else(|| "us-east-1".into());
         let http = ClientOptions::new().with_allow_http(var("AWS_ALLOW_HTTP").is_some_and(|v| v == "true"));
+        let http = http.with_timeout_disabled();
         Ok(Self { creds: s3.credentials().clone(), http: Shared.connect(&http)?, region })
     }
 
@@ -79,23 +79,22 @@ impl Aws {
             .unwrap_or_else(|| format!("https://{service}.{}.amazonaws.com", self.region))
     }
 
-    /// Calls `service`, signed, and returns the response's status and body.
-    pub async fn call(
+    /// Sends `service` a signed request, with `headers`, and returns its response as it comes. There is no time limit:
+    /// a response may stream for as long as the function that answers it runs.
+    pub async fn send(
         &self,
         service: &str,
         method: Method,
         path: &str,
-        content_type: &str,
+        headers: &[(&str, &str)],
         body: Vec<u8>,
-    ) -> Result<(StatusCode, Bytes)> {
+    ) -> Result<HttpResponse> {
         let cred = self.creds.get_credential().await?;
         let uri = format!("{}{path}", self.endpoint(service).trim_end_matches('/'));
-        let req = http::Request::builder().method(method).uri(uri).header(CONTENT_TYPE, content_type);
+        let req = headers.iter().fold(http::Request::builder().method(method).uri(uri), |r, (k, v)| r.header(*k, *v));
         let mut req: HttpRequest = req.body(body.into())?;
         AwsAuthorizer::new(&cred, service, &self.region).try_authorize(&mut req, None)?;
-        let res = self.http.execute(req).await?;
-        let status = res.status();
-        Ok((status, res.into_body().bytes().await?))
+        Ok(self.http.execute(req).await?)
     }
 
     /// Credentials of the session `session` of `role` (or, where STS has no roles, of the caller), with `policy` as
@@ -109,8 +108,9 @@ impl Aws {
         if let Some(role) = role {
             form += &format!("&RoleArn={}", query(role));
         }
-        let form = form.into_bytes();
-        let (status, body) = self.call("sts", Method::POST, "/", "application/x-www-form-urlencoded", form).await?;
+        let form = (form.into_bytes(), [(CONTENT_TYPE.as_str(), "application/x-www-form-urlencoded")]);
+        let res = self.send("sts", Method::POST, "/", &form.1, form.0).await?;
+        let (status, body) = (res.status(), res.into_body().bytes().await?);
         ensure!(status.is_success(), "AssumeRole answered {status}: {}", String::from_utf8_lossy(&body));
         let res: AssumeRoleResponse = quick_xml::de::from_reader(&body[..])?;
         Ok(res.assume_role_result.credentials)
