@@ -18,8 +18,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use wasmtime::{Result, bail, ensure, error::Context};
 
-pub const JSON_MAX: u64 = 64 << 10; // `current`, a release, or `install`
-pub const COMPONENT_MAX: u64 = 128 << 20;
+const JSON_MAX: u64 = 64 << 10; // `current`, a release, or `install`
+const COMPONENT_MAX: u64 = 128 << 20;
 pub const NATIVE_MAX: u64 = 1 << 30;
 pub const KEEP: usize = 10; // the releases an app keeps: how far back it can go
 const TRIES: usize = 3; // of a change, while others keep landing first
@@ -91,7 +91,7 @@ pub async fn read(store: &dyn ObjectStore, path: &Path, max: u64) -> Result<Opti
 }
 
 /// Whether there is an object at `path`.
-pub async fn exists(store: &dyn ObjectStore, path: &Path) -> Result<bool> {
+async fn exists(store: &dyn ObjectStore, path: &Path) -> Result<bool> {
     match store.head(path).await {
         Err(E::NotFound { .. }) => Ok(false),
         r => Ok(r.map(|_| true)?),

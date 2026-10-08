@@ -91,7 +91,7 @@ impl Cron {
 
     /// As EventBridge Scheduler's cron expressions, which have a year, count weekdays from 1 for Sunday, step from a
     /// number, and restrict one day field, the other being `?`: two when both are restricted.
-    pub fn eventbridge(&self) -> Vec<String> {
+    fn eventbridge(&self) -> Vec<String> {
         let field = |i: usize| {
             let lo = FIELDS[i].0;
             let items = self.text[i].split(',').map(|item| match item.split_once('/') {

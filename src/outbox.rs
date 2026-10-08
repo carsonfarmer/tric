@@ -27,7 +27,7 @@ const ROUNDS: [u64; 3] = [0, 60, 120];
 const EXCHANGE: Duration = Duration::from_secs(60);
 /// How long delivery tries to take its commit off the name's pending ones.
 const SETTLE: Duration = Duration::from_secs(30);
-pub const BODY_MAX: usize = 1 << 20;
+const BODY_MAX: usize = 1 << 20;
 
 /// The requests one turn holds, and where they came from.
 #[derive(Serialize, Deserialize)]
