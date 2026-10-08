@@ -2,6 +2,7 @@
 //! method to `/@<name>` is a turn on the name: it may write it, and its writes commit if it answers 1xx to 4xx. A
 //! conflict runs it again. On Lambda, an invocation that is not an HTTP request is an outbox or cron event.
 use crate::aws::Aws;
+use crate::cron;
 use crate::engine::{App, Engine};
 use crate::name::{self, BUSY, Committed, Conditions, Refused, Snap, Turn};
 use crate::outbound::{self, Allow, Fut, Sent};
@@ -226,33 +227,47 @@ impl Tric {
     ) -> BoxFuture<'static, Response> {
         let (tric, app, host) = (self.clone(), app.to_owned(), host.to_owned());
         forward(req.headers_mut(), from);
-        async move {
-            match tric.app(&app).await {
-                Ok(Some(loaded)) => tric.dispatch(&loaded, &app, req, &host, vec![], 0).await,
-                Ok(None) => status(StatusCode::NOT_FOUND),
-                Err(e) => {
-                    tracing::warn!(app, "{e:#}");
-                    status(StatusCode::INTERNAL_SERVER_ERROR)
-                }
-            }
-        }
-        .boxed()
+        async move { tric.route(&app, req, &host).await }.boxed()
     }
 
-    pub async fn handle(self: Arc<Self>, peer: SocketAddr, req: hyper::Request<Incoming>) -> Response {
-        let mut req = req.map(|b| b.map_err(wasmtime_wasi_http::Error::from).boxed_unsync());
-        if self.lambda.is_some() && req.headers().get(REQUEST_CONTEXT).is_some_and(|v| v == "null") {
-            return self.event(req).await;
-        }
-        let Some((app, host)) = self.viewer(peer, &mut req) else { return status(StatusCode::NOT_FOUND) };
-        match self.app(&app).await {
-            Ok(Some(loaded)) => self.dispatch(&loaded, &app, req, &host, vec![], 0).await,
+    /// Runs `req` in `app`, which is 404 if it is not deployed.
+    async fn route(self: &Arc<Self>, app: &str, req: Request, host: &str) -> Response {
+        match self.app(app).await {
+            Ok(Some(loaded)) => self.dispatch(&loaded, app, req, host, vec![], 0).await,
             Ok(None) => status(StatusCode::NOT_FOUND),
             Err(e) => {
                 tracing::warn!(app, "{e:#}");
                 status(StatusCode::INTERNAL_SERVER_ERROR)
             }
         }
+    }
+
+    /// Serves HTTP/1 on `listen`, and fires cron in-process unless on Lambda, where EventBridge Scheduler does.
+    pub async fn serve(self: Arc<Self>, listen: SocketAddr) -> Result<()> {
+        let listener = TcpListener::bind(listen).await?;
+        let what = self.only.clone().unwrap_or_else(|| format!("*.{}", self.domain));
+        eprintln!("serving {what} at http://{}", listener.local_addr()?);
+        if self.lambda.is_none() {
+            tokio::spawn(cron::tick(self.clone()));
+        }
+        loop {
+            let (stream, peer) = listener.accept().await?;
+            _ = stream.set_nodelay(true); // best effort; otherwise Nagle plus delayed ACK stalls a response by ~40 ms
+            let tric = self.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req| tric.clone().handle(peer, req).map(Ok::<_, Infallible>));
+                http1::Builder::new().serve_connection(TokioIo::new(stream), svc).await.ok();
+            });
+        }
+    }
+
+    async fn handle(self: Arc<Self>, peer: SocketAddr, req: hyper::Request<Incoming>) -> Response {
+        let mut req = req.map(|b| b.map_err(wasmtime_wasi_http::Error::from).boxed_unsync());
+        if self.lambda.is_some() && req.headers().get(REQUEST_CONTEXT).is_some_and(|v| v == "null") {
+            return self.event(req).await;
+        }
+        let Some((app, host)) = self.viewer(peer, &mut req) else { return status(StatusCode::NOT_FOUND) };
+        self.route(&app, req, &host).await
     }
 
     /// Makes a viewer's request what the app sees: where it came from in `Forwarded`, in place of any `X-Forwarded-*`,
@@ -535,22 +550,5 @@ impl WasiHttpHooks for Outbound {
         _: Fut<()>,
     ) -> Box<dyn Future<Output = Sent> + Send> {
         Box::new(self.0.clone().send(request))
-    }
-}
-
-/// Serves HTTP/1 on `listener`, each request with `handle`, which gets the peer's address.
-pub async fn run<H, F>(listener: TcpListener, handle: H) -> Result<()>
-where
-    H: Fn(SocketAddr, hyper::Request<Incoming>) -> F + Clone + Send + 'static,
-    F: Future<Output = Response> + Send + 'static,
-{
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        _ = stream.set_nodelay(true); // best effort; otherwise Nagle plus delayed ACK stalls a response by ~40 ms
-        let handle = handle.clone();
-        tokio::spawn(async move {
-            let svc = service_fn(move |req| handle(peer, req).map(Ok::<_, Infallible>));
-            http1::Builder::new().serve_connection(TokioIo::new(stream), svc).await.ok();
-        });
     }
 }

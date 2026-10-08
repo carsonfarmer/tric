@@ -18,7 +18,6 @@ use object_store::{Certificate, ClientOptions, ObjectStore, memory::InMemory};
 use serve::Tric;
 use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
-use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 use wasmtime::{Result, error::Context};
 use webpki_root_certs::TLS_SERVER_ROOT_CERTS;
@@ -95,31 +94,16 @@ async fn main() -> Result<()> {
         }
         None => (None, None),
     };
-    let s = || store.as_deref().context("there is no --store or TRIC_STORE");
+    let s = || store.as_ref().context("there is no --store or TRIC_STORE");
     match cmd {
         Cmd::Dev { path, e, listen } => {
             let store = store.clone().unwrap_or_else(|| Arc::new(InMemory::new()));
             let built = deploy::build(&path, &client).await?;
             let app = built.name.clone();
             deploy::deploy(&*store, None, built, &e).await?;
-            let tric = Tric::new(store, "localhost", Some(app.clone()), None)?;
-            tokio::spawn(cron::tick(tric.clone()));
-            let listener = TcpListener::bind(listen).await?;
-            eprintln!("serving {app} at http://{}", listener.local_addr()?);
-            serve::run(listener, move |peer, req| tric.clone().handle(peer, req)).await?
+            Tric::new(store, "localhost", Some(app), None)?.serve(listen).await?
         }
-        Cmd::Serve { listen, domain } => {
-            let store = store.clone().context("there is no --store or TRIC_STORE")?;
-            let on = aws.zip(lambda);
-            let ticks = on.is_none(); // on Lambda, EventBridge Scheduler fires cron
-            let tric = Tric::new(store, &domain, None, on)?;
-            if ticks {
-                tokio::spawn(cron::tick(tric.clone()));
-            }
-            let listener = TcpListener::bind(listen).await?;
-            eprintln!("serving *.{domain} at http://{}", listener.local_addr()?);
-            serve::run(listener, move |peer, req| tric.clone().handle(peer, req)).await?
-        }
+        Cmd::Serve { listen, domain } => Tric::new(s()?.clone(), &domain, None, aws.zip(lambda))?.serve(listen).await?,
         Cmd::Deploy { path, e } => {
             let built = deploy::build(&path, &client).await?;
             println!("{}", deploy::deploy(s()?, aws.as_ref(), built, &e).await?);
