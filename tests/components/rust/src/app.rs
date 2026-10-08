@@ -6,11 +6,12 @@
 //! - `/fetch?method=M&async=1&url=U`: sends M (GET by default) to U, which is the rest of the query, not decoded, with
 //!   `Prefer: respond-async` given `async`. The reply is `<status> <body>`, or the Debug of the `ErrorCode`.
 //! - `/kv?…`: see kv.rs.
+//! - `/chat`: a room of WebSockets, in Pushpin's WebSocket-over-HTTP: see chat.rs.
 //! - `/env`: the environment and the arguments; `/fs`: what reading the filesystem gets.
 //! - `/stream?n=N`: N lines, a second apart, in a body that streams.
 //! - `/hog?mb=N` holds N MiB; `/fields?n=N` holds N `fields`; `/loop` spins; `/print` writes to stdout and stderr.
 //! - anything else: `hello`.
-use crate::kv;
+use crate::{chat, kv};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::{fmt::Debug, fs, hint::black_box, io};
@@ -48,6 +49,7 @@ impl wasip3::exports::http::handler::Guest for App {
                 echo
             }
             "/fetch" => fetch(q.get("method").map_or("GET", |m| m), q.contains_key("async"), url).await,
+            "/chat" => return chat::respond(request, name.unwrap_or_default(), &q).await,
             "/kv" => kv::respond(q.get("store").map(|s| s.as_str()).or(name).unwrap_or_default(), &q).to_string(),
             "/env" => json!({
                 "env": std::env::vars().collect::<BTreeMap<_, _>>(),

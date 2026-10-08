@@ -311,20 +311,26 @@ async fn serves_and_forwards(kind: Kind) {
     assert_eq!(res.body, "0\n1\n2\n");
     assert!(res.head < Duration::from_secs(1) && start.elapsed() > Duration::from_secs(2), "the body streams");
 
-    // Whatever a client says of where it came from, or of whose it is, `Forwarded` is tric's, from the socket.
+    // Whatever a client says of where it came from, of whose it is, or of being a WebSocket's event, with the feature
+    // `ws` or without it, `Forwarded` is tric's, from the socket.
     let claims = [
         ("forwarded", "for=_cron"),
         ("x-forwarded-for", "9.9.9.9"),
+        ("x_forwarded_for", "9.9.9.9"),
         ("x-forwarded-host", "example.com"),
         ("x-tric-credentials", "{}"),
         ("x-amz-tenant-id", "other"),
+        ("connection-id", "c"),
+        ("meta-user", "u"),
+        ("content-type", "application/websocket-events"),
     ];
     let echo = tric.send("GET", "/echo?a=1", &claims).await.json();
     assert_eq!(echo["uri"], format!("http://{}/echo?a=1", tric.host));
     let headers = echo["headers"].as_array().unwrap();
     let forwarded: Vec<_> = headers.iter().filter(|h| h[0] == "forwarded").collect();
     assert_eq!(forwarded, [&json!(["forwarded", format!(r#"for=127.0.0.1;host="{}";proto=http"#, tric.host)])]);
-    let hop = |h: &&Value| ["x-forwarded-", "x-amz", "x-tric-"].iter().any(|p| h[0].as_str().unwrap().starts_with(p));
+    let ours = ["x-forwarded-", "x-amz", "x-tric-", "connection-id", "meta-", "content-type"];
+    let hop = |h: &&Value| ours.iter().any(|p| h[0].as_str().unwrap().replace('_', "-").starts_with(p));
     assert!(!headers.iter().any(|h| hop(&h)), "{headers:?}");
 
     assert_eq!(tric.get("/env").await.json()["env"]["GREETING"], "hi");
@@ -666,4 +672,199 @@ async fn drops_forged_events() {
     let line = "outbox: dropped an event, as its commit is not pending";
     assert!(tric.logged(line, Duration::from_secs(10)).await, "dropped");
     assert_eq!(tric.value("h", "echo").await, Value::Null);
+}
+
+/// WebSockets, with the feature `ws`: real clients of `tric dev`, and the app's `/chat` route.
+#[cfg(feature = "ws")]
+mod ws {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{Error, Message, client::IntoClientRequest};
+    use tokio_tungstenite::{WebSocketStream, client_async};
+
+    type Client = WebSocketStream<TcpStream>;
+    const EVENTS: &str = "application/websocket-events";
+
+    async fn dev() -> Tric {
+        Tric::app(Kind { stack: false, app: "app" }).await
+    }
+
+    /// The path of a room of its own.
+    fn room() -> String {
+        format!("/@{}/chat", unique())
+    }
+
+    /// A socket at `target`, sent with `headers`, with the id that the app greets it with; or why it was refused.
+    async fn open(tric: &Tric, target: &str, headers: &[(&str, &str)]) -> Result<(Client, String), Error> {
+        let stream = TcpStream::connect(&tric.addr).await.unwrap();
+        let mut req = format!("ws://{}{target}", tric.addr).into_client_request()?;
+        for (k, v) in headers {
+            req.headers_mut().append(http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+        }
+        let (mut ws, _) = client_async(req, stream).await?;
+        let greeting = next(&mut ws).await;
+        Ok((ws, greeting.strip_prefix("id ").expect("a greeting").to_owned()))
+    }
+
+    /// The status that refused a socket.
+    fn refused(res: Result<(Client, String), Error>) -> u16 {
+        match res.err() {
+            Some(Error::Http(res)) => res.status().as_u16(),
+            got => panic!("{got:?}"),
+        }
+    }
+
+    /// The next text message, which comes within ten seconds.
+    async fn next(ws: &mut Client) -> String {
+        match timeout(Duration::from_secs(10), ws.next()).await.expect("a message") {
+            Some(Ok(Message::Text(text))) => text.as_str().to_owned(),
+            got => panic!("{got:?}"),
+        }
+    }
+
+    /// Sends `text`, and gives the next message.
+    async fn ask(ws: &mut Client, text: &str) -> String {
+        ws.send(Message::text(text)).await.unwrap();
+        next(ws).await
+    }
+
+    /// The name of the room at `path`.
+    fn name(path: &str) -> &str {
+        path[2..].split('/').next().unwrap()
+    }
+
+    /// Waits for the last event of the room at `path` to be `want`.
+    async fn last_is(tric: &Tric, path: &str, want: &str) {
+        let name = name(path);
+        let start = Instant::now();
+        while tric.value(name, "last").await != want {
+            assert!(start.elapsed() < Duration::from_secs(10), "{name}: not {want}");
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn echoes_counts_and_broadcasts() {
+        let (tric, path) = (dev().await, room());
+        let ((mut a, _), (mut b, _)) = (open(&tric, &path, &[]).await.unwrap(), open(&tric, &path, &[]).await.unwrap());
+        assert_eq!(ask(&mut a, "hello").await, "hello");
+        a.send(Message::Binary(vec![0, 255, 13, 10].into())).await.unwrap();
+        assert_eq!(a.next().await.unwrap().unwrap(), Message::Binary(vec![0, 255, 13, 10].into()));
+        assert_eq!(ask(&mut a, "count").await, "0");
+
+        // What is said counts in the name's state, and goes to every socket in the room, the sender's too.
+        a.send(Message::text("say hi")).await.unwrap();
+        assert_eq!((next(&mut a).await, next(&mut b).await), ("1: hi".into(), "1: hi".into()));
+        assert_eq!(ask(&mut b, "say yo").await, "2: yo");
+        assert_eq!(next(&mut a).await, "2: yo");
+        assert_eq!(ask(&mut a, "count").await, "2");
+
+        // Another room has its own count, and hears nothing.
+        let (mut c, _) = open(&tric, &room(), &[]).await.unwrap();
+        assert_eq!(ask(&mut c, "count").await, "0");
+
+        // An answer that is a failure is not committed, so is not counted, nor said; and it ends the socket.
+        a.send(Message::text("boom no")).await.unwrap();
+        assert!(matches!(a.next().await, Some(Ok(Message::Close(Some(f)))) if u16::from(f.code) == 1011));
+        assert_eq!(ask(&mut b, "count").await, "2");
+    }
+
+    #[tokio::test]
+    async fn plain_sockets_are_not_subscribed() {
+        let (tric, path) = (dev().await, room());
+        let (mut plain, _) = open(&tric, &format!("{path}?plain"), &[]).await.unwrap();
+        let (mut a, _) = open(&tric, &path, &[]).await.unwrap();
+        plain.send(Message::text("say hi")).await.unwrap();
+        assert_eq!(next(&mut a).await, "1: hi");
+        assert_eq!(ask(&mut plain, "ping").await, "ping");
+    }
+
+    #[tokio::test]
+    async fn refuses_what_the_app_refuses() {
+        let (tric, path) = (dev().await, room());
+        assert_eq!(refused(open(&tric, &format!("{path}?deny"), &[]).await), 403);
+        // An app that takes no socket there answers an upgrade as it does any request, and so does a path not a name's.
+        assert_eq!(refused(open(&tric, &path.replace("/chat", "/"), &[]).await), 200);
+        assert_eq!(refused(open(&tric, "/chat", &[]).await), 400);
+    }
+
+    #[tokio::test]
+    async fn tells_the_app_how_a_socket_ends() {
+        let tric = dev().await;
+        let (closed, gone, broken, large) = (room(), room(), room(), room());
+        let (mut a, _) = open(&tric, &closed, &[]).await.unwrap();
+        a.close(None).await.unwrap();
+        last_is(&tric, &closed, "close").await;
+
+        drop(open(&tric, &gone, &[]).await.unwrap());
+        last_is(&tric, &gone, "disconnect").await;
+
+        // An answer that is not events ends it, with an error.
+        let (mut b, _) = open(&tric, &broken, &[]).await.unwrap();
+        b.send(Message::text("garbage")).await.unwrap();
+        assert!(matches!(b.next().await, Some(Ok(Message::Close(Some(f)))) if u16::from(f.code) == 1011));
+        last_is(&tric, &broken, "disconnect").await;
+
+        // So does a message past the limit, which is not read.
+        let (mut c, _) = open(&tric, &large, &[]).await.unwrap();
+        _ = c.send(Message::text("x".repeat((1 << 20) + 1))).await;
+        while let Ok(Some(Ok(_))) = timeout(Duration::from_secs(10), c.next()).await {}
+        last_is(&tric, &large, "disconnect").await;
+    }
+
+    #[tokio::test]
+    async fn holds_so_many_sockets() {
+        let (tric, path) = (dev().await, room());
+        let mut held = vec![];
+        for _ in 0..256 {
+            held.push(open(&tric, &path, &[]).await.unwrap());
+        }
+        assert_eq!(refused(open(&tric, &path, &[]).await), 503);
+    }
+
+    /// What a client says is never what tric says: not that a request is events, nor a socket's, nor tric's publish.
+    #[tokio::test]
+    async fn is_not_fooled_by_clients() {
+        let (tric, path) = (dev().await, room());
+        let (mut a, id) = open(&tric, &path, &[]).await.unwrap();
+
+        // Posing as events, and as the socket `a`, to say something: the app takes it for any request, as it is.
+        let say = Bytes::from("TEXT 5\r\nsay x\r\n");
+        let claims: [&[(&str, &str)]; 5] = [
+            &[("content-type", EVENTS)],
+            &[("content-type", EVENTS), ("connection-id", &id)],
+            &[
+                ("content-type", "text/plain"),
+                ("content-type", "Application/WebSocket-Events; x=y"),
+                ("connection-id", &id),
+            ],
+            &[("content-type", EVENTS), ("connection_id", &id), ("grip-hold", "stream"), ("meta-user", "a")],
+            &[("connection-id", &id)],
+        ];
+        for claim in claims {
+            let res = exchange(&tric.addr, &tric.host, "POST", &path, claim, say.clone()).await;
+            assert_eq!((res.status, &*res.body), (400, "not a socket"), "{claim:?}");
+        }
+        let echo = tric.send("GET", &path.replace("/chat", "/echo"), claims[3]).await.json();
+        for name in ["content-type", "connection-id", "connection_id", "grip-hold", "meta-user"] {
+            assert_eq!(header(&echo, name), None, "{name}");
+        }
+
+        // Nor is a socket's id the client's to choose.
+        let (_, mine) = open(&tric, &path, &[("connection-id", &id), ("content-type", EVENTS)]).await.unwrap();
+        assert_ne!(mine, id);
+
+        // Publishing is the app's, to itself, and the client has no way to say that it is.
+        let item = json!({ "channel": name(&path), "formats": { "ws-message": { "content": "x" } } });
+        let publish = json!({ "items": [item] });
+        for from in [&[][..], &[("forwarded", "for=_tric")]] {
+            let mut headers = vec![("content-type", "application/json")];
+            headers.extend(from);
+            let res = exchange(&tric.addr, &tric.host, "POST", "/publish/", &headers, publish.to_string().into()).await;
+            assert_eq!((res.status, &*res.body), (200, "hello"));
+        }
+
+        // None of that was counted, nor said.
+        assert_eq!(ask(&mut a, "count").await, "0");
+    }
 }

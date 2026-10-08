@@ -119,6 +119,25 @@ There is no web platform under QuickJS (no `TextEncoder`, `URL`, `fetch` or `con
 - **`Forwarded`** is set by tric on every request, and is the only word on where it came from: the client, `for=_cron`
   or `for=_tric`.
 
+## WebSockets
+
+Behind the cargo feature `ws`, which is off by default, and in `tric dev` only, for now:
+`cargo install --locked --path . --features ws`. A WebSocket opened at `/@name/…` is held by tric, and the app speaks to
+it in [Pushpin's WebSocket-over-HTTP](https://pushpin.org/docs/protocols/websocket-over-http/):
+- Each event (`OPEN`, `TEXT`, `BINARY`, `CLOSE`, `DISCONNECT`) is a `POST` to the path the socket opened at, of
+  `application/websocket-events`, with the socket's `Connection-Id` and the client's `Forwarded`. It is a turn on the
+  name, like any other.
+- The app accepts the socket by answering `OPEN`, and the events in its answers go to the socket. Any other answer is
+  the client's answer to the upgrade.
+- [GRIP](https://pushpin.org/docs/protocols/grip/) is there for broadcast, and no more. An app that answers `OPEN` with
+  `Sec-WebSocket-Extensions: grip` sends `m:` and a message for the client, or `c:` and JSON that subscribes the socket
+  to a channel, or unsubscribes it: `{"type":"subscribe","channel":"room"}`. A `POST` to `/publish/` at the app's own
+  origin, in Pushpin's publish API with a `ws-message` of `content`, sends it to a channel's sockets. With
+  `Prefer: respond-async`, it is sent only if the turn commits.
+
+[tests/components/rust/src/chat.rs](tests/components/rust/src/chat.rs) is a chat room. Not here: `PING` and `PONG`
+events, `detach`, subprotocols, binary or other formats of a publish, and `tric serve`.
+
 ## Running it
 
 `tric dev` runs one app in one process. `tric` itself is installed with `cargo install --locked --path .` in a

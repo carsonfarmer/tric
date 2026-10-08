@@ -29,6 +29,11 @@ pub fn keep(store: &str, key: &str, value: &[u8]) -> Result<(), String> {
     store::open(store).map_err(e)?.set(key, value).map_err(e)
 }
 
+/// Adds `delta` to the number at `key` of `store`, and returns it.
+pub fn incr(store: &str, key: &str, delta: i64) -> Result<i64, String> {
+    atomics::increment(&store::open(store).map_err(e)?, key, delta).map_err(e)
+}
+
 fn e(err: impl Debug) -> String {
     format!("{err:?}")
 }

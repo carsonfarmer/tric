@@ -14,6 +14,8 @@ mod route;
 mod serve;
 mod store;
 mod tric;
+#[cfg(feature = "ws")]
+mod ws;
 
 use clap::{Args, Parser};
 use std::{net::SocketAddr, path::PathBuf};
