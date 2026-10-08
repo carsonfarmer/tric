@@ -3,6 +3,8 @@
 #   COMPOSE_PROJECT_NAME=tric-<worktree> docker compose run --rm fixtures   (build tests/fixtures/*.wasm)
 #   COMPOSE_PROJECT_NAME=tric-<worktree> docker compose run --rm test       (the gate: fixtures, fmt, clippy, tests)
 #   COMPOSE_PROJECT_NAME=tric-<worktree> docker compose run --rm release    (dist/tric.zip, for Lambda's arm64)
+#   COMPOSE_PROJECT_NAME=tric-<worktree> docker compose up -d serve         (a local install, at <app>.localhost:3000)
+#   COMPOSE_PROJECT_NAME=tric-<worktree> docker compose run --rm tric …     (the CLI, on the local install)
 #   COMPOSE_PROJECT_NAME=tric-<worktree> docker compose run --rm tofu …     (OpenTofu in infra/aws: see its README)
 name: ${COMPOSE_PROJECT_NAME:-tric-main}
 
@@ -11,6 +13,14 @@ x-toolchain: &toolchain
   image: ${COMPOSE_PROJECT_NAME:-tric-main}-build
   working_dir: /src
   volumes: [".:/src", "cargo:/opt/cargo/registry", "target:/src/target"]
+
+# MinIO, as `s3` below serves it, for the AWS_ variables that object_store reads.
+x-minio: &minio
+  AWS_ENDPOINT: http://s3:9000
+  AWS_ALLOW_HTTP: "true"
+  AWS_ACCESS_KEY_ID: tric
+  AWS_SECRET_ACCESS_KEY: tric-secret
+  AWS_REGION: us-east-1
 
 services:
   dev:
@@ -26,13 +36,7 @@ services:
       && cargo test --locked
       && cargo publish --dry-run --locked --no-verify'
     depends_on: { s3: { condition: service_healthy } }
-    environment:
-      TRIC_TEST_STORE: s3://tric
-      AWS_ENDPOINT: http://s3:9000
-      AWS_ALLOW_HTTP: "true"
-      AWS_ACCESS_KEY_ID: tric
-      AWS_SECRET_ACCESS_KEY: tric-secret
-      AWS_REGION: us-east-1
+    environment: { <<: *minio, TRIC_TEST_STORE: s3://tric }
   fixtures:
     <<: *toolchain
     command: tests/components/build.sh
@@ -40,14 +44,31 @@ services:
   release:
     <<: *toolchain
     platform: linux/arm64
-    command: sh -c 'cargo build --release --bin tric && rm -f dist/tric.zip && mkdir -p dist && zip -j dist/tric.zip infra/aws/bootstrap target/release/tric'
-  # S3 for the tests: MinIO, with the bucket `tric`, versioned as an install's is. It outlives a run, as the tests' app
-  # names are their own.
+    command: >-
+      sh -c 'cargo build --release --bin tric && rm -f dist/tric.zip && mkdir -p dist
+      && zip -j dist/tric.zip infra/aws/bootstrap target/release/tric'
+  # A local install, as one on AWS is but for Lambda and Scheduler: every app in the bucket `local`, each at
+  # http://<app>.localhost:3000, with cron ticking in-process. TRIC_PORT moves it.
+  serve:
+    <<: *toolchain
+    command: cargo run --locked --release --bin tric -- serve --listen 0.0.0.0:3000
+    ports: ["127.0.0.1:${TRIC_PORT:-3000}:3000"]
+    depends_on: { s3: { condition: service_healthy } }
+    environment: { <<: *minio, TRIC_STORE: s3://local }
+  # The CLI, on the local install. It sees this directory at /src; mount another with -v to deploy what is in it.
+  tric:
+    <<: *toolchain
+    entrypoint: [cargo, run, --locked, --release, --quiet, --bin, tric, --]
+    depends_on: { s3: { condition: service_healthy } }
+    environment: { <<: *minio, TRIC_STORE: s3://local }
+  # S3: MinIO, with the buckets `tric`, for the tests, and `local`, for the local install, each versioned as an
+  # install's is. They outlive a run, as the tests' app names are their own.
   s3:
     image: minio/minio:RELEASE.2025-09-07T16-13-09Z
     entrypoint: >-
       sh -c 'minio server /data --quiet & until mc alias set s3 http://localhost:9000 tric tric-secret >/dev/null;
-      do sleep 1; done; mc mb -p s3/tric && mc version enable s3/tric && touch /tmp/ready && wait'
+      do sleep 1; done; mc mb -p s3/tric s3/local && mc version enable s3/tric && mc version enable s3/local
+      && touch /tmp/ready && wait'
     environment: { MINIO_ROOT_USER: tric, MINIO_ROOT_PASSWORD: tric-secret }
     healthcheck: { test: test -f /tmp/ready, interval: 1s, retries: 60 }
   tofu:
