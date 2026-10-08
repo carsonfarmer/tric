@@ -160,17 +160,22 @@ impl Tric {
         self.get(&format!("/@{name}/kv?op=get&key={key}")).await.json()["ok"].clone()
     }
 
-    /// Waits up to `limit` for `key` in `name` to have a value.
-    async fn wait_for(&self, name: &str, key: &str, limit: Duration) -> Option<String> {
+    /// Waits up to `limit` for `key` in `name` to hold an echo, which it returns.
+    async fn wait_for(&self, name: &str, key: &str, limit: Duration) -> Option<Value> {
         let start = Instant::now();
         while start.elapsed() < limit {
             if let Value::String(s) = self.value(name, key).await {
-                return Some(s);
+                return Some(serde_json::from_str(&s).unwrap());
             }
             sleep(Duration::from_millis(200)).await;
         }
         None
     }
+}
+
+/// The value of the first header `name` that an echo reports.
+fn header<'a>(echo: &'a Value, name: &str) -> Option<&'a str> {
+    echo["headers"].as_array().unwrap().iter().find(|h| h[0] == name).map(|h| h[1].as_str().unwrap())
 }
 
 impl Drop for Tric {
@@ -196,16 +201,14 @@ async fn serves_and_forwards() {
     ];
     let echo = dev.send("GET", "/echo?a=1", &fwd).await.json();
     assert_eq!(echo["uri"], "https://example.com/echo?a=1");
+    assert_eq!(header(&echo, "forwarded"), Some(r#"for=1.2.3.4;host="example.com";proto=https"#));
     let headers = echo["headers"].as_array().unwrap();
-    let header = |name: &str| headers.iter().find(|h| h[0] == name).map(|h| h[1].as_str().unwrap().to_owned());
-    assert_eq!(header("forwarded").as_deref(), Some(r#"for=1.2.3.4;host="example.com";proto=https"#));
     let hop = |h: &Value| ["x-forwarded-", "x-amzn-"].iter().any(|p| h[0].as_str().unwrap().starts_with(p));
     assert!(!headers.iter().any(hop), "{headers:?}");
     // A proto that is neither http nor https counts for nothing; the peer is `for` when there is no X-Forwarded-For.
     let echo = dev.send("GET", "/echo", &[("x-forwarded-proto", "gopher")]).await.json();
     assert_eq!(echo["uri"], format!("http://{}/echo", dev.addr));
-    let fwd = echo["headers"].as_array().unwrap().iter().find(|h| h[0] == "forwarded").unwrap()[1].clone();
-    assert_eq!(fwd, format!(r#"for=127.0.0.1;host="{}";proto=http"#, dev.addr));
+    assert_eq!(header(&echo, "forwarded"), Some(&*format!(r#"for=127.0.0.1;host="{}";proto=http"#, dev.addr)));
 
     let env = dev.get("/env").await.json();
     assert_eq!(env["env"]["GREETING"], "hi");
@@ -345,12 +348,10 @@ async fn delivers_the_outbox_once_committed(dev: Tric) {
     let res = dev.post(&format!("/@f/fetch?method=POST&async=1&url={me}/@g/echo")).await;
     assert_eq!((res.status, &*res.body), (200, "202 "));
     let echo = dev.wait_for("g", "echo", Duration::from_secs(10)).await.expect("delivered");
-    let echo: Value = serde_json::from_str(&echo).unwrap();
-    let headers = echo["headers"].as_array().unwrap();
-    let key = headers.iter().find(|h| h[0] == "idempotency-key").expect("an Idempotency-Key")[1].as_str().unwrap();
+    let key = header(&echo, "idempotency-key").expect("an Idempotency-Key");
     assert!(key.ends_with("/0"), "{key}");
-    assert!(headers.iter().all(|h| h[0] != "prefer"), "{headers:?}");
-    assert!(headers.iter().any(|h| h[0] == "forwarded" && h[1] == "for=_tric"), "{headers:?}");
+    assert_eq!(header(&echo, "prefer"), None);
+    assert_eq!(header(&echo, "forwarded"), Some("for=_tric"));
 
     // A turn that is discarded sends nothing.
     let res = dev.post(&format!("/@f/fetch?method=POST&async=1&status=500&url={me}/@h/echo")).await;
@@ -402,10 +403,9 @@ async fn fires_cron() {
     let dir = manifest("cron", "name = \"cron\"\ncomponent = APP\n[cron]\n\"* * * * *\" = \"/@ticks/echo\"\n");
     let dev = Tric::dev(dir, &[], None).await;
     let echo = dev.wait_for("ticks", "echo", Duration::from_secs(75)).await.expect("a tick within a minute");
-    let echo: Value = serde_json::from_str(&echo).unwrap();
     assert_eq!(echo["method"], "POST");
     assert_eq!(echo["uri"], "http://cron.localhost/@ticks/echo");
-    assert!(echo["headers"].as_array().unwrap().iter().any(|h| h[0] == "forwarded" && h[1] == "for=_cron"), "{echo}");
+    assert_eq!(header(&echo, "forwarded"), Some("for=_cron"));
 }
 
 #[tokio::test]
@@ -440,6 +440,5 @@ async fn serves_an_install() {
     assert_eq!((res.status, &*res.body), (200, "202 "));
     assert!(tric.wait_for("g", "echo", Duration::from_secs(10)).await.is_some(), "delivered");
     let echo = tric.wait_for("ticks", "echo", Duration::from_secs(75)).await.expect("a tick within a minute");
-    let echo: Value = serde_json::from_str(&echo).unwrap();
     assert_eq!(echo["uri"], format!("http://{name}.localhost/@ticks/echo"));
 }
