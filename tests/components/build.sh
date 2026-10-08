@@ -1,6 +1,7 @@
 #!/bin/sh
 # Builds the test fixtures into tests/fixtures/<name>.wasm, in the toolchain image: docker compose run --rm fixtures
-# One crate, two components: `app` (the routes that exercise the host) and `guard` (a wasi:http/middleware).
+# One crate, two components: `app` (the routes that exercise the host) and `guard` (a wasi:http/middleware); and `js`,
+# which has the routes of `app` again, in JavaScript.
 set -eu
 cd "$(dirname "$0")"
 out=../fixtures
@@ -15,4 +16,5 @@ for name in app guard; do
   cargo build --release --locked --target wasm32-wasip2 --manifest-path rust/Cargo.toml --features "$name"
   cp "${CARGO_TARGET_DIR:-rust/target}/wasm32-wasip2/release/fixture.wasm" "$out/$name.wasm"
 done
+js/build.sh
 ls -l "$out"

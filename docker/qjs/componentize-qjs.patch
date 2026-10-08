@@ -1,0 +1,153 @@
+diff --git a/cli/Cargo.toml b/cli/Cargo.toml
+index 487ba5c..a657f0d 100644
+--- a/cli/Cargo.toml
++++ b/cli/Cargo.toml
+@@ -119,14 +119,14 @@ version = "1"
+ version = "3.13"
+ 
+ [dev-dependencies.wasmtime]
+-version = "47"
++version = "=49.0.2"
+ features = [
+     "component-model",
+     "async",
+ ]
+ 
+ [dev-dependencies.wasmtime-wasi]
+-version = "47"
++version = "=49.0.2"
+ features = [
+     "p2",
+     "p3",
+@@ -150,3 +150,6 @@ incremental = false
+ 
+ [profile.test.package.componentize-qjs-cli]
+ opt-level = 1
++
++[patch.crates-io]
++componentize-qjs = { path = "../lib" }
+diff --git a/lib/Cargo.toml b/lib/Cargo.toml
+index 3fc8087..e221369 100644
+--- a/lib/Cargo.toml
++++ b/lib/Cargo.toml
+@@ -78,21 +78,21 @@ features = [
+ default-features = false
+ 
+ [dependencies.wasi-preview1-component-adapter-provider]
+-version = "47"
++version = "=49.0.2"
+ 
+ [dependencies.wasm-compose]
+ version = "0.258"
+ default-features = false
+ 
+ [dependencies.wasmtime]
+-version = "47"
++version = "=49.0.2"
+ features = [
+     "component-model",
+     "async",
+ ]
+ 
+ [dependencies.wasmtime-wasi]
+-version = "47"
++version = "=49.0.2"
+ features = [
+     "p2",
+     "p3",
+@@ -100,7 +100,7 @@ features = [
+ default-features = false
+ 
+ [dependencies.wasmtime-wizer]
+-version = "47"
++version = "=49.0.2"
+ features = [
+     "component-model",
+     "wasmtime",
+diff --git a/lib/src/lib.rs b/lib/src/lib.rs
+index 5ce624c..0b44ffe 100644
+--- a/lib/src/lib.rs
++++ b/lib/src/lib.rs
+@@ -14,7 +14,10 @@ use bytes::Bytes;
+ use resolver::Resolver;
+ use stubwasi::{stub_internal_imports, stub_wasi_imports};
+ use wasi_preview1_component_adapter_provider::WASI_SNAPSHOT_PREVIEW1_REACTOR_ADAPTER;
+-use wasmtime::component::{Component as WasmtimeComponent, Linker, ResourceTable};
++use wasmtime::component::types::ComponentItem;
++use wasmtime::component::{
++    Component as WasmtimeComponent, Linker, LinkerInstance, ResourceTable, ResourceType,
++};
+ use wasmtime::{Config, Engine, Store};
+ use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
+ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+@@ -244,7 +247,7 @@ async fn wizer_init(
+ 
+     let mut linker = Linker::new(&engine);
+     linker.allow_shadowing(true);
+-    linker.define_unknown_imports_as_traps(&comp)?;
++    trap_imports(&mut linker, &engine, &comp)?;
+     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+     wasmtime_wasi::p3::add_to_linker(&mut linker)?;
+ 
+@@ -271,7 +274,7 @@ async fn wizer_init(
+ 
+     let component = wizer
+         .snapshot_component(
+-            cx,
++            &cx,
+             &mut WasmtimeWizerComponent {
+                 store: &mut store,
+                 instance,
+@@ -282,6 +285,52 @@ async fn wizer_init(
+     Ok(component)
+ }
+ 
++/// Stand-in for `Linker::define_unknown_imports_as_traps`, which since wasmtime 49 leaves a trapping definition of a
++/// resource that merely aliases an earlier one (`wasi:io/streams` `error` is `wasi:io/error` `error`) next to the real
++/// definition that shadows its original, so the instance no longer type checks. Aliases are left undefined here.
++fn trap_imports(linker: &mut Linker<Ctx>, engine: &Engine, comp: &WasmtimeComponent) -> Result<()> {
++    fn item(
++        li: &mut LinkerInstance<'_, Ctx>,
++        engine: &Engine,
++        path: &str,
++        name: &str,
++        it: ComponentItem,
++        seen: &mut Vec<ResourceType>,
++    ) -> Result<()> {
++        let full = if path.is_empty() { name.to_string() } else { format!("{path}#{name}") };
++        match it {
++            ComponentItem::ComponentFunc(f) if f.async_() => li.func_new_concurrent(name, move |_, _, _, _| {
++                let full = full.clone();
++                Box::pin(async move { Err(wasmtime::format_err!("unknown import: `{full}` has not been defined")) })
++            })?,
++            ComponentItem::ComponentFunc(_) => li.func_new(name, move |_, _, _, _| {
++                Err(wasmtime::format_err!("unknown import: `{full}` has not been defined"))
++            })?,
++            ComponentItem::ComponentInstance(i) => {
++                let mut sub = li.instance(name)?;
++                for (n, e) in i.exports(engine) {
++                    item(&mut sub, engine, name, n, e.ty, seen)?;
++                }
++            }
++            ComponentItem::Resource(r) if !seen.contains(&r) => {
++                seen.push(r);
++                li.resource(name, ResourceType::host::<()>(), |_, _| Ok(()))?;
++            }
++            ComponentItem::Component(_) | ComponentItem::Module(_) => {
++                return Err(anyhow!("unable to define import `{full}` as a trap"));
++            }
++            _ => {}
++        }
++        Ok(())
++    }
++
++    let mut seen = Vec::new();
++    for (name, it) in comp.component_type().imports(engine) {
++        item(&mut linker.root(), engine, "", name, it.ty, &mut seen)?;
++    }
++    Ok(())
++}
++
+ fn register_module_loader(linker: &mut Linker<Ctx>, resolver: Option<Resolver>) -> Result<()> {
+     let resolve = resolver.clone();
+     let load = resolver;

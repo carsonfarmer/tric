@@ -46,6 +46,65 @@ call; it may call none otherwise, and never a private address. A directory with 
 (`allowed_outbound_hosts`), name the `component`, pin `middleware` to plug in front of it (`{ url, digest }`), and map
 `[cron]` schedules to paths (`"0 8 * * *" = "/@digest/run"`).
 
+## A JavaScript app
+
+Experimental. [componentize-qjs](https://crates.io/crates/componentize-qjs) 0.4.5 builds a JavaScript module into a
+component, on QuickJS, and this repository's toolchain image has it, patched ([docs/decisions.md](docs/decisions.md)
+says why). The module's top level runs once, at build time, and every request starts from the heap it leaves: so read
+the environment in the handler, and take secrets from `wasi:random`, as `Math.random` repeats in every request.
+
+```bash
+docker compose build dev                    # a few minutes, the first time
+mkdir -p hello-js/src hello-js/wit
+curl -fsSL 'https://static.crates.io/crates/wasip3/wasip3-0.9.0+wasi-0.3.0.crate' \
+  | tar xz -C hello-js/wit --strip-components=2 'wasip3-0.9.0+wasi-0.3.0/wit/deps'
+```
+
+The world lists what the app is given, and the module exports the handler:
+
+```wit
+// hello-js/wit/world.wit
+package example:hello;
+
+world app {
+  import wasi:http/types@0.3.0;
+  export wasi:http/handler@0.3.0;
+}
+```
+
+```js
+// hello-js/src/main.js
+import types from "wasi:http/types@0.3.0";
+
+export const handler = {
+  async handle(request) {
+    const body = wit.Stream(wit.Stream.U8);
+    const trailers = wit.Future(wit.Future.RESULT_OPTION_OTHER_ERROR_CODE);
+    const [response, sent] = types.Response.new(types.Fields.fromList([]), body.readable, trailers.readable);
+    sent.drop();
+    (async () => {
+      await body.writable.writeAll(Uint8Array.from("hello from tric\n", (c) => c.charCodeAt(0)));
+      body.writable.drop();
+      await trailers.writable.write({ tag: "ok", val: null });
+    })();
+    return response;
+  },
+};
+```
+
+```bash
+docker compose run --rm dev componentize-qjs --wit hello-js/wit --js hello-js/src/main.js --world app \
+  --output hello-js/hello.wasm
+tric dev hello-js/hello.wasm
+```
+
+There is no web platform under QuickJS (no `TextEncoder`, `URL`, `fetch` or `console`), so an app speaks WASI:
+- each import is a module named for it, with its names in camelCase;
+- an `option<T>` is `T | null`, a `u64` is a number, and a `result`'s error is thrown, with the variant as `payload`;
+- an exception that escapes the handler answers 500.
+
+[tests/components/js](tests/components/js) has the Rust test app's routes, in JavaScript.
+
 ## What an app sees
 
 - **Names.** A path whose first segment starts with `@` (`/@room:42/…`) addresses that name's state, which
