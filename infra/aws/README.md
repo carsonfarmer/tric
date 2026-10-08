@@ -1,15 +1,40 @@
 # tric on AWS
 
-An install: the app and KV buckets, the serving and compile functions, CloudFront at `*.<domain>`, a role
-per team, and a budget alert. Everything that can be tagged is tagged `tric = <name>`. Every command below runs from
-the repository's root, with `AWS_PROFILE` set to a profile that may administer the account.
+An install is one bucket, one Lambda function, CloudFront at `*.<domain>`, an EventBridge Scheduler group for the apps'
+cron, a policy for whoever deploys, and a budget alert, all in one account. Everything that can be tagged is tagged
+`tric = <name>`. Every command below runs from the repository's root, with `AWS_PROFILE` set to a profile that may
+administer the account.
+
+## Security first
+
+- **The bucket is the boundary.** Hosts load native code from `native/` without checking it, as it cannot be checked,
+  so whoever can write there can run code in the function, with its role: every app's state, and invoking itself. Only
+  the function and the account's administrators can. The `deploy` policy writes only under `apps/`: a deployer controls
+  every app's code, environment and state, but what they ship runs in the sandbox.
+- **Apps run in a sandbox**: no files, no sockets, only their own environment variables, outbound HTTP only to the
+  hosts their manifest lists and never to a private address, their own KV, and limits on time (10 s to answer, 300 s
+  in all) and memory (256 MiB). The apps share one process, so Wasmtime is what keeps them apart: an app that broke
+  out of it would have the function's role.
+- **Environment variables are stored as they are**, in `apps/<app>/current`, which deployers and the function read,
+  and one changed or removed stays in an old version for 7 days.
+- **The Function URL is public**, as CloudFront's origin. A request that skips CloudFront reaches only what CloudFront
+  would route it to, but sets its own `X-Forwarded-*`, so the `for` in an app's `Forwarded` is not proof of anything.
+- **The apps share `<domain>` as one site**, so one can set a cookie that the browser sends to all of them. Apps that
+  should not trust each other need installs of their own.
+- **No concurrency is reserved by default**, as a new account's quota may be only 10, so nothing but the account's
+  quota caps what a flood of requests costs: each instance that runs all day costs about $2 at 1769 MB. Set
+  `concurrency` to cap it. The budget alert only emails.
+- **Failures keep what failed**: an outbox's requests, headers and bodies included, in `failed/`, and an event whose
+  invocation crashed in `aws/lambda/async/`.
+- The bucket takes requests only over TLS. The module relies on S3's defaults for a new bucket: public access blocked,
+  ACLs off, and encryption at rest with keys S3 manages.
 
 ## The zone, once per domain
 
 The module serves from a public Route 53 zone that it reads but does not make, so destroying an install leaves the
 domain as it was. If the domain has no zone in the account yet:
 
-```sh
+```bash
 aws route53 create-hosted-zone --name <domain> --caller-reference "<domain>-$(date +%s)"
 ```
 
@@ -20,136 +45,97 @@ elsewhere, at its registrar. A zone costs $0.50 a month.
 ## Install
 
 The install's settings go in `infra/aws/terraform.tfvars`, which git ignores, as it holds the alert's emails; the
-variables are in [variables.tf](variables.tf). An account whose Lambda concurrency quota is under 122 has none to
-reserve, so needs `concurrency = { serve = -1, compile = -1 }` too.
+variables are in [variables.tf](variables.tf). The region is us-west-2 unless `region` says otherwise.
 
-```sh
-printf '%s\n' 'domain = "<domain>"' 'budget = { emails = ["<you>"] }' 'teams = ["<team>"]' > infra/aws/terraform.tfvars
-docker compose run --rm release            # builds dist/tric.zip
+```bash
+printf '%s\n' 'domain = "<domain>"' 'budget = { emails = ["<you>"] }' > infra/aws/terraform.tfvars
+docker compose run --rm release            # dist/tric.zip, for Lambda's arm64
 docker compose run --rm tofu init
 docker compose run --rm tofu apply
 ```
 
-The install's state is `infra/aws/terraform.tfstate`, which only this checkout has: keep it until the install is spun
-down, as without it tofu cannot. Before a second operator applies, move it to an S3 backend with `use_lockfile = true`,
-so that each has the latest state and two applies cannot run at once.
+The build takes a few minutes, more on an x86 machine, where Docker emulates arm64; the apply about five more, most of
+them CloudFront's. The install's state is `infra/aws/terraform.tfstate`, which only this checkout has: keep it until
+the install is spun down, as without it tofu cannot. Before a second operator applies, move it to an S3 backend with
+`use_lockfile = true`, so that each has the latest state and two applies cannot run at once.
 
-Apps are then at `https://<app>.<domain>`. A resolver that looked a name up before the apply made its records may
-keep that miss for up to 15 minutes, the zone's negative-caching time. The apps share `<domain>` as one site, so one
-can set a cookie that the browser sends to all of them: teams that should not trust each other need installs of their
-own.
+Apps are then at `https://<app>.<domain>`. A resolver that looked a name up before the apply made its records may keep
+that miss for up to 15 minutes, the zone's negative-caching time.
 
-## Teams
+## Deploying
 
-A team owns the apps named `<team>-…`: its role may publish, release and set the secrets of those, and otherwise only
-list the app bucket's keys. To add one, add its name to `teams` in `terraform.tfvars` and apply again. A team's name is
-1 to 38 of `a-z` and `0-9`, with no `-`, so no team's prefix is another's. Removing a name deletes the role, not the
-team's apps.
+The CLI writes the bucket directly, so IAM is its only auth: attach the `deploy_policy` output to whoever deploys, or
+deploy as an administrator. It takes its credentials, region and bucket from the environment, not from a profile:
 
-The roles trust the account, so the account's own IAM policies say who may assume each: give the team's members
-`sts:AssumeRole` on its ARN, from the `team_roles` output. The CLI takes its credentials from the `AWS_` variables, not
-from a profile. With a profile for the role in `~/.aws/config` (its `role_arn`, and a `source_profile`), a team member
-runs:
-
-```sh
-eval "$(aws configure export-credentials --profile <team> --format env)"
-export AWS_REGION=<region> TRIC_STORE=<store> TRIC_NATIVE=true   # the region and store from the outputs
+```bash
+eval "$(aws configure export-credentials --format env)"
+export AWS_REGION=$(docker compose run --rm -T tofu output -raw region)
+export TRIC_STORE=$(docker compose run --rm -T tofu output -raw store)
+tric deploy path/to/app                    # prints the release's id; live within 5 s
+tric releases <app>                        # newest first, marking the one it runs
+tric release <app> <id>                    # runs an older one again
+tric env <app> NAME=value OTHER=           # sets NAME and removes OTHER
 ```
+
+`deploy` and `release` also make the app's cron schedules in the Scheduler group those of the release it runs.
 
 ## Upgrading
 
-Pull the new tric, then build and apply as at install. The compile function is updated first. Native code is keyed by
-a hash of Wasmtime's version and settings, so after an upgrade that changes either, the hosts find none for any app:
-each compiles an app itself the first time it loads it, which makes that request slow (a large JavaScript component
-takes seconds), and asks the compile function for the new native code, which every later host loads. Publishing an app
-again asks for it ahead of any request. The old native code stays in each release's folder until the app drops that
-release.
+Pull the new tric, then build and apply as at install. Native code is keyed by Wasmtime's version and settings, so an
+upgrade that changes either finds none for any app: each app is compiled again at its first request, which a large
+component makes slow (seconds, for a JavaScript one), and its native code is written for the hosts that follow. What
+the old build wrote is then unused, and goes with `aws s3 rm --recursive s3://<bucket>/native/`, which costs only
+those compiles again.
 
-## Garbage
+## When things fail
 
-Nothing needs collecting. An app keeps the release it serves and its 10 latest publishes, each in a folder of its own
-with its component and native code, and each change to the app (a publish, a release or a secret) first deletes the
-folders of the releases it no longer keeps. A folder thus goes at the change after the one that dropped its release, by
-when hosts have mostly moved on, as each rechecks an app every 5 s. If the two changes land within 5 s, a host still
-serving the dropped release goes on serving it while it has it loaded, but fails with a `500` if it has to load it
-again, until its recheck. An app that never changes again keeps its last folders. A marker that asks for native code,
-which a failed compile leaves, goes after a day, and KV data is never touched.
-
-Deleting an app's `current` takes the app offline. The next change to the app starts its history again, in folders above
-the old ones, and the change after it deletes the old ones. Do it only while nothing publishes to the app: a publish
-that is still writing can leave its files in the next release's folder, which hosts then refuse, as they do not match
-its hashes.
+- **Logs** are in CloudWatch, as JSON: `aws logs tail /aws/lambda/<name> --follow`. `logs.filter` sets their level.
+- **An outbox** whose requests did not all succeed in their rounds is kept in `failed/<commit>`, its requests as the
+  app made them, for the operator to look at or send again by hand.
+- **An outbox or cron event** whose invocation crashed or timed out is tried twice more, and then kept in
+  `aws/lambda/async/<name>/<yyyy>/<mm>/<dd>/…`, as Lambda records it. A status does not fail an invocation, so an event
+  that ran and failed is in the logs, not here.
 
 ## Undoing a delete
 
-The app bucket keeps whatever is deleted or overwritten in it as an old version for 7 days, which the operator can
-bring back, though teams can neither read nor delete old versions. To bring back a key, list its versions and copy the
-one you want over it:
+The bucket keeps whatever is deleted or overwritten in it as an old version for 7 days. To bring back a key, list its
+versions and copy the one you want over it:
 
-```sh
-aws s3api list-object-versions --bucket <store> --prefix apps/<app>/current
-aws s3api copy-object --bucket <store> --key apps/<app>/current \
-  --copy-source '<store>/apps/<app>/current?versionId=<version>'
+```bash
+aws s3api list-object-versions --bucket <bucket> --prefix apps/<app>/current
+aws s3api copy-object --bucket <bucket> --key apps/<app>/current \
+  --copy-source '<bucket>/apps/<app>/current?versionId=<version>'
 ```
 
-Bring back a deleted `current` before anything changes the app: a change makes a new `current`, which bringing back the
-old one undoes, and the change after it deletes the old folders. An older `current` brought back over a live one needs
-the files of the folders it keeps, which come back the same way; the folders it does not keep go at the change after the
-next. KV data has no old versions.
-
-## Trust
-
-- **Apps** run in a sandbox: no files, environment, sockets or private addresses, outbound HTTP only to the hosts their
-  manifest lists, and limits on time and memory ([docs/apps.md](../../docs/apps.md#limits)). An app's KV stores are its
-  own, and only the serving function reaches the KV bucket.
-- **Teams** reach only their own apps, but can list every key in the app bucket, and so see other teams' app names and
-  release ids. An app's secrets are stored as they are, readable by its team and by the hosts, and one that is changed
-  or removed stays in an old version for 7 days, which only the operator can read.
-- **The apps share `<domain>`** as one site, so one can set a cookie that the browser sends to all of them. Teams that
-  should not trust each other need installs of their own.
-- **The hosts trust nothing in the buckets but native code:** every other read is size-capped and parsed strictly, and
-  every component and release is checked against its hash. Native code cannot be checked, and loading it runs it in the
-  host, so only the compile function may write it. A team may write only its apps' `current` and their folders'
-  `release` and `component`, while native code always ends in `.zst`, and the app bucket's policy refuses a key ending
-  in `.zst` from anyone but the compile function, the operator included. The compile function names native code by the
-  hash of the component it compiled, and a host loads only what is named by the component its app's `current` names. A
-  team may delete its apps' native code, which costs only a compile.
-- **The buckets** take requests only over TLS. The module relies on S3's defaults for new buckets: public access
-  blocked, ACLs off, and encryption at rest with keys S3 manages.
-- **The compile function** compiles every team's components, and can write native code for any app, so Wasmtime's
-  compiler is the boundary: a component that exploited it there could run its code in every app. It also makes every
-  team's native code in a few slots at a time, so a team that publishes many large components can delay the others',
-  whose hosts compile their apps meanwhile: slower cold starts, but nothing breaks.
-- **The operator**, with the account, can do anything, though writing native code takes changing the app bucket's
-  policy first, which CloudTrail records.
+An app's releases and components are never deleted, so an old `current` brought back runs as it did. A name's head can
+be brought back the same way, while nothing writes the name: the large values it pins by version are still there.
 
 ## Costs
 
 An idle install costs its storage and nothing else, plus $0.50 a month for the zone. A million requests cost about $0.83
-on Lambda if each takes 27 ms, as a KV read did at 1769 MB, and its free tier covers about 8 million such requests a
-month; $1 on CloudFront, past its free 10 million a month; and the S3 requests they make. A host reads an app's
-`current` at most once every 5 s, and the KV calls' costs are in [docs/apps.md](../../docs/apps.md#what-kv-costs).
-Prices are AWS's list prices for us-east-1, which vary by region. The reserved concurrency of `serve` caps what a flood
-of requests can cost, at about $40 a day by default, and the budget alert emails at 80% of $5 a month of the account's
-spend.
+on Lambda if each takes 27 ms at 1769 MB, and its free tier covers about 8 million such requests a month; $1 on
+CloudFront, past its free 10 million a month; and the S3 requests they make. A host reads an app's `current` at most
+once every 5 s. Each cron schedule that fires every minute is about 44,000 invocations a month, of Scheduler's free 14
+million. Prices are AWS's list prices for us-east-1, which vary by region.
 
 ## Spin down
 
-1. **The install.** The buckets go only with everything in them, and only if `force_destroy` is applied first. Both
-   commands need `dist/tric.zip`, as the plan reads it:
+1. **The install.** Detach the `deploy` policy from whoever has it. The bucket goes only with everything in it, and only
+   if `force_destroy` is applied first. Both commands need `dist/tric.zip`, as the plan reads it:
 
-   ```sh
+   ```bash
    docker compose run --rm tofu apply -var force_destroy=true
    docker compose run --rm tofu destroy -var force_destroy=true
    ```
 
-   CloudFront takes a few minutes to disable before it can be deleted.
+   Deleting the Scheduler group deletes the apps' schedules in it. CloudFront takes a few minutes to disable before it
+   can be deleted.
 
 2. **Check nothing is left**, in both the install's region and us-east-1 (the certificate's):
 
-   ```sh
+   ```bash
    aws resourcegroupstaggingapi get-resources --region <region> --tag-filters Key=tric
-   aws logs describe-log-groups --region <region> --log-group-name-prefix /aws/lambda/<name>-
+   aws logs describe-log-groups --region <region> --log-group-name-prefix /aws/lambda/<name>
    ```
 
    A function that logged after its log group was deleted leaves an untagged group of Lambda's own, which
@@ -158,7 +144,7 @@ spend.
 3. **The zone**, if no install will use the domain again. Destroy removes the install's records, which leaves the
    zone's own NS and SOA:
 
-   ```sh
+   ```bash
    aws route53 delete-hosted-zone --id <zone id>
    ```
 

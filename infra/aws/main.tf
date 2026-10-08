@@ -1,5 +1,5 @@
-# An install of tric: the app and KV buckets, the serving and compile functions, CloudFront in front of
-# the serving function at *.<domain>, the teams' roles, and a budget alert.
+# An install of tric: one bucket, one function, CloudFront in front of it at *.<domain>, a Scheduler group for the apps'
+# cron, and a budget alert. The function serves every app, and is invoked as well by its own outbox and by Scheduler.
 
 data "aws_caller_identity" "current" {}
 
@@ -9,80 +9,31 @@ data "aws_route53_zone" "this" {
 
 locals {
   account = data.aws_caller_identity.current.account_id
-  app     = aws_s3_bucket.this["app"].arn
-  kv      = aws_s3_bucket.this["kv"].arn
+  bucket  = aws_s3_bucket.this.arn
+  # Built from its parts, as the function's own role names it, and the role must exist before the function.
+  function = "arn:aws:lambda:${var.region}:${local.account}:function:${var.name}"
   # The Lambda Web Adapter, published by AWS: an extension that turns invocations into HTTP requests to the function.
   adapter = "arn:aws:lambda:${var.region}:753240598075:layer:LambdaAdapterLayerArm64:30"
   zip     = "${path.module}/../../dist/tric.zip" # as `docker compose run --rm release` builds it
-  team    = "$${aws:PrincipalTag/team}"          # for IAM to fill in: the `team` tag of the role
   # The one record that proves the domain is ours, as the certificate is for one name.
   validation = one(aws_acm_certificate.this.domain_validation_options)
-  env = {
-    TRIC_STORE                       = "s3://${aws_s3_bucket.this["app"].bucket}"
-    TRIC_NATIVE                      = "true"
-    RUST_LOG                         = var.logs.filter
-    AWS_LWA_READINESS_CHECK_PROTOCOL = "tcp" # as an HTTP check would cost `serve` a bucket read
-  }
-  # What each function may do, besides write its logs.
-  grants = {
-    serve = [
-      { Action = ["s3:GetObject"], Resource = ["${local.app}/apps/*"] },
-      { Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"], Resource = ["${local.kv}/kv/*"] },
-      { Action = ["s3:PutObject"], Resource = ["${local.app}/compile/*"] },
-      { Action = ["s3:ListBucket"], Resource = [local.app, local.kv] }, # so a missing key is a 404, not a 403
-    ]
-    # The only writer of native code, which every host runs: see the buckets' policies and the teams'.
-    compile = [
-      { Action = ["s3:GetObject"], Resource = ["${local.app}/apps/*/releases/*"] },
-      { Action = ["s3:PutObject"], Resource = ["${local.app}/apps/*/releases/*/*.zst"] },
-      { Action = ["s3:DeleteObject"], Resource = ["${local.app}/compile/*"] },
-      { Action = ["s3:ListBucket"], Resource = [local.app] },
-    ]
-  }
 }
 
-# The app bucket holds what teams publish, and the native code made of it; the KV bucket, the apps' data, which only
-# `serve` reaches.
+# Everything tric keeps: apps, their releases and components, native code, the names' state, and `install`.
 resource "aws_s3_bucket" "this" {
-  for_each      = toset(["app", "kv"])
-  bucket        = "${var.name}-${local.account}-${var.region}-${each.key}"
+  bucket        = "${var.name}-${local.account}-${var.region}"
   force_destroy = var.force_destroy
 }
 
-# Every change to an app bucket's object keeps the old version for a week, so whatever a team or tric deletes or
-# overwrites by mistake can be put back. KV data has no versions: its writes are many and small.
-resource "aws_s3_bucket_versioning" "app" {
-  bucket = aws_s3_bucket.this["app"].id
+# Versioned, as a name's head pins each large value it holds by version, so a snapshot can read a value that a later
+# turn replaced. What is overwritten or deleted is kept for 7 days, so the operator can put it back.
+resource "aws_s3_bucket_versioning" "this" {
+  bucket = aws_s3_bucket.this.id
   versioning_configuration { status = "Enabled" }
 }
 
-# The buckets' own policies bind every principal in the account, admins too, until someone changes them: they take only
-# TLS, and only the compile function may write native code into the app bucket, however the policies above are loosened.
-# S3's defaults already block public access, turn off ACLs and encrypt at rest.
-resource "aws_s3_bucket_policy" "this" {
-  for_each = aws_s3_bucket.this
-  bucket   = each.value.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [for s in [
-      {
-        Sid       = "TLSOnly"
-        Action    = ["s3:*"]
-        Resource  = [each.value.arn, "${each.value.arn}/*"]
-        Condition = { Bool = { "aws:SecureTransport" = "false" } }
-      },
-      {
-        Sid       = "NativeCodeOnlyFromCompile"
-        Action    = ["s3:PutObject"] # which a copy, a multipart upload and a restored version all need
-        Resource  = ["${each.value.arn}/apps/*.zst"]
-        Condition = { ArnNotEquals = { "aws:PrincipalArn" = aws_iam_role.fn["compile"].arn } }
-      },
-    ] : merge(s, { Effect = "Deny", Principal = "*" }) if s.Sid == "TLSOnly" || each.key == "app"]
-  })
-}
-
-resource "aws_s3_bucket_lifecycle_configuration" "app" {
-  bucket = aws_s3_bucket.this["app"].id
+resource "aws_s3_bucket_lifecycle_configuration" "this" {
+  bucket = aws_s3_bucket.this.id
   rule {
     id     = "versions"
     status = "Enabled"
@@ -91,107 +42,166 @@ resource "aws_s3_bucket_lifecycle_configuration" "app" {
     expiration { expired_object_delete_marker = true }
     abort_incomplete_multipart_upload { days_after_initiation = 1 }
   }
-  # A marker that a failed compile leaves, so that a host asks again a day later.
-  rule {
-    id     = "markers"
-    status = "Enabled"
-    filter { prefix = "compile/" }
-    expiration { days = 1 }
-  }
-  depends_on = [aws_s3_bucket_versioning.app]
+  depends_on = [aws_s3_bucket_versioning.this]
 }
 
-resource "aws_lambda_permission" "compile" {
-  statement_id   = "markers"
-  action         = "lambda:InvokeFunction"
-  function_name  = aws_lambda_function.compile.function_name
-  principal      = "s3.amazonaws.com"
-  source_arn     = local.app
-  source_account = local.account
+# The bucket's own policy binds every principal, the operator too: it takes only TLS. S3's defaults already block public
+# access, turn off ACLs and encrypt at rest.
+resource "aws_s3_bucket_policy" "this" {
+  bucket = aws_s3_bucket.this.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "TLSOnly"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = ["s3:*"]
+      Resource  = [local.bucket, "${local.bucket}/*"]
+      Condition = { Bool = { "aws:SecureTransport" = "false" } }
+    }]
+  })
 }
 
-resource "aws_s3_bucket_notification" "markers" {
-  bucket = aws_s3_bucket.this["app"].id
-  lambda_function {
-    lambda_function_arn = aws_lambda_function.compile.arn
-    events              = ["s3:ObjectCreated:*"]
-    filter_prefix       = "compile/"
-  }
-  depends_on = [aws_lambda_permission.compile]
-}
-
-resource "aws_cloudwatch_log_group" "fn" {
-  for_each          = local.grants
-  name              = "/aws/lambda/${var.name}-${each.key}"
+resource "aws_cloudwatch_log_group" "this" {
+  name              = "/aws/lambda/${var.name}"
   retention_in_days = var.logs.days
 }
 
-resource "aws_iam_role" "fn" {
-  for_each = local.grants
-  name     = "${var.name}-${each.key}"
+resource "aws_iam_role" "function" {
+  name = var.name
   assume_role_policy = jsonencode({
     Version   = "2012-10-17"
     Statement = [{ Effect = "Allow", Action = "sts:AssumeRole", Principal = { Service = "lambda.amazonaws.com" } }]
   })
 }
 
-resource "aws_iam_role_policy" "fn" {
-  for_each = local.grants
-  role     = aws_iam_role.fn[each.key].id
+# The bucket, which Lambda's records of failed events go to as well; invoking itself with an outbox; and its logs.
+resource "aws_iam_role_policy" "function" {
+  role = aws_iam_role.function.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [for s in concat(each.value, [{
-      Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
-      Resource = ["${aws_cloudwatch_log_group.fn[each.key].arn}:*"]
-    }]) : merge(s, { Effect = "Allow" })]
+    Statement = [for s in [
+      # GetObjectVersion, for a large value pinned by version.
+      {
+        Action   = ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject"]
+        Resource = ["${local.bucket}/*"]
+      },
+      { Action = ["s3:ListBucket"], Resource = [local.bucket] }, # so a missing key is a 404, not a 403
+      { Action = ["lambda:InvokeFunction"], Resource = [local.function] },
+      { Action = ["logs:CreateLogStream", "logs:PutLogEvents"], Resource = ["${aws_cloudwatch_log_group.this.arn}:*"] },
+    ] : merge(s, { Effect = "Allow" })]
   })
 }
 
-# One zip is both functions: its `bootstrap` runs the subcommand that the handler names.
-resource "aws_lambda_function" "compile" {
-  function_name                  = "${var.name}-compile"
-  handler                        = "compile-worker"
-  role                           = aws_iam_role.fn["compile"].arn
+# One function for everything: `bootstrap` runs `tric serve`, as the handler says, behind the adapter.
+resource "aws_lambda_function" "this" {
+  function_name                  = var.name
+  handler                        = "serve"
+  role                           = aws_iam_role.function.arn
   runtime                        = "provided.al2023"
   architectures                  = ["arm64"]
   layers                         = [local.adapter]
   filename                       = local.zip
   source_code_hash               = filebase64sha256(local.zip)
-  memory_size                    = 3008
-  timeout                        = 120
-  reserved_concurrent_executions = var.concurrency.compile
+  memory_size                    = var.memory
+  timeout                        = 900 # an outbox's delivery, which waits for its turn's commit and retries
+  reserved_concurrent_executions = var.concurrency
   environment {
-    # A 5xx fails the invocation, so Lambda retries the event.
-    variables = merge(local.env, { AWS_LWA_ERROR_STATUS_CODES = "500-599" })
+    variables = {
+      TRIC_STORE  = "s3://${aws_s3_bucket.this.bucket}"
+      TRIC_DOMAIN = var.domain
+      TRIC_LISTEN = "127.0.0.1:8080" # where the adapter sends requests
+      RUST_LOG    = var.logs.filter
+      # A TCP check, as an HTTP one would be a request to no app. No AWS_LWA_ERROR_STATUS_CODES: it would turn an app's
+      # 5xx into a 502, so Lambda retries an event only when the function crashes or times out.
+      AWS_LWA_READINESS_CHECK_PROTOCOL = "tcp"
+      AWS_LWA_INVOKE_MODE              = "response_stream" # as the Function URL's
+    }
   }
-  depends_on = [aws_iam_role_policy.fn]
+  depends_on = [aws_iam_role_policy.function, aws_cloudwatch_log_group.this]
 }
 
-resource "aws_lambda_function" "serve" {
-  function_name                  = "${var.name}-serve"
-  handler                        = "serve"
-  role                           = aws_iam_role.fn["serve"].arn
-  runtime                        = "provided.al2023"
-  architectures                  = ["arm64"]
-  layers                         = [local.adapter]
-  filename                       = local.zip
-  source_code_hash               = filebase64sha256(local.zip)
-  memory_size                    = var.serve.memory
-  timeout                        = 30
-  reserved_concurrent_executions = var.concurrency.serve
-  ephemeral_storage { size = var.serve.storage }
-  environment {
-    variables = merge(local.env, { AWS_LWA_PORT = "3000", TRIC_KV = "s3://${aws_s3_bucket.this["kv"].bucket}" })
+# An outbox or cron event whose invocation crashed or timed out is tried twice more, and then kept in the bucket, at
+# `aws/lambda/async/<function>/<yyyy>/<mm>/<dd>/…`, where Lambda puts it.
+resource "aws_lambda_function_event_invoke_config" "this" {
+  function_name                = aws_lambda_function.this.function_name
+  maximum_retry_attempts       = 2
+  maximum_event_age_in_seconds = 21600
+  destination_config {
+    on_failure { destination = local.bucket }
   }
-  # After the compile function, so a new build's hosts ask for native code from a compile function of the same build.
-  depends_on = [aws_iam_role_policy.fn, aws_lambda_function.compile]
 }
 
 # Public, as CloudFront's origin: one that skips CloudFront can still reach only what CloudFront would route it to.
-# The provider adds both of the permissions that a public Function URL needs.
-resource "aws_lambda_function_url" "serve" {
-  function_name      = aws_lambda_function.serve.function_name
+# The provider adds both of the permissions that a public Function URL needs. Streamed, so a response's head reaches
+# CloudFront within the 10 s an app has to answer, inside CloudFront's 30 s, and its body may take the 300 s it may.
+resource "aws_lambda_function_url" "this" {
+  function_name      = aws_lambda_function.this.function_name
   authorization_type = "NONE"
+  invoke_mode        = "RESPONSE_STREAM"
+}
+
+# The apps' cron: `tric deploy` and `tric release` keep a schedule in this group for each of an app's expressions, which
+# invokes the function with the role below. `install` tells them which.
+resource "aws_scheduler_schedule_group" "this" {
+  name = var.name
+}
+
+resource "aws_iam_role" "scheduler" {
+  name = "${var.name}-scheduler"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Principal = { Service = "scheduler.amazonaws.com" }
+      Condition = { StringEquals = { "aws:SourceAccount" = local.account } }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "scheduler" {
+  role = aws_iam_role.scheduler.id
+  policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Effect = "Allow", Action = ["lambda:InvokeFunction"], Resource = [aws_lambda_function.this.arn] }]
+  })
+}
+
+resource "aws_s3_object" "install" {
+  bucket       = aws_s3_bucket.this.id
+  key          = "install"
+  content_type = "application/json"
+  content = jsonencode({
+    function = aws_lambda_function.this.arn
+    role     = aws_iam_role.scheduler.arn
+    group    = aws_scheduler_schedule_group.this.name
+  })
+}
+
+# What the CLI needs to deploy, release and set the environment of any app, for the operator to attach to whoever
+# deploys. Its writes are under `apps/`, so a deployer cannot write native code, which hosts load unchecked: what a
+# deployer ships runs in the sandbox.
+resource "aws_iam_policy" "deploy" {
+  name = "${var.name}-deploy"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [for s in [
+      { Action = ["s3:GetObject", "s3:PutObject"], Resource = ["${local.bucket}/apps/*"] },
+      { Action = ["s3:GetObject"], Resource = ["${local.bucket}/install"] },
+      { Action = ["s3:ListBucket"], Resource = [local.bucket] },
+      { Action = ["scheduler:ListSchedules"], Resource = ["*"] }, # which takes no resource
+      {
+        Action   = ["scheduler:CreateSchedule", "scheduler:DeleteSchedule"]
+        Resource = ["arn:aws:scheduler:${var.region}:${local.account}:schedule/${var.name}/*"]
+      },
+      {
+        Action    = ["iam:PassRole"]
+        Resource  = [aws_iam_role.scheduler.arn]
+        Condition = { StringEquals = { "iam:PassedToService" = "scheduler.amazonaws.com" } }
+      },
+    ] : merge(s, { Effect = "Allow" })]
+  })
 }
 
 resource "aws_acm_certificate" "this" {
@@ -243,8 +253,8 @@ resource "aws_cloudfront_distribution" "this" {
   http_version    = "http2and3"
   is_ipv6_enabled = true
   origin {
-    origin_id   = "serve"
-    domain_name = split("/", aws_lambda_function_url.serve.function_url)[2]
+    origin_id   = "function"
+    domain_name = split("/", aws_lambda_function_url.this.function_url)[2]
     custom_origin_config {
       http_port              = 80
       https_port             = 443
@@ -253,7 +263,7 @@ resource "aws_cloudfront_distribution" "this" {
     }
   }
   default_cache_behavior {
-    target_origin_id         = "serve"
+    target_origin_id         = "function"
     viewer_protocol_policy   = "redirect-to-https"
     allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
     cached_methods           = ["GET", "HEAD"]
@@ -284,51 +294,6 @@ resource "aws_route53_record" "apps" {
     zone_id                = aws_cloudfront_distribution.this.hosted_zone_id
     evaluate_target_health = false
   }
-}
-
-# A team owns the apps named `<team>-…`: it may read and delete them, write their `current`, releases and components,
-# and the markers that ask for their native code. The `team` tag of its role says which; the roles allow no session
-# tags, which could otherwise claim another team.
-#
-# A team may not write native code, which every host runs unchecked, so it could run anything. IAM's `*` matches `/`,
-# so what keeps it out is that a native key ends in `.zst` and none of the keys a team may write does, and the app
-# bucket's policy, which lets only the compile function write such a key. Any key added here must keep it so. Deleting
-# native code costs only a compile.
-#
-# It may list the whole app bucket, as S3 answers a missing key with a 403 to a caller that may not list. A condition
-# that held lists to the team's prefixes but let a GET's 404 through would also let through a list of no prefix, so
-# teams see each other's app names and release ids; KV's keys are in a bucket of their own.
-resource "aws_iam_policy" "team" {
-  name = "${var.name}-team"
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [for s in [
-      { Action = ["s3:GetObject", "s3:DeleteObject"], Resource = ["${local.app}/apps/${local.team}-*"] },
-      {
-        Action = ["s3:PutObject"]
-        Resource = [for key in ["current", "releases/*/release", "releases/*/component"] :
-        "${local.app}/apps/${local.team}-*/${key}"]
-      },
-      { Action = ["s3:GetObject", "s3:PutObject"], Resource = ["${local.app}/compile/${local.team}-*"] },
-      { Action = ["s3:ListBucket"], Resource = [local.app] },
-    ] : merge(s, { Effect = "Allow" })]
-  })
-}
-
-resource "aws_iam_role" "team" {
-  for_each = var.teams
-  name     = "${var.name}-team-${each.key}"
-  tags     = { team = each.key }
-  assume_role_policy = jsonencode({
-    Version   = "2012-10-17"
-    Statement = [{ Effect = "Allow", Action = "sts:AssumeRole", Principal = { AWS = "arn:aws:iam::${local.account}:root" } }]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "team" {
-  for_each   = var.teams
-  role       = aws_iam_role.team[each.key].name
-  policy_arn = aws_iam_policy.team.arn
 }
 
 # The whole account's spend, as the function's URL is public.

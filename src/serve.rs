@@ -282,7 +282,8 @@ impl Tric {
         state::is_app(&app).then_some((app, host))
     }
 
-    /// Runs an event: delivers an outbox, or fires a cron job. A failed delivery answers 500, so Lambda tries it again.
+    /// Runs an event: delivers an outbox, or fires a cron job. A failed delivery answers 500 and is logged; Lambda tries
+    /// an event again only when the function crashes or times out, as no status fails an invocation.
     async fn event(self: Arc<Self>, req: Request) -> Response {
         let Ok(body) = Limited::new(req.into_body(), EVENT_MAX).collect().await else {
             return status(StatusCode::PAYLOAD_TOO_LARGE);
