@@ -60,10 +60,27 @@ call; it may call none otherwise, and never a private address. A directory with 
 - **`Forwarded`** is set by tric on every request, and is the only word on where it came from: the client, `for=_cron`
   or `for=_tric`.
 
+## Running it
+
+`tric dev` runs one app in one process. `tric` itself is installed with `cargo install --locked --path .` in a
+checkout.
+
+To run many apps, deploy them to a bucket. Two processes then serve them:
+- `tric route` maps `<app>.<domain>` to the app, and mints storage credentials that reach only that app;
+- `tric serve` runs the app with those credentials, and holds none of its own.
+
+`docker compose up route` runs both, with MinIO, at `http://<app>.localhost:3000`. In
+`docker compose run --rm dev`, `cargo run -- deploy <path>` deploys there.
+
+On AWS, serve gives each app its own Lambda tenant, so an escape from the Wasm sandbox reaches one app only.
+[infra/aws](infra/aws/README.md) installs it into an account with one `tofu apply`.
+
 ## Developing
 
 Everything runs in Docker, one stack per worktree. `docker compose run --rm test` is the gate: it builds the test
-components, checks formatting and lints, and runs the tests. [docs/plan.md](docs/plan.md) is the plan.
+components, checks formatting and lints, and runs the tests.
+- [docs/plan.md](docs/plan.md) is the plan.
+- [docs/decisions.md](docs/decisions.md) holds the choices it leaves open.
 
 ## Licence
 

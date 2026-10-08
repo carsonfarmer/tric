@@ -205,14 +205,17 @@ aws/lambda/async/                the dead letters: Lambda's on-failure records, 
 
 ### AWS (OpenTofu)
 
-- **The router:** a function URL with streaming, behind CloudFront at `*.<domain>`, plus an `outbox` alias. The alias
-  carries the async config: two retries, a 6 h maximum event age, and the bucket as the on-failure destination.
+- **The router:** two functions from one package, on one role:
+  - `route`, a function URL with streaming behind CloudFront at `*.<domain>`, which takes only requests carrying
+    CloudFront's origin secret;
+  - `events`, which takes only events, plus an `outbox` alias. The alias carries the async config: two retries, a
+    6 h maximum event age, and the bucket as the on-failure destination.
 - **serve:** per tenant (`PER_TENANT`), with no URL. Only the router may invoke it.
 - **The roles:**
   - the app role, which trusts only the router's role;
   - the router's role, which can assume the app role, HEAD `current` and invoke serve;
-  - serve's role, with its logs and `router:outbox` only;
-  - the Scheduler role, which can invoke the router.
+  - serve's role, with its logs and `events:outbox` only;
+  - the Scheduler role, which can invoke `events`, unqualified.
 - **The bucket:** versioning, the lifecycle rules (noncurrent versions, delete markers, the dead letters), and short log
   retention.
 - One `tofu apply` installs it all into a fresh account. The apply waits for the user's go-ahead.
