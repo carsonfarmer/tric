@@ -7,7 +7,7 @@ use crate::state::{self, random};
 use base64::{Engine as _, prelude::BASE64_STANDARD as B64};
 use bytes::Bytes;
 use http::HeaderMap;
-use object_store::{Error as E, GetOptions, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion, path::Path};
+use object_store::{GetOptions, ObjectStore, ObjectStoreExt, UpdateVersion, path::Path};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -99,8 +99,7 @@ fn value_path(app: &str, key: &str) -> Path {
 
 /// The head at `path`, with its version.
 pub async fn read(store: &dyn ObjectStore, path: &Path) -> Result<Option<(Head, UpdateVersion)>> {
-    let Some((bytes, version)) = state::read(store, path, HEAD_MAX as u64).await? else { return Ok(None) };
-    Ok(Some((serde_json::from_slice(&bytes)?, version)))
+    state::json(store, path, HEAD_MAX as u64).await
 }
 
 /// The `ETag` of a head's version: a strong one, whatever the store says.
@@ -348,14 +347,7 @@ impl Turn {
 
     /// Writes the head `head` over the version `base`, or where there is none, if that is still the head.
     async fn put(&self, head: &Head, base: Option<UpdateVersion>) -> Result<Option<UpdateVersion>> {
-        let json = serde_json::to_vec(head)?;
-        ensure!(json.len() <= HEAD_MAX, "the name would be over {HEAD_MAX} bytes");
-        let mode = base.map_or(PutMode::Create, PutMode::Update);
-        match self.store.put_opts(&self.path, json.into(), mode.into()).await {
-            Ok(r) => Ok(Some(UpdateVersion { e_tag: r.e_tag, version: r.version })),
-            Err(E::Precondition { .. } | E::AlreadyExists { .. } | E::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        state::put(&*self.store, &self.path, head, HEAD_MAX as u64, base).await
     }
 
     /// Claims the name, so that no other turn commits before this one, and returns whether it holds the claim. One that
@@ -593,13 +585,10 @@ pub async fn settle(store: &dyn ObjectStore, path: &Path, commit: &str, until: I
         if head.pending.remove(commit).is_none() {
             return Ok(());
         }
-        if !head.claim.as_ref().is_some_and(Claim::live) {
-            let json = serde_json::to_vec(&head)?;
-            match store.put_opts(path, json.into(), PutMode::Update(version).into()).await {
-                Ok(_) => return Ok(()),
-                Err(E::Precondition { .. } | E::NotFound { .. }) => {}
-                Err(e) => return Err(e.into()),
-            }
+        if !head.claim.as_ref().is_some_and(Claim::live)
+            && state::put(store, path, &head, HEAD_MAX as u64, Some(version)).await?.is_some()
+        {
+            return Ok(());
         }
         ensure!(Instant::now() < until, "the name stayed claimed");
         sleep(Duration::from_millis(rand::random_range(25..=50))).await;

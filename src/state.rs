@@ -13,7 +13,7 @@
 //! it, so it is trusted as the bucket is: whoever may write the bucket may run code in it.
 use bytes::Bytes;
 use object_store::{Error as E, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion, path::Path};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use wasmtime::{Result, bail, ensure, error::Context};
@@ -105,12 +105,32 @@ async fn fetch(store: &dyn ObjectStore, path: &Path, max: u64, hash: &str) -> Re
     Ok(bytes)
 }
 
-async fn json<T: for<'a> Deserialize<'a>>(store: &dyn ObjectStore, path: &Path) -> Result<Option<(T, UpdateVersion)>> {
-    match read(store, path, JSON_MAX).await? {
-        Some((bytes, version)) => {
-            Ok(Some((serde_json::from_slice(&bytes).with_context(|| format!("{path}"))?, version)))
-        }
-        None => Ok(None),
+/// The JSON object at `path` and its version, or `None` if there is none.
+pub async fn json<T: DeserializeOwned>(
+    store: &dyn ObjectStore,
+    path: &Path,
+    max: u64,
+) -> Result<Option<(T, UpdateVersion)>> {
+    let Some((bytes, version)) = read(store, path, max).await? else { return Ok(None) };
+    Ok(Some((serde_json::from_slice(&bytes).with_context(|| format!("{path}"))?, version)))
+}
+
+/// Writes `value` as JSON over the object at `path` with `base` as its version, or where there is none if `base` is
+/// `None`, if that is still the object: its new version, or `None` if another write landed first.
+pub async fn put(
+    store: &dyn ObjectStore,
+    path: &Path,
+    value: &impl Serialize,
+    max: u64,
+    base: Option<UpdateVersion>,
+) -> Result<Option<UpdateVersion>> {
+    let json = serde_json::to_vec(value)?;
+    ensure!(json.len() as u64 <= max, "{path} would be over {max} bytes");
+    let mode = base.map_or(PutMode::Create, PutMode::Update);
+    match store.put_opts(path, json.into(), mode.into()).await {
+        Ok(r) => Ok(Some(UpdateVersion { e_tag: r.e_tag, version: r.version })),
+        Err(E::Precondition { .. } | E::AlreadyExists { .. } | E::NotFound { .. }) => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -122,7 +142,7 @@ pub async fn apps(store: &dyn ObjectStore) -> Result<Vec<String>> {
 
 /// What `app` runs, if it has been deployed.
 pub async fn current(store: &dyn ObjectStore, app: &str) -> Result<Option<Current>> {
-    Ok(json(store, &path(app, &["current"])).await?.map(|(c, _)| c))
+    Ok(json(store, &path(app, &["current"]), JSON_MAX).await?.map(|(c, _)| c))
 }
 
 /// `app`'s release `id`.
@@ -138,7 +158,7 @@ pub async fn component(store: &dyn ObjectStore, app: &str, hash: &str) -> Result
 
 /// The install's details, if it is on AWS.
 pub async fn install(store: &dyn ObjectStore) -> Result<Option<Install>> {
-    Ok(json(store, &"install".into()).await?.map(|(i, _)| i))
+    Ok(json(store, &"install".into(), JSON_MAX).await?.map(|(i, _)| i))
 }
 
 /// Uploads `wasm` as `release`'s component, and `release` as a release of `app`, each unless it is there, and returns
@@ -170,15 +190,10 @@ pub async fn update(
     ensure!(is_app(app), "{app:?} is not an app name");
     let at = path(app, &["current"]);
     for _ in 0..TRIES {
-        let (old, version) = json(store, &at).await?.unzip();
+        let (old, version) = json(store, &at, JSON_MAX).await?.unzip();
         let new = change(old)?;
-        let bytes = serde_json::to_vec(&new)?;
-        ensure!(bytes.len() as u64 <= JSON_MAX, "{app}'s current would be over {JSON_MAX} bytes");
-        let mode = version.map_or(PutMode::Create, PutMode::Update);
-        match store.put_opts(&at, bytes.into(), mode.into()).await {
-            Ok(_) => return Ok(new),
-            Err(E::Precondition { .. } | E::AlreadyExists { .. } | E::NotFound { .. }) => {}
-            Err(e) => return Err(e.into()),
+        if put(store, &at, &new, JSON_MAX, version).await?.is_some() {
+            return Ok(new);
         }
     }
     bail!("{app} kept changing while this ran: run it again")
