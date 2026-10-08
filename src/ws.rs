@@ -7,8 +7,8 @@
 //! socket to a channel, or unsubscribes it. To publish to a channel, the app `POST`s Pushpin's publish API to
 //! `/publish/` at its own host, which `dispatch` takes in-process.
 //!
-//! What only tric says to the app is never believed from anyone else: `forward` calls `scrub` on each request that
-//! comes in, so a client's cannot claim to be an event, or a socket's, or GRIP's. Events are parsed whole and written
+//! What only tric says to the app is never believed from anyone else: `forward` strips it from each request that comes
+//! in, with this feature or without it, so a client's cannot claim to be an event, or a socket's, or GRIP's. Events are parsed whole and written
 //! out again, never passed on, and every size and count is bounded. Not here: `PING` and `PONG` events, `detach`,
 //! `Meta-` and `Grip-` headers, subprotocols, other formats of a publish, and an idle timeout.
 use crate::engine::ANSWER;
@@ -58,24 +58,6 @@ static SOCKETS: Semaphore = Semaphore::const_new(SOCKETS_MAX);
 /// Starts taking sockets and publishes.
 pub fn init() {
     BUS.get_or_init(|| broadcast::channel(256).0);
-}
-
-/// Removes from a request's `headers` what only `tric dev` says to the app: a `Connection-Id`, `Grip-` and `Meta-`
-/// headers, in either spelling of their dash, and a content type that mentions events.
-pub fn scrub(headers: &mut HeaderMap) {
-    let ours = |k: &&HeaderName| {
-        let k = k.as_str().replace('_', "-");
-        k == CONNECTION_ID.as_str() || k.starts_with("grip-") || k.starts_with("meta-")
-    };
-    let names: Vec<_> = headers.keys().filter(ours).cloned().collect();
-    for name in names {
-        headers.remove(name);
-    }
-    let events =
-        |v: &HeaderValue| String::from_utf8_lossy(v.as_bytes()).to_ascii_lowercase().contains("websocket-events");
-    if headers.get_all(CONTENT_TYPE).iter().any(events) {
-        headers.remove(CONTENT_TYPE);
-    }
 }
 
 /// Whether `parts` ask to upgrade, at a name.
@@ -444,14 +426,19 @@ mod tests {
         assert_eq!(Event::Close(Some(1000)).encode().as_ref(), b"CLOSE 2\r\n\x03\xe8\r\n");
     }
 
+    fn scrub(headers: &mut HeaderMap) {
+        crate::tric::forward(headers, HeaderValue::from_static("for=_tric"));
+    }
+
     #[test]
     fn scrubbing() {
         let mut headers = HeaderMap::new();
-        for k in "connection-id connection_id grip-sig grip_hold meta-user content-type authorization".split(' ') {
+        let names = "connection-id connection_id grip-sig grip_hold meta-user x_forwarded_for x_tric_c content-type";
+        for k in names.split(' ').chain(["authorization"]) {
             headers.append(HeaderName::from_bytes(k.as_bytes()).unwrap(), HeaderValue::from_static("Websocket-Events"));
         }
         scrub(&mut headers);
-        assert_eq!(headers.keys().map(|k| k.as_str()).collect::<Vec<_>>(), ["authorization"]);
+        assert_eq!(headers.keys().map(|k| k.as_str()).collect::<Vec<_>>(), ["authorization", "forwarded"]);
         for types in [&["text/plain, application/websocket-events"][..], &["application/json", "x/WebSocket-Events;y"]]
         {
             headers.remove(CONTENT_TYPE);

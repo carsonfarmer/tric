@@ -7,7 +7,7 @@ use crate::outbox::{self, Held, Sink};
 use crate::store::Store;
 use bytes::{Bytes, BytesMut};
 use futures_util::{FutureExt, StreamExt, stream};
-use http::header::{ETAG, FORWARDED, RETRY_AFTER};
+use http::header::{CONTENT_TYPE, ETAG, FORWARDED, RETRY_AFTER};
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use http_body_util::{BodyExt, BodyStream, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -122,17 +122,22 @@ where
     }
 }
 
-/// Makes `from` the only word on where a request came from: no other `Forwarded`, no `X-Forwarded-*` of a proxy, and
-/// none of the `X-Amz*` and `X-Tric-*` that AWS and tric pass between themselves.
+/// Makes `from` the only word on where a request came from: no other `Forwarded`, no `X-Forwarded-*` of a proxy, none
+/// of the `X-Amz*` and `X-Tric-*` that AWS and tric pass between themselves, and nothing that marks a WebSocket's event
+/// (`Connection-Id`, `Grip-*`, `Meta-*`, a content type of `websocket-events`), with the feature `ws` or without it.
+/// A name matches in either spelling of its dashes.
 pub fn forward(headers: &mut HeaderMap, from: HeaderValue) {
-    let hop = |k: &&HeaderName| ["x-forwarded-", "x-amz", "x-tric-"].iter().any(|p| k.as_str().starts_with(p));
-    let names: Vec<_> = headers.keys().filter(hop).cloned().collect();
+    const OURS: [&str; 6] = ["x-forwarded-", "x-amz", "x-tric-", "connection-id", "grip-", "meta-"];
+    let ours = |k: &&HeaderName| OURS.iter().any(|p| k.as_str().replace('_', "-").starts_with(p));
+    let names: Vec<_> = headers.keys().filter(ours).cloned().collect();
     for name in names {
         headers.remove(name);
     }
+    let events = |v: &HeaderValue| v.as_bytes().to_ascii_lowercase().windows(16).any(|w| w == b"websocket-events");
+    if headers.get_all(CONTENT_TYPE).iter().any(events) {
+        headers.remove(CONTENT_TYPE);
+    }
     headers.insert(FORWARDED, from);
-    #[cfg(feature = "ws")]
-    crate::ws::scrub(headers);
 }
 
 /// A turn's request body, which can run again if it was kept whole.

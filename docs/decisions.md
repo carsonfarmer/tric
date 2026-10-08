@@ -107,8 +107,10 @@ reason.
 - **Threat model.** What only tric says to the app is never believed from anyone else, and nothing a client sends is
   passed on as it is:
   - `forward`, which every request passes, removes a client's `Connection-Id`, `Grip-` and `Meta-` headers, in either
-    spelling of their dash, and a `Content-Type` that mentions `websocket-events`. So a plain request cannot be an
-    event, or a socket's, or GRIP's; the app answers it as any request, and `Forwarded` is still the only marker.
+    spelling of their dash, and a `Content-Type` that mentions `websocket-events`. It does so with the feature or
+    without it, so an app written for sockets is not fooled where tric holds none, as on AWS. A plain request cannot
+    be an event, or a socket's, or GRIP's; the app answers it as any request, and `Forwarded` is still the only
+    marker.
   - A socket's id is random, and an id alone speaks for no one: tric writes each event, from its own socket's frames.
   - A publish is taken only with `Forwarded: for=_tric`, which a client cannot send, as `forward` replaces its own.
     `tric serve` and `tric route` never take one.

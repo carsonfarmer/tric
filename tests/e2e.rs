@@ -311,20 +311,26 @@ async fn serves_and_forwards(kind: Kind) {
     assert_eq!(res.body, "0\n1\n2\n");
     assert!(res.head < Duration::from_secs(1) && start.elapsed() > Duration::from_secs(2), "the body streams");
 
-    // Whatever a client says of where it came from, or of whose it is, `Forwarded` is tric's, from the socket.
+    // Whatever a client says of where it came from, of whose it is, or of being a WebSocket's event, with the feature
+    // `ws` or without it, `Forwarded` is tric's, from the socket.
     let claims = [
         ("forwarded", "for=_cron"),
         ("x-forwarded-for", "9.9.9.9"),
+        ("x_forwarded_for", "9.9.9.9"),
         ("x-forwarded-host", "example.com"),
         ("x-tric-credentials", "{}"),
         ("x-amz-tenant-id", "other"),
+        ("connection-id", "c"),
+        ("meta-user", "u"),
+        ("content-type", "application/websocket-events"),
     ];
     let echo = tric.send("GET", "/echo?a=1", &claims).await.json();
     assert_eq!(echo["uri"], format!("http://{}/echo?a=1", tric.host));
     let headers = echo["headers"].as_array().unwrap();
     let forwarded: Vec<_> = headers.iter().filter(|h| h[0] == "forwarded").collect();
     assert_eq!(forwarded, [&json!(["forwarded", format!(r#"for=127.0.0.1;host="{}";proto=http"#, tric.host)])]);
-    let hop = |h: &&Value| ["x-forwarded-", "x-amz", "x-tric-"].iter().any(|p| h[0].as_str().unwrap().starts_with(p));
+    let ours = ["x-forwarded-", "x-amz", "x-tric-", "connection-id", "meta-", "content-type"];
+    let hop = |h: &&Value| ours.iter().any(|p| h[0].as_str().unwrap().replace('_', "-").starts_with(p));
     assert!(!headers.iter().any(|h| hop(&h)), "{headers:?}");
 
     assert_eq!(tric.get("/env").await.json()["env"]["GREETING"], "hi");
