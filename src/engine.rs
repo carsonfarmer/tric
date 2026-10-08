@@ -1,54 +1,51 @@
-//! The Wasmtime engine, and apps on it: a fresh store per request, under hard limits: 10 s, 256 MiB, 32 MiB copied in
-//! by one host call, nothing inherited, and outbound HTTP only to the hosts the app allows.
+//! The Wasmtime engine, and apps on it: one `wasi:http/handler@0.3` component each, a fresh instance per request, under
+//! hard limits, with nothing granted but what tric provides.
 use crate::kv::Imports;
-use crate::outbound::{Allow, Outbound};
-use http_body_util::BodyExt;
-use hyper::body::{Body, Bytes};
-use object_store::ObjectStore;
+use crate::serve::{Ctx, Outbound};
+use std::future::poll_fn;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::task::{Context, Poll};
-use std::{collections::BTreeMap, path::Path, pin::Pin, sync::Arc, thread, time::Duration, time::Instant};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio::time::{Sleep, sleep, timeout_at};
+use std::{sync::Arc, thread, time::Duration};
+use tokio::sync::{Semaphore, oneshot};
+use tokio::task::AbortHandle;
+use tokio::time::timeout;
 use tracing::Instrument;
-use wasmtime::component::{Component, GuestTaskId, HasSelf, Linker, ResourceTable};
-use wasmtime::{Config, ResourceLimiter, Result, Store, StoreContextMut};
+use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
+use wasmtime::{Config, ResourceLimiter, Result, Store, bail};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView, p2::pipe::MemoryOutputPipe};
-use wasmtime_wasi_config::{WasiConfig, WasiConfigVariables};
-use wasmtime_wasi_http::handler::{HandlerState, Instance, ProxyHandler, ProxyPre, Response, ShouldAccept};
-use wasmtime_wasi_http::handler::{WorkerExpiration, WorkerState, WorkerStatus};
-use wasmtime_wasi_http::{Error, WasiHttpCtx, WasiHttpCtxView, WasiHttpView, p2, p3};
+use wasmtime_wasi_http::p3::bindings::{Service, ServicePre};
+use wasmtime_wasi_http::{WasiBody, WasiHttpCtx, WasiHttpCtxView, WasiHttpView, p3};
 
-/// One epoch tick. A guest yields to the scheduler once per tick, so this bounds how long a runaway delays others.
+/// One epoch tick. A guest yields once per tick, so this bounds how long a runaway holds up the others.
 const TICK: Duration = Duration::from_millis(10);
-const TIMEOUT: Duration = Duration::from_secs(10); // from the start of instantiation to the end of the request
+/// From instantiation to the response's head.
+pub const ANSWER: Duration = Duration::from_secs(10);
+/// From instantiation to the end of everything the instance does, its response's body included.
+const TOTAL: Duration = Duration::from_secs(300);
 const MEMORY: usize = 256 << 20; // all linear memories of a store together
 const MEMORIES: usize = 4; // per store, as are the next two
 const INSTANCES: usize = 16;
 const TABLES: usize = 16;
 const TABLE_MAX: usize = 100_000; // elements in one table
-const LOG_CAP: usize = 64 << 10; // per stream, per request
-const MAX_INFLIGHT: usize = 64;
+const LOG_MAX: usize = 64 << 10; // of stdout, and of stderr, per request
+const IN_FLIGHT: usize = 64; // requests per app
 const RESOURCES: usize = 256; // live resources per store; the default is a million
 const HOSTCALL_FUEL: usize = 32 << 20; // bytes one host call may copy out of the guest; the default is 128 MiB
 
-/// Compiles components, and loads them as apps. Make one per process and load every app from it.
+/// Compiles components, and loads them as apps. One per process.
 pub struct Engine {
     engine: wasmtime::Engine,
     linker: Linker<Host>,
 }
 
 impl Engine {
-    /// Configures Wasmtime and starts the thread that ticks its epoch until the engine and its apps are dropped.
+    /// Configures Wasmtime and starts the thread that ticks its epoch for as long as the engine lives.
     pub fn new() -> Result<Self> {
         let mut cfg = Config::new();
-        // The architecture's baseline rather than this CPU's features, so every host of this build and architecture
-        // makes the same native code and can load any other's.
+        // The architecture's baseline, not this CPU's features, so every host of one build loads any other's native code.
         cfg.target(&target_lexicon::HOST.to_string())?;
-        cfg.wasm_component_model_async(true).wasm_component_model_async_stackful(true);
-        cfg.wasm_component_model_more_async_builtins(true).epoch_interruption(true);
+        cfg.wasm_component_model_async(true).epoch_interruption(true);
         let engine = wasmtime::Engine::new(&cfg)?;
-        // An OS thread, not a tokio task: a task would not run once every worker thread is busy with a guest.
+        // An OS thread, not a task: a task would not run while every worker thread is busy with a guest.
         let weak = engine.weak();
         thread::spawn(move || {
             while weak.upgrade().map(|e| e.increment_epoch()).is_some() {
@@ -56,23 +53,16 @@ impl Engine {
             }
         });
         let mut linker = Linker::new(&engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-        p2::add_only_http_to_linker_async(&mut linker)?;
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?; // as Rust's standard library on wasm32-wasip2 imports it
         wasmtime_wasi::p3::add_to_linker(&mut linker)?;
         p3::add_to_linker(&mut linker)?;
-        wasmtime_wasi_config::add_to_linker(&mut linker, |h: &mut Host| WasiConfig::from(&h.app.config))?;
         Imports::add_to_linker::<Host, HasSelf<Host>>(&mut linker, |h| h)?; // `wasi:keyvalue`
         Ok(Self { engine, linker })
     }
 
-    /// Compiles the component `wasm`, binary or WAT text.
+    /// Compiles the component `wasm`.
     pub fn compile(&self, wasm: &[u8]) -> Result<Component> {
         Component::new(&self.engine, wasm)
-    }
-
-    /// Compiles the component `wasm` to native code, which any engine of the same `compat` loads with `native`.
-    pub fn precompile(&self, wasm: &[u8]) -> Result<Vec<u8>> {
-        self.engine.precompile_component(wasm)
     }
 
     /// Which native code this engine loads: what an engine of the same build and architecture made.
@@ -82,57 +72,42 @@ impl Engine {
         format!("{:016x}", hasher.finish())
     }
 
-    /// Loads the native code in the file at `path`, which it maps rather than reads.
+    /// Loads native code that `Component::serialize` made.
     ///
     /// # Safety
     ///
-    /// Loading native code runs it, so the file must hold what `precompile` made, and must not change while the
-    /// component lives.
-    pub unsafe fn native(&self, path: &Path) -> Result<Component> {
-        unsafe { Component::deserialize_file(&self.engine, path) }
+    /// Loading native code runs it, so `bytes` must be what an engine of the same `compat` made.
+    pub unsafe fn deserialize(&self, bytes: &[u8]) -> Result<Component> {
+        unsafe { Component::deserialize(&self.engine, bytes) }
     }
 
-    /// Loads `code` as the app `name`, with `config` for its `wasi:config` and `kv`, which holds nothing else, for its
-    /// `wasi:keyvalue` data. It exports either `wasi:http/handler` (p3) or `incoming-handler` (p2). Its outbound HTTP
-    /// goes only to `allowed`, items like `https://api.example.com` or `https://*.example.com:8443`, and none at all if
-    /// that is empty.
-    pub fn load(
-        &self,
-        name: &str,
-        kv: Arc<dyn ObjectStore>,
-        code: &Component,
-        config: BTreeMap<String, String>,
-        allowed: &[String],
-    ) -> Result<App> {
-        let allow = allowed.iter().map(|a| Allow::parse(a)).collect::<Result<_, _>>().map_err(wasmtime::Error::msg)?;
-        let pre = self.linker.instantiate_pre(code)?;
-        let pre = match p3::bindings::ServiceIndices::new(&pre) {
-            Ok(_) => ProxyPre::P3(p3::bindings::ServicePre::new(pre)?),
-            Err(_) => ProxyPre::P2(p2::bindings::ProxyPre::new(pre)?),
-        };
-        let app = Arc::new(Shared { name: name.into(), config: config.into_iter().collect(), kv, allow });
-        let permits = Arc::new(Semaphore::new(MAX_INFLIGHT));
-        Ok(App(ProxyHandler::new(State { engine: self.engine.clone(), pre, app, permits })))
+    /// Loads `component` as the app `name`, with `env` as its environment.
+    pub fn load(&self, name: &str, component: &Component, env: Vec<(String, String)>) -> Result<App> {
+        let pre = ServicePre::new(self.linker.instantiate_pre(component)?)?;
+        let (name, env, permits) = (name.into(), env.into(), Arc::new(Semaphore::new(IN_FLIGHT)));
+        Ok(App { engine: self.engine.clone(), pre, name, env, permits })
     }
 }
 
-/// What every store of one app shares, so a request costs one reference count, not a copy.
-pub(crate) struct Shared {
-    name: String,
-    config: WasiConfigVariables,
-    pub(crate) kv: Arc<dyn ObjectStore>,
-    pub(crate) allow: Vec<Allow>,
+/// An app: a component ready to instantiate, its environment and its slots for requests in flight.
+pub struct App {
+    engine: wasmtime::Engine,
+    pre: ServicePre<Host>,
+    pub name: Arc<str>,
+    env: Arc<[(String, String)]>,
+    permits: Arc<Semaphore>,
 }
 
 /// Per-store state.
-pub(crate) struct Host {
-    pub(crate) table: ResourceTable,
+pub struct Host {
+    pub table: ResourceTable,
     wasi: WasiCtx,
     http: WasiHttpCtx,
     hooks: Outbound,
-    pub(crate) app: Arc<Shared>,
+    pub ctx: Arc<Ctx>,
     memory: usize, // linear memory in use
 }
+
 impl ResourceLimiter for Host {
     fn memory_growing(&mut self, current: usize, desired: usize, _: Option<usize>) -> Result<bool> {
         let total = self.memory - current + desired;
@@ -151,106 +126,107 @@ impl ResourceLimiter for Host {
         MEMORIES
     }
 }
+
 impl WasiView for Host {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView { ctx: &mut self.wasi, table: &mut self.table }
     }
 }
+
 impl WasiHttpView for Host {
     fn http(&mut self) -> WasiHttpCtxView<'_> {
         WasiHttpCtxView { ctx: &mut self.http, table: &mut self.table, hooks: &mut self.hooks }
     }
 }
 
-/// Expires the worker, which drops its store, at `TIMEOUT`, even if the guest is only waiting.
-struct Deadline(Pin<Box<Sleep>>);
-impl WorkerExpiration for Deadline {
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>, _: WorkerStatus, _: Instant) -> Poll<()> {
-        self.0.as_mut().poll(cx)
-    }
-}
+type Answer = Result<http::Response<WasiBody>>;
 
-/// What outlives the store: its output pipes and its slot among the in-flight requests.
-struct Worker {
-    out: MemoryOutputPipe,
-    err: MemoryOutputPipe,
-    _permit: OwnedSemaphorePermit,
-}
-type Wait = Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
-impl WorkerState for Worker {
-    type StoreData = Host;
-    type RequestData = ();
-    fn should_accept_request(&self, _: usize, _: usize) -> ShouldAccept {
-        ShouldAccept::Never // one request per store
-    }
-    fn on_request_start(&self, _: StoreContextMut<Host>, _: (), _: GuestTaskId) -> Wait {
-        Box::pin(std::future::pending()) // `Deadline` enforces the timeout
-    }
-    /// Runs once the worker is done, also after a trap or a timeout, when `result` is the cause.
-    fn drop(&self, store: Store<Host>, result: Result<()>) {
-        let (app, out, err) = (&store.data().app.name, self.out.contents(), self.err.contents());
-        _ = result.inspect_err(|e| tracing::warn!(app, "guest failed: {e:#}"));
-        if !out.is_empty() {
-            tracing::info!(app, stream = "stdout", "{}", String::from_utf8_lossy(&out).trim_end());
-        }
-        if !err.is_empty() {
-            tracing::warn!(app, stream = "stderr", "{}", String::from_utf8_lossy(&err).trim_end());
-        }
-    }
-}
-
-/// An app that serves HTTP, one fresh instance per request. Clones share the component and the in-flight limit.
-#[derive(Clone)]
-pub struct App(ProxyHandler<State>);
 impl App {
-    /// Serves one request. A guest that traps, times out or hits a limit before it responds gives an empty 500 and a
-    /// log line with the cause; the guest's own output is logged too. Waits while 64 requests are already in flight.
-    /// The 10 s deadline also cuts a body that is still streaming, so read it to the end promptly.
-    pub async fn handle<B>(&self, req: hyper::Request<B>) -> Response
-    where
-        B: Body<Data = Bytes> + Send + 'static,
-        B::Error: Into<Error>,
-    {
-        // A span, so a filter like `warn,[request{app=NAME}]=info` turns on one app's request lines.
-        let span = tracing::info_span!("request", app = self.0.state().app.name);
-        span.in_scope(|| tracing::info!(method = %req.method(), path = req.uri().path()));
-        let res = self.0.handle((), req.map(|b| b.map_err(Into::into).boxed_unsync())).instrument(span.clone()).await;
-        res.unwrap_or_else(|e| {
-            span.in_scope(|| tracing::warn!("request failed: {e:#}"));
-            hyper::Response::builder().status(500).body(Default::default()).unwrap() // an empty body
-        })
-    }
-}
-
-struct State {
-    engine: wasmtime::Engine,
-    pre: ProxyPre<Host>,
-    app: Arc<Shared>,
-    permits: Arc<Semaphore>,
-}
-impl HandlerState for State {
-    type StoreData = Host;
-    type WorkerExpiration = Deadline;
-    type WorkerState = Worker;
-    async fn instantiate(&self) -> Result<Instance<Host, Deadline, Worker>> {
-        let _permit = self.permits.clone().acquire_owned().await?;
-        let expiration = Deadline(Box::pin(sleep(TIMEOUT)));
-        let (out, err) = (MemoryOutputPipe::new(LOG_CAP), MemoryOutputPipe::new(LOG_CAP));
-        let mut host = Host {
-            table: ResourceTable::new(),
-            wasi: WasiCtx::builder().stdout(out.clone()).stderr(err.clone()).build(), // nothing else is granted
-            http: WasiHttpCtx::new(),
-            hooks: Outbound(self.app.clone()),
-            app: self.app.clone(),
-            memory: 0,
-        };
+    /// Runs one request in a fresh instance, with `ctx` for its state and its outbound requests, and returns the
+    /// response once its head is there, with a handle that ends the instance, body and all. Waits while 64 requests of
+    /// the app are in flight. An instance that has not answered 10 s after it was instantiated is ended; one that
+    /// answered runs on for up to 300 s, as its body streams.
+    pub async fn call(
+        &self,
+        req: http::Request<WasiBody>,
+        ctx: Arc<Ctx>,
+    ) -> Result<(http::Response<WasiBody>, AbortHandle)> {
+        let permit = self.permits.clone().acquire_owned().await?;
+        let (out, err) = (MemoryOutputPipe::new(LOG_MAX), MemoryOutputPipe::new(LOG_MAX));
+        let wasi = WasiCtx::builder().stdout(out.clone()).stderr(err.clone()).envs(&self.env).build();
+        let hooks = Outbound(ctx.clone());
+        let mut host = Host { table: ResourceTable::new(), wasi, http: WasiHttpCtx::new(), hooks, ctx, memory: 0 };
         host.table.set_max_capacity(RESOURCES);
         let mut store = Store::new(&self.engine, host);
         store.limiter(|h| h);
         store.set_hostcall_fuel(HOSTCALL_FUEL);
-        // `serve` is concurrent, so yield at every tick instead of trapping, and let `Deadline` end the request.
-        store.epoch_deadline_async_yield_and_update(1);
-        let proxy = timeout_at(expiration.0.deadline(), self.pre.instantiate_async(&mut store)).await??;
-        Ok(Instance { store, proxy, view: Host::http, expiration, state: Worker { out, err, _permit } })
+        store.epoch_deadline_async_yield_and_update(1); // yield at every tick; the deadlines below end a runaway
+        let (pre, (tx, rx)) = (self.pre.clone(), oneshot::channel::<Answer>());
+        let span = tracing::Span::current();
+        let task = tokio::spawn(
+            async move {
+                let _permit = permit;
+                let run = async {
+                    let guest = pre.instantiate_async(&mut store).await?;
+                    run(&mut store, guest, req, tx).await
+                };
+                match timeout(TOTAL, run).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!("guest failed: {e:#}"),
+                    Err(_) => tracing::warn!("guest ran past {TOTAL:?}"),
+                }
+                for (stream, pipe) in [("stdout", out), ("stderr", err)] {
+                    let text = pipe.contents();
+                    if !text.is_empty() {
+                        tracing::info!(stream, "{}", String::from_utf8_lossy(&text).trim_end());
+                    }
+                }
+            }
+            .instrument(span),
+        );
+        match timeout(ANSWER, rx).await {
+            Ok(Ok(Ok(res))) => Ok((res, task.abort_handle())),
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(_)) => bail!("the guest failed before it answered"),
+            Err(_) => {
+                task.abort();
+                bail!("the guest did not answer within {ANSWER:?}")
+            }
+        }
     }
+}
+
+/// Calls the guest's handler, sends its response, or the error that stood in for one, on `tx`, and runs the store
+/// until the guest has nothing left to do.
+async fn run(
+    store: &mut Store<Host>,
+    guest: Service,
+    req: http::Request<WasiBody>,
+    tx: oneshot::Sender<Answer>,
+) -> Result<()> {
+    let (req, io) = p3::Request::from_http(store.data_mut().http().hooks, req);
+    let req = store.data_mut().table.push(req)?;
+    let call = guest.wasi_http_handler().func_handle().start_call_concurrent(&mut *store, (req,))?;
+    store
+        .run_concurrent(async move |accessor| {
+            let answered = async {
+                let res = guest.wasi_http_handler().func_handle().finish_call_concurrent(accessor, call).await?.0;
+                let res = res.map_err(|e| wasmtime::format_err!("the guest answered {e:?}"))?;
+                accessor.with(|mut store| {
+                    store.get().ctx.answered();
+                    let res = store.get().table.delete(res)?;
+                    res.into_http(&mut store, io)
+                })
+            };
+            match answered.await {
+                Ok(res) => _ = tx.send(Ok(res)),
+                Err(e) => {
+                    _ = tx.send(Err(wasmtime::format_err!("{e:#}")));
+                    return Err(e);
+                }
+            }
+            poll_fn(|cx| accessor.poll_no_interesting_tasks(cx)).await;
+            Ok(())
+        })
+        .await?
 }

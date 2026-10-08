@@ -1,5 +1,0 @@
-name = "hello"
-component = "../fixtures/hello-p3.wasm"
-
-[config]
-greeting = "hi"

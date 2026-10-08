@@ -1,5 +1,5 @@
-//! Outbound HTTP: the allow list, then name lookup and TCP by hand, so only an address that passed the block check is dialled.
-use crate::engine::Shared;
+//! Outbound HTTP: the allow list, then name lookup and TCP by hand, so only an address that passed the block check is
+//! dialled.
 use http_body_util::BodyExt;
 use hyper::{Uri, client::conn::http1};
 use std::net::IpAddr;
@@ -9,7 +9,7 @@ use tokio::net::{TcpStream, lookup_host};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs::default_provider, pki_types::ServerName};
 use wasmtime_wasi_http::handler::{Request, Response};
-use wasmtime_wasi_http::{Error, RequestOptions, WasiHttpHooks, io::TokioIo};
+use wasmtime_wasi_http::{Error, io::TokioIo};
 
 const ANY: &str = "*://*:*";
 
@@ -24,10 +24,10 @@ fn origin(uri: &Uri) -> Option<String> {
 }
 
 /// One allow-list item, `scheme://host[:port]`, kept as its origin. A host may start with `*.`, and `*://*:*` allows any.
-pub(crate) struct Allow(String);
+pub struct Allow(String);
 
 impl Allow {
-    pub(crate) fn parse(item: &str) -> Result<Self, String> {
+    pub fn parse(item: &str) -> Result<Self, String> {
         let item = item.to_ascii_lowercase();
         // The item must be the start of its own origin, which a path, a user name or a port that is no number is not.
         let ok = |o: &String| o.starts_with(&item) && !o.contains(".:") && !o.replacen("//*.", "//", 1).contains('*');
@@ -66,26 +66,27 @@ static TLS: LazyLock<TlsConnector> = LazyLock::new(|| {
     Arc::new(config.with_root_certificates(roots).with_no_client_auth()).into()
 });
 
-/// The hooks of one store.
-pub(crate) struct Outbound(pub(crate) Arc<Shared>);
-type Fut<T> = Box<dyn Future<Output = Result<T, Error>> + Send>; // the boxed futures `WasiHttpHooks` deals in
-type Sent = Result<(Response, Fut<()>), Error>;
+/// The boxed futures that `WasiHttpHooks` deals in.
+pub type Fut<T> = Box<dyn Future<Output = Result<T, Error>> + Send>;
+pub type Sent = Result<(Response, Fut<()>), Error>;
 
-impl WasiHttpHooks for Outbound {
-    /// Timeouts are the store's 10 s deadline, so `RequestOptions` is ignored.
-    fn send_request(&mut self, req: Request, _: Option<RequestOptions>, _: Fut<()>) -> Fut<(Response, Fut<()>)> {
-        Box::new(send(self.0.clone(), req))
-    }
-}
-
-async fn send(app: Arc<Shared>, req: Request) -> Sent {
-    let uri = req.uri();
-    // A user name before an `@` is guest text that would reach the `Host` header. Credentials go in `Authorization`.
+/// Whether `allow` lets a request go to `uri`. A user name before an `@` is guest text that would reach the `Host`
+/// header, so it is refused; credentials go in `Authorization`.
+pub fn allowed(allow: &[Allow], uri: &Uri) -> Result<(), Error> {
     if uri.authority().is_some_and(|a| a.as_str().contains('@')) {
         return Err(Error::HttpRequestUriInvalid);
     }
-    if !origin(uri).is_some_and(|o| app.allow.iter().any(|a| a.allows(&o))) {
-        return Err(Error::HttpRequestDenied);
+    match origin(uri).is_some_and(|o| allow.iter().any(|a| a.allows(&o))) {
+        true => Ok(()),
+        false => Err(Error::HttpRequestDenied),
+    }
+}
+
+/// Sends `req` to a public address, over TLS for https.
+pub async fn send(req: Request) -> Sent {
+    let uri = req.uri();
+    if uri.authority().is_some_and(|a| a.as_str().contains('@')) {
+        return Err(Error::HttpRequestUriInvalid);
     }
     let tls = uri.scheme_str() == Some("https");
     let host = uri.host().unwrap_or_default().trim_matches(['[', ']']); // `[::1]` to `::1`, which `lookup_host` takes as it is

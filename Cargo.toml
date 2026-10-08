@@ -11,42 +11,30 @@ keywords = ["wasm", "wasi", "component-model", "serverless", "lambda"]
 categories = ["wasm", "web-programming::http-server", "command-line-utilities"]
 include = ["/src", "/wit", "/README.md", "/LICENSE"]
 
-[[bin]]
-name = "tric"
-required-features = ["cli"]
-
-# Embedders use `default-features = false`: the runtime is the library, the platform is the binary.
-[features]
-default = ["cli"]
-cli = [
-    "dep:clap", "dep:serde", "dep:serde_json", "dep:sha2", "dep:tempfile", "dep:tokio-util", "dep:toml",
-    "dep:tracing-subscriber", "dep:webpki-root-certs", "dep:zstd", "hyper/server", "object_store/aws", "tokio/macros",
-    "tokio/rt-multi-thread",
-]
-
 [dependencies]
+base64 = "0.22"
 bytes = "1"
-clap = { version = "4", features = ["derive", "env"], optional = true }
+clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
+http = "1"
+http-body = "1"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["client", "http1"] }
-object_store = { version = "=0.14.2", default-features = false }
-percent-encoding = "2"
+hyper = { version = "1", features = ["client", "http1", "server"] }
+object_store = { version = "=0.14.2", default-features = false, features = ["aws"] }
 rand = { version = "0.10", default-features = false, features = ["thread_rng"] } # as object_store has it
-serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
-sha2 = { version = "0.10", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
 target-lexicon = "0.13"
-tempfile = { version = "3", optional = true }
-tokio = { version = "1", features = ["net", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 # aws-lc-rs, as object_store's S3 client uses, so one TLS provider is linked, not two.
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
-tokio-util = { version = "0.7", features = ["io-util"], optional = true }
-toml = { version = "1", optional = true }
+toml = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+wac-graph = "0.12"
 # webpki-roots' roots as whole certificates, which is how the S3 client takes them.
-webpki-root-certs = { version = "1", optional = true }
+webpki-root-certs = "1"
 webpki-roots = "1"
 # The defaults minus what tric never uses: cache, profiling, coredump, debug, stack-switching, gc-copying and
 # compile-time-builtins (so no wit-parser either).
@@ -54,17 +42,13 @@ wasmtime = { version = "=49.0.2", default-features = false, features = [
     "addr2line", "anyhow", "async", "backtrace", "component-model", "component-model-async", "cranelift", "demangle",
     "gc", "gc-drc", "gc-null", "parallel-compilation", "pooling-allocator", "runtime", "std", "threads", "wat",
 ] }
+# p2 too, as Rust's standard library on wasm32-wasip2 imports it.
 wasmtime-wasi = { version = "=49.0.2", default-features = false, features = ["p2", "p3"] }
-wasmtime-wasi-config = "=49.0.2"
 # No `default-send-request`: that is the built-in outbound client, which resolves names after any check on them.
-wasmtime-wasi-http = { version = "=49.0.2", default-features = false, features = ["component-model-async", "p2", "p3"] }
-zstd = { version = "0.13", optional = true }
+wasmtime-wasi-http = { version = "=49.0.2", default-features = false, features = ["component-model-async", "p3"] }
 
 [dev-dependencies]
-async-trait = "0.1"
-object_store = { version = "=0.14.2", default-features = false, features = ["aws"] } # TRIC_TEST_STORE
-serde_json = "1"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
+tokio = { version = "1", features = ["io-util"] }
 
 # Test binaries link side by side, and full debug info for Wasmtime sent `ld` past the 7.7 GiB Podman VM.
 [profile.dev]

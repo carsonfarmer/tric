@@ -1,119 +1,87 @@
-//! What an install keeps in its bucket. Everything a team writes sits under the app's name, so the store's IAM can give
-//! each team the apps named `<team>-…`:
+//! The bucket: what each app runs, its releases and components, and the native code hosts make. Names' heads and large
+//! values are in `name`.
 //!
-//! - `apps/<app>/current`: the release the app runs, the releases it keeps, which it can go back to, and its secrets;
-//! - `apps/<app>/releases/<n>/`: the folder of a release it keeps, with the release, its component, and the native code
-//!   that the compile function made of the component for engines of `compat`, at `release`, `component` and
-//!   `<compat>-<component's hash>.zst`;
-//! - `kv/<app>/<bucket>/<key>`: its `wasi:keyvalue` data, which only hosts write, unless `--kv` gives it a bucket;
-//! - `compile/<app>/<n>`: a marker that asks the compile function for the native code of folder `n`.
+//! - `apps/<app>/current`: the release the app runs, its last `KEEP` releases, and its environment;
+//! - `apps/<app>/releases/<id>`: a release, whose id is its hash;
+//! - `apps/<app>/components/<sha256>`: a component, as composed;
+//! - `native/<compat>/<sha256>`: native code a host made of a component, for hosts of the same build;
+//! - `install`: on AWS, what the install is;
+//! - `failed/<commit>`: outbox events that ran out of tries.
 //!
-//! A folder is never used again once its release is dropped, so each change deletes the folders that `current` has
-//! dropped, and nothing else has to. Nothing read back is trusted but native code: every other read is capped, parsed
-//! strictly, and a release and its component are checked against their hashes. Writes have the same caps, so nothing is
-//! written that a read would refuse. Native code can't be checked, and loading it runs it, so only the compile function
-//! may write it: the store's IAM lets teams write only keys ending in `current`, `release` and `component`, and no one
-//! else a key ending in `.zst`.
-use futures_util::{StreamExt, TryStreamExt, stream};
-use hyper::body::Bytes;
-use object_store::{Error as E, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion, path::Path};
+//! Every read is capped and parsed strictly, and a release and a component are checked against their hashes; writes
+//! have the same caps, so nothing is written that a read would refuse. Native code can't be checked, and loading it runs
+//! it, so it is trusted as the bucket is: whoever may write the bucket may run code in it.
+use bytes::Bytes;
+use object_store::{Error as E, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion, path::Path};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use tric::{NAME_MAX, is_name};
 use wasmtime::{Result, bail, ensure, error::Context};
 
-const CURRENT: &str = "current";
-pub const RELEASE: &str = "release";
-pub const COMPONENT: &str = "component";
-const MARKERS: &str = "compile/";
-const JSON_MAX: u64 = 64 << 10; // a release or `current`, so a host keeping one of each per app stays small
+pub const JSON_MAX: u64 = 64 << 10; // `current`, a release, or `install`
 pub const COMPONENT_MAX: u64 = 128 << 20;
-pub const KEEP: usize = 10; // the publishes an app keeps besides the release it runs: how far back it can go
+pub const NATIVE_MAX: u64 = 1 << 30;
+pub const KEEP: usize = 10; // the releases an app keeps: how far back it can go
 const TRIES: usize = 3; // of a change, while others keep landing first
 
-/// The release an app runs, the releases it keeps, and its secrets, which outlive releases and override config of the
-/// same name.
-#[derive(Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Current {
-    pub release: Option<Entry>,
-    pub releases: Vec<Entry>, // its last `KEEP` publishes, newest first
-    pub next: u64,            // the folder its next new release gets
-    pub secrets: BTreeMap<String, String>,
-}
-
-impl Current {
-    /// The releases it keeps: the one it runs, if any, then the rest.
-    pub fn kept(&self) -> impl Iterator<Item = &Entry> {
-        self.release.iter().chain(&self.releases)
-    }
-}
-
-/// A release an app keeps: its id, which is its hash, its component's hash, and its folder.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Entry {
-    pub id: String,
-    pub component: String,
-    pub n: u64,
-}
-
-/// One immutable release of an app.
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Release {
-    pub component: String,
-    pub config: BTreeMap<String, String>,
-    pub allowed_outbound_hosts: Vec<String>,
-}
-
-/// `app`, if it is a name a host would serve.
-fn checked(app: &str) -> Result<&str> {
-    ensure!(is_name(app), "an app name is 1 to {NAME_MAX} of a-z, 0-9 and -, not {app:?}");
-    Ok(app)
-}
-
-/// `app`'s `object`.
-fn path(app: &str, object: &str) -> Result<String> {
-    Ok(format!("apps/{}/{object}", checked(app)?))
-}
-
-/// The file `name` in `app`'s folder `n`.
-pub fn file(app: &str, n: u64, name: &str) -> Result<String> {
-    path(app, &format!("releases/{n}/{name}"))
-}
-
-/// Where the native code made of the component with the hash `component`, in `app`'s folder `n`, is for engines of
-/// `compat`. It ends in `.zst`, never in what a team may write, which is how the store's IAM keeps teams from writing
-/// native code; so the compile function, which hashes what it compiles, vouches that it was made of `component`.
-pub fn native(app: &str, n: u64, component: &str, compat: &str) -> Result<String> {
-    file(app, n, &format!("{compat}-{component}.zst"))
-}
-
-pub fn kv(app: &str) -> String {
-    format!("kv/{app}")
-}
-
-/// The marker that asks for the native code of `app`'s folder `n`.
-pub fn marker(app: &str, n: u64) -> Result<String> {
-    Ok(format!("{MARKERS}{}/{n}", checked(app)?))
-}
-
-/// The app and the folder that the marker `key` names, if it is one: just what `marker` makes.
-pub fn marked(key: &str) -> Option<(&str, u64)> {
-    let (app, n) = key.strip_prefix(MARKERS)?.split_once('/')?;
-    let n = n.parse().ok()?;
-    (marker(app, n).ok()? == key).then_some((app, n))
+/// Whether `s` is an app name: a DNS label of `a-z0-9-` (RFC 1123), as it is a host's first label.
+pub fn is_app(s: &str) -> bool {
+    let alnum = |b: Option<&u8>| b.is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    let ok = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-';
+    s.len() <= 63 && alnum(s.as_bytes().first()) && alnum(s.as_bytes().last()) && s.bytes().all(ok)
 }
 
 pub fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// 128 random bits, as hex.
+pub fn random() -> String {
+    format!("{:032x}", rand::random::<u128>())
+}
+
+fn path(app: &str, parts: &[&str]) -> Path {
+    Path::from_iter(["apps", app].into_iter().chain(parts.iter().copied()))
+}
+
+pub fn native(compat: &str, component: &str) -> Path {
+    Path::from_iter(["native", compat, component])
+}
+
+/// What an app runs, and keeps.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Current {
+    pub release: String,
+    pub releases: Vec<String>, // newest first, the one it runs among them
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
+
+/// One immutable release of an app.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Release {
+    pub component: String, // its hash
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_outbound_hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cron: BTreeMap<String, String>, // expression to path
+}
+
+/// On AWS, what the install is, so `deploy` can keep each app's cron in step: the function schedules invoke, the role
+/// they invoke it with, and the Scheduler group they are in.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Install {
+    pub function: String,
+    pub role: String,
+    pub group: String,
+}
+
 /// The object at `path` and its version, or `None` if there is none.
-pub async fn read(store: &dyn ObjectStore, path: &str, max: u64) -> Result<Option<(Bytes, UpdateVersion)>> {
-    let mut r = match store.get(&path.into()).await {
+pub async fn read(store: &dyn ObjectStore, path: &Path, max: u64) -> Result<Option<(Bytes, UpdateVersion)>> {
+    let mut r = match store.get(path).await {
         Err(E::NotFound { .. }) => return Ok(None),
         r => r?,
     };
@@ -131,104 +99,84 @@ pub async fn exists(store: &dyn ObjectStore, path: &Path) -> Result<bool> {
 }
 
 /// The object at `path`, refused if its hash is not `hash`.
-async fn fetch(store: &dyn ObjectStore, path: &str, max: u64, hash: &str) -> Result<Bytes> {
+async fn fetch(store: &dyn ObjectStore, path: &Path, max: u64, hash: &str) -> Result<Bytes> {
     let (bytes, _) = read(store, path, max).await?.with_context(|| format!("there is no {path}"))?;
     ensure!(self::hash(&bytes) == hash, "{path} does not match its hash");
     Ok(bytes)
 }
 
-/// `app`'s release `e`.
-pub async fn release(store: &dyn ObjectStore, app: &str, e: &Entry) -> Result<Release> {
-    Ok(serde_json::from_slice(&fetch(store, &file(app, e.n, RELEASE)?, JSON_MAX, &e.id).await?)?)
+async fn json<T: for<'a> Deserialize<'a>>(store: &dyn ObjectStore, path: &Path) -> Result<Option<(T, UpdateVersion)>> {
+    match read(store, path, JSON_MAX).await? {
+        Some((bytes, version)) => {
+            Ok(Some((serde_json::from_slice(&bytes).with_context(|| format!("{path}"))?, version)))
+        }
+        None => Ok(None),
+    }
 }
 
-/// The component of `app`'s release `e`.
-pub async fn component(store: &dyn ObjectStore, app: &str, e: &Entry) -> Result<Bytes> {
-    fetch(store, &file(app, e.n, COMPONENT)?, COMPONENT_MAX, &e.component).await
+/// The apps that have been deployed, or at least uploaded to.
+pub async fn apps(store: &dyn ObjectStore) -> Result<Vec<String>> {
+    let listed = store.list_with_delimiter(Some(&"apps".into())).await?;
+    Ok(listed.common_prefixes.iter().filter_map(|p| p.filename().map(str::to_owned)).collect())
 }
 
-/// Publishes the component `wasm` with `config` and `allowed_outbound_hosts` as a release of `app`, without serving it,
-/// and returns its entry. It is recorded before it is written, so no change deletes its folder meanwhile. A release
-/// that `app` keeps keeps its folder, which gets what it lacks, and a component that another kept release has is
-/// copied.
-pub async fn publish(
-    store: &dyn ObjectStore,
-    app: &str,
-    wasm: Bytes,
-    config: BTreeMap<String, String>,
-    allowed_outbound_hosts: Vec<String>,
-) -> Result<Entry> {
-    let component = hash(&wasm);
-    let json = serde_json::to_vec(&Release { component: component.clone(), config, allowed_outbound_hosts })?;
+/// What `app` runs, if it has been deployed.
+pub async fn current(store: &dyn ObjectStore, app: &str) -> Result<Option<Current>> {
+    Ok(json(store, &path(app, &["current"])).await?.map(|(c, _)| c))
+}
+
+/// `app`'s release `id`.
+pub async fn release(store: &dyn ObjectStore, app: &str, id: &str) -> Result<Release> {
+    let bytes = fetch(store, &path(app, &["releases", id]), JSON_MAX, id).await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// `app`'s component with the hash `hash`.
+pub async fn component(store: &dyn ObjectStore, app: &str, hash: &str) -> Result<Bytes> {
+    fetch(store, &path(app, &["components", hash]), COMPONENT_MAX, hash).await
+}
+
+/// The install's details, if it is on AWS.
+pub async fn install(store: &dyn ObjectStore) -> Result<Option<Install>> {
+    Ok(json(store, &"install".into()).await?.map(|(i, _)| i))
+}
+
+/// Uploads `wasm` as `release`'s component, and `release` as a release of `app`, each unless it is there, and returns
+/// the release's id. Neither is ever deleted, so one written is there for good.
+pub async fn put_release(store: &dyn ObjectStore, app: &str, wasm: Bytes, release: &Release) -> Result<String> {
+    ensure!(is_app(app), "an app name is 1 to 63 of a-z, 0-9 and -, starting and ending with a letter or digit");
+    ensure!(release.component == hash(&wasm), "a release names its component's hash");
+    let json = serde_json::to_vec(release)?;
     ensure!(json.len() as u64 <= JSON_MAX, "{app}'s release would be over {JSON_MAX} bytes");
     ensure!(wasm.len() as u64 <= COMPONENT_MAX, "{app}'s component would be over {COMPONENT_MAX} bytes");
     let id = hash(&json);
-    let (e, from) = update(store, app, |c| {
-        let e = c.kept().find(|e| e.id == id).cloned();
-        let e = e.unwrap_or_else(|| Entry { id: id.clone(), component: component.clone(), n: c.next });
-        c.next = c.next.max(e.n.checked_add(1).with_context(|| format!("{app} has used every folder number"))?);
-        c.releases.retain(|r| r.n != e.n);
-        c.releases.insert(0, e.clone());
-        c.releases.truncate(KEEP);
-        let from = c.kept().find(|r| r.component == component && r.n != e.n).map(|r| r.n);
-        Ok((e, from))
-    })
-    .await?;
-    for (name, bytes) in [(RELEASE, Bytes::from(json)), (COMPONENT, wasm)] {
-        let to = file(app, e.n, name)?.into();
-        if exists(store, &to).await? {
-            continue; // as when it is published again
-        }
-        let copied = match from {
-            Some(from) if name == COMPONENT => store.copy(&file(app, from, name)?.into(), &to).await.is_ok(),
-            _ => false,
-        };
-        if !copied {
-            store.put(&to, bytes.into()).await?;
+    for (at, bytes) in
+        [(path(app, &["components", &release.component]), wasm), (path(app, &["releases", &id]), json.into())]
+    {
+        if !exists(store, &at).await? {
+            store.put(&at, bytes.into()).await?;
         }
     }
-    Ok(e)
+    Ok(id)
 }
 
-/// `app`'s `current` and its version, or the default and `None` if it has none.
-pub async fn current(store: &dyn ObjectStore, app: &str) -> Result<(Current, Option<UpdateVersion>)> {
-    match read(store, &path(app, CURRENT)?, JSON_MAX).await? {
-        Some((bytes, version)) => Ok((serde_json::from_slice(&bytes)?, Some(version))),
-        None => Ok(Default::default()),
-    }
-}
-
-/// Applies `change` to `app`'s `current` with a conditional write, which fails if another change landed in between, so
-/// neither is lost, and then reads it and tries again, `TRIES` times in all.
-///
-/// Each try first deletes the folders that the `current` it read dropped: those below its `next` that it does not keep.
-/// No later `current` keeps them, so they go whether or not the change lands, and as they go a change after the one
-/// that dropped them, a host has mostly moved on from them. What a crash or a slow publish leaves goes the same way.
-/// Then it takes `next` past every folder there, so none is used again, even after `current` is deleted, when nothing
-/// is below its `next`, or an old one is brought back; and the change after it deletes those it does not keep.
-pub async fn update<T>(
+/// Applies `change` to `app`'s `current`, or to `None` if it has none, with a conditional write, which fails if another
+/// change landed in between, so neither is lost; then reads it and tries again, `TRIES` times in all.
+pub async fn update(
     store: &dyn ObjectStore,
     app: &str,
-    mut change: impl FnMut(&mut Current) -> Result<T>,
-) -> Result<T> {
-    let (at, folders) = (path(app, CURRENT)?.into(), path(app, "releases")?.into());
-    let folder = |m: &ObjectMeta| m.location.parts().nth(3)?.as_ref().parse::<u64>().ok();
+    mut change: impl FnMut(Option<Current>) -> Result<Current>,
+) -> Result<Current> {
+    ensure!(is_app(app), "{app:?} is not an app name");
+    let at = path(app, &["current"]);
     for _ in 0..TRIES {
-        let (mut value, version) = current(store, app).await?;
-        let files: Vec<_> = store.list(Some(&folders)).try_collect().await?;
-        let past = files.iter().filter_map(folder).max().map_or(0, |n| n.saturating_add(1));
-        let dropped = |n: u64| n < value.next && !value.kept().any(|e| e.n == n);
-        let gone: Vec<_> =
-            files.into_iter().filter(|m| folder(m).is_some_and(dropped)).map(|m| Ok::<_, E>(m.location)).collect();
-        store.delete_stream(stream::iter(gone).boxed()).try_collect::<Vec<_>>().await?;
-        value.next = value.next.max(past);
-        let out = change(&mut value)?;
-        let json = serde_json::to_vec(&value)?;
-        ensure!(json.len() as u64 <= JSON_MAX, "{app}'s {CURRENT} would be over {JSON_MAX} bytes");
+        let (old, version) = json(store, &at).await?.unzip();
+        let new = change(old)?;
+        let bytes = serde_json::to_vec(&new)?;
+        ensure!(bytes.len() as u64 <= JSON_MAX, "{app}'s current would be over {JSON_MAX} bytes");
         let mode = version.map_or(PutMode::Create, PutMode::Update);
-        match store.put_opts(&at, json.into(), mode.into()).await {
-            Ok(_) => return Ok(out),
-            // a conditional write to a deleted `current` is refused with a 404
+        match store.put_opts(&at, bytes.into(), mode.into()).await {
+            Ok(_) => return Ok(new),
             Err(E::Precondition { .. } | E::AlreadyExists { .. } | E::NotFound { .. }) => {}
             Err(e) => return Err(e.into()),
         }
@@ -239,68 +187,53 @@ pub async fn update<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use object_store::{PutPayload, memory::InMemory};
-
-    #[tokio::test]
-    async fn refuses_what_a_host_would_not_serve() {
-        let store = InMemory::new();
-        for app in ["Acme-blog", "../x", "a/b", ""] {
-            assert!(update(&store, app, |_| Ok(())).await.is_err(), "{app}");
-            assert!(publish(&store, app, "x".into(), BTreeMap::new(), vec![]).await.is_err(), "{app}");
-        }
-        let big = "x".repeat(JSON_MAX as usize);
-        let e = update(&store, "app", |c| Ok(_ = c.secrets.insert("big".into(), big.clone()))).await.unwrap_err();
-        assert!(e.to_string().contains("would be over"), "{e}");
-        assert!(current(&store, "app").await.unwrap().0 == Current::default()); // and it still reads
-    }
+    use object_store::memory::InMemory;
 
     #[test]
-    fn reads_only_the_markers_it_makes() {
-        assert_eq!(marked(&marker("app", 7).unwrap()), Some(("app", 7)));
-        for key in [
-            "compile/app//7",
-            "compile/App/7",
-            "compile/app/x",
-            "compile/app/7/8",
-            "compile/app/-1",
-            "compile/app/+7",
-            "compile/app/07",
-            "kv/app/7",
-        ] {
-            assert!(marked(key).is_none(), "{key}");
+    fn app_names() {
+        for ok in ["a", "a-b", "0", "abc123", &"a".repeat(63)] {
+            assert!(is_app(ok), "{ok}");
+        }
+        for bad in ["", "-a", "a-", "A", "a.b", "a_b", "a/b", &"a".repeat(64)] {
+            assert!(!is_app(bad), "{bad}");
         }
     }
 
-    /// A change deletes the folders that the one before it dropped, and what is written to them later, but not a folder
-    /// at or above the `next` it read, as a publish may be writing it, nor anything else, nor anything with no
-    /// `current`. Either way it takes `next` past every folder there, and the change after it deletes those it does not
-    /// keep.
     #[tokio::test]
-    async fn a_change_deletes_what_was_dropped() {
+    async fn releases_are_checked() {
         let store = InMemory::new();
-        let entry = |n| Entry { id: String::new(), component: String::new(), n };
-        update(&store, "app", |c| Ok((c.release, c.releases, c.next) = (Some(entry(0)), vec![entry(1), entry(2)], 3)))
-            .await
-            .unwrap();
-        for key in ["0/release", "1/component", "2/release", "3/component", "x/release"] {
-            store.put(&format!("apps/app/releases/{key}").into(), PutPayload::new()).await.unwrap();
-        }
-        let left = async || {
-            let all: Vec<_> = store.list(Some(&"apps/app/releases".into())).try_collect().await.unwrap();
-            let mut all: Vec<_> = all.iter().map(|m| m.location.as_ref()[18..].to_string()).collect();
-            all.sort();
-            all
-        };
-        assert_eq!(update(&store, "app", |c| Ok(c.releases.pop().map(|_| c.next))).await.unwrap(), Some(4));
-        assert_eq!(left().await.len(), 5); // as a host may still be loading 2
-        store.put(&native("app", 2, "c", "0123").unwrap().into(), PutPayload::new()).await.unwrap(); // a late compile's
-        update(&store, "app", |_| Ok(())).await.unwrap();
-        assert_eq!(left().await, ["0/release", "1/component", "x/release"]);
+        let wasm = Bytes::from("wasm");
+        let r = Release { component: hash(&wasm), ..Default::default() };
+        let id = put_release(&store, "app", wasm.clone(), &r).await.unwrap();
+        assert_eq!(put_release(&store, "app", wasm.clone(), &r).await.unwrap(), id); // the same release
+        assert_eq!(release(&store, "app", &id).await.unwrap(), r);
+        assert_eq!(component(&store, "app", &r.component).await.unwrap(), wasm);
+        store.put(&path("app", &["components", &r.component]), "other".into()).await.unwrap();
+        let e = component(&store, "app", &r.component).await.unwrap_err();
+        assert!(e.to_string().contains("does not match its hash"), "{e}");
+        assert!(put_release(&store, "App", wasm.clone(), &r).await.is_err());
+        assert!(put_release(&store, "app", "x".into(), &r).await.is_err());
+    }
 
-        store.delete(&"apps/app/current".into()).await.unwrap();
-        assert_eq!(update(&store, "app", |c| Ok(c.next)).await.unwrap(), 2);
-        assert_eq!(left().await.len(), 3);
-        update(&store, "app", |_| Ok(())).await.unwrap();
-        assert_eq!(left().await, ["x/release"]);
+    #[tokio::test]
+    async fn changes_all_land() {
+        use object_store::throttle::{ThrottleConfig, ThrottledStore};
+        let ms = std::time::Duration::from_millis(10);
+        let config = ThrottleConfig { wait_get_per_call: ms, wait_put_per_call: ms, ..Default::default() };
+        let store = ThrottledStore::new(InMemory::new(), config);
+        update(&store, "app", |_| Ok(Current::default())).await.unwrap();
+        let set = |k: &'static str| {
+            update(&store, "app", move |c| {
+                let mut c = c.unwrap();
+                c.env.insert(k.into(), "x".into());
+                Ok(c)
+            })
+        };
+        let (a, b, c) = tokio::join!(set("a"), set("b"), set("c"));
+        a.and(b).and(c).unwrap();
+        assert_eq!(current(&store, "app").await.unwrap().unwrap().env.len(), 3);
+        let big = "x".repeat(JSON_MAX as usize);
+        let e = update(&store, "app", |_| Ok(Current { release: big.clone(), ..Default::default() })).await;
+        assert!(e.unwrap_err().to_string().contains("would be over"));
     }
 }

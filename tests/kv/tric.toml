@@ -1,5 +1,0 @@
-name = "kv"
-component = "../fixtures/kv-p3.wasm"
-
-[config]
-greeting = "hi"

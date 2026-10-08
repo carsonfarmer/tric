@@ -1,12 +1,21 @@
-//! tric: a scale-to-zero host for WASI components.
-mod cli;
-mod compile;
+//! tric: a scale-to-zero host for WASI components, with their state in object storage.
+mod aws;
+mod cron;
+mod deploy;
+mod engine;
+mod kv;
+mod name;
+mod outbound;
+mod outbox;
 mod serve;
 mod state;
 
+use aws::Aws;
 use clap::{Parser, Subcommand};
+use object_store::aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::client::{HttpClient, HttpConnector, ReqwestConnector};
-use object_store::{Certificate, ClientOptions, ObjectStore, aws::AmazonS3Builder};
+use object_store::{Certificate, ClientOptions, ObjectStore, memory::InMemory};
+use serve::Tric;
 use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 use tokio::net::TcpListener;
@@ -14,103 +23,126 @@ use tracing_subscriber::EnvFilter;
 use wasmtime::{Result, error::Context};
 use webpki_root_certs::TLS_SERVER_ROOT_CERTS;
 
-const NO_STORE: &str = "there is no --store or TRIC_STORE";
-
 #[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// The install's bucket, like `s3://NAME`. Credentials, region and endpoint come from the usual `AWS_` variables
     #[arg(long, global = true, env = "TRIC_STORE")]
     store: Option<String>,
-    /// Whether the install has a compile function, so hosts load apps from its native code and `publish` waits for it.
-    /// Without it, a host compiles every app it loads
-    #[arg(long, global = true, env = "TRIC_NATIVE")]
-    native: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Serve the install in --store, or else the app described by DIR/tric.toml, each app at a host like APP.localhost
-    Serve {
+    /// Serve the app at PATH, at any host, with its state in memory unless there is a --store
+    Dev {
+        /// A directory with a tric.toml, or a component, whose file name less `.wasm` is the app's name
         #[arg(default_value = ".")]
-        dir: PathBuf,
+        path: PathBuf,
+        /// Set an environment variable
+        #[arg(short, value_name = "NAME=VALUE", value_parser = var)]
+        e: Vec<(String, String)>,
         #[arg(long, default_value = "127.0.0.1:3000")]
         listen: SocketAddr,
-        /// The bucket of the apps' KV data, if not --store: one of its own keeps KV's keys from whoever may list --store
-        #[arg(long, env = "TRIC_KV")]
-        kv: Option<String>,
     },
-    /// Make the native code that the install's markers ask for, as the Lambda Web Adapter posts their events
-    CompileWorker {
-        #[arg(long, default_value = "127.0.0.1:8080")] // the adapter's default
+    /// Serve every app of the install, each at APP.DOMAIN
+    Serve {
+        #[arg(long, env = "TRIC_LISTEN", default_value = "127.0.0.1:3000")]
         listen: SocketAddr,
+        #[arg(long, env = "TRIC_DOMAIN", default_value = "localhost")]
+        domain: String,
     },
-    /// Upload the app described by DIR/tric.toml as a release, without serving it, and print `APP ID`. With --native,
-    /// then wait until its native code is made
-    Publish {
-        #[arg(default_value = ".")]
-        dir: PathBuf,
+    /// Upload the app at PATH and make it the release its app runs, then print the release's id
+    Deploy {
+        /// A directory with a tric.toml, or a component, whose file name less `.wasm` is the app's name
+        path: PathBuf,
+        /// Set an environment variable; an empty value removes it
+        #[arg(short, value_name = "NAME=VALUE", value_parser = var)]
+        e: Vec<(String, String)>,
     },
-    /// Serve APP from its release ID
+    /// Run APP's release ID, one of those it keeps
     Release { app: String, id: String },
-    /// List APP's releases, newest first, marking the one it serves
+    /// List APP's releases, newest first, marking the one it runs
     Releases { app: String },
-    /// Set APP's secret NAME to stdin, less a trailing newline, whichever release it runs. An empty value removes it
-    Secret { app: String, name: String },
-    /// List the names of APP's secrets
-    Secrets { app: String },
+    /// Set APP's environment variables, an empty value removing one, whichever release it runs; then list their names
+    Env {
+        app: String,
+        #[arg(value_name = "NAME=VALUE", value_parser = var)]
+        vars: Vec<(String, String)>,
+    },
+}
+
+fn var(s: &str) -> Result<(String, String), String> {
+    s.split_once('=').map(|(k, v)| (k.into(), v.into())).ok_or_else(|| format!("{s:?} is not NAME=VALUE"))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into());
-    tracing_subscriber::fmt().json().with_env_filter(filter).init();
-    let Args { store, native, cmd } = Args::parse();
+    let lambda = std::env::var("AWS_LAMBDA_FUNCTION_NAME").ok();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn,tric=info".into());
+    match lambda {
+        Some(_) => tracing_subscriber::fmt().json().with_env_filter(filter).init(),
+        None => tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init(),
+    }
+    let Args { store, cmd } = Args::parse();
     let http = SharedClients::default();
-    let bucket = |url| {
-        let s = AmazonS3Builder::from_env().with_url(url).with_http_connector(http.clone()).build();
-        s.map(|s| Arc::new(s) as Arc<dyn ObjectStore>)
+    let client = http.connect(&ClientOptions::new())?;
+    let (store, aws) = match store {
+        Some(url) => {
+            let (s3, aws) = bucket(&url, &http, client.clone())?;
+            (Some(s3 as Arc<dyn ObjectStore>), Some(aws))
+        }
+        None => (None, None),
     };
-    let store = store.map(bucket).transpose()?;
-    let s = || store.as_deref().context(NO_STORE);
+    let s = || store.as_deref().context("there is no --store or TRIC_STORE");
     match cmd {
-        Cmd::Serve { dir, listen, kv } => {
-            let install = match store {
-                Some(store) => {
-                    let kv = kv.map(bucket).transpose()?.unwrap_or_else(|| store.clone());
-                    serve::Install::new(store, native, kv)?
-                }
-                None => serve::Install::dev(&dir).await?,
-            };
-            serve::run(TcpListener::bind(listen).await?, move |req| install.clone().handle(req)).await?
+        Cmd::Dev { path, e, listen } => {
+            let store = store.clone().unwrap_or_else(|| Arc::new(InMemory::new()));
+            let built = deploy::build(&path, &client).await?;
+            let app = built.name.clone();
+            deploy::deploy(&*store, None, built, &e).await?;
+            let tric = Tric::new(store, "localhost", Some(app.clone()), None)?;
+            tokio::spawn(cron::tick(tric.clone()));
+            let listener = TcpListener::bind(listen).await?;
+            eprintln!("serving {app} at http://{}", listener.local_addr()?);
+            serve::run(listener, move |peer, req| tric.clone().handle(peer, req)).await?
         }
-        Cmd::CompileWorker { listen } => {
-            let worker = Arc::new(compile::Worker::new(store.context(NO_STORE)?)?);
-            serve::run(TcpListener::bind(listen).await?, move |req| worker.clone().handle(req)).await?
-        }
-        Cmd::Publish { dir } => {
-            let (app, e) = cli::publish(s()?, &dir, true).await?;
-            println!("{app} {}", e.id); // first, as the release stands even if the wait fails
-            if native {
-                cli::precompile(s()?, &app, &e).await?;
+        Cmd::Serve { listen, domain } => {
+            let store = store.clone().context("there is no --store or TRIC_STORE")?;
+            let on = aws.zip(lambda);
+            let ticks = on.is_none(); // on Lambda, EventBridge Scheduler fires cron
+            let tric = Tric::new(store, &domain, None, on)?;
+            if ticks {
+                tokio::spawn(cron::tick(tric.clone()));
             }
+            let listener = TcpListener::bind(listen).await?;
+            eprintln!("serving *.{domain} at http://{}", listener.local_addr()?);
+            serve::run(listener, move |peer, req| tric.clone().handle(peer, req)).await?
         }
-        Cmd::Release { app, id } => cli::release(s()?, &app, &id).await?,
-        Cmd::Releases { app } => cli::releases(s()?, &app).await?.iter().for_each(|r| println!("{r}")),
-        Cmd::Secret { app, name } => {
-            let value = std::io::read_to_string(std::io::stdin())?;
-            cli::set_secret(s()?, &app, &name, value.strip_suffix('\n').unwrap_or(&value)).await?
+        Cmd::Deploy { path, e } => {
+            let built = deploy::build(&path, &client).await?;
+            println!("{}", deploy::deploy(s()?, aws.as_ref(), built, &e).await?);
         }
-        Cmd::Secrets { app } => cli::secrets(s()?, &app).await?.iter().for_each(|n| println!("{n}")),
+        Cmd::Release { app, id } => deploy::release(s()?, aws.as_ref(), &app, &id).await?,
+        Cmd::Releases { app } => deploy::releases(s()?, &app).await?.iter().for_each(|r| println!("{r}")),
+        Cmd::Env { app, vars } => deploy::env(s()?, &app, &vars).await?.iter().for_each(|n| println!("{n}")),
     }
     Ok(())
 }
 
-/// One HTTP client for each set of options, so the buckets, all at one S3 endpoint, share its connections, and the
-/// roots are loaded once. Every bucket's options come from the `AWS_` variables and so are the same, though off Lambda
-/// a credential provider connects with its own. `ClientOptions` has no `Eq`, so its `Debug` is the key: that has every
-/// field but a certificate added in code, and the roots are added after.
+/// The bucket at `url`, and the other AWS APIs with its credentials, in its region.
+fn bucket(url: &str, http: &SharedClients, client: HttpClient) -> Result<(Arc<AmazonS3>, Aws)> {
+    let builder = AmazonS3Builder::from_env().with_url(url).with_http_connector(http.clone());
+    let region = builder.get_config_value(&AmazonS3ConfigKey::Region).unwrap_or_else(|| "us-east-1".into());
+    let s3 = builder.build()?;
+    let aws = Aws::new(&s3, client, region);
+    Ok((Arc::new(s3), aws))
+}
+
+/// One HTTP client for each set of options, so everything at one endpoint shares its connections, and the roots are
+/// loaded once. `ClientOptions` has no `Eq`, so its `Debug` is the key: that has every field but a certificate added in
+/// code, and the roots are added after.
 #[derive(Debug, Clone, Default)]
 struct SharedClients(Arc<Mutex<HashMap<String, HttpClient>>>);
 
