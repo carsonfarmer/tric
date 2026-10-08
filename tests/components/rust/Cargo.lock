@@ -33,7 +33,6 @@ dependencies = [
  "form_urlencoded",
  "http",
  "serde_json",
- "wasip2",
  "wasip3",
  "wit-bindgen",
 ]
@@ -332,15 +331,6 @@ name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
-
-[[package]]
-name = "wasip2"
-version = "2.0.1+wasi-0.2.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89aafd4b69fb41a64cfd5d7f214cde92ab422ec4d9bcd55fcc816d3f5f49bbf3"
-dependencies = [
- "wit-bindgen",
-]
 
 [[package]]
 name = "wasip3"

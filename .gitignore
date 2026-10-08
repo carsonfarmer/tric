@@ -10,3 +10,4 @@ node_modules/
 *.tfvars
 .env
 tests/fixtures/
+tests/components/rust/wit/deps/

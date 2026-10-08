@@ -1,0 +1,6 @@
+package tric:fixture;
+
+/// The test middleware. `deps/` is wasip3's own copy of the WASI 0.3.0 WIT, which build.sh puts there.
+world guard {
+  include wasi:http/middleware@0.3.0;
+}
