@@ -11,7 +11,7 @@ use bytes::{Bytes, BytesMut};
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use futures_util::{StreamExt, stream};
 use http::header::{ETAG, FORWARDED, HOST, RETRY_AFTER};
-use http::{HeaderMap, HeaderValue, StatusCode, Uri, uri::Authority};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, uri::Authority};
 use http_body_util::{BodyExt, BodyStream, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::{server::conn::http1, service::service_fn};
@@ -116,9 +116,11 @@ fn tag(mut res: Response, etag: Option<String>) -> Response {
     res
 }
 
-/// Says where a request came from in `Forwarded` (RFC 7239), and only there.
+/// Says where a request came from in `Forwarded` (RFC 7239), and only there: without the `X-Forwarded-*` of a proxy in
+/// front, or the `X-Amzn-*` of Lambda and its adapter, whose contexts name the account and the function.
 fn forward(headers: &mut HeaderMap, from: HeaderValue) {
-    let names: Vec<_> = headers.keys().filter(|k| k.as_str().starts_with("x-forwarded-")).cloned().collect();
+    let hop = |k: &&HeaderName| ["x-forwarded-", "x-amzn-"].iter().any(|p| k.as_str().starts_with(p));
+    let names: Vec<_> = headers.keys().filter(hop).cloned().collect();
     for name in names {
         headers.remove(name);
     }

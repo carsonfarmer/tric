@@ -188,14 +188,19 @@ async fn serves_and_forwards() {
     assert_eq!((res.status, &*res.body), (200, "hello"));
     assert_eq!(dev.get("/?status=418").await.status, 418);
 
-    let fwd =
-        [("x-forwarded-for", "9.9.9.9, 1.2.3.4"), ("x-forwarded-host", "example.com"), ("x-forwarded-proto", "https")];
+    let fwd = [
+        ("x-forwarded-for", "9.9.9.9, 1.2.3.4"),
+        ("x-forwarded-host", "example.com"),
+        ("x-forwarded-proto", "https"),
+        ("x-amzn-lambda-context", "{}"),
+    ];
     let echo = dev.send("GET", "/echo?a=1", &fwd).await.json();
     assert_eq!(echo["uri"], "https://example.com/echo?a=1");
     let headers = echo["headers"].as_array().unwrap();
     let header = |name: &str| headers.iter().find(|h| h[0] == name).map(|h| h[1].as_str().unwrap().to_owned());
     assert_eq!(header("forwarded").as_deref(), Some(r#"for=1.2.3.4;host="example.com";proto=https"#));
-    assert!(headers.iter().all(|h| !h[0].as_str().unwrap().starts_with("x-forwarded-")), "{headers:?}");
+    let hop = |h: &Value| ["x-forwarded-", "x-amzn-"].iter().any(|p| h[0].as_str().unwrap().starts_with(p));
+    assert!(!headers.iter().any(hop), "{headers:?}");
     // A proto that is neither http nor https counts for nothing; the peer is `for` when there is no X-Forwarded-For.
     let echo = dev.send("GET", "/echo", &[("x-forwarded-proto", "gopher")]).await.json();
     assert_eq!(echo["uri"], format!("http://{}/echo", dev.addr));
