@@ -24,7 +24,8 @@ fn origin(uri: &Uri) -> Option<String> {
     Some(format!("{}://{}:{}", uri.scheme_str()?, uri.host()?, uri.port_u16().unwrap_or(default)).to_ascii_lowercase())
 }
 
-/// One allow-list item, `scheme://host[:port]`, kept as its origin. A host may start with `*.`, and `*://*:*` allows any.
+/// One allow-list item, `scheme://host[:port]`, kept as its origin. A host may start with `*.`, and `*://*:*` allows
+/// any.
 pub struct Allow(String);
 
 impl Allow {
@@ -56,14 +57,16 @@ fn blocked(ip: IpAddr) -> bool {
                 || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24
                 || (o[0] == 198 && o[1] & 0xfe == 18) // 198.18.0.0/15
         }
-        IpAddr::V6(a) => a.segments()[0] & 0xe000 != 0x2000 || a.segments()[0] == 0x2002, // 2002::/16 embeds an IPv4 address
+        // 2002::/16 embeds an IPv4 address.
+        IpAddr::V6(a) => a.segments()[0] & 0xe000 != 0x2000 || a.segments()[0] == 0x2002,
     }
 }
 
 static TLS: LazyLock<TlsConnector> = LazyLock::new(|| {
     let mut roots = RootCertStore::empty();
     roots.add_parsable_certificates(TLS_SERVER_ROOT_CERTS.iter().cloned());
-    let provider = Arc::new(default_provider()); // named, because a second provider in the build would make the default ambiguous
+    // Named, because a second provider in the build would make the default ambiguous.
+    let provider = Arc::new(default_provider());
     let config = ClientConfig::builder_with_provider(provider).with_safe_default_protocol_versions().unwrap();
     Arc::new(config.with_root_certificates(roots).with_no_client_auth()).into()
 });
@@ -91,7 +94,7 @@ pub async fn send(req: Request) -> Sent {
         return Err(Error::HttpRequestUriInvalid);
     }
     let tls = uri.scheme_str() == Some("https");
-    let host = uri.host().unwrap_or_default().trim_matches(['[', ']']); // `[::1]` to `::1`, which `lookup_host` takes as it is
+    let host = uri.host().unwrap_or_default().trim_matches(['[', ']']); // `[::1]` to `::1`, as `lookup_host` takes it
     let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
     // Resolve here, judge every address, and dial only those addresses: there is no second lookup to rebind.
     let found = lookup_host((host, port)).await.map_err(|_| Error::DnsError { rcode: None, info_code: None })?;
@@ -109,8 +112,8 @@ pub async fn send(req: Request) -> Sent {
 
 async fn exchange(io: impl AsyncRead + AsyncWrite + Send + Unpin + 'static, mut req: Request) -> Sent {
     let (mut sender, conn) = http1::handshake(TokioIo::new(io)).await?;
-    // The driver feeds the body, so it lives as long as the body does: Wasmtime drops the io future early when a p3 guest
-    // drops its transmit result. Dropping the body, or this future before there is one, aborts it.
+    // The driver feeds the body, so it lives as long as the body does: Wasmtime drops the io future early when a p3
+    // guest drops its transmit result. Dropping the body, or this future before there is one, aborts it.
     let driver = wasmtime_wasi::runtime::spawn(conn);
     let path = req.uri().path_and_query().map_or("/", |p| p.as_str()); // the wire wants the path only
     *req.uri_mut() = path.parse().map_err(|_| Error::HttpRequestUriInvalid)?;

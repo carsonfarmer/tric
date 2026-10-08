@@ -41,7 +41,8 @@ impl Engine {
     /// Configures Wasmtime and starts the thread that ticks its epoch for as long as the engine lives.
     pub fn new() -> Result<Self> {
         let mut cfg = Config::new();
-        // The architecture's baseline, not this CPU's features, so every host of one build loads any other's native code.
+        // The architecture's baseline, not this CPU's features, so every host of one build loads any other's native
+        // code.
         cfg.target(&target_lexicon::HOST.to_string())?;
         cfg.wasm_component_model_async(true).epoch_interruption(true);
         let engine = wasmtime::Engine::new(&cfg)?;

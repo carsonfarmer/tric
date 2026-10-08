@@ -189,7 +189,8 @@ impl Conditions {
         Self { if_match: list(http::header::IF_MATCH), if_none_match: list(http::header::IF_NONE_MATCH) }
     }
 
-    /// Whether they hold for the head with `etag`, or for no head: `If-Match` compares strongly, `If-None-Match` weakly.
+    /// Whether they hold for the head with `etag`, or for no head: `If-Match` compares strongly, `If-None-Match`
+    /// weakly.
     fn hold(&self, etag: Option<&str>) -> bool {
         let any = |list: &str, strong: bool| match list.trim() {
             "*" => etag.is_some(),
@@ -372,7 +373,8 @@ impl Turn {
         }
     }
 
-    /// Readies an unsafe outbound request: before the answer, by claiming the name; after it, by waiting for the commit.
+    /// Readies an unsafe outbound request: before the answer, by claiming the name; after it, by waiting for the
+    /// commit.
     pub async fn before_unsafe(&self) -> Result<(), &'static str> {
         if self.claim().await {
             return Ok(());
@@ -461,8 +463,8 @@ impl Turn {
         Ok(next)
     }
 
-    /// Writes `value` at `key` if it still holds `seen`, and returns whether it did. A key the turn has not written holds
-    /// what it did when the turn opened, which is what `seen` was read from.
+    /// Writes `value` at `key` if it still holds `seen`, and returns whether it did. A key the turn has not written
+    /// holds what it did when the turn opened, which is what `seen` was read from.
     pub fn swap(&self, key: &str, seen: &Option<Bytes>, value: Bytes) -> Result<bool, Error> {
         let mut s = self.state();
         if s.writes.get(key).is_some_and(|w| w != seen) {
@@ -472,9 +474,9 @@ impl Turn {
         Ok(true)
     }
 
-    /// Commits the turn: its large values go to objects of their own, its held requests to the outbox, and its head over
-    /// the version it read, if that is still the head. The `ETag` it returns is the new head's, or the old one's when
-    /// there was nothing to write.
+    /// Commits the turn: its large values go to objects of their own, its held requests to the outbox, and its head
+    /// over the version it read, if that is still the head. The `ETag` it returns is the new head's, or the old one's
+    /// when there was nothing to write.
     pub async fn commit(&self, tric: &Arc<Tric>, host: &str) -> Result<Committed> {
         let _one = self.claiming.lock().await; // so a claim in flight lands first
         let (mut head, base, writes, held, claimed, doomed) = {

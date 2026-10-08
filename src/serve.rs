@@ -299,8 +299,8 @@ impl Tric {
         state::is_app(&app).then_some((app, host))
     }
 
-    /// Runs an event: delivers an outbox, or fires a cron job. A failed delivery answers 500 and is logged; Lambda tries
-    /// an event again only when the function crashes or times out, as no status fails an invocation.
+    /// Runs an event: delivers an outbox, or fires a cron job. A failed delivery answers 500 and is logged; Lambda
+    /// tries an event again only when the function crashes or times out, as no status fails an invocation.
     async fn event(self: Arc<Self>, req: Request) -> Response {
         let Ok(body) = Limited::new(req.into_body(), EVENT_MAX).collect().await else {
             return status(StatusCode::PAYLOAD_TOO_LARGE);
@@ -407,7 +407,8 @@ impl Tric {
     /// The app `name`, loading it if it is new or its release or environment changed. A name is kept only once it has
     /// been deployed, so a made-up name costs a read each, and no memory.
     async fn app(self: &Arc<Self>, name: &str) -> Result<Option<Arc<Loaded>>> {
-        let known = self.apps.lock().await.get(name).cloned(); // apart, as the `match` would hold the lock into its arms
+        // Apart, as the `match` would hold the lock into its arms.
+        let known = self.apps.lock().await.get(name).cloned();
         let served = match known {
             Some(served) => served,
             None => {

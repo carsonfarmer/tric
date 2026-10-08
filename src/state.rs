@@ -9,8 +9,8 @@
 //! - `failed/<commit>`: outbox events that ran out of tries.
 //!
 //! Every read is capped and parsed strictly, and a release and a component are checked against their hashes; writes
-//! have the same caps, so nothing is written that a read would refuse. Native code can't be checked, and loading it runs
-//! it, so it is trusted as the bucket is: whoever may write the bucket may run code in it.
+//! have the same caps, so nothing is written that a read would refuse. Native code can't be checked, and loading it
+//! runs it, so it is trusted as the bucket is: whoever may write the bucket may run code in it.
 use bytes::Bytes;
 use object_store::{Error as E, ObjectStore, ObjectStoreExt, PutMode, UpdateVersion, path::Path};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};

@@ -1,7 +1,7 @@
-//! The outbox: requests a turn sends with `Prefer: respond-async` (RFC 7240) are held, and go out once, and only if, the
-//! turn commits, in order, each with an `Idempotency-Key`. A commit enqueues them as an event before it writes the head,
-//! with the head's version it writes over; delivery waits for the head to move past that version, and goes ahead only if
-//! the commit is among the head's pending ones, so an event of a turn that did not commit is dropped.
+//! The outbox: requests a turn sends with `Prefer: respond-async` (RFC 7240) are held, and go out once, and only if,
+//! the turn commits, in order, each with an `Idempotency-Key`. A commit enqueues them as an event before it writes the
+//! head, with the head's version it writes over; delivery waits for the head to move past that version, and goes ahead
+//! only if the commit is among the head's pending ones, so an event of a turn that did not commit is dropped.
 use crate::name;
 use crate::outbound;
 use crate::serve::Tric;
