@@ -37,7 +37,9 @@ services:
       sh -c 'CARGO_TARGET_DIR=/src/target/fixtures tests/components/build.sh
       && cargo fmt --check
       && cargo clippy --locked --all-targets -- -D warnings
+      && cargo clippy --locked --all-targets --features ws -- -D warnings
       && cargo test --locked
+      && cargo test --locked --features ws
       && cargo publish --dry-run --locked --no-verify'
     environment:
       <<: *minio
