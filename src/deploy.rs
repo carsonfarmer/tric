@@ -137,11 +137,15 @@ pub async fn deploy(
     Ok(id)
 }
 
+/// What `app` runs, which it does once it has been deployed.
+async fn deployed(store: &dyn ObjectStore, app: &str) -> Result<Current> {
+    state::current(store, app).await?.with_context(|| format!("{app} has not been deployed"))
+}
+
 /// Makes `app` run its release `id`, which must be one it keeps.
 pub async fn release(store: &dyn ObjectStore, aws: Option<&Aws>, app: &str, id: &str) -> Result<()> {
     let kept = |c: &Current| c.releases.iter().any(|r| r == id);
-    let c = state::current(store, app).await?.with_context(|| format!("{app} has not been deployed"))?;
-    ensure!(kept(&c), "{app} keeps no release {id}: see `tric releases {app}`");
+    ensure!(kept(&deployed(store, app).await?), "{app} keeps no release {id}: see `tric releases {app}`");
     let release = state::release(store, app, id).await?;
     state::update(store, app, |c| {
         let c = c.with_context(|| format!("{app} has not been deployed"))?;
@@ -154,7 +158,7 @@ pub async fn release(store: &dyn ObjectStore, aws: Option<&Aws>, app: &str, id: 
 
 /// `app`'s releases, newest first, marking the one it runs.
 pub async fn releases(store: &dyn ObjectStore, app: &str) -> Result<Vec<String>> {
-    let c = state::current(store, app).await?.with_context(|| format!("{app} has not been deployed"))?;
+    let c = deployed(store, app).await?;
     Ok(c.releases.iter().map(|r| if *r == c.release { format!("{r} running") } else { r.clone() }).collect())
 }
 
@@ -162,17 +166,17 @@ pub async fn releases(store: &dyn ObjectStore, app: &str) -> Result<Vec<String>>
 pub async fn env(store: &dyn ObjectStore, app: &str, vars: &[(String, String)]) -> Result<Vec<String>> {
     check_env(vars)?;
     let c = match vars {
-        [] => state::current(store, app).await?,
-        _ => Some(
+        [] => deployed(store, app).await?,
+        _ => {
             state::update(store, app, |c| {
                 let mut c = c.with_context(|| format!("{app} has not been deployed"))?;
                 merge(&mut c.env, vars);
                 Ok(c)
             })
-            .await?,
-        ),
+            .await?
+        }
     };
-    Ok(c.with_context(|| format!("{app} has not been deployed"))?.env.into_keys().collect())
+    Ok(c.env.into_keys().collect())
 }
 
 fn check_env(vars: &[(String, String)]) -> Result<()> {
@@ -205,14 +209,15 @@ mod tests {
     use super::*;
     use object_store::memory::InMemory;
 
+    fn built(wasm: String) -> Built {
+        let wasm = Bytes::from(wasm);
+        Built { name: "app".into(), release: Release { component: hash(&wasm), ..Default::default() }, wasm }
+    }
+
     #[tokio::test]
     async fn keeps_its_latest_releases() {
         let store = InMemory::new();
-        let deploy = async |n: usize| {
-            let wasm = Bytes::from(format!("wasm{n}"));
-            let release = Release { component: hash(&wasm), ..Default::default() };
-            super::deploy(&store, None, Built { name: "app".into(), wasm, release }, &[]).await.unwrap()
-        };
+        let deploy = async |n: usize| super::deploy(&store, None, built(format!("wasm{n}")), &[]).await.unwrap();
         let mut all = vec![];
         for n in 0..=KEEP {
             all.push(deploy(n).await);
@@ -233,10 +238,7 @@ mod tests {
         let store = InMemory::new();
         let kv = |k: &str, v: &str| (k.to_owned(), v.to_owned());
         assert!(env(&store, "app", &[kv("A", "1")]).await.is_err(), "not deployed");
-        let wasm = Bytes::from("wasm");
-        let built =
-            Built { name: "app".into(), release: Release { component: hash(&wasm), ..Default::default() }, wasm };
-        deploy(&store, None, built, &[kv("A", "1"), kv("B", "2")]).await.unwrap();
+        deploy(&store, None, built("wasm".into()), &[kv("A", "1"), kv("B", "2")]).await.unwrap();
         assert_eq!(env(&store, "app", &[kv("B", ""), kv("C", "3")]).await.unwrap(), ["A", "C"]);
         assert_eq!(env(&store, "app", &[]).await.unwrap(), ["A", "C"]);
         assert!(env(&store, "app", &[kv("A=B", "1")]).await.is_err());
