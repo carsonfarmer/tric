@@ -1,6 +1,6 @@
 //! Names: each name's state is one object, its head, which a turn changes with a compare-and-swap when it commits.
 use crate::engine::ANSWER;
-use crate::kv::{Error, KeyResponse};
+use crate::kv::{Error, KeyResponse, other};
 use crate::outbox::{Held, Outbox};
 use crate::serve::Tric;
 use crate::state::{self, random};
@@ -16,13 +16,13 @@ use tokio::{sync::watch, time::sleep};
 use wasmtime::{Result, ensure};
 
 const NAME_MAX: usize = 128;
-pub const KEY_MAX: usize = 256; // bytes
-pub const VALUE_MAX: usize = 1 << 20;
+const KEY_MAX: usize = 256; // bytes
+const VALUE_MAX: usize = 1 << 20;
 const INLINE_MAX: usize = 1 << 10; // a larger value is an object of its own
 const HEAD_MAX: usize = 1 << 20;
 const OBJECT_LEN: usize = 200; // the most a reference to a value object takes in a head
 const HELD_MAX: usize = 1_000_000; // bytes of held requests, as JSON, so an event is within Lambda's 1 MB
-pub const PAGE: usize = 1000; // keys per `list-keys`
+const PAGE: usize = 1000; // keys per `list-keys`
 /// How long a turn waits for others' claims, and reruns, before it gives up with a 429.
 pub const BUSY: Duration = Duration::from_secs(5);
 /// A claim outlives the deadline of the turn that took it, by the time a commit may take.
@@ -51,7 +51,7 @@ pub struct Head {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pending: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claim: Option<Claim>,
+    claim: Option<Claim>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -74,18 +74,18 @@ struct Obj {
 /// A turn's lease on a name, until a Unix millisecond.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Claim {
+struct Claim {
     id: String,
     until: u64,
 }
 
 impl Claim {
-    pub fn live(&self) -> bool {
+    fn live(&self) -> bool {
         self.until > now()
     }
 }
 
-pub fn now() -> u64 {
+fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
@@ -103,12 +103,8 @@ pub async fn read(store: &dyn ObjectStore, path: &Path) -> Result<Option<(Head, 
 }
 
 /// The `ETag` of a head's version: a strong one, whatever the store says.
-pub fn etag(version: &UpdateVersion) -> Option<String> {
+fn etag(version: &UpdateVersion) -> Option<String> {
     version.e_tag.as_ref().map(|e| format!("\"{}\"", e.trim_matches('"')))
-}
-
-fn other(e: impl ToString) -> Error {
-    Error::Other(e.to_string())
 }
 
 fn key_ok(key: &str) -> Result<(), Error> {
@@ -118,18 +114,19 @@ fn key_ok(key: &str) -> Result<(), Error> {
     }
 }
 
-/// Loads a value.
-async fn load(store: &dyn ObjectStore, app: &str, v: &Value) -> Result<Bytes, Error> {
-    match v {
-        Value::Data(b64) => Ok(B64.decode(b64).map_err(other)?.into()),
-        Value::Object(o) => {
+/// Loads a value, if there is one.
+async fn load(store: &dyn ObjectStore, app: &str, v: Option<&Value>) -> Result<Option<Bytes>, Error> {
+    Ok(Some(match v {
+        None => return Ok(None),
+        Some(Value::Data(b64)) => B64.decode(b64).map_err(other)?.into(),
+        Some(Value::Object(o)) => {
             ensure_size(o.size)?;
             let opts = GetOptions { version: o.version.clone(), ..Default::default() };
             let got = store.get_opts(&value_path(app, &o.key), opts).await.map_err(other)?;
             ensure_size(got.meta.size)?;
-            got.bytes().await.map_err(other)
+            got.bytes().await.map_err(other)?
         }
-    }
+    }))
 }
 
 fn ensure_size(size: u64) -> Result<(), Error> {
@@ -164,10 +161,7 @@ impl Snap {
     }
 
     pub async fn get(&self, key: &str) -> Result<Option<Bytes>, Error> {
-        match self.head.values.get(key) {
-            Some(v) => Ok(Some(load(&*self.store, &self.app, v).await?)),
-            None => Ok(None),
-        }
+        load(&*self.store, &self.app, self.head.values.get(key)).await
     }
 
     pub fn exists(&self, key: &str) -> bool {
@@ -424,10 +418,7 @@ impl Turn {
                 None => s.head.values.get(key).cloned(),
             }
         };
-        match v {
-            Some(v) => Ok(Some(load(&*self.store, &self.app, &v).await?)),
-            None => Ok(None),
-        }
+        load(&*self.store, &self.app, v.as_ref()).await
     }
 
     pub fn exists(&self, key: &str) -> bool {

@@ -20,7 +20,7 @@ use wasi::keyvalue::atomics::{self, CasError};
 pub use wasi::keyvalue::store::{self, Error, KeyResponse};
 type R<T> = Result<T, Error>;
 
-fn other(e: impl ToString) -> Error {
+pub fn other(e: impl ToString) -> Error {
     Error::Other(e.to_string())
 }
 
