@@ -13,6 +13,8 @@ use wasmtime::{Error, Result, ensure, error::Context, format_err};
 
 const MANIFEST: &str = "tric.toml";
 const MIDDLEWARE_MAX: usize = 64 << 20;
+/// An app's cron jobs: so deploy finds all its schedules, and a failed deploy's too, in one page of Scheduler's 100.
+const CRON_MAX: usize = 50;
 
 /// `MANIFEST`. Paths in it are relative to its directory.
 #[derive(Default, Deserialize)]
@@ -69,6 +71,7 @@ pub async fn read(path: &Path, allow: &[String]) -> Result<App> {
     for item in &m.allowed_outbound_hosts {
         Allow::parse(item)?;
     }
+    ensure!(m.cron.len() <= CRON_MAX, "an app has {CRON_MAX} cron jobs or fewer");
     for (fields, path) in &m.cron {
         Cron::parse(fields)?;
         ensure!(path.starts_with('/') && path.parse::<http::uri::PathAndQuery>().is_ok(), "bad cron path {path:?}");

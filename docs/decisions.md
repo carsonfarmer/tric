@@ -58,6 +58,8 @@ reason.
 - **Schedules are named for what they are,** as `<hash(app)[..24]>-<hash(body)[..39]>`. A changed schedule is a new
   one: deploy creates the missing schedules first, then deletes the extras. They are in one group, which the install
   makes.
+- **An app has 50 cron jobs at most,** so deploy reads its schedules in one page of 100, a failed deploy's extras
+  included, and needs no paging. More than 100 fails the deploy, which says to delete them by hand.
 - **A cron expression can't restrict both the day of the month and the day of the week.** POSIX cron runs a job
   when either one matches, and Scheduler can't say that, so tric refuses it everywhere.
 

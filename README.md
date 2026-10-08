@@ -44,7 +44,7 @@ tric dev target/wasm32-wasip2/release/hello.wasm   # at http://127.0.0.1:3000
 `tric dev` takes `-e NAME=VALUE` for the app's environment, and `--allow scheme://host[:port]` for each host it may
 call; it may call none otherwise, and never a private address. A directory with a `tric.toml` may list these hosts too
 (`allowed_outbound_hosts`), name the `component`, pin `middleware` to plug in front of it (`{ url, digest }`), and map
-`[cron]` schedules to paths (`"0 8 * * *" = "/@digest/run"`).
+`[cron]` schedules to paths (`"0 8 * * *" = "/@digest/run"`), 50 at most.
 
 ## A JavaScript app
 

@@ -95,19 +95,10 @@ async fn schedule(aws: &Aws, app: &str, cron: &BTreeMap<String, String>, s: &Sch
     struct Summary {
         name: String,
     }
-    let (mut have, mut next) = (BTreeSet::new(), None::<String>);
-    loop {
-        let mut path = format!("/schedules?ScheduleGroup={}&NamePrefix={prefix}-", query(&s.group));
-        if let Some(token) = &next {
-            path += &format!("&NextToken={}", query(token));
-        }
-        let page: Page = serde_json::from_slice(&scheduler(aws, Method::GET, &path, vec![], StatusCode::OK).await?)?;
-        have.extend(page.schedules.into_iter().map(|s| s.name));
-        next = page.next_token;
-        if next.is_none() {
-            break;
-        }
-    }
+    let path = format!("/schedules?ScheduleGroup={}&NamePrefix={prefix}-&MaxResults=100", query(&s.group));
+    let page: Page = serde_json::from_slice(&scheduler(aws, Method::GET, &path, vec![], StatusCode::OK).await?)?;
+    ensure!(page.next_token.is_none(), "{app} has over 100 schedules, after failed deploys: delete them by hand");
+    let have: BTreeSet<String> = page.schedules.into_iter().map(|s| s.name).collect();
     for (name, body) in want.iter().filter(|(name, _)| !have.contains(*name)) {
         scheduler(aws, Method::POST, &format!("/schedules/{name}"), body.clone(), StatusCode::CONFLICT).await?;
     }
