@@ -10,6 +10,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::aws_lc_rs::default_provider, pki_types::ServerName};
 use wasmtime_wasi_http::handler::{Request, Response};
 use wasmtime_wasi_http::{Error, io::TokioIo};
+use webpki_root_certs::TLS_SERVER_ROOT_CERTS;
 
 const ANY: &str = "*://*:*";
 
@@ -60,7 +61,8 @@ fn blocked(ip: IpAddr) -> bool {
 }
 
 static TLS: LazyLock<TlsConnector> = LazyLock::new(|| {
-    let roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.into() };
+    let mut roots = RootCertStore::empty();
+    roots.add_parsable_certificates(TLS_SERVER_ROOT_CERTS.iter().cloned());
     let provider = Arc::new(default_provider()); // named, because a second provider in the build would make the default ambiguous
     let config = ClientConfig::builder_with_provider(provider).with_safe_default_protocol_versions().unwrap();
     Arc::new(config.with_root_certificates(roots).with_no_client_auth()).into()
