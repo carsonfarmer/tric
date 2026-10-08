@@ -1,7 +1,7 @@
 //! End to end: tric serving the fixtures in tests/fixtures, which tests/components/build.sh builds. Each test of an
-//! app's semantics runs twice: on `tric dev`, with its state in memory, and on `tric route` in front of `tric serve`,
-//! with its state in the compose stack's MinIO, as an app of its own. Each test runs its own processes, at ports of
-//! their own.
+//! app's semantics runs four times: on `tric dev`, with its state in memory, and on `tric route` in front of
+//! `tric serve`, with its state in the compose stack's MinIO, as an app of its own; each with the Rust app and with the
+//! JavaScript one. Each test runs its own processes, at ports of their own.
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http::HeaderMap;
@@ -38,14 +38,14 @@ fn unique() -> String {
     format!("t{t:x}-{}", N.fetch_add(1, Ordering::Relaxed))
 }
 
-/// A directory of its own with a tric.toml of `toml`, in which `APP` and `GUARD` are the fixtures' paths, and `DIGEST`
-/// the guard's.
-fn manifest(toml: &str) -> PathBuf {
+/// A directory of its own with a tric.toml of `toml`, in which `APP` is the path `app`, `GUARD` the guard fixture's and
+/// `DIGEST` its digest.
+fn manifest(app: &Path, toml: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(unique());
     std::fs::create_dir_all(&dir).unwrap();
-    let path = |name| format!("{:?}", fixture(name).display().to_string());
+    let path = |path: &Path| format!("{:?}", path.display().to_string());
     let digest = format!("sha256:{:x}", Sha256::digest(std::fs::read(fixture("guard")).unwrap()));
-    let toml = toml.replace("APP", &path("app")).replace("GUARD", &path("guard")).replace("DIGEST", &digest);
+    let toml = toml.replace("APP", &path(app)).replace("GUARD", &path(&fixture("guard"))).replace("DIGEST", &digest);
     std::fs::write(dir.join("tric.toml"), toml).unwrap();
     dir
 }
@@ -65,7 +65,7 @@ fn owner() -> AmazonS3 {
 
 /// Deploys the app at `path`, with `args`, as an app of its own, named after its directory, and returns that name.
 async fn deploy(path: &Path, args: &[&str]) -> String {
-    let dir = if path.is_dir() { path.to_owned() } else { manifest(&format!("component = {:?}\n", path.display())) };
+    let dir = if path.is_dir() { path.to_owned() } else { manifest(path, "component = APP\n") };
     let mut deploy = Command::new(TRIC);
     deploy.arg("deploy").arg(&dir).args(args);
     let out = deploy.env("AWS_ACCESS_KEY_ID", std::env::var("MINIO_ROOT_USER").unwrap_or_default());
@@ -131,10 +131,11 @@ async fn route(port: u16, outbox: &str, serve: &str, log: &Log) -> (Child, Strin
     start(&mut route, log, "route: ").await
 }
 
+/// Where an app runs, and which app it is: the fixture `app`, or `js`.
 #[derive(Clone, Copy)]
-enum Kind {
-    Dev,
-    Stack,
+struct Kind {
+    stack: bool,
+    app: &'static str,
 }
 
 /// tric, as one process or more, which print their logs if a test fails.
@@ -186,12 +187,12 @@ impl Tric {
     /// stack of its own.
     async fn new(kind: Kind, path: &Path, args: &[&str]) -> Self {
         let log = Log::default();
-        let Kind::Stack = kind else {
+        if !kind.stack {
             let mut dev = Command::new(TRIC);
             dev.arg("dev").arg(path).args(["--listen", "127.0.0.1:0"]).args(args);
             let (dev, addr) = start(&mut dev, &log, "").await;
             return Self { host: addr.clone(), addr, outbox: String::new(), apps: vec![], log, _children: vec![dev] };
-        };
+        }
         let app = deploy(path, args).await;
         let [port, outbox] = ports();
         let (domain, outbox) = (format!("localhost:{port}"), format!("127.0.0.1:{outbox}"));
@@ -203,7 +204,7 @@ impl Tric {
 
     /// The app fixture, as a file.
     async fn app(kind: Kind) -> Self {
-        Self::new(kind, &fixture("app"), &[]).await
+        Self::new(kind, &fixture(kind.app), &[]).await
     }
 
     async fn send(&self, method: &str, target: &str, headers: &[(&str, &str)]) -> Res {
@@ -269,15 +270,18 @@ impl Drop for Tric {
     }
 }
 
-/// Each test, on `tric dev` and on a stack.
+/// Each test, on `tric dev` and on a stack, with the Rust app and with the JavaScript one.
 macro_rules! both {
+    (@in $mod:ident $stack:literal $app:literal $($test:ident)*) => {
+        mod $mod {
+            $(#[tokio::test] async fn $test() { super::$test(super::Kind { stack: $stack, app: $app }).await })*
+        }
+    };
     ($($test:ident),* $(,)?) => {
-        mod dev {
-            $(#[tokio::test] async fn $test() { super::$test(super::Kind::Dev).await })*
-        }
-        mod stack {
-            $(#[tokio::test] async fn $test() { super::$test(super::Kind::Stack).await })*
-        }
+        both!(@in dev false "app" $($test)*);
+        both!(@in stack true "app" $($test)*);
+        both!(@in js_dev false "js" $($test)*);
+        both!(@in js_stack true "js" $($test)*);
     };
 }
 
@@ -294,7 +298,7 @@ both!(
 );
 
 async fn serves_and_forwards(kind: Kind) {
-    let tric = Tric::new(kind, &fixture("app"), &["-e", "GREETING=hi"]).await;
+    let tric = Tric::new(kind, &fixture(kind.app), &["-e", "GREETING=hi"]).await;
     let res = tric.get("/").await;
     assert_eq!((res.status, &*res.body), (200, "hello"));
     assert_eq!(tric.get("/?status=418").await.status, 418);
@@ -316,14 +320,19 @@ async fn serves_and_forwards(kind: Kind) {
     assert!(!headers.iter().any(|h| hop(&h)), "{headers:?}");
 
     assert_eq!(tric.get("/env").await.json()["env"]["GREETING"], "hi");
-    assert_eq!(tric.get("/print").await.body, "printed");
+    if kind.app == "app" {
+        assert_eq!(tric.get("/print").await.body, "printed"); // only Rust has stdio
+    }
 }
 
 async fn confines_the_guest(kind: Kind) {
     let tric = Tric::app(kind).await;
-    let fs = tric.get("/fs").await.json();
-    for (what, outcome) in fs.as_object().unwrap() {
-        assert!(outcome.get("err").is_some(), "{what}: {outcome}");
+    if kind.app == "app" {
+        // only Rust has files to try
+        let fs = tric.get("/fs").await.json();
+        for (what, outcome) in fs.as_object().unwrap() {
+            assert!(outcome.get("err").is_some(), "{what}: {outcome}");
+        }
     }
     assert_eq!(tric.get("/hog?mb=10").await.body, "hogged 10 MiB");
     assert_eq!(tric.get("/hog?mb=300").await.status, 500);
@@ -458,7 +467,7 @@ async fn fetches_itself(kind: Kind) {
 }
 
 async fn runs_middleware(kind: Kind) {
-    let dir = manifest("component = APP\nmiddleware = [{ url = GUARD, digest = \"DIGEST\" }]\n");
+    let dir = manifest(&fixture(kind.app), "component = APP\nmiddleware = [{ url = GUARD, digest = \"DIGEST\" }]\n");
     let tric = Tric::new(kind, &dir, &["-e", "GUARD_TOKEN=t"]).await;
     assert_eq!(tric.get("/").await.status, 401);
     assert_eq!(tric.send("GET", "/", &[("authorization", "Bearer x")]).await.status, 401);
@@ -471,7 +480,8 @@ async fn runs_middleware(kind: Kind) {
 #[tokio::test]
 async fn refuses_forged_middleware() {
     let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-    let dir = manifest(&format!("component = APP\nmiddleware = [{{ url = GUARD, digest = \"{digest}\" }}]\n"));
+    let toml = format!("component = APP\nmiddleware = [{{ url = GUARD, digest = \"{digest}\" }}]\n");
+    let dir = manifest(&fixture("app"), &toml);
     let out = Command::new(TRIC).arg("dev").arg(&dir).output().await.unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success() && err.contains("does not match its digest"), "{err}");
@@ -480,7 +490,7 @@ async fn refuses_forged_middleware() {
 async fn confines_outbound_requests(kind: Kind) {
     let tric = Tric::app(kind).await;
     assert!(tric.get("/fetch?url=http://example.com/").await.body.contains("HttpRequestDenied"));
-    let tric = Tric::new(kind, &fixture("app"), &["--allow", "*://*:*"]).await;
+    let tric = Tric::new(kind, &fixture(kind.app), &["--allow", "*://*:*"]).await;
     for url in ["http://127.0.0.2:9/", "http://10.0.0.1/", "http://169.254.169.254/", "http://[::1]:9/"] {
         let body = tric.get(&format!("/fetch?url={url}")).await.body;
         assert!(body.contains("DestinationIpProhibited"), "{url}: {body}");
@@ -488,7 +498,8 @@ async fn confines_outbound_requests(kind: Kind) {
 }
 
 async fn fires_cron(kind: Kind) {
-    let tric = Tric::new(kind, &manifest("component = APP\n[cron]\n\"* * * * *\" = \"/@ticks/echo\"\n"), &[]).await;
+    let dir = manifest(&fixture(kind.app), "component = APP\n[cron]\n\"* * * * *\" = \"/@ticks/echo\"\n");
+    let tric = Tric::new(kind, &dir, &[]).await;
     let echo = tric.wait_for("ticks", "echo", Duration::from_secs(75)).await.expect("a tick within a minute");
     assert_eq!(echo["method"], "POST");
     // On a stack, any router on the bucket may fire it: each test's does, at a port of its own.
@@ -626,7 +637,7 @@ async fn isolates_apps() {
 /// so neither an app, nor anyone who learns a commit id, can send requests as another. Acceptance criterion 5.
 #[tokio::test]
 async fn drops_forged_events() {
-    let tric = Tric::app(Kind::Stack).await;
+    let tric = Tric::app(Kind { stack: true, app: "app" }).await;
     let me = format!("http://{}", tric.host);
     assert_eq!(tric.post(&format!("/@f/fetch?method=POST&async=1&url={me}/@g/echo")).await.body, "202 ");
     let echo = tric.wait_for("g", "echo", Duration::from_secs(10)).await.expect("delivered");
