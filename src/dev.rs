@@ -6,21 +6,18 @@ use crate::manifest;
 use crate::outbound::Allow;
 use crate::outbox::{self, Sink};
 use crate::store::Store;
-use crate::tric::{Response, Tric, forward, forwarded, status};
+use crate::tric::{self, Response, Tric, forward, forwarded, status};
 use bytes::Bytes;
 use futures_util::{FutureExt, future::BoxFuture};
 use http::header::HOST;
 use http::{StatusCode, uri::Authority};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
-use hyper::{server::conn::http1, service::service_fn};
-use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Weak};
 use tokio::net::TcpListener;
 use wasmtime::Result;
-use wasmtime_wasi_http::io::TokioIo;
 
 /// Serves the app at `path` on `listen`, with `env` as its environment and `allow` added to its allowed hosts.
 pub async fn run(path: &Path, allow: &[String], env: Vec<(String, String)>, listen: SocketAddr) -> Result<()> {
@@ -31,7 +28,7 @@ pub async fn run(path: &Path, allow: &[String], env: Vec<(String, String)>, list
     let listener = TcpListener::bind(listen).await?;
     let addr = listener.local_addr()?;
     let jobs = app.cron.iter().map(|(f, path)| Ok((Cron::parse(f)?, format!("http://{addr}{path}"))));
-    let jobs = jobs.collect::<Result<_>>()?;
+    let jobs: Vec<_> = jobs.collect::<Result<_>>()?;
     let tric = Arc::new_cyclic(|tric: &Weak<Tric>| {
         let tric = tric.clone();
         let sink: Sink = Arc::new(move |event: Bytes| -> BoxFuture<'static, Result<()>> {
@@ -45,17 +42,14 @@ pub async fn run(path: &Path, allow: &[String], env: Vec<(String, String)>, list
         });
         Tric { app: app.name.clone(), store: Store::memory(), code, allow, sink }
     });
-    tokio::spawn(cron::tick(tric.clone(), jobs));
+    let ticker = tric.clone();
+    tokio::spawn(cron::tick(move |t| {
+        for (_, url) in jobs.iter().filter(|(cron, _)| cron.matches(t)) {
+            tokio::spawn(cron::fire(ticker.clone(), url.clone()));
+        }
+    }));
     eprintln!("serving {} at http://{addr}", app.name);
-    loop {
-        let (tcp, peer) = listener.accept().await?;
-        _ = tcp.set_nodelay(true); // otherwise Nagle and delayed ACKs hold a response up by ~40 ms
-        let tric = tric.clone();
-        tokio::spawn(async move {
-            let svc = service_fn(move |req| handle(tric.clone(), peer, req).map(Ok::<_, Infallible>));
-            http1::Builder::new().serve_connection(TokioIo::new(tcp), svc).await.ok();
-        });
-    }
+    tric::listen(listener, move |peer, req| handle(tric.clone(), peer, req)).await
 }
 
 /// Runs a request from `peer`, at the host its `Host` names, its URI made absolute and `Forwarded` set from the socket.

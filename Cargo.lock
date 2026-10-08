@@ -2583,6 +2583,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "object_store",
+ "quick-xml",
  "rand",
  "serde",
  "serde_json",

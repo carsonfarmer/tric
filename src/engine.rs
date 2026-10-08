@@ -3,6 +3,7 @@
 use crate::kv::Imports;
 use crate::tric::{Ctx, Outbound};
 use std::future::poll_fn;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::{sync::Arc, thread, time::Duration};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::AbortHandle;
@@ -66,6 +67,22 @@ impl Engine {
     /// Compiles the component `wasm`.
     pub fn compile(&self, wasm: &[u8]) -> Result<Component> {
         Component::new(&self.engine, wasm)
+    }
+
+    /// Which engines' native code this one loads, in hex: those of the same Wasmtime, configuration and target.
+    pub fn compat(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        self.engine.precompile_compatibility_hash().hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+
+    /// The component whose native code `bytes` is.
+    ///
+    /// # Safety
+    ///
+    /// Loading native code runs it, so `bytes` must be what an engine of the same `compat` made.
+    pub unsafe fn deserialize(&self, bytes: &[u8]) -> Result<Component> {
+        unsafe { Component::deserialize(&self.engine, bytes) }
     }
 
     /// Loads `component` as an app, with `env` as its environment.

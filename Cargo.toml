@@ -20,6 +20,7 @@ http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 object_store = { version = "=0.14.2", default-features = false, features = ["aws"] }
+quick-xml = { version = "0.41", features = ["serialize"] } # as object_store has it, for STS's answers
 rand = { version = "0.10", default-features = false, features = ["thread_rng"] } # as object_store has it
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -81,15 +81,13 @@ impl Cron {
     }
 }
 
-/// Fires `jobs`, each an expression and the URL it posts to, at the start of each minute.
-pub async fn tick(tric: Arc<Tric>, jobs: Vec<(Cron, String)>) {
+/// Calls `fire` at the start of each minute, with that minute's Unix second.
+pub async fn tick(mut fire: impl FnMut(u64)) {
     loop {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let next = (now / 60 + 1) * 60;
         sleep(Duration::from_secs(next - now)).await;
-        for (_, url) in jobs.iter().filter(|(cron, _)| cron.matches(next)) {
-            tokio::spawn(fire(tric.clone(), url.clone()));
-        }
+        fire(next);
     }
 }
 

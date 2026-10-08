@@ -6,20 +6,28 @@ use crate::outbound::{self, Allow, Fut, Sent};
 use crate::outbox::{self, Held, Sink};
 use crate::store::Store;
 use bytes::{Bytes, BytesMut};
-use futures_util::{StreamExt, stream};
+use futures_util::{FutureExt, StreamExt, stream};
 use http::header::{ETAG, FORWARDED, RETRY_AFTER};
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use http_body_util::{BodyExt, BodyStream, StreamBody};
-use hyper::body::Frame;
+use hyper::body::{Frame, Incoming};
+use hyper::{server::conn::http1, service::service_fn};
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::net::TcpListener;
 use tokio::{sync::Mutex, time::sleep};
-use wasmtime_wasi_http::{RequestOptions, WasiBody, WasiHttpHooks};
+use wasmtime_wasi_http::{RequestOptions, WasiBody, WasiHttpHooks, io::TokioIo};
 
 pub type Request = http::Request<WasiBody>;
 pub type Response = http::Response<WasiBody>;
+
+/// The app a request to serve is for, which the router sets, as Lambda names a tenant.
+pub const TENANT: HeaderName = HeaderName::from_static("x-amz-tenant-id");
+/// The app's storage credentials, which the router sets, as JSON that `credential_process` would print.
+pub const CREDENTIALS: HeaderName = HeaderName::from_static("x-tric-credentials");
 
 /// A turn's request body is kept up to this, so the turn can run again; past it, the turn claims its name first.
 const REPLAY_MAX: usize = 6 << 20;
@@ -78,6 +86,37 @@ pub fn forwarded(ip: IpAddr, host: &str, proto: &str) -> Option<HeaderValue> {
         IpAddr::V6(ip) => format!("\"[{ip}]\""),
     };
     HeaderValue::try_from(format!("for={for};host=\"{host}\";proto={proto}")).ok()
+}
+
+/// Whether `s` is a DNS label in lowercase: 1 to 63 of `a-z`, `0-9` and `-`, with no `-` at either end. An app's name
+/// is one.
+pub fn label(s: &str) -> bool {
+    let ok = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-';
+    (1..=63).contains(&s.len()) && s.bytes().all(ok) && !s.starts_with('-') && !s.ends_with('-')
+}
+
+/// The app at `host`, which must be exactly a label, a dot and `domain`, port and all, in any case.
+pub fn app_at(host: &str, domain: &str) -> Option<String> {
+    let host = host.to_ascii_lowercase();
+    let app = host.strip_suffix(&domain.to_ascii_lowercase())?.strip_suffix('.')?;
+    label(app).then(|| app.to_owned())
+}
+
+/// Serves HTTP/1.1 on `listener`, answering each request with `handle`, which is given the client's address.
+pub async fn listen<F, R>(listener: TcpListener, handle: F) -> wasmtime::Result<()>
+where
+    F: Fn(SocketAddr, hyper::Request<Incoming>) -> R + Clone + Send + 'static,
+    R: Future<Output = Response> + Send + 'static,
+{
+    loop {
+        let (tcp, peer) = listener.accept().await?;
+        _ = tcp.set_nodelay(true); // otherwise Nagle and delayed ACKs hold a response up by ~40 ms
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            let svc = service_fn(move |req| handle(peer, req).map(Ok::<_, Infallible>));
+            http1::Builder::new().serve_connection(TokioIo::new(tcp), svc).await.ok();
+        });
+    }
 }
 
 /// Makes `from` the only word on where a request came from: no other `Forwarded`, no `X-Forwarded-*` of a proxy, and

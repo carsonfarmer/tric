@@ -110,6 +110,13 @@ pub async fn send(req: Request) -> Sent {
     exchange(TLS.connect(name, tcp).await.map_err(Error::Tls)?, req).await
 }
 
+/// Sends `req` to `addr`, a part of tric itself, over plain HTTP: no allow list and no block check.
+pub async fn internal(addr: &str, req: Request) -> Sent {
+    let tcp = TcpStream::connect(addr).await.map_err(Error::Connect)?;
+    _ = tcp.set_nodelay(true);
+    exchange(tcp, req).await
+}
+
 async fn exchange(io: impl AsyncRead + AsyncWrite + Send + Unpin + 'static, mut req: Request) -> Sent {
     let (mut sender, conn) = http1::handshake(TokioIo::new(io)).await?;
     // The driver feeds the body, so it lives as long as the body does: Wasmtime drops the io future early when a p3
