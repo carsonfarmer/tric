@@ -18,7 +18,6 @@ while idle: the only standing costs are the domain's Route 53 zone and what the 
   - the lifecycle rules expire noncurrent versions after a day, and dead letters after 14 days.
 - **CloudFront and DNS.** CloudFront serves `*.<domain>` with a wildcard certificate from ACM, and Route 53 aliases
   point the domain at it.
-- **A $5 monthly budget**, alerting at $4. It is created only when `alert_email` is set.
 
 ## Who can do what
 
@@ -66,10 +65,10 @@ All commands run from the repository's root.
    eval "$(aws configure export-credentials --profile <profile> --format env)"
    ```
 
-3. Install. `alert_email` is optional, and passing it adds the budget:
+3. Install:
 
    ```bash
-   export TF_VAR_domain=example.com TF_VAR_alert_email=you@example.com
+   export TF_VAR_domain=example.com
    docker compose run --rm tofu init
    docker compose run --rm tofu apply
    ```

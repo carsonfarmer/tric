@@ -34,12 +34,6 @@ variable "package" {
   default     = "../../dist/tric.zip"
 }
 
-variable "alert_email" {
-  description = "Where to send an alert when the month's costs pass $4 of a $5 budget; no budget if empty"
-  type        = string
-  default     = ""
-}
-
 provider "aws" {
   region = var.region
   default_tags { tags = { app = var.name } }
@@ -406,22 +400,6 @@ resource "aws_route53_record" "apps" {
     name                   = aws_cloudfront_distribution.apps.domain_name
     zone_id                = aws_cloudfront_distribution.apps.hosted_zone_id
     evaluate_target_health = false
-  }
-}
-
-resource "aws_budgets_budget" "cost" {
-  count        = var.alert_email == "" ? 0 : 1
-  name         = var.name
-  budget_type  = "COST"
-  limit_amount = "5"
-  limit_unit   = "USD"
-  time_unit    = "MONTHLY"
-  notification {
-    comparison_operator        = "GREATER_THAN"
-    threshold                  = 80
-    threshold_type             = "PERCENTAGE"
-    notification_type          = "ACTUAL"
-    subscriber_email_addresses = [var.alert_email]
   }
 }
 

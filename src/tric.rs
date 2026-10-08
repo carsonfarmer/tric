@@ -1,7 +1,7 @@
 //! Running an app: each request in a fresh instance. A request with an unsafe method to `/@<name>` is a turn on the
 //! name: its writes, and the requests it holds, commit if it answers anything but 5xx. A conflict runs it again.
 use crate::engine::App;
-use crate::name::{self, BUSY, Committed, Conditions, Refused, Snap, Turn};
+use crate::name::{self, BUSY, Committed, Conditions, Refused, Snap, TooLarge, Turn};
 use crate::outbound::{self, Allow, Fut, Sent};
 use crate::outbox::{self, Held, Sink};
 use crate::store::Store;
@@ -269,7 +269,10 @@ impl Tric {
                 Err(e) => {
                     instance.abort();
                     tracing::warn!(app = self.app, name, "{e:#}");
-                    return later(StatusCode::SERVICE_UNAVAILABLE);
+                    return match e.is::<TooLarge>() {
+                        true => status(StatusCode::INTERNAL_SERVER_ERROR),
+                        false => later(StatusCode::SERVICE_UNAVAILABLE),
+                    };
                 }
             }
         }

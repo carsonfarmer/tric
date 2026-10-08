@@ -154,35 +154,31 @@ fn dropped(why: &str) -> Delivered {
 
 /// Sends `e`'s `n`th request: `Ok` if it is done, or else the `Retry-After` its response gave.
 async fn send(tric: &Arc<Tric>, e: &Event, n: usize) -> Result<(), Option<Duration>> {
+    let failed = |why: String| -> Option<Duration> {
+        tracing::info!(app = e.app, commit = e.commit, n, "outbox: {why}");
+        None
+    };
     let exchange = async {
-        let req = e.requests[n].request(&e.commit, n).map_err(|err| format!("{err:#}"))?;
+        let req = e.requests[n].request(&e.commit, n).map_err(|err| failed(format!("{err:#}")))?;
         let res = match req.uri().authority().is_some_and(|a| a.as_str().eq_ignore_ascii_case(&e.host)) {
             true => tric.fetch(req, "for=_tric").await,
             false => match outbound::allowed(&tric.allow, req.uri()) {
-                Ok(()) => outbound::send(req).await.map(|(res, _)| res).map_err(|err| format!("{err:?}"))?,
+                Ok(()) => outbound::send(req).await.map_err(|err| failed(format!("{err:?}")))?.0,
                 Err(err) => {
                     tracing::warn!(app = e.app, commit = e.commit, n, "outbox: not sent, as {err:?}");
-                    return Ok(None);
+                    return Ok(());
                 }
             },
         };
         let (status, after) = (res.status(), retry_after(res.headers()));
         _ = res.into_body().collect().await;
-        Ok::<_, String>(Some((status, after)))
+        if status == StatusCode::TOO_MANY_REQUESTS || !(200..500).contains(&status.as_u16()) {
+            failed(format!("answered {status}"));
+            return Err(after);
+        }
+        Ok::<_, Option<Duration>>(())
     };
-    match timeout(EXCHANGE, exchange).await {
-        Ok(Ok(None)) => Ok(()),
-        Ok(Ok(Some((s, _)))) if s != StatusCode::TOO_MANY_REQUESTS && (200..500).contains(&s.as_u16()) => Ok(()),
-        Ok(Ok(Some((s, after)))) => {
-            tracing::info!(app = e.app, commit = e.commit, n, "outbox: answered {s}");
-            Err(after)
-        }
-        Ok(Err(err)) => {
-            tracing::info!(app = e.app, commit = e.commit, n, "outbox: {err}");
-            Err(None)
-        }
-        Err(_) => Err(None),
-    }
+    timeout(EXCHANGE, exchange).await.unwrap_or(Err(None))
 }
 
 /// A `Retry-After` of delay-seconds.

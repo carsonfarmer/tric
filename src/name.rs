@@ -19,7 +19,6 @@ const KEY_MAX: usize = 256; // bytes
 const VALUE_MAX: usize = 1 << 20;
 const INLINE_MAX: usize = 1 << 10; // a larger value is an object of its own
 const HEAD_MAX: usize = 1 << 20;
-const OBJECT_LEN: usize = 200; // the most a reference to a value object takes in a head
 const HELD_MAX: usize = 1_000_000; // bytes of held requests, as JSON, so an event is within Lambda's 1 MB
 const PAGE: usize = 1000; // keys per `list-keys`
 /// How long a turn waits for others' claims, and reruns, before it gives up with a 429.
@@ -112,7 +111,7 @@ pub async fn read(store: &Store, path: &Path) -> Result<Option<(Head, UpdateVers
 /// `None` if another write landed first.
 async fn put(store: &Store, path: &Path, head: &Head, base: Option<UpdateVersion>) -> Result<Option<UpdateVersion>> {
     let json = serde_json::to_vec(head)?;
-    ensure!(json.len() <= HEAD_MAX, "{path} would be over {HEAD_MAX} bytes");
+    ensure!(json.len() <= HEAD_MAX, TooLarge);
     store.put(path, json.into(), store::over(base)).await
 }
 
@@ -231,7 +230,6 @@ struct State {
     head: Head,                  // as read, or as this turn's claim wrote it
     base: Option<UpdateVersion>, // the head's version, if there is a head
     writes: BTreeMap<String, Option<Bytes>>,
-    size: usize, // of the head's JSON with the writes, projected
     answered: bool,
     claim: Option<String>, // this turn's, once taken
     doomed: bool,          // a claim failed, so the commit will
@@ -256,15 +254,13 @@ pub enum Committed {
     Conflict,             // another turn changed the name first
 }
 
-/// The JSON length of an entry of `values`: the key, a colon, the value and a comma.
-fn entry_len(key: &str, value: usize) -> usize {
-    serde_json::to_string(key).map_or(0, |k| k.len()) + value + 2
-}
+/// Why a commit failed when its head would be over `HEAD_MAX`: the app wrote too much, so, as for a trap, it answers 500.
+#[derive(Debug)]
+pub struct TooLarge;
 
-fn value_len(v: &Bytes) -> usize {
-    match v.len() {
-        n if n <= INLINE_MAX => 11 + n.div_ceil(3) * 4, // `{"data":""}` and the base64
-        _ => OBJECT_LEN,
+impl std::fmt::Display for TooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "the name would be over {HEAD_MAX} bytes")
     }
 }
 
@@ -279,27 +275,8 @@ impl State {
         if self.answered {
             return Err(other("the name is read-only after the response"));
         }
-        let (writes, size) = (self.writes.clone(), self.size);
-        for (k, v) in items {
-            self.size = self.size - self.entry(&k) + v.as_ref().map_or(0, |v| entry_len(&k, value_len(v)));
-            self.writes.insert(k, v);
-            if self.size > HEAD_MAX {
-                (self.writes, self.size) = (writes, size);
-                return Err(other(format!("the name would be over {HEAD_MAX} bytes")));
-            }
-        }
+        self.writes.extend(items);
         Ok(())
-    }
-
-    /// The length the entry for `key` takes now.
-    fn entry(&self, key: &str) -> usize {
-        match self.writes.get(key) {
-            Some(Some(v)) => entry_len(key, value_len(v)),
-            Some(None) => 0,
-            None => {
-                self.head.values.get(key).map_or(0, |v| entry_len(key, serde_json::to_string(v).map_or(0, |j| j.len())))
-            }
-        }
     }
 }
 
@@ -324,10 +301,9 @@ impl Turn {
                 if !conditions.hold(base.as_ref().and_then(etag).as_deref()) {
                     return Ok(Err(Refused::Precondition));
                 }
-                let size = serde_json::to_vec(&head)?.len();
                 let (writes, held) = Default::default();
                 let state =
-                    State { head, base, writes, size, answered: false, claim: None, doomed: false, held, held_size: 0 };
+                    State { head, base, writes, answered: false, claim: None, doomed: false, held, held_size: 0 };
                 let (app, name, settled) = (app.into(), name.into(), watch::Sender::new(None));
                 let (state, claiming) = (Mutex::new(state), Default::default());
                 let turn =
@@ -526,6 +502,7 @@ impl Turn {
             }
             let now = now();
             head.pending.retain(|_, p| now.saturating_sub(p.at) < PENDING_TTL.as_millis() as u64);
+            head.claim = None;
             if !held.is_empty() {
                 let commit = store::random();
                 let event = Event {
@@ -537,11 +514,10 @@ impl Turn {
                     requests: held,
                 };
                 let bytes = Bytes::from(serde_json::to_vec(&event)?);
-                let digest = store::hash(&bytes);
+                head.pending.insert(commit, Pending { digest: store::hash(&bytes), at: now });
+                ensure!(serde_json::to_vec(&head)?.len() <= HEAD_MAX, TooLarge); // or the event would be sent in vain
                 sink(bytes).await?;
-                head.pending.insert(commit, Pending { digest, at: now });
             }
-            head.claim = None;
             put(&self.store, &self.path, &head, base.clone()).await
         };
         let put = put.await;
@@ -608,6 +584,7 @@ pub async fn settle(store: &Store, app: &str, name: &str, commit: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::{BodyExt, Empty};
 
     #[test]
     fn names() {
@@ -653,7 +630,19 @@ mod tests {
             r#"{"values":{"big":{"object":{"key":"00000000000000000000000000000000","version":"v1"}},"k":{"data":"dg=="}},"pending":{"c":{"digest":"d","at":1}}}"#
         );
         assert!(serde_json::from_str::<Head>(r#"{"values":{},"x":1}"#).is_err());
-        // what the projection counts for an inline value is what it takes
-        assert_eq!(value_len(&Bytes::from("v")), r#"{"data":"dg=="}"#.len());
+    }
+
+    #[tokio::test]
+    async fn too_large() {
+        let store = Store::memory();
+        let turn =
+            Turn::open(&store, "a", "n", false, &Default::default(), Instant::now()).await.unwrap().ok().unwrap();
+        let v = Bytes::from(vec![0; INLINE_MAX]);
+        turn.write((0..800).map(|k| (k.to_string(), Some(v.clone()))).collect()).unwrap();
+        let body = Empty::new().map_err(|n| match n {}).boxed_unsync();
+        turn.hold(Held::of(http::Request::new(body)).await.ok().unwrap()).unwrap();
+        let sink: Sink = Arc::new(|_| panic!("an event of a commit that fails is not sent"));
+        assert!(turn.commit("h", &sink).await.err().unwrap().is::<TooLarge>());
+        assert!(read(&store, &path("a", "n")).await.unwrap().is_none());
     }
 }

@@ -208,12 +208,7 @@ impl Route {
             let due = release.cron.into_iter().filter(|(fields, _)| Cron::parse(fields).is_ok_and(|c| c.matches(t)));
             for (_, path) in due {
                 let (route, app) = (self.clone(), app.clone());
-                tokio::spawn(async move {
-                    match route.event(&app, &path, "for=_cron", Bytes::new()).await {
-                        Ok(res) => tracing::info!(app, path, status = res.status().as_u16(), "cron"),
-                        Err(e) => tracing::warn!(app, path, "cron: {e:#}"),
-                    }
-                });
+                tokio::spawn(async move { route.fire(&app, &path).await });
             }
         }
     }
@@ -230,16 +225,20 @@ impl Route {
             Ok(_) => return status(StatusCode::BAD_REQUEST),
             Err(code) => return status(code),
         };
-        let res = match self.known(&job.app).await {
-            Ok(true) => self.event(&job.app, &job.path, "for=_cron", Bytes::new()).await,
+        match self.known(&job.app).await {
+            Ok(true) => self.fire(&job.app, &job.path).await,
             Ok(false) => return status(StatusCode::NOT_FOUND), // an app with no release has no tenant
-            Err(e) => Err(e),
-        };
-        match res {
-            Ok(res) => tracing::info!(app = job.app, path = job.path, status = res.status().as_u16(), "cron"),
             Err(e) => tracing::warn!(app = job.app, path = job.path, "cron: {e:#}"),
         }
         status(StatusCode::NO_CONTENT)
+    }
+
+    /// Fires the cron job at `path` of `app`, and logs how it went.
+    async fn fire(&self, app: &str, path: &str) {
+        match self.event(app, path, "for=_cron", Bytes::new()).await {
+            Ok(res) => tracing::info!(app, path, status = res.status().as_u16(), "cron"),
+            Err(e) => tracing::warn!(app, path, "cron: {e:#}"),
+        }
     }
 
     /// Takes a delivery event that serve hands over, and relays it to the app it names, as Lambda does an event: at

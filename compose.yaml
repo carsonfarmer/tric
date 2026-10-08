@@ -87,7 +87,7 @@ services:
     image: ghcr.io/opentofu/opentofu:1.13
     working_dir: /src/infra/aws
     volumes: [".:/src"]
-    environment: [AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, TF_VAR_domain, TF_VAR_alert_email]
+    environment: [AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, TF_VAR_domain]
     profiles: [aws]
   minio:
     image: minio/minio:RELEASE.2025-09-07T16-13-09Z
