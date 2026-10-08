@@ -1,26 +1,20 @@
 # tric
 
-SpinKube without Kubernetes: a small host for WASI HTTP components that scales to zero. One AWS Lambda function serves
-every app, each at its own subdomain, and everything it knows (apps, releases, secrets, KV data) lives in S3, so an idle
-install costs only its storage. Each request gets a fresh Wasmtime instance that can reach nothing it was not given.
+A small host for WASI HTTP components that scales to zero. One process serves every app in a bucket, each at its own
+subdomain; on AWS that process is one Lambda function behind CloudFront and the bucket is S3, so an idle install costs
+its storage and nothing else. Each request gets a fresh Wasmtime instance that can reach nothing it was not given, and
+state is the bucket's too: each app's key-value data, kept in **names** that requests change one at a time.
 
-## Quick start
+tric runs components; it does not build them. Anything that exports `wasi:http/handler@0.3` is an app.
 
-From nothing to an app at `https://hello.<domain>`. You need Rust 1.96 or later, Docker, an AWS account with the AWS CLI
-signed in to it, and a domain to serve the apps under.
+## An app
 
-**1. Install the CLI.**
-
-```bash
-cargo install --locked --git https://github.com/carsonfarmer/tric tric
-```
-
-**2. Write an app.** Any component that exports `wasi:http` will do; this one is Rust.
+You need Rust 1.96 or later, with the `wasm32-wasip2` target, and Docker.
 
 ```bash
 rustup target add wasm32-wasip2
 cargo new --lib hello && cd hello
-cargo add wasip3 --features http-compat
+cargo add wasip3@0.9 --features http-compat
 cargo add http
 printf '\n[lib]\ncrate-type = ["cdylib"]\n' >> Cargo.toml
 ```
@@ -41,72 +35,65 @@ impl wasip3::exports::http::handler::Guest for App {
 }
 ```
 
-Then build it, and describe it in a `tric.toml` beside `Cargo.toml`:
+Build it, and name it in a `tric.toml` beside `Cargo.toml`:
 
 ```bash
 cargo build --release --target wasm32-wasip2
 printf 'name = "hello"\ncomponent = "target/wasm32-wasip2/release/hello.wasm"\n' > tric.toml
 ```
 
-**3. Run it locally.** `tric serve` serves the app in the current directory at `hello.localhost:3000`, until Ctrl-C:
+`tric.toml` may also list the hosts the app may call (`allowed_outbound_hosts = ["https://api.example.com"]`),
+middleware to wrap it in, and cron schedules (`[cron]`, `"0 8 * * *" = "/@digest/run"`).
+[docs/decisions.md](docs/decisions.md) says what each does, and what an app may import.
+
+## Running it
+
+**One app**, with its state in memory, until Ctrl-C:
 
 ```bash
-tric serve
+cargo install --locked --git https://github.com/carsonfarmer/tric tric
+tric dev                                   # the app in this directory, at http://127.0.0.1:3000
 ```
 
-In another terminal:
+**A local install**, which is what an install on AWS is but for Lambda and EventBridge Scheduler: every app in one
+bucket (MinIO, in Docker), each at `http://<app>.localhost:3000`, with cron ticking in-process. Nothing to install but
+Docker. From a clone of this repository:
 
 ```bash
+docker compose up -d serve
+docker compose run --rm -v "$PWD/../hello:/app" tric deploy /app
 curl hello.localhost:3000
 ```
 
-**4. Install tric on AWS**, with `AWS_PROFILE` set to a profile that may administer the account. The domain needs a
-public Route 53 zone in the account. If it has none yet, make one, and point the domain at the four name servers it
-prints:
+The `tric` service is the CLI, on the local install: `deploy`, `releases`, `release` and `env`, as on AWS. Apps,
+releases and state outlive the containers, in the `s3` service's volume; `docker compose down -v` removes them.
+
+**Lambda, locally**: the build that runs on AWS, `dist/tric.zip`, on Lambda's own image with its emulator, against the
+local install's bucket. Lambda takes events, not HTTP, so send it one as a Function URL or EventBridge Scheduler would:
 
 ```bash
-aws route53 create-hosted-zone --name <domain> --caller-reference "<domain>-$(date +%s)"
+docker compose run --rm release            # dist/tric.zip, for Lambda's arm64
+docker compose up -d --build lambda
+curl -d '{"version":"2.0","rawPath":"/","headers":{"x-forwarded-host":"hello.localhost"},
+  "requestContext":{"http":{"method":"GET","path":"/"}}}' localhost:9000/2015-03-31/functions/function/invocations
+curl -d '{"cron":{"app":"hello","path":"/"}}' localhost:9000/2015-03-31/functions/function/invocations
 ```
 
-The install's settings go in `infra/aws/terraform.tfvars`, which git ignores: the domain, and an email address for the
-budget alert. An account whose Lambda concurrency quota is under 122 (`aws lambda get-account-settings`), as a new
-account's is, needs `concurrency = { serve = -1, compile = -1 }` there too.
+The outbox's events are invocations of the function itself, which the emulator cannot take, so there a turn that holds
+requests fails.
 
-```bash
-cd .. && git clone https://github.com/carsonfarmer/tric && cd tric
-printf '%s\n' 'domain = "<domain>"' 'budget = { emails = ["<you@example.com>"] }' > infra/aws/terraform.tfvars
-docker compose run --rm release
-docker compose run --rm tofu init
-docker compose run --rm tofu apply
-```
+## On AWS
 
-The build takes a few minutes (more on an x86 machine, where Docker emulates arm64), and the apply about five more,
-most of them CloudFront's. [infra/aws/README.md](infra/aws/README.md) has the details.
-
-**5. Release the app.** Still in the clone, point the CLI at the install (us-west-2 is the module's default region),
-then publish and release from the app's directory:
-
-```bash
-export AWS_REGION=us-west-2 TRIC_STORE=$(docker compose run --rm -T tofu output -raw store) TRIC_NATIVE=true
-eval "$(aws configure export-credentials --format env)"
-cd ../hello && tric release $(tric publish)
-curl https://hello.<domain>
-```
-
-`tric publish` uploads the app and waits for its native code; `tric release` serves it. Within 5 s it is live.
-
-## Then
-
-- [Writing apps](docs/apps.md): the manifest, releases and secrets, KV and its consistency, outbound HTTP, limits,
-  and composing components.
-- [Running an install](infra/aws/README.md): teams, upgrades, garbage and undoing deletes, the trust model, costs, and
-  spinning it down.
-- [The plan](docs/plan.md) and [the decisions](docs/decisions.md) behind it.
+`tofu apply` in [infra/aws](infra/aws/README.md) installs tric into an account: a bucket, a function, CloudFront at
+`*.<domain>`, a Scheduler group, a policy for whoever deploys, and a budget alert. The CLI then deploys to it as to the
+local install, with `TRIC_STORE` naming its bucket. That README covers the security model, upgrades, failures, undoing
+deletes, costs and spinning it down.
 
 ## Developing
 
-Everything runs in Docker. `docker compose run --rm test` builds the test components and runs the tests;
-[compose.yaml](compose.yaml) lists the rest.
+Everything runs in Docker, one stack per worktree. `docker compose run --rm test` is the gate CI runs: it builds the
+test components, checks formatting and lints, and runs the tests, the end-to-end ones against MinIO as well as in
+memory. [compose.yaml](compose.yaml) lists the rest, and [docs/decisions.md](docs/decisions.md) is what tric is and why.
 
 ## Licence
 
