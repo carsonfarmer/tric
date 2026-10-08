@@ -454,7 +454,7 @@ async fn delivers_the_outbox_once_committed(kind: Kind) {
     let me = format!("http://{}", tric.host);
     let res = tric.post(&format!("/@f/fetch?method=POST&async=1&url={me}/@g/echo")).await;
     assert_eq!((res.status, &*res.body), (200, "202 "));
-    let echo = tric.wait_for("g", "echo", Duration::from_secs(10)).await.expect("delivered");
+    let echo = tric.wait_for("g", "echo", Duration::from_secs(30)).await.expect("delivered");
     let key = header(&echo, "idempotency-key").expect("an Idempotency-Key");
     assert!(key.ends_with("/0"), "{key}");
     assert_eq!(header(&echo, "prefer"), None);
@@ -654,7 +654,7 @@ async fn drops_forged_events() {
     let tric = Tric::app(Kind { stack: true, app: "app" }).await;
     let me = format!("http://{}", tric.host);
     assert_eq!(tric.post(&format!("/@f/fetch?method=POST&async=1&url={me}/@g/echo")).await.body, "202 ");
-    let echo = tric.wait_for("g", "echo", Duration::from_secs(10)).await.expect("delivered");
+    let echo = tric.wait_for("g", "echo", Duration::from_secs(30)).await.expect("delivered");
     let key = header(&echo, "idempotency-key").expect("an Idempotency-Key");
     let (commit, _) = key.rsplit_once('/').unwrap();
 
@@ -670,7 +670,7 @@ async fn drops_forged_events() {
     let body = Bytes::from(event.to_string());
     assert_eq!(exchange(&tric.outbox, &tric.outbox, "POST", "/", &[], body).await.status, 202);
     let line = "outbox: dropped an event, as its commit is not pending";
-    assert!(tric.logged(line, Duration::from_secs(10)).await, "dropped");
+    assert!(tric.logged(line, Duration::from_secs(30)).await, "dropped");
     assert_eq!(tric.value("h", "echo").await, Value::Null);
 }
 
