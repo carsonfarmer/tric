@@ -11,6 +11,10 @@ keywords = ["wasm", "wasi", "component-model", "serverless", "lambda"]
 categories = ["wasm", "web-programming::http-server", "command-line-utilities"]
 include = ["/src", "/wit", "/README.md", "/LICENSE"]
 
+[features]
+# WebSockets, in `tric dev`: Pushpin's WebSocket-over-HTTP.
+ws = ["dep:hyper-util", "dep:tokio-tungstenite"]
+
 [dependencies]
 base64 = "0.22"
 bytes = "1"
@@ -20,6 +24,7 @@ futures-util = "0.3"
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true } # as reqwest has it
 object_store = { version = "=0.14.2", default-features = false, features = ["aws"] }
 quick-xml = { version = "0.41", features = ["serialize"] } # as object_store has it, for STS's answers
 rand = { version = "0.10", default-features = false, features = ["thread_rng"] } # as object_store has it
@@ -30,6 +35,8 @@ target-lexicon = "0.13"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 # aws-lc-rs, as object_store's S3 client uses, so one TLS provider is linked, not two.
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
+# Only the handshake's key and the framing: no TLS, and no client of its own.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

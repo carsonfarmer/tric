@@ -114,7 +114,10 @@ where
         let handle = handle.clone();
         tokio::spawn(async move {
             let svc = service_fn(move |req| handle(peer, req).map(Ok::<_, Infallible>));
-            http1::Builder::new().serve_connection(TokioIo::new(tcp), svc).await.ok();
+            let conn = http1::Builder::new().serve_connection(TokioIo::new(tcp), svc);
+            #[cfg(feature = "ws")]
+            let conn = conn.with_upgrades();
+            conn.await.ok();
         });
     }
 }
@@ -128,6 +131,8 @@ pub fn forward(headers: &mut HeaderMap, from: HeaderValue) {
         headers.remove(name);
     }
     headers.insert(FORWARDED, from);
+    #[cfg(feature = "ws")]
+    crate::ws::scrub(headers);
 }
 
 /// A turn's request body, which can run again if it was kept whole.
@@ -182,6 +187,10 @@ impl Tric {
 
     /// Runs `req` in an instance, as a turn if it is one.
     async fn dispatch(self: &Arc<Self>, req: Request, host: &str, chain: Vec<String>, depth: usize) -> Response {
+        #[cfg(feature = "ws")]
+        if crate::ws::publishes(&req) {
+            return crate::ws::publish(req).await;
+        }
         let ctx = |turn, chain| {
             let (tric, snaps, host) = (self.clone(), Mutex::default(), host.into());
             Arc::new(Ctx { tric, turn, snaps, host, chain, depth })

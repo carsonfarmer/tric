@@ -21,6 +21,8 @@ use wasmtime::Result;
 
 /// Serves the app at `path` on `listen`, with `env` as its environment and `allow` added to its allowed hosts.
 pub async fn run(path: &Path, allow: &[String], env: Vec<(String, String)>, listen: SocketAddr) -> Result<()> {
+    #[cfg(feature = "ws")]
+    crate::ws::init();
     let app = manifest::read(path, allow).await?;
     let engine = Engine::new()?;
     let code = Arc::new(engine.load(&engine.compile(&app.wasm)?, env)?);
@@ -65,6 +67,10 @@ async fn handle(tric: Arc<Tric>, peer: SocketAddr, req: hyper::Request<Incoming>
     };
     parts.uri = uri;
     forward(&mut parts.headers, from);
+    #[cfg(feature = "ws")]
+    if crate::ws::wants(&parts) {
+        return crate::ws::open(tric, host, parts).await;
+    }
     let body = body.map_err(wasmtime_wasi_http::Error::from).boxed_unsync();
     tric.run(http::Request::from_parts(parts, body), &host).await
 }
