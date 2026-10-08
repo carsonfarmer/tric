@@ -7,6 +7,7 @@
 //!   `Prefer: respond-async` given `async`. The reply is `<status> <body>`, or the Debug of the `ErrorCode`.
 //! - `/kv?…`: see kv.rs.
 //! - `/env`: the environment and the arguments; `/fs`: what reading the filesystem gets.
+//! - `/stream?n=N`: N lines, a second apart, in a body that streams.
 //! - `/hog?mb=N` holds N MiB; `/fields?n=N` holds N `fields`; `/loop` spins; `/print` writes to stdout and stderr.
 //! - anything else: `hello`.
 use crate::kv;
@@ -15,7 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::{fmt::Debug, fs, hint::black_box, io};
 use wasip3::http::types::{ErrorCode, Fields, Method, Request, Response, Scheme};
 use wasip3::http::{client, service::export};
-use wasip3::{clocks::monotonic_clock, http_compat::http_into_wasi_response, wit_future};
+use wasip3::{clocks::monotonic_clock, http_compat::http_into_wasi_response, wit_future, wit_stream};
 
 export!(App);
 struct App;
@@ -35,6 +36,9 @@ impl wasip3::exports::http::handler::Guest for App {
             monotonic_clock::wait_for(ms * 1_000_000).await;
         }
         let n: usize = q.get("mb").or(q.get("n")).and_then(|v| v.parse().ok()).unwrap_or(1);
+        if path == "/stream" {
+            return Ok(stream(n));
+        }
         let body = match path.as_str() {
             "/echo" => {
                 let echo = echo(request, &method).await.to_string();
@@ -90,6 +94,23 @@ async fn echo(request: Request, method: &http::Method) -> Value {
     let (body, _) = Request::consume_body(request, wit_future::new(|| Ok(())).1);
     let body = String::from_utf8_lossy(&body.collect().await).into_owned();
     json!({ "method": method.as_str(), "uri": uri, "headers": headers, "body": body })
+}
+
+/// `n` lines, a second apart, in a body that streams.
+fn stream(n: usize) -> Response {
+    let (mut lines, body) = wit_stream::new();
+    let (done, trailers) = wit_future::new(|| Ok(None));
+    wasip3::wit_bindgen::spawn_local(async move {
+        for i in 0..n {
+            if i > 0 {
+                monotonic_clock::wait_for(1_000_000_000).await;
+            }
+            lines.write_all(format!("{i}\n").into_bytes()).await;
+        }
+        drop(lines);
+        _ = done.write(Ok(None)).await;
+    });
+    Response::new(Fields::new(), Some(body), trailers).0
 }
 
 async fn fetch(method: &str, respond_async: bool, url: &str) -> String {

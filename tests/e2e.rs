@@ -151,6 +151,8 @@ struct Tric {
 }
 
 struct Res {
+    /// How long the answer's head took.
+    head: Duration,
     status: u16,
     headers: HeaderMap,
     body: String,
@@ -175,10 +177,12 @@ async fn exchange(addr: &str, host: &str, method: &str, target: &str, headers: &
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
+    let start = Instant::now();
     let res = sender.send_request(req.body(Full::new(body)).unwrap()).await.unwrap();
+    let head = start.elapsed();
     let (parts, body) = res.into_parts();
     let body = String::from_utf8_lossy(&body.collect().await.unwrap().to_bytes()).into_owned();
-    Res { status: parts.status.as_u16(), headers: parts.headers, body }
+    Res { head, status: parts.status.as_u16(), headers: parts.headers, body }
 }
 
 impl Tric {
@@ -298,6 +302,10 @@ async fn serves_and_forwards(kind: Kind) {
     let res = tric.get("/").await;
     assert_eq!((res.status, &*res.body), (200, "hello"));
     assert_eq!(tric.get("/?status=418").await.status, 418);
+    let start = Instant::now();
+    let res = tric.get("/stream?n=3").await;
+    assert_eq!(res.body, "0\n1\n2\n");
+    assert!(res.head < Duration::from_secs(1) && start.elapsed() > Duration::from_secs(2), "the body streams");
 
     // Whatever a client says of where it came from, or of whose it is, `Forwarded` is tric's, from the socket.
     let claims = [
