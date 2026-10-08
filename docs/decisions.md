@@ -76,3 +76,20 @@ reason.
   `http`. The router sets `https` on AWS and `http` locally.
 - **A middleware `url`** is fetched when it is `http(s)`. Anything else is a path, relative to `tric.toml`'s
   directory. Its `digest` is always required.
+
+## JavaScript
+
+- **A JavaScript app is built by componentize-qjs 0.4.5, patched, and speaks WASI directly.** It is experimental.
+  - It is the only toolchain found that makes WASI 0.3 components: StarlingMonkey and ComponentizeJS make 0.2 ones.
+  - As published it can't build a world that imports an async function. Its Wasmtime 47 can't stub the import for the
+    build-time run, and 49 stubs a resource that merely aliases another wrongly. `docker/build.Dockerfile` builds it
+    from crates.io, by sha256, with `docker/qjs/componentize-qjs.patch` (Wasmtime 49.0.2, the host's, and its own
+    trapping of the imports the run is not given) and a lockfile.
+  - There is no shim for `fetch`, `Request` or `URL`: they are not WASI, and tric invents nothing. An app that wants
+    them brings them.
+  - The fixture in `tests/components/js` has every route of the Rust one but `/print` and `/fs`, which try tric's own
+    stdio and files, and QuickJS has neither. Its text is strict UTF-8, where Rust's is lossy.
+  - The module's top level runs once, at build time, with an empty environment, and its heap is every request's
+    start: `Math.random` repeats in every request, so what must be secret comes from `wasi:random`.
+  - Its component imports the WASI 0.2 interfaces the runtime stands on, as a Rust app's does, and exports an `init`
+    that tric never calls.
