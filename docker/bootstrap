@@ -1,0 +1,4 @@
+#!/bin/sh
+# Lambda's entry point on provided.al2023: `tric route` or `tric serve`, as the function's handler says. The Lambda Web
+# Adapter, a layer, turns each invocation into an HTTP request to it.
+exec "$LAMBDA_TASK_ROOT/tric" "$_HANDLER"

@@ -158,7 +158,7 @@ impl Route {
             return Ok(creds.clone());
         }
         let minted = Instant::now();
-        let creds = self.aws.assume(self.role.as_deref(), &format!("app-{app}"), &policy(&self.bucket, app)).await?;
+        let creds = self.aws.assume(self.role.as_deref(), app, &policy(&self.bucket, app)).await?;
         let mut creds = HeaderValue::try_from(serde_json::to_string(&creds)?)?;
         creds.set_sensitive(true);
         let mut all = self.creds.lock().unwrap();

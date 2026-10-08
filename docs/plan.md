@@ -108,7 +108,7 @@ apps/<app>/components/<sha256>   the component, after middleware; deploy writes 
 apps/<app>/names/<name>          a head; changed only by If-Match / If-None-Match: *
 apps/<app>/values/<unique>       a value too big to inline; written once, read by version id
 native/<app>/<compat>/<sha256>   compiled code, written by the app's own tenant on a miss
-dead/                            Lambda's on-failure records (platform only; lifecycle expires them)
+aws/lambda/async/                the dead letters: Lambda's on-failure records, under its fixed prefix (platform only)
 ```
 
 - **A head** is plain JSON with three parts:
@@ -131,7 +131,7 @@ dead/                            Lambda's on-failure records (platform only; lif
 2. HEAD `apps/<app>/current`, cached for a few seconds, misses included. An unknown app gets 404, and no tenant is ever
    created for it.
 3. Mint credentials with STS `AssumeRole` on the one app role:
-   - the session name is `app-<app>`;
+   - the session name is the app (STS allows 64 characters, too few for `app-` and a 63-character label);
    - the session policy grants:
      - `apps/<app>/{names,values}/*`: read and write;
      - the rest of `apps/<app>/*`: read;
@@ -180,7 +180,7 @@ dead/                            Lambda's on-failure records (platform only; lif
   4. Clear the commit from `pending`.
 
   Any 5xx, 429 or network error answers 5xx. The router's invocation then fails, Lambda retries it twice, and then it
-  goes to `dead/`.
+  goes to the dead letters.
 - **At a turn's answer, with background requests:** invoke the router's `outbox` alias first, then commit, recording
   the digest in `pending`.
 - **It is a plain HTTP server.** On Lambda, the Lambda Web Adapter translates.
@@ -206,14 +206,14 @@ dead/                            Lambda's on-failure records (platform only; lif
 ### AWS (OpenTofu)
 
 - **The router:** a function URL with streaming, behind CloudFront at `*.<domain>`, plus an `outbox` alias. The alias
-  carries the async config: two retries, a 6 h maximum event age, and `dead/` as the on-failure destination.
+  carries the async config: two retries, a 6 h maximum event age, and the bucket as the on-failure destination.
 - **serve:** per tenant (`PER_TENANT`), with no URL. Only the router may invoke it.
 - **The roles:**
   - the app role, which trusts only the router's role;
   - the router's role, which can assume the app role, HEAD `current` and invoke serve;
   - serve's role, with its logs and `router:outbox` only;
   - the Scheduler role, which can invoke the router.
-- **The bucket:** versioning, the lifecycle rules (noncurrent versions, delete markers, `dead/`), and short log
+- **The bucket:** versioning, the lifecycle rules (noncurrent versions, delete markers, the dead letters), and short log
   retention.
 - One `tofu apply` installs it all into a fresh account. The apply waits for the user's go-ahead.
 
@@ -285,7 +285,7 @@ Each step ends with the gate passing (`docker compose run --rm test`) and a comm
 - serve's role has no S3 access;
 - the app role trusts only the router;
 - the outbox alias carries the async config and the failure destination;
-- lifecycle expires noncurrent versions and `dead/`.
+- lifecycle expires noncurrent versions and the dead letters.
 
 **The remote test, after the user says go:**
 - an app answers through CloudFront, and streams;
