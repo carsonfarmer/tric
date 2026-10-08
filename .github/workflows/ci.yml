@@ -1,5 +1,5 @@
-# The Docker gate, as run locally: the test components, fmt, clippy for both feature sets, the tests, and a check that
-# the crate packages. The suite against a real bucket (TRIC_TEST_STORE) is run by hand.
+# The gate, as `docker compose run --rm test` runs it locally: the test components, fmt, clippy, the tests (end to end
+# in memory and against MinIO), and a check that the crate packages.
 name: ci
 on:
   push: { branches: [main] }
@@ -12,11 +12,5 @@ jobs:
     env: { COMPOSE_PROJECT_NAME: tric-ci }
     steps:
       - uses: actions/checkout@v7
-      - run: docker compose build dev
-      - run: docker compose run --rm fixtures
-      - run: >-
-          docker compose run --rm -T dev sh -c 'cargo fmt --check
-          && cargo clippy --locked --all-targets -- -D warnings
-          && cargo clippy --locked --no-default-features --lib -- -D warnings
-          && cargo test --locked
-          && cargo publish --dry-run --locked --no-verify'
+      - run: docker compose build test
+      - run: docker compose run --rm -T test
