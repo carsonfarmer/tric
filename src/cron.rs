@@ -1,9 +1,10 @@
 //! Cron: POSIX expressions, five fields in UTC, each naming a path that gets a `POST` with `Forwarded: for=_cron` in
 //! every minute it matches. Local hosts tick in-process; on AWS each is an EventBridge Scheduler schedule, which
 //! `deploy` and `release` keep in step with the release that runs.
-use crate::aws::{Aws, Schedule, Target, Window};
+use crate::aws::Aws;
 use crate::serve::Tric;
 use crate::state::{self, Install, hash};
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -116,17 +117,16 @@ pub async fn sync(aws: &Aws, install: &Install, app: &str, cron: &BTreeMap<Strin
     let prefix = format!("{}-", &hash(app.as_bytes())[..16]);
     let mut want = BTreeMap::new();
     for (expr, path) in cron {
-        let input = serde_json::json!({ "cron": { "app": app, "path": path } }).to_string();
-        for schedule_expression in Cron::parse(expr)?.eventbridge() {
-            let target = Target { arn: install.function.clone(), role_arn: install.role.clone(), input: input.clone() };
-            let schedule = Schedule {
-                schedule_expression,
-                schedule_expression_timezone: "UTC",
-                flexible_time_window: Window { mode: "OFF" },
-                group_name: install.group.clone(),
-                target,
-            };
-            want.insert(format!("{prefix}{}", &hash(&serde_json::to_vec(&schedule)?)[..16]), schedule);
+        let input = json!({ "cron": { "app": app, "path": path } }).to_string();
+        for expression in Cron::parse(expr)?.eventbridge() {
+            let schedule = json!({
+                "ScheduleExpression": expression,
+                "ScheduleExpressionTimezone": "UTC",
+                "FlexibleTimeWindow": { "Mode": "OFF" },
+                "GroupName": install.group,
+                "Target": { "Arn": install.function, "RoleArn": install.role, "Input": input },
+            });
+            want.insert(format!("{prefix}{}", &hash(schedule.to_string().as_bytes())[..16]), schedule);
         }
     }
     let have = aws.schedules(&install.group, &prefix).await?;

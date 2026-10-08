@@ -4,38 +4,13 @@ use bytes::Bytes;
 use http::{Method, StatusCode, header::CONTENT_TYPE};
 use object_store::aws::{AmazonS3, AwsAuthorizer, AwsCredentialProvider};
 use object_store::client::{HttpClient, HttpRequest};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use wasmtime::{Result, ensure};
 
 pub struct Aws {
     creds: AwsCredentialProvider,
     http: HttpClient,
     region: String,
-}
-
-/// A schedule as `CreateSchedule` takes it.
-#[derive(Serialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct Schedule {
-    pub schedule_expression: String,
-    pub schedule_expression_timezone: &'static str,
-    pub flexible_time_window: Window,
-    pub group_name: String,
-    pub target: Target,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct Window {
-    pub mode: &'static str,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct Target {
-    pub arn: String,
-    pub role_arn: String,
-    pub input: String,
 }
 
 #[derive(Deserialize)]
@@ -117,9 +92,11 @@ impl Aws {
         }
     }
 
-    pub async fn create(&self, name: &str, schedule: &Schedule) -> Result<()> {
+    /// Creates the schedule `name`, from `schedule` as `CreateSchedule` takes it.
+    pub async fn create(&self, name: &str, schedule: &serde_json::Value) -> Result<()> {
         let path = format!("/schedules/{}", query(name));
-        let (status, body) = self.call("scheduler", Method::POST, &path, serde_json::to_vec(schedule)?, None).await?;
+        let (status, body) =
+            self.call("scheduler", Method::POST, &path, schedule.to_string().into_bytes(), None).await?;
         ensure!(status.is_success(), "CreateSchedule answered {status}: {}", String::from_utf8_lossy(&body));
         Ok(())
     }
