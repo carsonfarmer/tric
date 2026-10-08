@@ -298,10 +298,8 @@ async fn body<T: DeserializeOwned>(req: hyper::Request<Incoming>) -> Result<(Byt
     if req.method() != Method::POST {
         return Err(StatusCode::METHOD_NOT_ALLOWED);
     }
-    let Ok(body) = Limited::new(req.into_body(), EVENT_MAX).collect().await else {
-        return Err(StatusCode::PAYLOAD_TOO_LARGE);
-    };
-    let body = body.to_bytes();
+    let body = Limited::new(req.into_body(), EVENT_MAX).collect().await;
+    let body = body.map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?.to_bytes();
     let t = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
     Ok((body, t))
 }

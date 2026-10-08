@@ -334,10 +334,8 @@ pub fn publishes(req: &Request) -> bool {
 
 /// Gives a publish's messages to the sockets subscribed to their channels, or answers `400`.
 pub async fn publish(req: Request) -> Response {
-    let Ok(body) = Limited::new(req.into_body(), BODY_MAX).collect().await else {
-        return status(StatusCode::BAD_REQUEST);
-    };
-    let (Some(messages), Some(bus)) = (messages(&body.to_bytes()), BUS.get()) else {
+    let body = Limited::new(req.into_body(), BODY_MAX).collect().await;
+    let (Some(messages), Some(bus)) = (body.ok().and_then(|b| messages(&b.to_bytes())), BUS.get()) else {
         return status(StatusCode::BAD_REQUEST);
     };
     for message in messages {
