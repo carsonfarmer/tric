@@ -49,7 +49,7 @@ pub async fn run(
     scheduler: Option<Scheduler>,
 ) -> Result<()> {
     let app = manifest::read(path, allow).await?;
-    ensure!(label(&app.name), "the app's name, {:?}, is not 1 to 63 of a-z, 0-9 and - (a DNS label)", app.name);
+    ensure!(label(&app.name), "the app's name, {:?}, is not 2 to 63 of a-z, 0-9 and - (a DNS label)", app.name);
     Engine::new()?.compile(&app.wasm)?;
     let sha = store::hash(&app.wasm);
     let s3 = store::s3(bucket, None)?;

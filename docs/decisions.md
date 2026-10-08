@@ -8,21 +8,27 @@ reason.
 - **The router is two functions on AWS,** built from one package and running as one role. `tric-route` holds the
   function URL, and has the origin secret. `tric-events` has no secret and so takes only events:
   - invoked as `outbox`, it takes delivery events;
-  - invoked unqualified, it takes cron.
+  - invoked unqualified, it takes cron, for an app with a release only.
 
   A single function would take both kinds of input, and only a header would keep them apart.
 - **The origin is guarded by a shared secret, not by CloudFront's origin access control.** With OAC on a function
   URL, clients would have to send `x-amz-content-sha256` with every body. The router compares the secret's SHA-256
-  digests, so a closer guess takes no longer to check.
+  digests, so a closer guess takes no longer to check, and an empty secret counts as none. A request that goes around
+  CloudFront is refused, but still costs an invocation.
 - **The viewer's address comes from `CloudFront-Viewer-Address`,** which the `AllViewerExceptHostHeader` policy
   forwards. The app's host comes from `X-Forwarded-Host`, which a CloudFront function sets from `Host`, replacing
   any the viewer sent. A request without either is refused.
-- **The tenant id travels as `X-Amz-Tenant-Id`.** serve answers 403 when it differs from the Host's app, and when
-  credentials are missing.
-- **The STS session name is the app.** STS allows 64 characters, which leaves no room for a prefix on top of a
-  63-character label.
+- **The tenant id travels as `X-Amz-Tenant-Id`.** The router sends the app's name both as Lambda's tenant id and as
+  that header in the event. serve answers 403 when the header differs from the Host's app, and when credentials are
+  missing. It checks what the router wrote, so it guards against the router's mistakes; Lambda's tenancy is what keeps
+  apps apart.
+- **The STS session name is the app.** STS allows 2 to 64 characters, which leaves no room for a prefix on top of a
+  63-character label, so an app's name is 2 characters at least.
 - **Credentials last an hour,** the most for a role assumed by a role. The router uses them for 45 minutes after it
   mints them.
+- **An escape from serve's sandbox can invoke the `outbox`,** as serve's role may, with events that name another app.
+  They are delivered only if that app's head holds their digest, so they are dropped, but each may hold the other
+  app's tenant for up to 30 s first, waiting for a commit to land. That costs money, and breaks nothing.
 - **Native code is the app's own.** `native/<app>/…` is written with the app's credentials, so tampered native code
   reaches only the tenant that wrote it. serve compiles again when the native code won't deserialize. Components are
   checked against their digest when they are loaded.

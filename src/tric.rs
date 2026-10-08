@@ -88,11 +88,11 @@ pub fn forwarded(ip: IpAddr, host: &str, proto: &str) -> Option<HeaderValue> {
     HeaderValue::try_from(format!("for={for};host=\"{host}\";proto={proto}")).ok()
 }
 
-/// Whether `s` is a DNS label in lowercase: 1 to 63 of `a-z`, `0-9` and `-`, with no `-` at either end. An app's name
-/// is one.
+/// Whether `s` is an app's name: a DNS label in lowercase, of 2 to 63 `a-z`, `0-9` and `-`, with no `-` at either end.
+/// 2 at least, as it is the app's STS session name.
 pub fn label(s: &str) -> bool {
     let ok = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-';
-    (1..=63).contains(&s.len()) && s.bytes().all(ok) && !s.starts_with('-') && !s.ends_with('-')
+    (2..=63).contains(&s.len()) && s.bytes().all(ok) && !s.starts_with('-') && !s.ends_with('-')
 }
 
 /// The app at `host`, which must be exactly a label, a dot and `domain`, port and all, in any case.

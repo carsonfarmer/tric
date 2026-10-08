@@ -230,7 +230,12 @@ impl Route {
             Ok(_) => return status(StatusCode::BAD_REQUEST),
             Err(code) => return status(code),
         };
-        match self.event(&job.app, &job.path, "for=_cron", Bytes::new()).await {
+        let res = match self.known(&job.app).await {
+            Ok(true) => self.event(&job.app, &job.path, "for=_cron", Bytes::new()).await,
+            Ok(false) => return status(StatusCode::NOT_FOUND), // an app with no release has no tenant
+            Err(e) => Err(e),
+        };
+        match res {
             Ok(res) => tracing::info!(app = job.app, path = job.path, status = res.status().as_u16(), "cron"),
             Err(e) => tracing::warn!(app = job.app, path = job.path, "cron: {e:#}"),
         }

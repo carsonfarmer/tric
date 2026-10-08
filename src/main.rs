@@ -122,6 +122,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Serve { listen, domain, bucket, outbox } => serve::run(listen, domain, bucket, outbox).await,
         Cmd::Route { listen, outbox_listen, domain, bucket, serve, role, origin } => {
+            let origin = origin.filter(|o| !o.is_empty()); // an empty secret takes only events, as none does
             route::run(listen, outbox_listen, domain, bucket, serve, role, origin).await
         }
     }

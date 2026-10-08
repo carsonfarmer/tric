@@ -41,7 +41,8 @@ There are three things to know:
   secret can reach the router directly and claim any client address. They still cannot reach another app's data, or
   forge cron or tric's own calls.
 - **Apps share cookies across `*.<domain>`**, so use a domain for tric alone.
-- **Shared between apps:** the account's Lambda concurrency, the log groups and the router.
+- **Shared between apps:** the account's Lambda concurrency, the log groups and the router. One app that is busy, or
+  slow to answer, can use up the concurrency, and the others are then throttled.
 
 ## Install
 
