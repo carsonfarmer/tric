@@ -136,8 +136,9 @@ resource "aws_iam_role_policy" "route" {
       { Effect = "Allow", Action = "sts:AssumeRole", Resource = aws_iam_role.app.arn },
       { Effect = "Allow", Action = "s3:GetObject", Resource = "${local.bucket}/apps/*/current" },
       { Effect = "Allow", Action = "lambda:InvokeFunction", Resource = local.serve },
-      # The outbox alias's on-failure records, which Lambda writes as the function.
-      { Effect = "Allow", Action = "s3:PutObject", Resource = "${local.bucket}/aws/lambda/async/*" },
+      # The outbox alias's on-failure records, which Lambda writes as the function under `aws/lambda/async/`. Lambda
+      # takes the destination only if the role may write the whole bucket.
+      { Effect = "Allow", Action = "s3:PutObject", Resource = "${local.bucket}/*" },
       { Effect = "Allow", Action = "s3:ListBucket", Resource = local.bucket },
     ]
   })

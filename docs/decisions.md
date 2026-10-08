@@ -41,8 +41,9 @@ reason.
 ## AWS
 
 - **The dead letters are under `aws/lambda/async/`.** That is the prefix Lambda's S3 failure destination always
-  writes to. The router's role may write there and list the bucket, which is what Lambda needs. The router is trusted
-  either way.
+  writes to. Lambda takes the destination only if the router's role may write the whole bucket and list it, so it
+  may. That adds little: the router writes `apps/` and `native/` already, as any app, and a component is checked
+  against its digest when it is loaded. The router is trusted either way.
 - **serve and the router run behind the Lambda Web Adapter,** as plain HTTP servers. Their package carries its own
   `bootstrap`, which runs `tric <handler>`, because `provided.al2023` has no wrapper for that. The adapter's
   readiness check is a `GET /`. Any status below 500 counts as ready, including the router's 403.
