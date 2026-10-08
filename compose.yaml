@@ -5,6 +5,7 @@
 #   COMPOSE_PROJECT_NAME=tric-<worktree> docker compose run --rm release    (dist/tric.zip, for Lambda's arm64)
 #   COMPOSE_PROJECT_NAME=tric-<worktree> docker compose up -d serve         (a local install, at <app>.localhost:3000)
 #   COMPOSE_PROJECT_NAME=tric-<worktree> docker compose run --rm tric …     (the CLI, on the local install)
+#   COMPOSE_PROJECT_NAME=tric-<worktree> docker compose up -d --build lambda (dist/tric.zip, as Lambda runs it)
 #   COMPOSE_PROJECT_NAME=tric-<worktree> docker compose run --rm tofu …     (OpenTofu in infra/aws: see its README)
 name: ${COMPOSE_PROJECT_NAME:-tric-main}
 
@@ -61,6 +62,25 @@ services:
     entrypoint: [cargo, run, --locked, --release, --quiet, --bin, tric, --]
     depends_on: { s3: { condition: service_healthy } }
     environment: { <<: *minio, TRIC_STORE: s3://local }
+  # Lambda, locally, on the local install: dist/tric.zip, from `release`, as the function runs it, for the paths only
+  # Lambda takes. Invoke it with an event, as Lambda would: `curl -d '{"cron":{"app":"…","path":"/…"}}'
+  # localhost:9000/2015-03-31/functions/function/invocations`. Its outbox's Invoke goes to AWS, and fails. The
+  # emulator holds port 8080, so tric listens on 8081; otherwise the environment is the function's in infra/aws.
+  lambda:
+    build: { context: dist, dockerfile: ../docker/lambda.Dockerfile }
+    image: ${COMPOSE_PROJECT_NAME:-tric-main}-lambda
+    platform: linux/arm64
+    profiles: [lambda]
+    ports: ["127.0.0.1:${LAMBDA_PORT:-9000}:8080"]
+    depends_on: { s3: { condition: service_healthy } }
+    environment:
+      <<: *minio
+      TRIC_STORE: s3://local
+      TRIC_DOMAIN: localhost
+      TRIC_LISTEN: 127.0.0.1:8081
+      AWS_LWA_PORT: "8081"
+      AWS_LWA_READINESS_CHECK_PROTOCOL: tcp
+      AWS_LWA_INVOKE_MODE: response_stream
   # S3: MinIO, with the buckets `tric`, for the tests, and `local`, for the local install, each versioned as an
   # install's is. They outlive a run, as the tests' app names are their own.
   s3:
