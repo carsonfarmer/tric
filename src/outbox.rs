@@ -1,55 +1,59 @@
-//! The outbox: requests a turn sends with `Prefer: respond-async` (RFC 7240) are held, and go out once, and only if,
-//! the turn commits, in order, each with an `Idempotency-Key`. A commit enqueues them as an event before it writes the
-//! head, with the head's version it writes over; delivery waits for the head to move past that version, and goes ahead
-//! only if the commit is among the head's pending ones, so an event of a turn that did not commit is dropped.
-use crate::name;
+//! Background requests: those a turn sends with `Prefer: respond-async` (RFC 7240) are held, and go out once, and only
+//! if, the turn commits, in order, each with an `Idempotency-Key`. A commit hands them to a sink as one delivery event
+//! before it writes the head, and keeps the event's SHA-256 in the head's `pending`. Delivery waits for the head to move
+//! past the version the commit wrote over, and goes ahead only if the commit is pending there with that digest: an event
+//! of a turn that did not commit is dropped, as is one forged by someone who learnt a commit id.
+use crate::name::{self, Head};
 use crate::outbound;
-use crate::serve::Tric;
+use crate::store;
+use crate::tric::{Request, Response, Tric, status};
 use base64::{Engine as _, prelude::BASE64_STANDARD as B64};
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
+use http::header::RETRY_AFTER;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use http_body_util::{BodyExt, Full, Limited};
-use object_store::ObjectStoreExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::{sleep, timeout};
-use wasmtime::{Result, bail};
-use wasmtime_wasi_http::{Error, handler::Request};
+use wasmtime::Result;
+use wasmtime_wasi_http::Error;
 
 const PREFER: HeaderName = HeaderName::from_static("prefer");
-
-/// How long delivery waits for the commit to land, at most: it is under way when it enqueues.
-const LANDING: Duration = Duration::from_secs(300);
-/// Waits before each round of tries: a request that fails is tried again in the next, from where the last stopped.
-const ROUNDS: [u64; 3] = [0, 60, 120];
+/// How long delivery waits for the commit to land: a commit is under way when it hands over its event.
+const LANDING: Duration = Duration::from_secs(30);
 /// One request's whole exchange, its response's body included.
 const EXCHANGE: Duration = Duration::from_secs(60);
-/// How long delivery tries to take its commit off the name's pending ones.
-const SETTLE: Duration = Duration::from_secs(30);
 const BODY_MAX: usize = 1 << 20;
+/// The relay's waits between tries, unless a `Retry-After` asks for longer, up to `WAIT_MAX`.
+const WAITS: [u64; 2] = [1, 2];
+const WAIT_MAX: Duration = Duration::from_secs(60);
+
+/// Where a commit hands its delivery event, the event's JSON, before it writes the head.
+pub type Sink = Arc<dyn Fn(Bytes) -> BoxFuture<'static, Result<()>> + Send + Sync>;
 
 /// The requests one turn holds, and where they came from.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Outbox {
+pub struct Event {
     pub app: String,
-    pub name: String,
-    pub commit: String,
-    /// The head's `ETag`, as the store gives it, that the commit writes over; none if there was no head.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after: Option<String>,
     /// The host the turn was asked at, so a request to it runs in-process.
     pub host: String,
+    pub name: String,
+    /// The head's version, as the store's `ETag`, that the commit writes over; none if there was no head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    pub commit: String,
     pub requests: Vec<Held>,
 }
 
 /// A request, as held.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Held {
     method: String,
-    url: String,
+    uri: String,
     headers: Vec<(String, String)>,
     body: String, // base64
 }
@@ -58,6 +62,13 @@ pub struct Held {
 pub fn respond_async(headers: &HeaderMap) -> bool {
     let token = |p: &str| p.split([';', '=']).next().unwrap_or_default().trim().eq_ignore_ascii_case("respond-async");
     headers.get_all(PREFER).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).any(token)
+}
+
+/// The response that stands in for one the app gets when its request is held.
+pub fn accepted() -> Response {
+    let mut res = status(StatusCode::ACCEPTED);
+    res.headers_mut().insert("preference-applied", HeaderValue::from_static("respond-async"));
+    res
 }
 
 impl Held {
@@ -74,7 +85,7 @@ impl Held {
         let body = Limited::new(body, BODY_MAX).collect().await.map_err(|_| Error::HttpRequestBodySize(None))?;
         Ok(Self {
             method: parts.method.to_string(),
-            url: parts.uri.to_string(),
+            uri: parts.uri.to_string(),
             headers,
             body: B64.encode(body.to_bytes()),
         })
@@ -82,7 +93,7 @@ impl Held {
 
     /// The request, as the `n`th of the commit `commit`.
     fn request(&self, commit: &str, n: usize) -> Result<Request> {
-        let mut req = http::Request::builder().method(Method::from_bytes(self.method.as_bytes())?).uri(&self.url);
+        let mut req = http::Request::builder().method(Method::from_bytes(self.method.as_bytes())?).uri(&self.uri);
         for (k, v) in &self.headers {
             req = req.header(HeaderName::try_from(k)?, HeaderValue::try_from(v)?);
         }
@@ -91,73 +102,107 @@ impl Held {
     }
 }
 
-/// The response that stands in for one the app gets when its request is held.
-pub fn accepted() -> http::Response<wasmtime_wasi_http::WasiBody> {
-    let mut res = crate::serve::status(StatusCode::ACCEPTED);
-    res.headers_mut().insert("preference-applied", HeaderValue::from_static("respond-async"));
-    res
+/// How a delivery went.
+pub enum Delivered {
+    /// Every request was delivered, or the event was dropped.
+    Done,
+    /// A request failed, so the event is to be tried again, after the `Retry-After` given.
+    Retry(Option<Duration>),
 }
 
-/// Delivers `o`, if its commit landed: each request until it is done, which a response of 2xx to 4xx but 429 is, in
-/// `ROUNDS`; then records it in `failed/<commit>` if any is not, and takes the commit off the name's pending ones.
-pub async fn deliver(tric: &Arc<Tric>, o: Outbox) -> Result<()> {
-    let path = name::path(&o.app, &o.name);
+/// Delivers the event `bytes` of `tric`'s app, if its commit landed with its digest: each request in order, until one
+/// fails, which a response of 5xx or 429 or a failed exchange is. A request to a host the app may not reach is done.
+pub async fn deliver(tric: &Arc<Tric>, bytes: &[u8]) -> Delivered {
+    let e = match serde_json::from_slice::<Event>(bytes) {
+        Ok(e) if e.app == tric.app => e,
+        _ => return dropped("not an event of this app"),
+    };
+    let path = name::path(&e.app, &e.name);
     let (start, mut wait) = (Instant::now(), Duration::from_millis(50));
-    let head = loop {
-        let read = name::read(&*tric.store, &path).await?;
-        if read.as_ref().and_then(|(_, v)| v.e_tag.as_ref()) != o.after.as_ref() {
-            break read.map(|(head, _)| head);
-        }
-        if start.elapsed() > LANDING {
-            bail!("{}/{}: commit {} never landed", o.app, o.name, o.commit);
+    let head: Option<Head> = loop {
+        match name::read(&tric.store, &path).await {
+            Ok(read) if read.as_ref().and_then(|(_, v)| v.e_tag.as_ref()) != e.base.as_ref() => {
+                break read.map(|(head, _)| head);
+            }
+            Ok(_) if start.elapsed() > LANDING => return dropped("its commit never landed"),
+            Ok(_) => {}
+            Err(err) => {
+                tracing::info!(app = e.app, commit = e.commit, "outbox: {err:#}");
+                return Delivered::Retry(None);
+            }
         }
         sleep(wait).await;
-        wait = (wait * 2).min(Duration::from_secs(2));
+        wait = (wait * 2).min(Duration::from_secs(1));
     };
-    if !head.is_some_and(|h| h.pending.contains_key(&o.commit)) {
-        return Ok(()); // the turn did not commit
+    let digest = store::hash(bytes);
+    if !head.is_some_and(|h| h.pending.get(&e.commit).is_some_and(|p| p.digest == digest)) {
+        return dropped("its commit is not pending");
     }
-    let mut next = 0;
-    for round in ROUNDS {
-        sleep(Duration::from_secs(round)).await;
-        while next < o.requests.len() && send(tric, &o, next).await {
-            next += 1;
-        }
-        if next == o.requests.len() {
-            break;
+    for n in 0..e.requests.len() {
+        if let Err(after) = send(tric, &e, n).await {
+            return Delivered::Retry(after);
         }
     }
-    if next < o.requests.len() {
-        tracing::warn!(app = o.app, name = o.name, commit = o.commit, "outbox: request {next} failed every try");
-        tric.store.put(&format!("failed/{}", o.commit).into(), serde_json::to_vec(&o)?.into()).await?;
-    }
-    name::settle(&*tric.store, &path, &o.commit, Instant::now() + SETTLE).await
+    name::settle(&tric.store, &e.app, &e.name, &e.commit).await;
+    Delivered::Done
 }
 
-/// Sends `o`'s `n`th request, and returns whether it is done.
-async fn send(tric: &Arc<Tric>, o: &Outbox, n: usize) -> bool {
+fn dropped(why: &str) -> Delivered {
+    tracing::info!("outbox: dropped an event, as {why}");
+    Delivered::Done
+}
+
+/// Sends `e`'s `n`th request: `Ok` if it is done, or else the `Retry-After` its response gave.
+async fn send(tric: &Arc<Tric>, e: &Event, n: usize) -> Result<(), Option<Duration>> {
     let exchange = async {
-        let req = o.requests[n].request(&o.commit, n).map_err(|e| format!("{e:#}"))?;
-        let res = match tric.is_self(&o.app, &o.host, req.uri()) {
-            true => tric.fetch(&o.app, &o.host, req, HeaderValue::from_static("for=_tric")).await,
-            false => outbound::send(req).await.map(|(res, _)| res).map_err(|e| format!("{e:?}"))?,
+        let req = e.requests[n].request(&e.commit, n).map_err(|err| format!("{err:#}"))?;
+        let res = match req.uri().authority().is_some_and(|a| a.as_str().eq_ignore_ascii_case(&e.host)) {
+            true => tric.fetch(req, "for=_tric").await,
+            false => match outbound::allowed(&tric.allow, req.uri()) {
+                Ok(()) => outbound::send(req).await.map(|(res, _)| res).map_err(|err| format!("{err:?}"))?,
+                Err(err) => {
+                    tracing::warn!(app = e.app, commit = e.commit, n, "outbox: not sent, as {err:?}");
+                    return Ok(None);
+                }
+            },
         };
-        let status = res.status();
+        let (status, after) = (res.status(), retry_after(res.headers()));
         _ = res.into_body().collect().await;
-        Ok::<_, String>(status)
+        Ok::<_, String>(Some((status, after)))
     };
     match timeout(EXCHANGE, exchange).await {
-        Ok(Ok(s)) if s != StatusCode::TOO_MANY_REQUESTS && (200..500).contains(&s.as_u16()) => true,
-        Ok(Ok(s)) => {
-            tracing::info!(app = o.app, commit = o.commit, n, "outbox: answered {s}");
-            false
+        Ok(Ok(None)) => Ok(()),
+        Ok(Ok(Some((s, _)))) if s != StatusCode::TOO_MANY_REQUESTS && (200..500).contains(&s.as_u16()) => Ok(()),
+        Ok(Ok(Some((s, after)))) => {
+            tracing::info!(app = e.app, commit = e.commit, n, "outbox: answered {s}");
+            Err(after)
         }
-        Ok(Err(e)) => {
-            tracing::info!(app = o.app, commit = o.commit, n, "outbox: {e}");
-            false
+        Ok(Err(err)) => {
+            tracing::info!(app = e.app, commit = e.commit, n, "outbox: {err}");
+            Err(None)
         }
-        Err(_) => false,
+        Err(_) => Err(None),
     }
+}
+
+/// A `Retry-After` of delay-seconds.
+pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    headers.get(RETRY_AFTER)?.to_str().ok()?.trim().parse().ok().map(Duration::from_secs)
+}
+
+/// Tries a delivery `attempt` up to three times, waiting 1 s and then 2 s between tries, or what `Retry-After` asked;
+/// then logs the event as lost.
+pub async fn relay<F: Future<Output = Delivered>>(mut attempt: impl FnMut() -> F) {
+    for wait in WAITS.map(Some).into_iter().chain([None]) {
+        match (attempt().await, wait) {
+            (Delivered::Done, _) => return,
+            (Delivered::Retry(after), Some(wait)) => {
+                sleep(after.unwrap_or_default().max(Duration::from_secs(wait)).min(WAIT_MAX)).await
+            }
+            (Delivered::Retry(_), None) => {}
+        }
+    }
+    tracing::warn!("outbox: an event failed every try, so it is lost");
 }
 
 #[cfg(test)]

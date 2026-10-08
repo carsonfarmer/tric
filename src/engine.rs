@@ -1,9 +1,8 @@
 //! The Wasmtime engine, and apps on it: one `wasi:http/handler@0.3` component each, a fresh instance per request, under
 //! hard limits, with nothing granted but what tric provides.
 use crate::kv::Imports;
-use crate::serve::{Ctx, Outbound};
+use crate::tric::{Ctx, Outbound};
 use std::future::poll_fn;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::{sync::Arc, thread, time::Duration};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::AbortHandle;
@@ -44,7 +43,10 @@ impl Engine {
         // The architecture's baseline, not this CPU's features, so every host of one build loads any other's native
         // code.
         cfg.target(&target_lexicon::HOST.to_string())?;
+        // Callback-only async: no stackful tasks, threads, extra builtins or error contexts.
         cfg.wasm_component_model_async(true).epoch_interruption(true);
+        cfg.wasm_component_model_more_async_builtins(false).wasm_component_model_async_stackful(false);
+        cfg.wasm_component_model_threading(false).wasm_component_model_error_context(false);
         let engine = wasmtime::Engine::new(&cfg)?;
         // An OS thread, not a task: a task would not run while every worker thread is busy with a guest.
         let weak = engine.weak();
@@ -66,27 +68,11 @@ impl Engine {
         Component::new(&self.engine, wasm)
     }
 
-    /// Which native code this engine loads: what an engine of the same build and architecture made.
-    pub fn compat(&self) -> String {
-        let mut hasher = DefaultHasher::new();
-        self.engine.precompile_compatibility_hash().hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
-    }
-
-    /// Loads native code that `Component::serialize` made.
-    ///
-    /// # Safety
-    ///
-    /// Loading native code runs it, so `bytes` must be what an engine of the same `compat` made.
-    pub unsafe fn deserialize(&self, bytes: &[u8]) -> Result<Component> {
-        unsafe { Component::deserialize(&self.engine, bytes) }
-    }
-
-    /// Loads `component` as the app `name`, with `env` as its environment.
-    pub fn load(&self, name: &str, component: &Component, env: Vec<(String, String)>) -> Result<App> {
+    /// Loads `component` as an app, with `env` as its environment.
+    pub fn load(&self, component: &Component, env: Vec<(String, String)>) -> Result<App> {
         let pre = ServicePre::new(self.linker.instantiate_pre(component)?)?;
-        let (name, env, permits) = (name.into(), env.into(), Arc::new(Semaphore::new(IN_FLIGHT)));
-        Ok(App { engine: self.engine.clone(), pre, name, env, permits })
+        let (env, permits) = (env.into(), Arc::new(Semaphore::new(IN_FLIGHT)));
+        Ok(App { engine: self.engine.clone(), pre, env, permits })
     }
 }
 
@@ -94,7 +80,6 @@ impl Engine {
 pub struct App {
     engine: wasmtime::Engine,
     pre: ServicePre<Host>,
-    pub name: Arc<str>,
     env: Arc<[(String, String)]>,
     permits: Arc<Semaphore>,
 }

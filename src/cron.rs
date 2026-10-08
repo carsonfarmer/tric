@@ -1,11 +1,7 @@
 //! Cron: POSIX expressions, five fields in UTC, each naming a path that gets a `POST` with `Forwarded: for=_cron` in
-//! every minute it matches. Local hosts tick in-process; on AWS each is an EventBridge Scheduler schedule, which
-//! `deploy` and `release` keep in step with the release that runs.
-use crate::aws::Aws;
-use crate::serve::Tric;
-use crate::state::{self, Install, hash};
-use serde_json::json;
-use std::collections::BTreeMap;
+//! every minute it matches.
+use crate::tric::Tric;
+use http_body_util::BodyExt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
@@ -41,11 +37,6 @@ fn set(field: &str, (lo, hi): (u32, u32)) -> Option<u64> {
         bits |= (a..=b).step_by(step as usize).fold(0, |m, v| m | 1 << v);
     }
     Some(bits)
-}
-
-/// The values in `bits`, each plus `plus`, as a list.
-fn list(bits: u64, plus: u32) -> String {
-    (0..64).filter(|v| bits >> v & 1 == 1).map(|v| (v + plus).to_string()).collect::<Vec<_>>().join(",")
 }
 
 /// The year, month and day of a day since 1970-01-01, in the proleptic Gregorian calendar (Howard Hinnant's algorithm).
@@ -88,83 +79,29 @@ impl Cron {
         let day = if self.restricted(2) && self.restricted(4) { dom || dow } else { dom && dow };
         has(0, t / 60 % 60) && has(1, t / 3600 % 24) && has(3, month) && day
     }
-
-    /// As EventBridge Scheduler's cron expressions, which have a year, count weekdays from 1 for Sunday, step from a
-    /// number, and restrict one day field, the other being `?`: two when both are restricted.
-    fn eventbridge(&self) -> Vec<String> {
-        let field = |i: usize| {
-            let lo = FIELDS[i].0;
-            let items = self.text[i].split(',').map(|item| match item.split_once('/') {
-                Some(("*", step)) => format!("{lo}/{step}"),
-                Some(_) => list(set(item, FIELDS[i]).unwrap_or_default(), 0),
-                None => item.into(),
-            });
-            items.collect::<Vec<_>>().join(",")
-        };
-        let (min, hour, dom, month, dow) = (field(0), field(1), field(2), field(3), list(self.sets[4], 1));
-        let cron = |dom: &str, dow: &str| format!("cron({min} {hour} {dom} {month} {dow} *)");
-        match (self.restricted(2), self.restricted(4)) {
-            (_, false) => vec![cron(&dom, "?")],
-            (false, true) => vec![cron("?", &dow)],
-            (true, true) => vec![cron(&dom, "?"), cron("?", &dow)],
-        }
-    }
 }
 
-/// Makes `app`'s schedules those of `cron`: creates the missing and deletes the rest. A schedule is named for the app
-/// and for everything in it, so one that changes in any way is another schedule.
-pub async fn sync(aws: &Aws, install: &Install, app: &str, cron: &BTreeMap<String, String>) -> Result<()> {
-    let prefix = format!("{}-", &hash(app.as_bytes())[..16]);
-    let mut want = BTreeMap::new();
-    for (expr, path) in cron {
-        let input = json!({ "cron": { "app": app, "path": path } }).to_string();
-        for expression in Cron::parse(expr)?.eventbridge() {
-            let schedule = json!({
-                "ScheduleExpression": expression,
-                "ScheduleExpressionTimezone": "UTC",
-                "FlexibleTimeWindow": { "Mode": "OFF" },
-                "GroupName": install.group,
-                "Target": { "Arn": install.function, "RoleArn": install.role, "Input": input },
-            });
-            want.insert(format!("{prefix}{}", &hash(schedule.to_string().as_bytes())[..16]), schedule);
-        }
-    }
-    let have = aws.schedules(&install.group, &prefix).await?;
-    for name in have.iter().filter(|n| !want.contains_key(*n)) {
-        aws.delete(&install.group, name).await?;
-    }
-    for (name, schedule) in want.iter().filter(|(n, _)| !have.contains(n)) {
-        aws.create(name, schedule).await?;
-    }
-    Ok(())
-}
-
-/// Fires every app's cron in-process, at the start of each minute, or only `tric`'s one app's.
-pub async fn tick(tric: Arc<Tric>) {
+/// Fires `jobs`, each an expression and the URL it posts to, at the start of each minute.
+pub async fn tick(tric: Arc<Tric>, jobs: Vec<(Cron, String)>) {
     loop {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let next = (now / 60 + 1) * 60;
         sleep(Duration::from_secs(next - now)).await;
-        if let Err(e) = fire(&tric, next).await {
-            tracing::warn!("cron: {e:#}");
+        for (_, url) in jobs.iter().filter(|(cron, _)| cron.matches(next)) {
+            tokio::spawn(fire(tric.clone(), url.clone()));
         }
     }
 }
 
-async fn fire(tric: &Arc<Tric>, t: u64) -> Result<()> {
-    let apps = match tric.only() {
-        Some(app) => vec![app.to_owned()],
-        None => state::apps(&*tric.store).await?,
+/// Posts to `url`, as cron.
+pub async fn fire(tric: Arc<Tric>, url: String) {
+    let res = match http::Request::post(&url).body(Default::default()) {
+        Ok(req) => tric.fetch(req, "for=_cron").await,
+        Err(e) => return tracing::warn!(url, "cron: {e}"),
     };
-    for app in apps {
-        let Some(current) = state::current(&*tric.store, &app).await? else { continue };
-        for (expr, path) in state::release(&*tric.store, &app, &current.release).await?.cron {
-            if Cron::parse(&expr).is_ok_and(|c| c.matches(t)) {
-                tokio::spawn(tric.clone().cron(app.clone(), path));
-            }
-        }
-    }
-    Ok(())
+    let status = res.status();
+    _ = res.into_body().collect().await;
+    tracing::info!(url, status = status.as_u16(), "cron");
 }
 
 #[cfg(test)]
@@ -218,16 +155,5 @@ mod tests {
         {
             assert!(Cron::parse(bad).is_err(), "{bad:?}");
         }
-    }
-
-    #[test]
-    fn eventbridge() {
-        let e = |s: &str| Cron::parse(s).unwrap().eventbridge();
-        assert_eq!(e("* * * * *"), ["cron(* * * * ? *)"]);
-        assert_eq!(e("*/15 0-6/3 * * *"), ["cron(0/15 0,3,6 * * ? *)"]);
-        assert_eq!(e("0 8 */2 * *"), ["cron(0 8 1/2 * ? *)"]);
-        assert_eq!(e("0 8 * * 1-5"), ["cron(0 8 ? * 2,3,4,5,6 *)"]);
-        assert_eq!(e("0 8 * * 0,7"), ["cron(0 8 ? * 1 *)"]);
-        assert_eq!(e("0 8 1,15 * 1"), ["cron(0 8 1,15 * ? *)", "cron(0 8 ? * 2 *)"]);
     }
 }

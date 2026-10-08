@@ -1,16 +1,15 @@
-//! End to end: tric serving the fixtures in tests/fixtures, which tests/components/build.sh builds. Each test runs its
-//! own host, at a port of its own: `tric dev`, with its state in memory, and, given a bucket in `TRIC_TEST_STORE` (as
-//! `docker compose run --rm test` has, in MinIO), `tric dev` and `tric serve` with their state there.
+//! End to end: `tric dev` serving the fixtures in tests/fixtures, which tests/components/build.sh builds. Each test runs
+//! its own host, at a port of its own, with its state in memory.
 use bytes::Bytes;
 use http::HeaderMap;
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
 use serde_json::{Value, json};
-use std::ffi::OsStr;
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
@@ -23,57 +22,20 @@ fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{name}.wasm"))
 }
 
-/// A directory with a tric.toml of `toml`, in which `APP` and `GUARD` are the fixtures' paths.
+/// A directory with a tric.toml of `toml`, in which `APP` and `GUARD` are the fixtures' paths, and `DIGEST` the guard's.
 fn manifest(dir: &str, toml: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = |name| format!("{:?}", fixture(name).display().to_string());
-    std::fs::write(dir.join("tric.toml"), toml.replace("APP", &path("app")).replace("GUARD", &path("guard"))).unwrap();
+    let digest = format!("sha256:{:x}", Sha256::digest(std::fs::read(fixture("guard")).unwrap()));
+    let toml = toml.replace("APP", &path("app")).replace("GUARD", &path("guard")).replace("DIGEST", &digest);
+    std::fs::write(dir.join("tric.toml"), toml).unwrap();
     dir
-}
-
-/// The bucket to test against, if there is one.
-fn s3() -> Option<String> {
-    std::env::var("TRIC_TEST_STORE").ok().filter(|s| !s.is_empty())
-}
-
-/// An app name no other test or run has: the bucket outlives a run.
-fn fresh(prefix: &str) -> String {
-    format!("{prefix}-{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
-}
-
-/// The test app, served by `tric dev`, in memory or in `store`.
-async fn app(store: Option<&str>) -> Tric {
-    match store {
-        None => Tric::dev(fixture("app"), &[], None).await,
-        Some(store) => {
-            let name = fresh("app");
-            Tric::dev(manifest(&name, &format!("name = \"{name}\"\ncomponent = APP\n")), &[], Some(store)).await
-        }
-    }
-}
-
-/// Runs the command `args` on the install in `store`, and returns what it prints.
-async fn cli(store: &str, args: &[&str]) -> String {
-    let out = Command::new(TRIC).args(["--store", store]).args(args).output().await.unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8(out.stdout).unwrap()
-}
-
-/// Waits up to 15 s for `f` to hold, as a change to an app takes up to 5 s to reach a host.
-async fn until(what: &str, f: impl AsyncFn() -> bool) {
-    let start = Instant::now();
-    while !f().await {
-        assert!(start.elapsed() < Duration::from_secs(15), "{what}");
-        sleep(Duration::from_millis(250)).await;
-    }
 }
 
 /// A host, which prints its log if a test fails.
 struct Tric {
     addr: String,
-    /// What requests have in `Host`.
-    host: String,
     log: Arc<Mutex<String>>,
     _child: Child,
 }
@@ -95,22 +57,10 @@ impl Res {
 }
 
 impl Tric {
-    /// `tric dev` of the app at `path`.
-    async fn dev(path: PathBuf, env: &[&str], store: Option<&str>) -> Self {
-        let mut args = vec!["dev".into(), path.into_os_string(), "--listen".into(), "127.0.0.1:0".into()];
-        env.iter().for_each(|e| args.extend(["-e".into(), e.into()]));
-        store.iter().for_each(|s| args.extend(["--store".into(), s.into()]));
-        Self::start(&args).await
-    }
-
-    /// `tric serve` of every app in `store`, at `<app>.localhost`.
-    async fn serve(store: &str) -> Self {
-        Self::start(&["serve", "--store", store, "--listen", "127.0.0.1:0", "--domain", "localhost"]).await
-    }
-
-    async fn start<S: AsRef<OsStr>>(args: &[S]) -> Self {
+    /// `tric dev` of the app at `path`, with `args` besides.
+    async fn dev(path: &Path, args: &[&str]) -> Self {
         let mut cmd = Command::new(TRIC);
-        cmd.args(args).env_remove("TRIC_STORE").env_remove("TRIC_DOMAIN").env_remove("TRIC_LISTEN");
+        cmd.arg("dev").arg(path).args(["--listen", "127.0.0.1:0"]).args(args);
         let mut child = cmd.stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
         let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
         let log = Arc::new(Mutex::new(String::new()));
@@ -130,14 +80,19 @@ impl Tric {
                 kept.lock().unwrap().push_str(&format!("{line}\n"));
             }
         });
-        Self { host: addr.clone(), addr, log, _child: child }
+        Self { addr, log, _child: child }
+    }
+
+    /// The app fixture, as a file.
+    async fn app() -> Self {
+        Self::dev(&fixture("app"), &[]).await
     }
 
     async fn send(&self, method: &str, target: &str, headers: &[(&str, &str)]) -> Res {
         let stream = TcpStream::connect(&self.addr).await.unwrap();
         let (mut sender, conn) = http1::handshake(TokioIo::new(stream)).await.unwrap();
         tokio::spawn(conn);
-        let mut req = http::Request::builder().method(method).uri(target).header("host", &self.host);
+        let mut req = http::Request::builder().method(method).uri(target).header("host", &self.addr);
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
@@ -188,36 +143,34 @@ impl Drop for Tric {
 
 #[tokio::test]
 async fn serves_and_forwards() {
-    let dev = Tric::dev(fixture("app"), &["GREETING=hi"], None).await;
+    let dev = Tric::dev(&fixture("app"), &["-e", "GREETING=hi"]).await;
     let res = dev.get("/").await;
     assert_eq!((res.status, &*res.body), (200, "hello"));
     assert_eq!(dev.get("/?status=418").await.status, 418);
 
-    let fwd = [
-        ("x-forwarded-for", "9.9.9.9, 1.2.3.4"),
+    // Whatever a client says of where it came from, `Forwarded` is tric's, from the socket.
+    let claims = [
+        ("forwarded", "for=_cron"),
+        ("x-forwarded-for", "9.9.9.9"),
         ("x-forwarded-host", "example.com"),
-        ("x-forwarded-proto", "https"),
-        ("x-amzn-lambda-context", "{}"),
+        ("x-tric-credentials", "{}"),
+        ("x-amz-tenant-id", "other"),
     ];
-    let echo = dev.send("GET", "/echo?a=1", &fwd).await.json();
-    assert_eq!(echo["uri"], "https://example.com/echo?a=1");
-    assert_eq!(header(&echo, "forwarded"), Some(r#"for=1.2.3.4;host="example.com";proto=https"#));
+    let echo = dev.send("GET", "/echo?a=1", &claims).await.json();
+    assert_eq!(echo["uri"], format!("http://{}/echo?a=1", dev.addr));
     let headers = echo["headers"].as_array().unwrap();
-    let hop = |h: &Value| ["x-forwarded-", "x-amzn-"].iter().any(|p| h[0].as_str().unwrap().starts_with(p));
-    assert!(!headers.iter().any(hop), "{headers:?}");
-    // A proto that is neither http nor https counts for nothing; the peer is `for` when there is no X-Forwarded-For.
-    let echo = dev.send("GET", "/echo", &[("x-forwarded-proto", "gopher")]).await.json();
-    assert_eq!(echo["uri"], format!("http://{}/echo", dev.addr));
-    assert_eq!(header(&echo, "forwarded"), Some(&*format!(r#"for=127.0.0.1;host="{}";proto=http"#, dev.addr)));
+    let forwarded: Vec<_> = headers.iter().filter(|h| h[0] == "forwarded").collect();
+    assert_eq!(forwarded, [&json!(["forwarded", format!(r#"for=127.0.0.1;host="{}";proto=http"#, dev.addr)])]);
+    let hop = |h: &&Value| ["x-forwarded-", "x-amz", "x-tric-"].iter().any(|p| h[0].as_str().unwrap().starts_with(p));
+    assert!(!headers.iter().any(|h| hop(&h)), "{headers:?}");
 
-    let env = dev.get("/env").await.json();
-    assert_eq!(env["env"]["GREETING"], "hi");
+    assert_eq!(dev.get("/env").await.json()["env"]["GREETING"], "hi");
     assert_eq!(dev.get("/print").await.body, "printed");
 }
 
 #[tokio::test]
 async fn confines_the_guest() {
-    let dev = Tric::dev(fixture("app"), &[], None).await;
+    let dev = Tric::app().await;
     let fs = dev.get("/fs").await.json();
     for (what, outcome) in fs.as_object().unwrap() {
         assert!(outcome.get("err").is_some(), "{what}: {outcome}");
@@ -230,28 +183,9 @@ async fn confines_the_guest() {
     assert_eq!(dev.get("/").await.body, "hello", "a guest that ran away costs the host nothing more");
 }
 
-/// For each scenario, a module of two tests: `in_memory`, and `in_s3`, which passes if there is no bucket to test.
-macro_rules! in_memory_and_s3 {
-    ($($scenario:ident),*) => {$(
-        mod $scenario {
-            #[tokio::test]
-            async fn in_memory() {
-                super::$scenario(super::app(None).await).await
-            }
-
-            #[tokio::test]
-            async fn in_s3() {
-                if let Some(s3) = super::s3() {
-                    super::$scenario(super::app(Some(&s3)).await).await
-                }
-            }
-        }
-    )*};
-}
-
-in_memory_and_s3!(turns_commit_or_discard, turns_on_one_name_serialize, delivers_the_outbox_once_committed);
-
-async fn turns_commit_or_discard(dev: Tric) {
+#[tokio::test]
+async fn turns_commit_or_discard() {
+    let dev = Tric::app().await;
     let set = dev.post("/@a/kv?op=set&key=k&value=1").await;
     assert_eq!((set.status, set.json()), (200, json!({ "ok": null })));
     let etag = set.header("etag").expect("a turn's answer has the name's ETag").to_owned();
@@ -274,7 +208,7 @@ async fn turns_commit_or_discard(dev: Tric) {
     assert_eq!(dev.post("/@a/kv?op=set&key=k&value=4&status=409").await.status, 409);
     assert_eq!(dev.value("a", "k").await, "4");
 
-    // Outside a turn on it, a store is read-only.
+    // Outside a turn on it, a name is read-only.
     for (method, target) in [("GET", "/@a/kv?"), ("POST", "/@b/kv?store=a&"), ("POST", "/kv?store=a&")] {
         let err = dev.send(method, &format!("{target}op=set&key=k&value=5"), &[]).await.json()["err"].clone();
         assert!(err.as_str().is_some_and(|e| e.contains("AccessDenied")), "{method} {target}: {err}");
@@ -294,7 +228,7 @@ async fn turns_commit_or_discard(dev: Tric) {
     assert_eq!(dev.post("/@c/kv?op=rmw&key=n&n=3").await.json()["ok"], 0);
     assert_eq!(dev.value("c", "n").await, "3");
 
-    // A value over 1 KiB is an object of its own, which the head names by version in a versioned bucket.
+    // A value too big to inline is a value of its own, which a discarded turn leaves as it was.
     let big = |c: &str| c.repeat(2000);
     for c in ["x", "y"] {
         assert_eq!(dev.post(&format!("/@d/kv?op=set&key=k&value={}", big(c))).await.status, 200);
@@ -309,8 +243,9 @@ async fn turns_commit_or_discard(dev: Tric) {
     assert_eq!(dev.get(&format!("/@{}/", "n".repeat(129))).await.status, 404, "too long a name");
 }
 
-async fn turns_on_one_name_serialize(dev: Tric) {
-    let dev = Arc::new(dev);
+#[tokio::test]
+async fn turns_on_one_name_serialize() {
+    let dev = Arc::new(Tric::app().await);
     let tasks: Vec<_> = (0..20)
         .map(|_| {
             let dev = dev.clone();
@@ -331,7 +266,7 @@ async fn turns_on_one_name_serialize(dev: Tric) {
     let n = dev.post("/@counter/kv?op=incr&key=n&delta=0").await.json()["ok"].as_i64().unwrap();
     assert_eq!(n, ok, "every turn that answered 200 counted once, and no other");
 
-    // A turn holds its name: one that comes while it runs waits, and then is turned away.
+    // A turn that has run long enough claims its name: one that comes while it runs waits, and then is turned away.
     let slow = tokio::spawn({
         let dev = dev.clone();
         async move { dev.post("/@held/kv?op=set&key=k&value=1&sleep=8000").await }
@@ -343,7 +278,9 @@ async fn turns_on_one_name_serialize(dev: Tric) {
     assert_eq!(dev.value("held", "k").await, "1");
 }
 
-async fn delivers_the_outbox_once_committed(dev: Tric) {
+#[tokio::test]
+async fn delivers_the_outbox_once_committed() {
+    let dev = Tric::app().await;
     let me = format!("http://{}", dev.addr);
     let res = dev.post(&format!("/@f/fetch?method=POST&async=1&url={me}/@g/echo")).await;
     assert_eq!((res.status, &*res.body), (200, "202 "));
@@ -357,13 +294,13 @@ async fn delivers_the_outbox_once_committed(dev: Tric) {
     let res = dev.post(&format!("/@f/fetch?method=POST&async=1&status=500&url={me}/@h/echo")).await;
     assert_eq!(res.status, 500);
     assert_eq!(dev.wait_for("h", "echo", Duration::from_secs(3)).await, None);
-    // Nor is there an outbox outside a turn: the request goes, and is answered.
+    // Without a turn there is no commit to hold a request for: it goes at once, and is answered.
     assert!(dev.get(&format!("/fetch?method=POST&async=1&url={me}/@i/echo")).await.body.starts_with("200 "));
 }
 
 #[tokio::test]
 async fn fetches_itself() {
-    let dev = Tric::dev(fixture("app"), &[], None).await;
+    let dev = Tric::app().await;
     let me = format!("http://{}", dev.addr);
     assert_eq!(dev.get(&format!("/fetch?url={me}/")).await.body, "200 hello");
     let echo = dev.get(&format!("/fetch?url={me}/echo")).await.body;
@@ -376,22 +313,28 @@ async fn fetches_itself() {
 
 #[tokio::test]
 async fn runs_middleware() {
-    let dir = manifest("guarded", "name = \"guarded\"\ncomponent = APP\nmiddleware = [{ path = GUARD }]\n");
-    let dev = Tric::dev(dir, &["GUARD_TOKEN=t"], None).await;
+    let dir = manifest("guarded", "component = APP\nmiddleware = [{ url = GUARD, digest = \"DIGEST\" }]\n");
+    let dev = Tric::dev(&dir, &["-e", "GUARD_TOKEN=t"]).await;
     assert_eq!(dev.get("/").await.status, 401);
     assert_eq!(dev.send("GET", "/", &[("authorization", "Bearer x")]).await.status, 401);
     let res = dev.send("GET", "/", &[("authorization", "Bearer t")]).await;
     assert_eq!((res.status, &*res.body), (200, "hello"));
     let env = dev.send("GET", "/env", &[("authorization", "Bearer t")]).await.json();
     assert_eq!(env["env"]["GUARD_TOKEN"], "t", "the app and its middleware share one environment");
+
+    let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    let dir =
+        manifest("forged", &format!("component = APP\nmiddleware = [{{ url = GUARD, digest = \"{digest}\" }}]\n"));
+    let out = Command::new(TRIC).arg("dev").arg(&dir).output().await.unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("does not match its digest"), "{err}");
 }
 
 #[tokio::test]
 async fn confines_outbound_requests() {
-    let dev = Tric::dev(fixture("app"), &[], None).await;
+    let dev = Tric::app().await;
     assert!(dev.get("/fetch?url=http://example.com/").await.body.contains("HttpRequestDenied"));
-    let dir = manifest("open", "name = \"open\"\ncomponent = APP\nallowed_outbound_hosts = [\"*://*:*\"]\n");
-    let dev = Tric::dev(dir, &[], None).await;
+    let dev = Tric::dev(&fixture("app"), &["--allow", "*://*:*"]).await;
     for url in ["http://127.0.0.2:9/", "http://10.0.0.1/", "http://169.254.169.254/", "http://[::1]:9/"] {
         let body = dev.get(&format!("/fetch?url={url}")).await.body;
         assert!(body.contains("DestinationIpProhibited"), "{url}: {body}");
@@ -400,45 +343,9 @@ async fn confines_outbound_requests() {
 
 #[tokio::test]
 async fn fires_cron() {
-    let dir = manifest("cron", "name = \"cron\"\ncomponent = APP\n[cron]\n\"* * * * *\" = \"/@ticks/echo\"\n");
-    let dev = Tric::dev(dir, &[], None).await;
+    let dev = Tric::dev(&manifest("cron", "component = APP\n[cron]\n\"* * * * *\" = \"/@ticks/echo\"\n"), &[]).await;
     let echo = dev.wait_for("ticks", "echo", Duration::from_secs(75)).await.expect("a tick within a minute");
     assert_eq!(echo["method"], "POST");
-    assert_eq!(echo["uri"], "http://cron.localhost/@ticks/echo");
+    assert_eq!(echo["uri"], format!("http://{}/@ticks/echo", dev.addr));
     assert_eq!(header(&echo, "forwarded"), Some("for=_cron"));
-}
-
-#[tokio::test]
-async fn serves_an_install() {
-    let Some(s3) = s3() else { return };
-    let name = fresh("site");
-    let toml = format!("name = \"{name}\"\ncomponent = APP\n[cron]\n\"* * * * *\" = \"/@ticks/echo\"\n");
-    let plain = manifest(&name, &toml);
-    let first = cli(&s3, &["deploy", plain.to_str().unwrap()]).await.trim().to_owned();
-
-    let mut tric = Tric::serve(&s3).await;
-    assert_eq!(tric.get("/").await.status, 404, "{} is no app's host", tric.host);
-    tric.host = "nope.localhost".into();
-    assert_eq!(tric.get("/").await.status, 404, "nope has not been deployed");
-    tric.host = format!("{name}.localhost");
-    assert_eq!(tric.get("/").await.body, "hello");
-
-    // A change reaches a host in at most `FRESH`.
-    assert_eq!(cli(&s3, &["env", &name, "GREETING=hi"]).await, "GREETING\n");
-    until("the new environment", async || tric.get("/env").await.json()["env"]["GREETING"] == "hi").await;
-    let toml = format!("name = \"{name}\"\ncomponent = APP\nmiddleware = [{{ path = GUARD }}]\n");
-    let guarded = manifest(&format!("{name}-guarded"), &toml);
-    let second = cli(&s3, &["deploy", guarded.to_str().unwrap(), "-e", "GUARD_TOKEN=t"]).await.trim().to_owned();
-    until("the guarded release", async || tric.get("/").await.status == 401).await;
-    assert_eq!(cli(&s3, &["releases", &name]).await, format!("{second} running\n{first}\n"));
-    assert_eq!(cli(&s3, &["env", &name]).await, "GREETING\nGUARD_TOKEN\n");
-    cli(&s3, &["release", &name, &first]).await;
-    until("the first release again", async || tric.get("/").await.status == 200).await;
-
-    // The outbox and cron, at `<app>.<domain>`.
-    let res = tric.post(&format!("/@f/fetch?method=POST&async=1&url=http://{name}.localhost/@g/echo")).await;
-    assert_eq!((res.status, &*res.body), (200, "202 "));
-    assert!(tric.wait_for("g", "echo", Duration::from_secs(10)).await.is_some(), "delivered");
-    let echo = tric.wait_for("ticks", "echo", Duration::from_secs(75)).await.expect("a tick within a minute");
-    assert_eq!(echo["uri"], format!("http://{name}.localhost/@ticks/echo"));
 }
