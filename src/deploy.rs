@@ -71,10 +71,10 @@ pub async fn build(path: &Path, http: &HttpClient) -> Result<Built> {
         "{name:?} is no app name: 1 to 63 of a-z, 0-9 and -, starting and ending with a letter or digit"
     );
     for item in &allowed_outbound_hosts {
-        Allow::parse(item).map_err(Error::msg)?;
+        Allow::parse(item)?;
     }
     for (expr, path) in &cron {
-        Cron::parse(expr).map_err(Error::msg)?;
+        Cron::parse(expr)?;
         ensure!(path.starts_with('/') && path.parse::<http::uri::PathAndQuery>().is_ok(), "bad cron path {path:?}");
     }
     let engine = Engine::new()?;

@@ -427,8 +427,7 @@ impl Tric {
             let start = Instant::now();
             let release = state::release(&*tric.store, &app, &current.release).await?;
             let component = tric.component(&app, &release.component).await?;
-            let allow = release.allowed_outbound_hosts.iter().map(|a| Allow::parse(a).map_err(Error::msg));
-            let allow = allow.collect::<Result<_>>()?;
+            let allow = release.allowed_outbound_hosts.iter().map(|a| Allow::parse(a)).collect::<Result<_>>()?;
             let loaded = Loaded { app: tric.engine.load(&app, &component, current.env.into_iter().collect())?, allow };
             tracing::info!(app, ms = start.elapsed().as_millis() as u64, "loaded");
             Ok(Arc::new(loaded))

@@ -28,14 +28,14 @@ fn origin(uri: &Uri) -> Option<String> {
 pub struct Allow(String);
 
 impl Allow {
-    pub fn parse(item: &str) -> Result<Self, String> {
+    pub fn parse(item: &str) -> wasmtime::Result<Self> {
         let item = item.to_ascii_lowercase();
         // The item must be the start of its own origin, which a path, a user name or a port that is no number is not.
         let ok = |o: &String| o.starts_with(&item) && !o.contains(".:") && !o.replacen("//*.", "//", 1).contains('*');
         match item.parse().ok().as_ref().and_then(origin).filter(ok) {
             _ if item == ANY => Ok(Self(item)),
             Some(o) => Ok(Self(o)),
-            None => Err(format!("bad allowed host {item:?}")),
+            None => Err(wasmtime::format_err!("bad allowed host {item:?}")),
         }
     }
 

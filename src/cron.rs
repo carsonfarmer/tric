@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
-use wasmtime::{Error, Result};
+use wasmtime::{Result, format_err};
 
 /// Each field's range: minute, hour, day of the month, month, day of the week (Sunday is 0 and 7).
 const FIELDS: [(u32, u32); 5] = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)];
@@ -59,9 +59,9 @@ fn civil(days: u64) -> (u64, u64, u64) {
 }
 
 impl Cron {
-    pub fn parse(expr: &str) -> Result<Self, String> {
+    pub fn parse(expr: &str) -> Result<Self> {
         let text: Vec<String> = expr.split_whitespace().map(str::to_owned).collect();
-        let bad = || format!("bad cron expression {expr:?}: five fields of numbers, *, -, / and ,");
+        let bad = || format_err!("bad cron expression {expr:?}: five fields of numbers, *, -, / and ,");
         if text.len() != 5 {
             return Err(bad());
         }
@@ -117,7 +117,7 @@ pub async fn sync(aws: &Aws, install: &Install, app: &str, cron: &BTreeMap<Strin
     let mut want = BTreeMap::new();
     for (expr, path) in cron {
         let input = serde_json::json!({ "cron": { "app": app, "path": path } }).to_string();
-        for schedule_expression in Cron::parse(expr).map_err(Error::msg)?.eventbridge() {
+        for schedule_expression in Cron::parse(expr)?.eventbridge() {
             let target = Target { arn: install.function.clone(), role_arn: install.role.clone(), input: input.clone() };
             let schedule = Schedule {
                 schedule_expression,
