@@ -42,7 +42,12 @@ There are three things to know:
   forge cron or tric's own calls.
 - **Apps share cookies across `*.<domain>`**, so use a domain for tric alone.
 - **Shared between apps:** the account's Lambda concurrency, the log groups and the router. One app that is busy, or
-  slow to answer, can use up the concurrency, and the others are then throttled.
+  slow to answer, can use up the router's concurrency, and the others are then throttled.
+- **The router's concurrency is capped** at `route_concurrency`, 200 by default, which it reserves from the
+  account's. A flood of client requests then holds at most 200 routers and the 200 serves they call, and further
+  requests get 429, so about 600 of a 1,000 quota stays for cron and the outbox. Reserving costs nothing and keeps
+  nothing warm. AWS keeps at least 100 unreserved, so an account still at a new account's limit of 10 needs
+  `-var route_concurrency=-1`.
 
 ## Install
 
@@ -101,6 +106,7 @@ week, but not both, because Scheduler can't express both. tric refuses it everyw
 nothing on AWS:
 - serve's tenancy;
 - the one function URL;
+- the router's reserved concurrency;
 - serve's and the router's permissions;
 - the app role's trust, and what it lets a session write;
 - Scheduler's target;

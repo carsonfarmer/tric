@@ -34,6 +34,12 @@ variable "package" {
   default     = "../../dist/tric.zip"
 }
 
+variable "route_concurrency" {
+  description = "The most client requests run at once, reserved from the account's concurrency; -1 for no cap"
+  type        = number
+  default     = 200
+}
+
 provider "aws" {
   region = var.region
   default_tags { tags = { app = var.name } }
@@ -281,6 +287,9 @@ resource "aws_lambda_function" "function" {
   layers           = [local.adapter]
   memory_size      = each.value.memory
   timeout          = each.value.timeout
+  # A flood of client requests holds at most this many routers, and as many serves, so the rest of the account's
+  # concurrency stays for cron and the outbox. Reserving keeps nothing warm: it costs nothing while idle.
+  reserved_concurrent_executions = each.key == "route" ? var.route_concurrency : -1
   environment { variables = merge(each.value.env, { AWS_LWA_PORT = "3000" }) }
   # An app per tenant: a Lambda execution environment never runs two apps.
   dynamic "tenancy_config" {

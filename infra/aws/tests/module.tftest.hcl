@@ -69,6 +69,10 @@ run "module" {
     error_message = "serve runs a Lambda tenant per app"
   }
   assert {
+    condition     = [for f in aws_lambda_function.function : f.reserved_concurrent_executions] == [-1, 200, -1]
+    error_message = "the router alone has reserved concurrency: events and serve share the account's rest"
+  }
+  assert {
     condition     = aws_lambda_function_url.route.function_name == "tric-route"
     error_message = "the one function URL is the router's: serve has none"
   }
