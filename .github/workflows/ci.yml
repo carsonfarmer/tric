@@ -1,5 +1,5 @@
 # The gate, as `docker compose run --rm test` runs it locally: the test components, fmt, clippy, the tests (end to end
-# in memory and against MinIO), and a check that the crate packages.
+# in memory and against RustFS), and a check that the crate packages.
 name: ci
 on:
   push: { branches: [main] }

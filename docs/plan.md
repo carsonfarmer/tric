@@ -196,7 +196,7 @@ aws/lambda/async/                the dead letters: Lambda's on-failure records, 
   - `route` on `<app>.localhost:3000`, with the HTTP backend; it ticks cron itself and relays outbox events with the
     same backoff;
   - `serve`, with no storage credentials of its own;
-  - MinIO, with versioning and STS through a `router` user.
+  - RustFS, with versioning and STS through a `router` user.
 - **`tric deploy [path] [--allow host]… [-e K=V]…`:**
   1. plug in the middleware;
   2. compile, to check the component;
@@ -258,7 +258,7 @@ Each step ends with the gate passing (`docker compose run --rm test`) and a comm
    - Write the engine (callback-only async), names and turns, `wasi:keyvalue`, outbound, the outbox, cron and
      `tric dev`.
    - The e2e suite proves the app semantics on `tric dev`.
-2. **`tric serve` and `tric route` over HTTP,** with compose and MinIO STS, and the acceptance criteria below.
+2. **`tric serve` and `tric route` over HTTP,** with compose and RustFS's STS, and the acceptance criteria below.
 3. **The Lambda backend:** `InvokeWithResponseStream` and its event stream, events through the Lambda Web Adapter,
    and the `outbox` alias check.
 4. **OpenTofu,** then `tofu validate` and the module checks below.
@@ -269,7 +269,7 @@ Each step ends with the gate passing (`docker compose run --rm test`) and a comm
 ## Acceptance criteria
 
 **The local gate:**
-1. **Cross-app denial, on MinIO.** With app A's credentials:
+1. **Cross-app denial, on RustFS.** With app A's credentials:
    - B's `current`, B's names and `native/B/…` are refused;
    - so are writes to A's own `current` and components;
    - A's names, values and `native/A/…` work.

@@ -59,7 +59,8 @@ reason.
   one: deploy creates the missing schedules first, then deletes the extras. They are in one group, which the install
   makes.
 - **An app has 50 cron jobs at most,** so deploy reads its schedules in one page of 100, a failed deploy's extras
-  included, and needs no paging. More than 100 fails the deploy, which says to delete them by hand.
+  included, and needs no paging: Scheduler applies the name prefix before it pages, as a probe of a group of 104 showed.
+  More than 100 fails the deploy, which says to delete them by hand.
 - **A cron expression can't restrict both the day of the month and the day of the week.** POSIX cron runs a job
   when either one matches, and Scheduler can't say that, so tric refuses it everywhere.
 
@@ -77,10 +78,12 @@ reason.
 
 ## Local
 
-- **The local `router` user on MinIO is broader than the router's role on AWS.**
-  - MinIO's `AssumeRole` narrows the caller's own policy, so the user holds what the app role holds on AWS.
-  - It may also list the bucket, because the local router ticks cron itself. MinIO lists prefixes that hold only
-    delete markers, so cron skips an app whose `current` is gone.
+- **The local store is RustFS,** pinned by digest. MinIO's community edition is archived, and its images are gone.
+  It refuses a session token that is missing or tampered with, though with 500, not 403.
+- **The local `router` user on RustFS is broader than the router's role on AWS.**
+  - RustFS's `AssumeRole` takes no role: it narrows the caller's own policy, so the user holds what the app role holds
+    on AWS.
+  - It may also list the bucket, because the local router ticks cron itself.
 - **The local router answers 202 to an outbox event,** then relays it with backoff, honouring `Retry-After`, as
   Lambda's async invoke would.
 - **serve takes the scheme from the router's `Forwarded`.** `proto=https` gives `https`, and anything else gives

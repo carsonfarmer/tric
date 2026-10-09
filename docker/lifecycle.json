@@ -1,0 +1,11 @@
+{
+  "rules": [
+    {
+      "id": "tric",
+      "status": "Enabled",
+      "expiration": {},
+      "noncurrentVersionExpiration": { "noncurrentDays": 1 },
+      "expiredObjectDeleteMarker": true
+    }
+  ]
+}

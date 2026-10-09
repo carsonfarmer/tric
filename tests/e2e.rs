@@ -1,7 +1,7 @@
 //! End to end: tric serving the fixtures in tests/fixtures, which tests/components/build.sh builds. Each test of an
 //! app's semantics runs four times: on `tric dev`, with its state in memory, and on `tric route` in front of
-//! `tric serve`, with its state in the compose stack's MinIO, as an app of its own; each with the Rust app and with the
-//! JavaScript one. Each test runs its own processes, at ports of their own.
+//! `tric serve`, with its state in the compose stack's RustFS, as an app of its own; each with the Rust app and with
+//! the JavaScript one. Each test runs its own processes, at ports of their own.
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http::HeaderMap;
@@ -60,7 +60,7 @@ fn ports<const N: usize>() -> [u16; N] {
 fn owner() -> AmazonS3 {
     let var = |k| std::env::var(k).unwrap_or_else(|_| panic!("{k}: run the tests in compose, which sets it"));
     let s3 = AmazonS3Builder::from_env().with_bucket_name(var("TRIC_BUCKET"));
-    s3.with_access_key_id(var("MINIO_ROOT_USER")).with_secret_access_key(var("MINIO_ROOT_PASSWORD")).build().unwrap()
+    s3.with_access_key_id(var("RUSTFS_ACCESS_KEY")).with_secret_access_key(var("RUSTFS_SECRET_KEY")).build().unwrap()
 }
 
 /// Deploys the app at `path`, with `args`, as an app of its own, named after its directory, and returns that name.
@@ -68,8 +68,8 @@ async fn deploy(path: &Path, args: &[&str]) -> String {
     let dir = if path.is_dir() { path.to_owned() } else { manifest(path, "component = APP\n") };
     let mut deploy = Command::new(TRIC);
     deploy.arg("deploy").arg(&dir).args(args);
-    let out = deploy.env("AWS_ACCESS_KEY_ID", std::env::var("MINIO_ROOT_USER").unwrap_or_default());
-    let out = out.env("AWS_SECRET_ACCESS_KEY", std::env::var("MINIO_ROOT_PASSWORD").unwrap_or_default());
+    let out = deploy.env("AWS_ACCESS_KEY_ID", std::env::var("RUSTFS_ACCESS_KEY").unwrap_or_default());
+    let out = out.env("AWS_SECRET_ACCESS_KEY", std::env::var("RUSTFS_SECRET_KEY").unwrap_or_default());
     let out = out.output().await.unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     dir.file_name().unwrap().to_str().unwrap().to_owned()
@@ -117,7 +117,7 @@ async fn start(cmd: &mut Command, log: &Log, tag: &str) -> (Child, String) {
 async fn serve(domain: &str, outbox: &str, log: &Log) -> (Child, String) {
     let mut serve = Command::new(TRIC);
     serve.args(["serve", "--listen", "127.0.0.1:0", "--domain", domain, "--outbox", outbox]);
-    for var in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD"] {
+    for var in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "RUSTFS_ACCESS_KEY", "RUSTFS_SECRET_KEY"] {
         serve.env_remove(var);
     }
     start(&mut serve, log, "serve: ").await

@@ -147,7 +147,7 @@ To run many apps, deploy them to a bucket. Two processes then serve them:
 - `tric route` maps `<app>.<domain>` to the app, and mints storage credentials that reach only that app;
 - `tric serve` runs the app with those credentials, and holds none of its own.
 
-`docker compose up route` runs both, with MinIO, at `http://<app>.localhost:3000`. In
+`docker compose up route` runs both, with RustFS, at `http://<app>.localhost:3000`. In
 `docker compose run --rm dev`, `cargo run -- deploy <path>` deploys there.
 
 On AWS, serve gives each app its own Lambda tenant, so an escape from the Wasm sandbox reaches one app only.

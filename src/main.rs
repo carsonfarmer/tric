@@ -76,7 +76,7 @@ enum Cmd {
         /// serve: a Lambda function, by its ARN, which runs this router as Lambda's, or `host:port`
         #[arg(long, env = "TRIC_SERVE")]
         serve: String,
-        /// The role whose sessions are the apps' credentials; none where STS has no roles, as MinIO's
+        /// The role whose sessions are the apps' credentials; none where STS takes none, as RustFS's
         #[arg(long, env = "TRIC_ROLE")]
         role: Option<String>,
         /// On Lambda, the secret CloudFront sends as `X-Tric-Origin`, without which a request is refused; a router
