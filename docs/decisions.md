@@ -46,6 +46,9 @@ reason.
 - **Lambda's own permissions.** With `authorization_type = NONE`, the AWS provider grants `lambda:InvokeFunctionUrl`
   to anyone. It grants `lambda:InvokeFunction` only with `lambda:InvokedViaFunctionUrl`, so the router can't be
   invoked directly.
+- **Memory is capped per linear memory:** 256 MiB each, and 4 to a store. Wasmtime's `StoreLimits` has no total for a
+  store, and one would still miss an app's calls to itself, each a store of its own, 16 deep, with 64 requests in
+  flight. On AWS, what bounds an app is serve's 1 GiB: past it, Lambda ends that tenant's environment, and no other.
 
 ## AWS
 
@@ -138,14 +141,13 @@ An app speaks Pushpin's WebSocket-over-HTTP, and a little of GRIP, so it runs th
 sockets and where API Gateway WebSocket does, on AWS. A probe on AWS, behind CloudFront, settled the AWS side.
 
 - **Behind the cargo feature `ws`.** Off, nothing changes and nothing more is compiled. On, `tric dev` adds
-  tokio-tungstenite, for the handshake's key and the framing, and hyper-util, for the upgrade; hyper-util is linked
-  already, by reqwest. The AWS package is built with it.
+  tokio-tungstenite, for the handshake, which it checks as RFC 6455 says, and the framing; and hyper-util, for the
+  upgrade, which reqwest links already. The AWS package is built with it.
 - **The same URL.** CloudFront hides `Upgrade` from its functions, so the viewer-request function takes a request with
   `Sec-WebSocket-Key` as an upgrade, sends it to API Gateway with `updateRequestOrigin`, at `/ws`, and puts the path
   in `X-Forwarded-Path`. A separate host for sockets would be one more name to know.
 - **The origin secret is checked at `$connect`.** API Gateway WebSocket has no resource policy and no WAF of its own,
-  so the secret is the gate, as it is for the function URL. `events` holds the secret for that alone, and still has
-  no URL.
+  so the secret is the gate, as it is for the function URL.
 - **API Gateway invokes `events` through its `ws` alias,** buffered. The adapter passes a WebSocket event to the
   router whole, and reads `{statusCode, headers}` back, which a streaming function can't give. Routes are selected by
   `$request.body.action`, API Gateway's usual expression, which means nothing here: every route has the one
@@ -221,5 +223,10 @@ sockets and where API Gateway WebSocket does, on AWS. A probe on AWS, behind Clo
   as none matches it closely enough to be worth a container. The tests feed the router API Gateway's events, against
   a stand-in for `@connections`.
 - **The size.** The budget was all the WebSocket code, `tric dev`'s and the router's, in what `src/ws.rs` was before
-  it (494 lines). `src/ws.rs` is 494 lines, and its hooks elsewhere add 63, most of them the outbox handing back what
-  a delivery published, so the budget is missed by 63. No feature was removed.
+  it (494 lines). When it landed, `src/ws.rs` was 494 lines, and its hooks elsewhere added 63, most of them the outbox
+  handing back what a delivery published, so the budget was missed by 63. No feature was removed.
+
+## Code
+
+- **Imports are as rustfmt leaves them.** Its `imports_granularity`, which is unstable, made `src` longer at every
+  setting (`Module` by 41 lines, `Crate` by 90, `One` by 130), and clippy has no lint for it.

@@ -1,13 +1,5 @@
 # tric: the build plan
 
-**This is the only plan. After any compaction, re-read this file before doing anything else.**
-
-This is a full rewrite. The target is the system described below, and nothing else:
-- Old code is not a reference for behaviour; the approved design is.
-- A piece of old code is copied in only if it already does exactly what a section below says. It is re-read line by
-  line when it is copied.
-- There is no backward compatibility: not with old buckets, old heads, old commands or old infrastructure.
-
 ## The principles
 
 1. **Invent nothing.** Every behaviour maps to a standard.
@@ -254,24 +246,6 @@ ws/channels/<app>/<channel>/<id> a socket's subscription to a channel (router on
 - head caches;
 - GCP and Azure;
 - the `guard` middleware.
-
-## Order of work
-
-Each step ends with the gate passing (`docker compose run --rm test`) and a commit.
-
-1. **The fresh tree.**
-   - Delete everything that isn't the plan: the source, the tests, the infrastructure, the docs and the compose
-     services.
-   - Write the engine (callback-only async), names and turns, `wasi:keyvalue`, outbound, the outbox, cron and
-     `tric dev`.
-   - The e2e suite proves the app semantics on `tric dev`.
-2. **`tric serve` and `tric route` over HTTP,** with compose and RustFS's STS, and the acceptance criteria below.
-3. **The Lambda backend:** `InvokeWithResponseStream` and its event stream, events through the Lambda Web Adapter,
-   and the `outbox` alias check.
-4. **OpenTofu,** then `tofu validate` and the module checks below.
-5. **Docs:** `docs/decisions.md` and the READMEs.
-6. **JS and WebSockets,** from `feat/js` and `feat/ws`, on the new tree.
-7. **Ask the user before `tofu apply`,** then run the remote checks.
 
 ## Acceptance criteria
 

@@ -2,14 +2,14 @@
 // the `status=N` of its query, after `sleep=MS` milliseconds if given. Under `/@<name>` a route is the same, with the
 // name as the store of `/kv` unless the query names one.
 //
-// - `/echo`: the request, as `{"method", "uri", "headers": [[name, value], ..], "body"}`; under a name, and with an
+// - `/echo`: the request, as `{"method", "uri", "headers": [[name, value], ..]}`; under a name, and with an
 //   unsafe method, kept in the name's key `echo` too.
 // - `/fetch?method=M&async=1&url=U`: sends M (GET by default) to U, which is the rest of the query, not decoded, with
 //   `Prefer: respond-async` given `async`. The reply is `<status> <body>`, or the case of the `ErrorCode`.
 // - `/kv?…`: see kv.js.
-// - `/env`: the environment and the arguments.
+// - `/env`: the environment.
 // - `/stream?n=N`: N lines, a second apart, in a body that streams.
-// - `/hog?mb=N` holds N MiB; `/fields?n=N` holds N `fields`; `/loop` spins; anything else: `hello`.
+// - `/hog?mb=N` holds N MiB; `/loop` spins; anything else: `hello`.
 import types from "wasi:http/types@0.3.0";
 import client from "wasi:http/client@0.3.0";
 import environment from "wasi:cli/environment@0.3.0";
@@ -38,7 +38,7 @@ export const handler = {
     let body;
     switch (path) {
       case "/echo": {
-        const echo = await describe(request);
+        const echo = describe(request);
         body = JSON.stringify(echo);
         if (name !== null && !["GET", "HEAD", "OPTIONS", "TRACE"].includes(echo.method)) keep(name, "echo", body);
         break;
@@ -50,16 +50,10 @@ export const handler = {
         body = JSON.stringify(respond(q.get("store") ?? name ?? "", q));
         break;
       case "/env":
-        body = JSON.stringify({
-          env: Object.fromEntries(environment.getEnvironment()),
-          args: environment.getArguments(),
-        });
+        body = JSON.stringify({ env: Object.fromEntries(environment.getEnvironment()) });
         break;
       case "/hog":
         body = `hogged ${new Uint8Array(n << 20).fill(1).length >> 20} MiB`;
-        break;
-      case "/fields":
-        body = `held ${Array.from({ length: n }, () => Fields.fromList([])).length} fields`;
         break;
       case "/loop":
         for (;;);
@@ -93,10 +87,10 @@ function answer(chunks, status = 200) {
   return response;
 }
 
-/** The body of `message`, as text, which `consume` (`Request.consumeBody` or `Response.consumeBody`) consumes. */
-async function text(consume, message) {
+/** The body of `response`, as text. */
+async function text(response) {
   const done = wit.Future(wit.Future.RESULT_VOID_ERROR_CODE);
-  const [stream] = consume(message, done.readable);
+  const [stream] = Response.consumeBody(response, done.readable);
   const written = done.writable.write({ tag: "ok", val: null });
   const bytes = [];
   for await (const chunk of stream) for (const byte of chunk) bytes.push(byte);
@@ -105,7 +99,7 @@ async function text(consume, message) {
 }
 
 /** The request, for `/echo`. */
-async function describe(request) {
+function describe(request) {
   const method = request.getMethod();
   const scheme = request.getScheme();
   const uri = `${scheme ? (scheme.val ?? scheme.tag).toLowerCase() : ""}://${request.getAuthority() ?? ""}`;
@@ -113,7 +107,6 @@ async function describe(request) {
     method: method.tag === "other" ? method.val : method.tag.toUpperCase(),
     uri: uri + (request.getPathWithQuery() ?? ""),
     headers: request.getHeaders().copyAll().map(([k, v]) => [k, decode(v)]),
-    body: await text(Request.consumeBody, request),
   };
 }
 
@@ -134,5 +127,5 @@ async function send(method, respondAsync, url) {
   } catch (e) {
     return debug(e);
   }
-  return `${response.getStatusCode()} ${await text(Response.consumeBody, response)}`;
+  return `${response.getStatusCode()} ${await text(response)}`;
 }

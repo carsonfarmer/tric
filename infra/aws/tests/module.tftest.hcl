@@ -21,29 +21,18 @@ mock_provider "aws" {
   mock_resource "aws_apigatewayv2_api" {
     defaults = { id = "a1b2c3", execution_arn = "arn:aws:execute-api:us-west-2:123456789012:a1b2c3" }
   }
+  mock_resource "aws_iam_role" {
+    defaults = { arn = "arn:aws:iam::123456789012:role/tric-x" }
+  }
   mock_resource "aws_lambda_alias" {
     defaults = { invoke_arn = "arn:aws:apigateway:us-west-2:lambda:path/x/invocations" }
   }
 }
 
+# The router's role apart from the rest, so that the app role's trust is seen to name it.
 override_resource {
   target = aws_iam_role.route
   values = { arn = "arn:aws:iam::123456789012:role/tric-route" }
-}
-
-override_resource {
-  target = aws_iam_role.app
-  values = { arn = "arn:aws:iam::123456789012:role/tric-app" }
-}
-
-override_resource {
-  target = aws_iam_role.serve
-  values = { arn = "arn:aws:iam::123456789012:role/tric-serve" }
-}
-
-override_resource {
-  target = aws_iam_role.scheduler
-  values = { arn = "arn:aws:iam::123456789012:role/tric-scheduler" }
 }
 
 mock_provider "aws" {
@@ -137,7 +126,7 @@ run "module" {
       aws_lambda_permission.ws.function_name == "tric-events" && aws_lambda_permission.ws.qualifier == "ws"
       && aws_lambda_permission.ws.principal == "apigateway.amazonaws.com"
       && aws_lambda_permission.ws.source_arn == "arn:aws:execute-api:us-west-2:123456789012:a1b2c3/ws/*"
-      && aws_apigatewayv2_integration.ws.integration_uri == aws_lambda_alias.ws.invoke_arn
+      && aws_apigatewayv2_integration.ws.integration_uri == aws_lambda_alias.events["ws"].invoke_arn
       && alltrue([for r in aws_apigatewayv2_route.ws : r.route_response_selection_expression == null])
     )
     error_message = "API Gateway alone invokes the ws alias, from its own stage, with no route response"

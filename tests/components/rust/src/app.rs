@@ -1,15 +1,15 @@
 //! The test app. Every route answers 200, or the `status=N` of its query, after `sleep=MS` milliseconds if given. Under
 //! `/@<name>` a route is the same, with the name as the store of `/kv` unless the query names one.
 //!
-//! - `/echo`: the request, as `{"method", "uri", "headers": [[name, value], ..], "body"}`; under a name, and with an
+//! - `/echo`: the request, as `{"method", "uri", "headers": [[name, value], ..]}`; under a name, and with an
 //!   unsafe method, kept in the name's key `echo` too.
 //! - `/fetch?method=M&async=1&url=U`: sends M (GET by default) to U, which is the rest of the query, not decoded, with
 //!   `Prefer: respond-async` given `async`. The reply is `<status> <body>`, or the Debug of the `ErrorCode`.
 //! - `/kv?…`: see kv.rs.
 //! - `/chat`: a room of WebSockets, in Pushpin's WebSocket-over-HTTP: see chat.rs.
-//! - `/env`: the environment and the arguments; `/fs`: what reading the filesystem gets.
+//! - `/env`: the environment; `/fs`: what reading the filesystem gets.
 //! - `/stream?n=N`: N lines, a second apart, in a body that streams.
-//! - `/hog?mb=N` holds N MiB; `/fields?n=N` holds N `fields`; `/loop` spins; `/print` writes to stdout and stderr.
+//! - `/hog?mb=N` holds N MiB; `/loop` spins; `/print` writes to stdout and stderr.
 //! - anything else: `hello`.
 use crate::{chat, kv};
 use serde_json::{Value, json};
@@ -42,7 +42,7 @@ impl wasip3::exports::http::handler::Guest for App {
         }
         let body = match path.as_str() {
             "/echo" => {
-                let echo = echo(request, &method).await.to_string();
+                let echo = echo(&request, &method).to_string();
                 if let Some(name) = name.filter(|_| !method.is_safe()) {
                     kv::keep(name, "echo", echo.as_bytes()).map_err(|e| ErrorCode::InternalError(Some(e)))?;
                 }
@@ -51,11 +51,7 @@ impl wasip3::exports::http::handler::Guest for App {
             "/fetch" => fetch(q.get("method").map_or("GET", |m| m), q.contains_key("async"), url).await,
             "/chat" => return chat::respond(request, name.unwrap_or_default(), &q).await,
             "/kv" => kv::respond(q.get("store").map(|s| s.as_str()).or(name).unwrap_or_default(), &q).to_string(),
-            "/env" => json!({
-                "env": std::env::vars().collect::<BTreeMap<_, _>>(),
-                "args": std::env::args().collect::<Vec<_>>(),
-            })
-            .to_string(),
+            "/env" => json!({ "env": std::env::vars().collect::<BTreeMap<_, _>>() }).to_string(),
             "/fs" => {
                 let ls = |dir| fs::read_dir(dir).map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>());
                 json!({
@@ -66,7 +62,6 @@ impl wasip3::exports::http::handler::Guest for App {
                 .to_string()
             }
             "/hog" => format!("hogged {} MiB", black_box(vec![1u8; n << 20]).len() >> 20),
-            "/fields" => format!("held {} fields", black_box((0..n).map(|_| Fields::new()).collect::<Vec<_>>()).len()),
             "/loop" => loop {
                 std::hint::spin_loop()
             },
@@ -82,7 +77,7 @@ impl wasip3::exports::http::handler::Guest for App {
     }
 }
 
-async fn echo(request: Request, method: &http::Method) -> Value {
+fn echo(request: &Request, method: &http::Method) -> Value {
     let scheme = match request.get_scheme() {
         Some(Scheme::Http) => "http".into(),
         Some(Scheme::Https) => "https".into(),
@@ -93,9 +88,7 @@ async fn echo(request: Request, method: &http::Method) -> Value {
     let uri = format!("{scheme}://{authority}{}", request.get_path_with_query().unwrap_or_default());
     let headers = request.get_headers().copy_all();
     let headers: Vec<_> = headers.into_iter().map(|(k, v)| (k, String::from_utf8_lossy(&v).into_owned())).collect();
-    let (body, _) = Request::consume_body(request, wit_future::new(|| Ok(())).1);
-    let body = String::from_utf8_lossy(&body.collect().await).into_owned();
-    json!({ "method": method.as_str(), "uri": uri, "headers": headers, "body": body })
+    json!({ "method": method.as_str(), "uri": uri, "headers": headers })
 }
 
 /// `n` lines, a second apart, in a body that streams.

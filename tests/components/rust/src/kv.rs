@@ -1,7 +1,7 @@
 //! The `/kv` route: wasi:keyvalue. The reply is `{"ok": value}` or `{"err": "<Debug of the error>"}`.
 //!
 //! `/kv?op=OP&key=K&value=V&keys=A,B&cursor=C&delta=N&between=X&n=N`, after `store::open` of the store:
-//! - `open`, `get` (value or null), `set`, `delete`, `exists`, `incr` (the new value, delta defaults to 1);
+//! - `get` (value or null), `set`, `delete`, `exists`, `incr` (the new value, delta defaults to 1);
 //! - `list` is `{"keys": [..], "cursor": C or null}`;
 //! - `cas` is `Cas::new`, `current`, then `swap` to V: `{"seen": current, "swapped": true}`, or `swapped: false` with the
 //!   `latest` value from the refreshed handle. `between=X` sets the key to X before the swap, which makes it fail;
@@ -55,7 +55,6 @@ fn run(store: &str, q: &HashMap<String, String>) -> Result<Value, String> {
     let bucket = store::open(store).map_err(e)?;
     let b = &bucket;
     Ok(match arg("op") {
-        "open" => Value::Null,
         "get" => json!(text(b.get(key).map_err(e)?)),
         "set" => json!(b.set(key, value).map_err(e)?),
         "delete" => json!(b.delete(key).map_err(e)?),

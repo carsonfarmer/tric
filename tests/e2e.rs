@@ -123,12 +123,13 @@ async fn serve(domain: &str, outbox: &str, log: &Log) -> (Child, String) {
     start(&mut serve, log, "serve: ").await
 }
 
-/// `tric route` at `port`, for apps at `<app>.localhost:<port>`, with its outbox at `outbox`, sending to `serve`.
-async fn route(port: u16, outbox: &str, serve: &str, log: &Log) -> (Child, String) {
+/// `tric route` at `port`, for apps at `<app>.localhost:<port>`, with its outbox at `outbox`, sending to `serve`, and
+/// `env` in its environment.
+async fn route(port: u16, outbox: &str, serve: &str, env: &[(&str, &str)], log: &Log) -> (Child, String) {
     let (listen, domain) = (format!("127.0.0.1:{port}"), format!("localhost:{port}"));
     let mut route = Command::new(TRIC);
     route.args(["route", "--listen", &listen, "--outbox-listen", outbox, "--domain", &domain, "--serve", serve]);
-    start(&mut route, log, "route: ").await
+    start(route.envs(env.iter().copied()), log, "route: ").await
 }
 
 /// Where an app runs, and which app it is: the fixture `app`, or `js`.
@@ -187,21 +188,24 @@ async fn exchange(addr: &str, host: &str, method: &str, target: &str, headers: &
 }
 
 impl Tric {
-    /// The app at `path`, with `args` as `tric dev` and `tric deploy` take them: on `tric dev`, or deployed and on a
-    /// stack of its own.
+    /// The app at `path`, with `args` as `tric dev` and `tric deploy` take them: on `tric dev`, or on a stack.
     async fn new(kind: Kind, path: &Path, args: &[&str]) -> Self {
-        let log = Log::default();
-        if !kind.stack {
-            let mut dev = Command::new(TRIC);
-            dev.arg("dev").arg(path).args(["--listen", "127.0.0.1:0"]).args(args);
-            let (dev, addr) = start(&mut dev, &log, "").await;
-            return Self { host: addr.clone(), addr, outbox: String::new(), apps: vec![], log, _children: vec![dev] };
+        if kind.stack {
+            return Self::stack(path, args, &[]).await;
         }
-        let app = deploy(path, args).await;
-        let [port, outbox] = ports();
+        let log = Log::default();
+        let mut dev = Command::new(TRIC);
+        dev.arg("dev").arg(path).args(["--listen", "127.0.0.1:0"]).args(args);
+        let (dev, addr) = start(&mut dev, &log, "").await;
+        Self { host: addr.clone(), addr, outbox: String::new(), apps: vec![], log, _children: vec![dev] }
+    }
+
+    /// The app at `path`, deployed with `args`, on a stack of its own whose router has `env` in its environment.
+    async fn stack(path: &Path, args: &[&str], env: &[(&str, &str)]) -> Self {
+        let (app, log, [port, outbox]) = (deploy(path, args).await, Log::default(), ports());
         let (domain, outbox) = (format!("localhost:{port}"), format!("127.0.0.1:{outbox}"));
         let (serve, at) = serve(&domain, &outbox, &log).await;
-        let (route, addr) = route(port, &outbox, &at, &log).await;
+        let (route, addr) = route(port, &outbox, &at, env, &log).await;
         let host = format!("{app}.{domain}");
         Self { addr, host, outbox, apps: vec![app], log, _children: vec![serve, route] }
     }
@@ -230,27 +234,25 @@ impl Tric {
 
     /// Waits up to `limit` for `key` in `name` to hold an echo, which it returns.
     async fn wait_for(&self, name: &str, key: &str, limit: Duration) -> Option<Value> {
-        let start = Instant::now();
-        while start.elapsed() < limit {
-            if let Value::String(s) = self.value(name, key).await {
-                return Some(serde_json::from_str(&s).unwrap());
-            }
-            sleep(Duration::from_millis(200)).await;
-        }
-        None
+        until(limit, async || self.value(name, key).await.as_str().map(|s| serde_json::from_str(s).unwrap())).await
     }
 
     /// Waits up to `limit` for the log to have `line`.
     async fn logged(&self, line: &str, limit: Duration) -> bool {
-        let start = Instant::now();
-        while !self.log.lock().unwrap().contains(line) {
-            if start.elapsed() > limit {
-                return false;
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-        true
+        until(limit, async || self.log.lock().unwrap().contains(line).then_some(())).await.is_some()
     }
+}
+
+/// What `f` gives, once it gives something, asked every 100 ms for up to `limit`.
+async fn until<T>(limit: Duration, mut f: impl AsyncFnMut() -> Option<T>) -> Option<T> {
+    let start = Instant::now();
+    while start.elapsed() < limit {
+        if let Some(t) = f().await {
+            return Some(t);
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    None
 }
 
 /// The value of the first header `name` that an echo reports.
@@ -321,6 +323,8 @@ async fn serves_and_forwards(kind: Kind) {
         ("x-tric-credentials", "{}"),
         ("x-amz-tenant-id", "other"),
         ("connection-id", "c"),
+        ("connection_id", "c"),
+        ("grip-hold", "stream"),
         ("meta-user", "u"),
         ("content-type", "application/websocket-events"),
     ];
@@ -329,7 +333,7 @@ async fn serves_and_forwards(kind: Kind) {
     let headers = echo["headers"].as_array().unwrap();
     let forwarded: Vec<_> = headers.iter().filter(|h| h[0] == "forwarded").collect();
     assert_eq!(forwarded, [&json!(["forwarded", format!(r#"for=127.0.0.1;host="{}";proto=http"#, tric.host)])]);
-    let ours = ["x-forwarded-", "x-amz", "x-tric-", "connection-id", "meta-", "content-type"];
+    let ours = ["x-forwarded-", "x-amz", "x-tric-", "connection-id", "grip-", "meta-", "content-type"];
     let hop = |h: &&Value| ours.iter().any(|p| h[0].as_str().unwrap().replace('_', "-").starts_with(p));
     assert!(!headers.iter().any(|h| hop(&h)), "{headers:?}");
 
@@ -570,7 +574,7 @@ async fn isolates_apps() {
     let (fake, seen) = stand_in().await;
     let log = Log::default();
     let [port, outbox] = ports();
-    let (route, addr) = route(port, &format!("127.0.0.1:{outbox}"), &fake, &log).await;
+    let (route, addr) = route(port, &format!("127.0.0.1:{outbox}"), &fake, &[], &log).await;
     let mut tric = Tric {
         addr,
         host: format!("{a}.localhost:{port}"),
@@ -749,11 +753,9 @@ mod ws {
     /// Waits for the last event of the room at `path` to be `want`.
     async fn last_is(tric: &Tric, path: &str, want: &str) {
         let name = name(path);
-        let start = Instant::now();
-        while tric.value(name, "last").await != want {
-            assert!(start.elapsed() < Duration::from_secs(10), "{name}: not {want}");
-            sleep(Duration::from_millis(100)).await;
-        }
+        let last =
+            until(Duration::from_secs(10), async || (tric.value(name, "last").await == want).then_some(())).await;
+        assert!(last.is_some(), "{name}: not {want}");
     }
 
     #[tokio::test]
@@ -861,11 +863,6 @@ mod ws {
             let res = exchange(&tric.addr, &tric.host, "POST", &path, claim, say.clone()).await;
             assert_eq!((res.status, &*res.body), (400, "not a socket"), "{claim:?}");
         }
-        let echo = tric.send("GET", &path.replace("/chat", "/echo"), claims[3]).await.json();
-        for name in ["content-type", "connection-id", "connection_id", "grip-hold", "meta-user"] {
-            assert_eq!(header(&echo, name), None, "{name}");
-        }
-
         // Nor is a socket's id the client's to choose.
         let (_, mine) = open(&tric, &path, &[("connection-id", &id), ("content-type", EVENTS)]).await.unwrap();
         assert_ne!(mine, id);
@@ -893,17 +890,9 @@ mod ws {
 
     impl Gateway {
         async fn new() -> Self {
-            let app = deploy(&fixture("app"), &[]).await;
-            let ((fake, seen), log, [port, events]) = (stand_in().await, Log::default(), ports());
-            let (domain, events) = (format!("localhost:{port}"), format!("127.0.0.1:{events}"));
-            let (serve, at) = serve(&domain, &events, &log).await;
-            let mut route = Command::new(TRIC);
-            let listen = format!("127.0.0.1:{port}");
-            route.args(["route", "--listen", &listen, "--outbox-listen", &events, "--domain", &domain, "--serve", &at]);
-            route.args(["--origin", "secret"]).env("TRIC_WS", format!("http://{fake}/ws"));
-            let (route, addr) = start(&mut route, &log, "route: ").await;
-            let host = format!("{app}.{domain}");
-            let tric = Tric { addr, host, outbox: events, apps: vec![app], log, _children: vec![serve, route] };
+            let (fake, seen) = stand_in().await;
+            let ws = format!("http://{fake}/ws");
+            let tric = Tric::stack(&fixture("app"), &[], &[("TRIC_ORIGIN", "secret"), ("TRIC_WS", &ws)]).await;
             Self { tric, seen }
         }
 
@@ -949,23 +938,18 @@ mod ws {
             let mut want: Vec<_> =
                 want.iter().map(|&(method, id, body)| [method, id, body].map(str::to_owned)).collect();
             want.sort();
-            let start = Instant::now();
-            loop {
-                let got = {
-                    let mut seen = self.seen.lock().unwrap();
-                    let id =
-                        |r: &http::Request<Bytes>| r.uri().path().replace("/ws/@connections/", "").replace("%3D", "=");
-                    let body = |r: &http::Request<Bytes>| String::from_utf8_lossy(r.body()).into_owned();
-                    let mut got: Vec<_> = seen.iter().map(|r| [r.method().to_string(), id(r), body(r)]).collect();
-                    got.sort();
-                    if got == want {
-                        return seen.clear();
-                    }
-                    got
-                };
-                assert!(start.elapsed() < Duration::from_secs(10), "sent {got:?}, not {want:?}");
-                sleep(Duration::from_millis(100)).await;
-            }
+            let got = |seen: &[http::Request<Bytes>]| {
+                let id = |r: &http::Request<Bytes>| r.uri().path().replace("/ws/@connections/", "").replace("%3D", "=");
+                let body = |r: &http::Request<Bytes>| String::from_utf8_lossy(r.body()).into_owned();
+                let mut got: Vec<_> = seen.iter().map(|r| [r.method().to_string(), id(r), body(r)]).collect();
+                got.sort();
+                got
+            };
+            let sent = until(Duration::from_secs(10), async || {
+                let mut seen = self.seen.lock().unwrap();
+                (got(&seen) == want).then(|| seen.clear())
+            });
+            assert!(sent.await.is_some(), "sent {:?}, not {want:?}", got(&self.seen.lock().unwrap()));
         }
     }
 

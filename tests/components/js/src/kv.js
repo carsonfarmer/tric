@@ -35,8 +35,6 @@ function run(name, q) {
   const keys = arg("keys").split(",").filter(Boolean);
   const bucket = store.open(name);
   switch (arg("op")) {
-    case "open":
-      return null;
     case "get":
       return text(bucket.get(key));
     case "set":

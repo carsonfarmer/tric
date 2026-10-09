@@ -1,10 +1,4 @@
-# tric on AWS, for a fresh account whose Route 53 already hosts the domain:
-# - the router, behind CloudFront at *.<domain>, as two functions from one package: `route`, the function URL, takes
-#   only CloudFront's requests; `events` takes only events, by alias: `cron` from Scheduler, `outbox` from serve, and
-#   `ws`, sockets' events, from API Gateway, which holds the sockets that CloudFront sends it;
-# - serve, with a Lambda tenant per app and no URL;
-# - one bucket, versioned.
-# Nothing runs while idle. `docker compose run --rm package` builds the package; see infra/aws/README.md.
+# tric on AWS, for an account whose Route 53 already hosts the domain: see README.md. Nothing runs while idle.
 terraform {
   required_version = ">= 1.8"
   required_providers {
@@ -331,16 +325,19 @@ resource "aws_lambda_function" "function" {
   depends_on = [aws_cloudwatch_log_group.function, aws_iam_role_policy.route, aws_iam_role_policy.serve]
 }
 
-# serve invokes this alias with delivery events: retried twice, kept up to 6 hours, then written to the bucket.
-resource "aws_lambda_alias" "outbox" {
-  name             = "outbox"
+# The events function's aliases, one for each source, as the router takes no event that names no alias: serve invokes
+# `outbox` with delivery events, Scheduler `cron` with the apps' cron, and API Gateway `ws` with sockets' events.
+resource "aws_lambda_alias" "events" {
+  for_each         = toset(["outbox", "cron", "ws"])
+  name             = each.key
   function_name    = aws_lambda_function.function["events"].function_name
   function_version = "$LATEST"
 }
 
+# Delivery events are retried twice, kept up to 6 hours, then written to the bucket.
 resource "aws_lambda_function_event_invoke_config" "outbox" {
   function_name                = aws_lambda_function.function["events"].function_name
-  qualifier                    = aws_lambda_alias.outbox.name
+  qualifier                    = aws_lambda_alias.events["outbox"].name
   maximum_retry_attempts       = 2
   maximum_event_age_in_seconds = 21600
   destination_config {
@@ -348,25 +345,12 @@ resource "aws_lambda_function_event_invoke_config" "outbox" {
   }
 }
 
-# Scheduler invokes this alias with the apps' cron; the router takes no event that names no alias.
-resource "aws_lambda_alias" "cron" {
-  name             = "cron"
-  function_name    = aws_lambda_function.function["events"].function_name
-  function_version = "$LATEST"
-}
-
-# API Gateway invokes this alias with sockets' events, and nothing else may.
-resource "aws_lambda_alias" "ws" {
-  name             = "ws"
-  function_name    = aws_lambda_function.function["events"].function_name
-  function_version = "$LATEST"
-}
-
+# API Gateway alone may invoke `ws`.
 resource "aws_lambda_permission" "ws" {
   statement_id  = "ws"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.function["events"].function_name
-  qualifier     = aws_lambda_alias.ws.name
+  qualifier     = aws_lambda_alias.events["ws"].name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${local.ws}/*"
 }
@@ -384,7 +368,7 @@ resource "aws_apigatewayv2_integration" "ws" {
   api_id             = aws_apigatewayv2_api.ws.id
   integration_type   = "AWS_PROXY"
   integration_method = "POST"
-  integration_uri    = aws_lambda_alias.ws.invoke_arn
+  integration_uri    = aws_lambda_alias.events["ws"].invoke_arn
 }
 
 resource "aws_apigatewayv2_route" "ws" {
@@ -533,7 +517,7 @@ output "TRIC_SCHEDULES" {
 }
 
 output "TRIC_EVENTS" {
-  value = aws_lambda_alias.cron.arn
+  value = aws_lambda_alias.events["cron"].arn
 }
 
 output "TRIC_SCHEDULER_ROLE" {

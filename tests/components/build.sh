@@ -16,5 +16,11 @@ for name in app guard; do
   cargo build --release --locked --target wasm32-wasip2 --manifest-path rust/Cargo.toml --features "$name"
   cp "${CARGO_TARGET_DIR:-rust/target}/wasm32-wasip2/release/fixture.wasm" "$out/$name.wasm"
 done
-js/build.sh
+
+# The same packages, and tric's wasi:keyvalue, for the JavaScript app. componentize-qjs runs the app's top level at
+# build time and keeps the heap that leaves: see docs/decisions.md.
+rm -rf js/wit/deps
+cp -R rust/wit/deps js/wit/deps
+cp -R ../../wit/keyvalue js/wit/deps/keyvalue
+componentize-qjs --wit js/wit --js js/src/app.js --world app --output "$out/js.wasm"
 ls -l "$out"
