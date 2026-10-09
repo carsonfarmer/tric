@@ -109,13 +109,9 @@ impl Route {
         let (Some(from), Ok(host)) = (forwarded(ip, &host, proto), HeaderValue::try_from(host)) else {
             return status(StatusCode::BAD_REQUEST);
         };
-        let creds = match self.known(&app).await {
-            Ok(true) => self.creds(&app).await,
-            Ok(false) => return status(StatusCode::NOT_FOUND),
-            Err(e) => Err(e),
-        };
-        let creds = match creds {
-            Ok(creds) => creds,
+        let creds = match self.tenant(&app).await {
+            Ok(Some(creds)) => creds,
+            Ok(None) => return status(StatusCode::NOT_FOUND),
             Err(e) => {
                 tracing::warn!(app, "{e:#}");
                 return status(StatusCode::SERVICE_UNAVAILABLE);
@@ -157,21 +153,19 @@ impl Route {
         self.handle(ip, host, "https", req).await
     }
 
-    /// Whether `app` has a release, as it did up to `KNOWN_FOR` ago.
-    async fn known(&self, app: &str) -> Result<bool> {
-        cached(&self.known, KNOWN_FOR, app, self.store.head(&store::app(app, &["current"]))).await
-    }
-
-    /// `app`'s credentials, as serve takes them: minted with a session policy that reaches only `app`'s objects, and
-    /// used for `CREDS_FOR`.
-    async fn creds(&self, app: &str) -> Result<HeaderValue> {
-        cached(&self.creds, CREDS_FOR, app, async {
+    /// `app`'s credentials, as serve takes them, if it has a release, as it did up to `KNOWN_FOR` ago: minted with a
+    /// session policy that reaches only `app`'s objects, and used for `CREDS_FOR`.
+    async fn tenant(&self, app: &str) -> Result<Option<HeaderValue>> {
+        if !cached(&self.known, KNOWN_FOR, app, self.store.head(&store::app(app, &["current"]))).await? {
+            return Ok(None);
+        }
+        let creds = cached(&self.creds, CREDS_FOR, app, async {
             let creds = self.aws.assume(self.role.as_deref(), app, &policy(&self.bucket, app)).await?;
             let mut creds = HeaderValue::try_from(serde_json::to_string(&creds)?)?;
             creds.set_sensitive(true);
             Ok(creds)
-        })
-        .await
+        });
+        creds.await.map(Some)
     }
 
     /// Sends `req` to serve, as `app`'s tenant, with `app`'s credentials.
@@ -193,12 +187,13 @@ impl Route {
         }
     }
 
-    /// Sends serve a `POST` of `body` to `path` of `app`, from tric itself, as `from` says.
-    async fn event(&self, app: &str, path: &str, from: &'static str, body: Bytes) -> Result<Response> {
-        let creds = self.creds(app).await?;
+    /// Sends serve a `POST` of `body` to `path` of `app`, from tric itself, as `from` says; `None` if `app` has no
+    /// release.
+    async fn event(&self, app: &str, path: &str, from: &'static str, body: Bytes) -> Result<Option<Response>> {
+        let Some(creds) = self.tenant(app).await? else { return Ok(None) };
         let req = http::Request::post(path).header(HOST, format!("{app}.{}", self.domain));
         let req = req.header(FORWARDED, from).body(Full::new(body).map_err(|n| match n {}).boxed_unsync())?;
-        Ok(self.send(app, creds, req).await)
+        Ok(Some(self.send(app, creds, req).await))
     }
 
     /// Fires the cron jobs, of every app, that match the minute `t`.
@@ -232,20 +227,20 @@ impl Route {
             Ok(_) => return status(StatusCode::BAD_REQUEST),
             Err(code) => return status(code),
         };
-        match self.known(&job.app).await {
-            Ok(true) => self.fire(&job.app, &job.path).await,
-            Ok(false) => return status(StatusCode::NOT_FOUND), // an app with no release has no tenant
-            Err(e) => tracing::warn!(app = job.app, path = job.path, "cron: {e:#}"),
+        match self.fire(&job.app, &job.path).await {
+            true => status(StatusCode::NO_CONTENT),
+            false => status(StatusCode::NOT_FOUND), // an app with no release has no tenant
         }
-        status(StatusCode::NO_CONTENT)
     }
 
-    /// Fires the cron job at `path` of `app`, and logs how it went.
-    async fn fire(&self, app: &str, path: &str) {
+    /// Fires the cron job at `path` of `app`, and logs how it went; false if `app` has no release.
+    async fn fire(&self, app: &str, path: &str) -> bool {
         match self.event(app, path, "for=_cron", Bytes::new()).await {
-            Ok(res) => tracing::info!(app, path, status = res.status().as_u16(), "cron"),
+            Ok(Some(res)) => tracing::info!(app, path, status = res.status().as_u16(), "cron"),
+            Ok(None) => return false,
             Err(e) => tracing::warn!(app, path, "cron: {e:#}"),
         }
+        true
     }
 
     /// Takes a delivery event that serve hands over, and relays it to the app it names, as Lambda does an event: at
@@ -277,20 +272,16 @@ impl Route {
     /// Sends serve `app`'s delivery event: done once serve has it delivered, or dropped, and to be tried again after a
     /// 429, a 5xx or a failed exchange.
     async fn deliver(&self, app: &str, event: Bytes) -> Delivered {
-        let res = match self.known(app).await {
-            Ok(true) => self.event(app, "/", "for=_tric", event).await,
-            Ok(false) => {
-                tracing::info!(app, "outbox: dropped an event, as its app has no release");
-                return Delivered::Done;
-            }
-            Err(e) => Err(e),
-        };
-        match res {
-            Ok(res) if res.status() == StatusCode::TOO_MANY_REQUESTS || res.status().is_server_error() => {
+        match self.event(app, "/", "for=_tric", event).await {
+            Ok(Some(res)) if res.status() == StatusCode::TOO_MANY_REQUESTS || res.status().is_server_error() => {
                 tracing::info!(app, "outbox: serve answered {}", res.status());
                 Delivered::Retry(outbox::retry_after(res.headers()))
             }
-            Ok(_) => Delivered::Done,
+            Ok(Some(_)) => Delivered::Done,
+            Ok(None) => {
+                tracing::info!(app, "outbox: dropped an event, as its app has no release");
+                Delivered::Done
+            }
             Err(e) => {
                 tracing::info!(app, "outbox: {e:#}");
                 Delivered::Retry(None)
