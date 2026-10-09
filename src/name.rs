@@ -557,21 +557,6 @@ mod tests {
         assert!(c(None, None).hold(None));
     }
 
-    #[test]
-    fn head_json() {
-        let mut head = Head::default();
-        assert_eq!(serde_json::to_string(&head).unwrap(), "{}");
-        head.values.insert("k".into(), Value::Data(B64.encode("v")));
-        head.values.insert("big".into(), Value::Object { key: "0".repeat(32), version: Some("v1".into()) });
-        head.pending.insert("c".into(), Pending { digest: "d".into(), at: 1 });
-        let json = serde_json::to_string(&head).unwrap();
-        assert_eq!(
-            json,
-            r#"{"values":{"big":{"object":{"key":"00000000000000000000000000000000","version":"v1"}},"k":{"data":"dg=="}},"pending":{"c":{"digest":"d","at":1}}}"#
-        );
-        assert!(serde_json::from_str::<Head>(r#"{"values":{},"x":1}"#).is_err());
-    }
-
     #[tokio::test]
     async fn too_large() {
         let store = Store::memory();

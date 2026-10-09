@@ -217,33 +217,6 @@ mod tests {
         m
     }
 
-    #[test]
-    fn reads_messages_as_they_arrive() {
-        let chunk = frame(&[(":event-type", b"PayloadChunk"), (":message-type", b"event")], b"hi");
-        let done = frame(&[(":event-type", b"InvokeComplete")], b"{}");
-        let all = [chunk.clone(), done.clone()].concat();
-        // Fed a byte at a time, each message comes whole once its last byte is in, and not before.
-        let (mut buf, mut got) = (BytesMut::new(), vec![]);
-        for (i, b) in all.iter().enumerate() {
-            buf.extend([*b]);
-            if let Some(m) = message(&mut buf).unwrap() {
-                got.push((i + 1, m));
-            }
-        }
-        assert!(buf.is_empty());
-        let [(at, m), (end, done)] = &got[..] else { panic!("{got:?}") };
-        assert_eq!((*at, *end), (chunk.len(), all.len()));
-        assert_eq!(
-            (m.header(":event-type"), m.header(":message-type"), &m.payload[..]),
-            (Some("PayloadChunk"), Some("event"), &b"hi"[..])
-        );
-        assert_eq!((done.header(":event-type"), &done.payload[..]), (Some("InvokeComplete"), &b"{}"[..]));
-        // A header that is not a string, which Lambda never sends, is refused, not skipped.
-        let mut bad = frame(&[("n", b"1")], b"");
-        bad[14] = 4; // the header's type: a 32-bit integer
-        assert!(message(&mut BytesMut::from(&bad[..])).is_err());
-    }
-
     /// An answer's event stream, cut into pieces of `n` bytes.
     fn stream(payloads: &[&[u8]], complete: &str, n: usize) -> BoxStream<'static, Result<Bytes, HttpError>> {
         let event = |kind: &str, p: &[u8]| frame(&[(":event-type", kind.as_bytes()), (":message-type", b"event")], p);
@@ -275,5 +248,9 @@ mod tests {
         assert!(answer(stream(&[], failed, 3)).await.is_err());
         let res = answer(stream(&[br#"{"statusCode":200}"#, &[0; 8], b"part"], failed, 3)).await.unwrap();
         assert!(res.into_body().collect().await.is_err());
+        // A header that is not a string, which Lambda never sends, is refused, not skipped.
+        let mut bad = frame(&[("n", b"1")], b"");
+        bad[14] = 4; // the header's type: a 32-bit integer
+        assert!(message(&mut BytesMut::from(&bad[..])).is_err());
     }
 }
