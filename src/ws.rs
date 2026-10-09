@@ -12,8 +12,8 @@ use crate::{aws, engine::ANSWER, name, route::Route, route::body, route::viewer,
 use base64::{Engine as _, prelude::BASE64_URL_SAFE_NO_PAD as B64};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt, future, stream};
-use http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_EXTENSIONS};
-use http::header::{SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL, SEC_WEBSOCKET_VERSION, UPGRADE};
+use http::header::UPGRADE;
+use http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_PROTOCOL};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, request::Parts};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{body::Incoming, upgrade::OnUpgrade, upgrade::Upgraded};
@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, sync::Arc, sync::LazyLock, sync::Mutex, time::Duration};
 use tokio::{sync::Semaphore, sync::mpsc, time::timeout};
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role, WebSocketConfig, frame::coding::CloseCode};
-use tokio_tungstenite::{WebSocketStream, tungstenite, tungstenite::handshake::derive_accept_key};
+use tokio_tungstenite::{WebSocketStream, tungstenite, tungstenite::handshake::server::create_response_with_body};
 
 const EVENTS: &str = "application/websocket-events";
 const CONNECTION_ID: HeaderName = HeaderName::from_static("connection-id");
@@ -38,7 +38,6 @@ const SOCKETS_MAX: usize = 256;
 const RUNNING_MAX: usize = 16;
 const STALL: Duration = Duration::from_secs(30);
 
-/// One event.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 enum Event {
     Open,
@@ -114,14 +113,13 @@ fn parse(mut body: &[u8]) -> Option<Vec<Event>> {
         let end = body.windows(2).position(|w| w == b"\r\n")?;
         let head = std::str::from_utf8(&body[..end]).ok()?;
         body = &body[end + 2..];
-        let (kind, len) = head.split_once(' ').map_or((head, None), |(kind, len)| (kind, Some(len)));
-        let content = match len {
-            None => None,
-            Some(l) if l.len() <= 8 && l.bytes().all(|b| b.is_ascii_hexdigit()) => {
+        let (kind, content) = match head.split_once(' ') {
+            None => (head, None),
+            Some((kind, l)) if l.len() <= 8 && l.bytes().all(|b| b.is_ascii_hexdigit()) => {
                 let n = usize::from_str_radix(l, 16).ok().filter(|n| *n <= MESSAGE_MAX)?;
                 let content = body.get(..n)?;
                 body = body.get(n..)?.strip_prefix(b"\r\n")?;
-                Some(content)
+                (kind, Some(content))
             }
             Some(_) => return None,
         };
@@ -300,9 +298,9 @@ impl Hub<'_> {
     /// a subscription whose socket is gone.
     pub(crate) async fn publish(&self, app: &str, messages: Vec<(String, String)>) {
         for (channel, m) in messages.iter().filter(|(c, m)| name::is_name(c) && m.len() <= MESSAGE_MAX) {
-            let files = self.store().files(&Path::from_iter(["ws", "channels", app, channel])).await;
-            let files = files.inspect_err(|e| tracing::warn!(app, "ws: {e:#}")).unwrap_or_default();
-            let ids = files.into_iter().filter_map(|f| String::from_utf8(B64.decode(f).ok()?).ok());
+            let list = self.store().list(&Path::from_iter(["ws", "channels", app, channel])).await;
+            let subs = list.inspect_err(|e| tracing::warn!(app, "ws: {e:#}")).map(|l| l.objects).unwrap_or_default();
+            let ids = subs.iter().filter_map(|o| String::from_utf8(B64.decode(o.location.filename()?).ok()?).ok());
             let send = |id: String| async move {
                 _ = self.post(&id, Some(m.clone())).await && self.sub(app, channel, &id, false).await.is_ok();
             };
@@ -311,7 +309,6 @@ impl Hub<'_> {
     }
 }
 
-/// Where the record of the socket `id` is kept.
 fn record(id: &str) -> Path {
     Path::from_iter(["ws", "connections", &B64.encode(id)])
 }
@@ -329,14 +326,15 @@ pub fn wants(parts: &Parts) -> bool {
 
 /// Opens a socket for the upgrade in `parts`, in `tric dev`: asks the app, and answers `101` if it accepts.
 pub async fn open(tric: Arc<Tric>, mut parts: Parts) -> Response {
-    let (upgrade, key) = (parts.extensions.remove::<OnUpgrade>(), parts.headers.get(SEC_WEBSOCKET_KEY));
-    let is = |name, want: &[u8]| parts.headers.get(name).is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(want));
-    let fine = parts.method == Method::GET && is(UPGRADE, b"websocket") && is(SEC_WEBSOCKET_VERSION, b"13");
-    let (Some(upgrade), Some(key), true) = (upgrade, key, fine) else { return status(StatusCode::BAD_REQUEST) };
+    let upgrade = parts.extensions.remove::<OnUpgrade>();
+    let req = http::Request::from_parts(parts, ());
+    let (Some(upgrade), Ok(mut res)) = (upgrade, create_response_with_body(&req, Default::default)) else {
+        return status(StatusCode::BAD_REQUEST);
+    };
     let Ok(permit) = SOCKETS.try_acquire() else { return status(StatusCode::SERVICE_UNAVAILABLE) };
     let (id, (tx, rx)) = (random(), mpsc::channel(ITEMS_MAX));
     OPEN.lock().unwrap().insert(id.clone(), tx);
-    let protocol = match Hub::Dev(&tric).open(&id, Conn::of(&tric.app, parts.uri.to_string(), &parts.headers)).await {
+    let protocol = match Hub::Dev(&tric).open(&id, Conn::of(&tric.app, req.uri().to_string(), req.headers())).await {
         Ok(protocol) => protocol,
         Err(code) => return (OPEN.lock().unwrap().remove(&id), status(code)).1,
     };
@@ -345,9 +343,10 @@ pub async fn open(tric: Arc<Tric>, mut parts: Parts) -> Response {
         OPEN.lock().unwrap().remove(&id);
         (Hub::Dev(&tric).disconnect(&id, code).await, permit)
     });
-    let res = http::Response::builder().status(StatusCode::SWITCHING_PROTOCOLS).header(UPGRADE, "websocket");
-    let res = res.header(CONNECTION, "upgrade").header(SEC_WEBSOCKET_ACCEPT, derive_accept_key(key.as_bytes()));
-    protocol.into_iter().fold(res, |res, p| res.header(SEC_WEBSOCKET_PROTOCOL, p)).body(Default::default()).unwrap()
+    if let Some(protocol) = protocol {
+        res.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, protocol);
+    }
+    res
 }
 
 /// Serves `tric dev`'s socket `id` until it ends: each message of the client as a turn of its own, `RUNNING_MAX` at

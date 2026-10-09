@@ -5,7 +5,7 @@ use crate::outbox::{Event, Held, Sink};
 use crate::store::{self, Store};
 use base64::{Engine as _, prelude::BASE64_STANDARD as B64};
 use bytes::Bytes;
-use http::HeaderMap;
+use http::{HeaderMap, StatusCode};
 use object_store::{PutMode, UpdateVersion, path::Path};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -64,16 +64,12 @@ pub struct Pending {
 #[serde(rename_all = "lowercase", deny_unknown_fields)]
 enum Value {
     Data(String), // base64
-    Object(Obj),
-}
-
-/// A value too large to keep in the head: the object `apps/<app>/values/<key>` at `version`, in a versioned bucket.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Obj {
-    key: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    version: Option<String>,
+    /// A value too large to keep in the head: the object `apps/<app>/values/<key>` at `version`, in a versioned bucket.
+    Object {
+        key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+    },
 }
 
 /// A turn's lease on a name, until a Unix millisecond.
@@ -112,32 +108,12 @@ pub async fn read(store: &Store, path: &Path) -> Result<Option<(Head, UpdateVers
 async fn put(store: &Store, path: &Path, head: &Head, base: Option<UpdateVersion>) -> Result<Option<UpdateVersion>> {
     let json = serde_json::to_vec(head)?;
     ensure!(json.len() <= HEAD_MAX, TooLarge);
-    store.put(path, json.into(), store::over(base)).await
+    store.put(path, json.into(), base.map_or(PutMode::Create, PutMode::Update)).await
 }
 
 /// The `ETag` of a head's version: a strong one, whatever the store says.
 fn etag(version: &UpdateVersion) -> Option<String> {
     version.e_tag.as_ref().map(|e| format!("\"{}\"", e.trim_matches('"')))
-}
-
-/// Loads a value, if there is one.
-async fn load(store: &Store, app: &str, v: Option<&Value>) -> Result<Option<Bytes>, Error> {
-    match v {
-        None => Ok(None),
-        Some(Value::Data(b64)) => Ok(Some(B64.decode(b64).map_err(other)?.into())),
-        Some(Value::Object(o)) => {
-            let got = store.get(&value_path(app, &o.key), o.version.clone(), VALUE_MAX as u64).await;
-            let got = got.map_err(|e| other(format!("{e:#}")))?.ok_or_else(|| other("the value is missing"))?;
-            Ok(Some(got.0))
-        }
-    }
-}
-
-/// One page of `keys`, which are in order: the first `PAGE` after `cursor`, which is the last key of the page before.
-fn page<'a>(keys: impl Iterator<Item = &'a str>, cursor: Option<String>) -> KeyResponse {
-    let keys: Vec<String> =
-        keys.filter(|k| cursor.as_deref().is_none_or(|c| *k > c)).take(PAGE).map(str::to_owned).collect();
-    KeyResponse { cursor: (keys.len() == PAGE).then(|| keys[PAGE - 1].clone()), keys }
 }
 
 /// `If-Match` and `If-None-Match`, which a turn evaluates against the head's `ETag` before it runs.
@@ -168,24 +144,10 @@ impl Conditions {
     }
 }
 
-/// The entity tags of a list, each with whether it is weak, quotes and all.
+/// The entity tags of a list, each with whether it is weak, quotes and all. A tag with a comma in it is split, so it
+/// matches none of the head's, which have none.
 fn tags(list: &str) -> impl Iterator<Item = (bool, &str)> {
-    let mut rest = list;
-    std::iter::from_fn(move || {
-        rest = rest.trim_start_matches([' ', '\t', ',']);
-        let weak = rest.starts_with("W/");
-        rest = rest.strip_prefix("W/").unwrap_or(rest);
-        let end = rest.strip_prefix('"')?.find('"')? + 2;
-        let (tag, after) = rest.split_at(end);
-        rest = after;
-        Some((weak, tag))
-    })
-}
-
-/// Why a turn did not open.
-pub enum Refused {
-    Busy,         // others held the name, or kept changing it, for `BUSY`
-    Precondition, // its conditions failed
+    list.split(',').map(str::trim).map(|t| t.strip_prefix("W/").map_or((false, t), |t| (true, t)))
 }
 
 /// What a turn changes, under its lock.
@@ -262,7 +224,7 @@ impl Turn {
     }
 
     /// Opens a turn on `name`, once no one else's claim is live, if `conditions` hold, and claimed if `claim`; or
-    /// refuses it at `until`.
+    /// refuses it, with 412 if they do not, or with 429 if others still hold the name, or keep changing it, at `until`.
     pub async fn open(
         store: &Store,
         app: &str,
@@ -270,18 +232,18 @@ impl Turn {
         claim: bool,
         conditions: &Conditions,
         until: Instant,
-    ) -> Result<Result<Arc<Self>, Refused>> {
+    ) -> Result<Result<Arc<Self>, StatusCode>> {
         loop {
             let turn = Self::new(store, app, name, read(store, &path(app, name)).await?, false);
             let free = !turn.state().head.claim.as_ref().is_some_and(Claim::live);
             if free && !conditions.hold(turn.etag().as_deref()) {
-                return Ok(Err(Refused::Precondition));
+                return Ok(Err(StatusCode::PRECONDITION_FAILED));
             }
             if free && (!claim || turn.claim().await) {
                 return Ok(Ok(turn));
             }
             if Instant::now() >= until {
-                return Ok(Err(Refused::Busy));
+                return Ok(Err(StatusCode::TOO_MANY_REQUESTS));
             }
             sleep(Duration::from_millis(rand::random_range(25..=50))).await;
         }
@@ -302,32 +264,31 @@ impl Turn {
     /// turn does not know of.
     pub async fn claim(self: &Arc<Self>) -> bool {
         let turn = self.clone();
-        tokio::spawn(async move { turn.take_claim().await }).await.unwrap_or(false)
-    }
-
-    async fn take_claim(&self) -> bool {
-        let _one = self.claiming.lock().await;
-        let (mut head, base) = {
-            let s = self.state();
-            if s.claim.is_some() || s.doomed || s.answered {
-                return s.claim.is_some();
+        let claim = async move {
+            let _one = turn.claiming.lock().await;
+            let (mut head, base) = {
+                let s = turn.state();
+                if s.claim.is_some() || s.doomed || s.answered {
+                    return s.claim.is_some();
+                }
+                (s.head.clone(), s.base.clone())
+            };
+            let id = store::random();
+            head.claim = Some(Claim { id: id.clone(), until: now() + CLAIM_TTL.as_millis() as u64 });
+            let put = put(&turn.store, &turn.path, &head, base).await;
+            let mut s = turn.state();
+            match put {
+                Ok(Some(version)) => {
+                    (s.head.claim, s.base, s.claim) = (head.claim, Some(version), Some(id));
+                    true
+                }
+                Ok(None) | Err(_) => {
+                    s.doomed = true;
+                    false
+                }
             }
-            (s.head.clone(), s.base.clone())
         };
-        let id = store::random();
-        head.claim = Some(Claim { id: id.clone(), until: now() + CLAIM_TTL.as_millis() as u64 });
-        let put = put(&self.store, &self.path, &head, base).await;
-        let mut s = self.state();
-        match put {
-            Ok(Some(version)) => {
-                (s.head.claim, s.base, s.claim) = (head.claim, Some(version), Some(id));
-                true
-            }
-            Ok(None) | Err(_) => {
-                s.doomed = true;
-                false
-            }
-        }
+        tokio::spawn(claim).await.unwrap_or(false)
     }
 
     /// Readies an unsafe outbound request: before the answer, by claiming the name; after it, by waiting for the
@@ -382,7 +343,15 @@ impl Turn {
                 None => s.head.values.get(key).cloned(),
             }
         };
-        load(&self.store, &self.app, v.as_ref()).await
+        match v {
+            None => Ok(None),
+            Some(Value::Data(b64)) => Ok(Some(B64.decode(b64).map_err(other)?.into())),
+            Some(Value::Object { key, version }) => {
+                let got = self.store.get(&value_path(&self.app, &key), version, VALUE_MAX as u64).await;
+                let got = got.map_err(|e| other(format!("{e:#}")))?.ok_or_else(|| other("the value is missing"))?;
+                Ok(Some(got.0))
+            }
+        }
     }
 
     pub fn exists(&self, key: &str) -> bool {
@@ -399,7 +368,14 @@ impl Turn {
                 None => keys.remove(k.as_str()),
             };
         }
-        page(keys.into_iter(), cursor)
+        // One page: the first `PAGE` keys after `cursor`, which is the last key of the page before.
+        let keys: Vec<String> = keys
+            .into_iter()
+            .filter(|k| cursor.as_deref().is_none_or(|c| *k > c))
+            .take(PAGE)
+            .map(str::to_owned)
+            .collect();
+        KeyResponse { cursor: (keys.len() == PAGE).then(|| keys[PAGE - 1].clone()), keys }
     }
 
     /// Buffers writes, `None` deleting, all or none of them.
@@ -414,7 +390,7 @@ impl Turn {
             Some(v) => v.clone(),
             None => match s.head.values.get(key) {
                 Some(Value::Data(b64)) => Some(B64.decode(b64).map_err(other)?.into()),
-                Some(Value::Object(_)) => return Err(other("not a counter")),
+                Some(Value::Object { .. }) => return Err(other("not a counter")),
                 None => None,
             },
         };
@@ -472,13 +448,13 @@ impl Turn {
                         let path = value_path(&self.app, &k);
                         let version = self.store.put(&path, v, PutMode::Overwrite).await?.and_then(|v| v.version);
                         made.push(path);
-                        head.values.insert(key, Value::Object(Obj { key: k, version }))
+                        head.values.insert(key, Value::Object { key: k, version })
                     }
                     Some(v) => head.values.insert(key, Value::Data(B64.encode(v))),
                     None => head.values.remove(&key),
                 };
-                if let Some(Value::Object(o)) = old {
-                    gone.push(value_path(&self.app, &o.key));
+                if let Some(Value::Object { key: k, .. }) = old {
+                    gone.push(value_path(&self.app, &k));
                 }
             }
             let now = now();
@@ -586,7 +562,7 @@ mod tests {
         let mut head = Head::default();
         assert_eq!(serde_json::to_string(&head).unwrap(), "{}");
         head.values.insert("k".into(), Value::Data(B64.encode("v")));
-        head.values.insert("big".into(), Value::Object(Obj { key: "0".repeat(32), version: Some("v1".into()) }));
+        head.values.insert("big".into(), Value::Object { key: "0".repeat(32), version: Some("v1".into()) });
         head.pending.insert("c".into(), Pending { digest: "d".into(), at: 1 });
         let json = serde_json::to_string(&head).unwrap();
         assert_eq!(

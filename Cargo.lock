@@ -2613,6 +2613,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "clap",
  "futures-util",
  "http",
@@ -2620,6 +2621,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "object_store",
+ "percent-encoding",
  "quick-xml",
  "rand",
  "serde",

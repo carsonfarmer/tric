@@ -1,7 +1,7 @@
 //! The Wasmtime engine, and apps on it: one `wasi:http/handler@0.3` component each, a fresh instance per request, under
 //! hard limits, with nothing granted but what tric provides.
 use crate::kv::Imports;
-use crate::tric::{Ctx, Outbound};
+use crate::tric::{Ctx, Outbound, Request, Response};
 use sha2::{Digest, Sha256};
 use std::future::poll_fn;
 use std::hash::{Hash, Hasher};
@@ -11,10 +11,10 @@ use tokio::task::AbortHandle;
 use tokio::time::timeout;
 use tracing::Instrument;
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
-use wasmtime::{Config, ResourceLimiter, Result, Store, bail};
+use wasmtime::{Config, Result, Store, StoreLimits, StoreLimitsBuilder, bail};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView, p2::pipe::MemoryOutputPipe};
 use wasmtime_wasi_http::p3::bindings::{Service, ServicePre};
-use wasmtime_wasi_http::{WasiBody, WasiHttpCtx, WasiHttpCtxView, WasiHttpView, p3};
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView, p3};
 
 /// One epoch tick. A guest yields once per tick, so this bounds how long a runaway holds up the others.
 const TICK: Duration = Duration::from_millis(10);
@@ -22,7 +22,7 @@ const TICK: Duration = Duration::from_millis(10);
 pub const ANSWER: Duration = Duration::from_secs(10);
 /// From instantiation to the end of everything the instance does, its response's body included.
 const TOTAL: Duration = Duration::from_secs(300);
-const MEMORY: usize = 256 << 20; // all linear memories of a store together
+const MEMORY: usize = 256 << 20; // one linear memory
 const MEMORIES: usize = 4; // per store, as are the next two
 const INSTANCES: usize = 16;
 const TABLES: usize = 16;
@@ -65,7 +65,6 @@ impl Engine {
         Ok(Self { engine, linker })
     }
 
-    /// Compiles the component `wasm`.
     pub fn compile(&self, wasm: &[u8]) -> Result<Component> {
         Component::new(&self.engine, wasm)
     }
@@ -119,26 +118,7 @@ pub struct Host {
     http: WasiHttpCtx,
     hooks: Outbound,
     pub ctx: Arc<Ctx>,
-    memory: usize, // linear memory in use
-}
-
-impl ResourceLimiter for Host {
-    fn memory_growing(&mut self, current: usize, desired: usize, _: Option<usize>) -> Result<bool> {
-        let total = self.memory - current + desired;
-        Ok((total <= MEMORY).then(|| self.memory = total).is_some())
-    }
-    fn table_growing(&mut self, _: usize, desired: usize, _: Option<usize>) -> Result<bool> {
-        Ok(desired <= TABLE_MAX)
-    }
-    fn instances(&self) -> usize {
-        INSTANCES
-    }
-    fn tables(&self) -> usize {
-        TABLES
-    }
-    fn memories(&self) -> usize {
-        MEMORIES
-    }
+    limits: StoreLimits,
 }
 
 impl WasiView for Host {
@@ -153,26 +133,25 @@ impl WasiHttpView for Host {
     }
 }
 
-type Answer = Result<http::Response<WasiBody>>;
+type Answer = Result<Response>;
 
 impl App {
     /// Runs one request in a fresh instance, with `ctx` for its state and its outbound requests, and returns the
     /// response once its head is there, with a handle that ends the instance, body and all. Waits while 64 requests of
     /// the app are in flight. An instance that has not answered 10 s after it was instantiated is ended; one that
     /// answered runs on for up to 300 s, as its body streams.
-    pub async fn call(
-        &self,
-        req: http::Request<WasiBody>,
-        ctx: Arc<Ctx>,
-    ) -> Result<(http::Response<WasiBody>, AbortHandle)> {
+    pub async fn call(&self, req: Request, ctx: Arc<Ctx>) -> Result<(Response, AbortHandle)> {
         let permit = self.permits.clone().acquire_owned().await?;
         let (out, err) = (MemoryOutputPipe::new(LOG_MAX), MemoryOutputPipe::new(LOG_MAX));
         let wasi = WasiCtx::builder().stdout(out.clone()).stderr(err.clone()).envs(&self.env).build();
         let hooks = Outbound(ctx.clone());
-        let mut host = Host { table: ResourceTable::new(), wasi, http: WasiHttpCtx::new(), hooks, ctx, memory: 0 };
+        let limits =
+            StoreLimitsBuilder::new().memory_size(MEMORY).memories(MEMORIES).instances(INSTANCES).tables(TABLES);
+        let limits = limits.table_elements(TABLE_MAX).build();
+        let mut host = Host { table: ResourceTable::new(), wasi, http: WasiHttpCtx::new(), hooks, ctx, limits };
         host.table.set_max_capacity(RESOURCES);
         let mut store = Store::new(&self.engine, host);
-        store.limiter(|h| h);
+        store.limiter(|h| &mut h.limits);
         store.set_hostcall_fuel(HOSTCALL_FUEL);
         store.epoch_deadline_async_yield_and_update(1); // yield at every tick; the deadlines below end a runaway
         let (pre, (tx, rx)) = (self.pre.clone(), oneshot::channel::<Answer>());
@@ -212,12 +191,7 @@ impl App {
 
 /// Calls the guest's handler, sends its response, or the error that stood in for one, on `tx`, and runs the store
 /// until the guest has nothing left to do.
-async fn run(
-    store: &mut Store<Host>,
-    guest: Service,
-    req: http::Request<WasiBody>,
-    tx: oneshot::Sender<Answer>,
-) -> Result<()> {
+async fn run(store: &mut Store<Host>, guest: Service, req: Request, tx: oneshot::Sender<Answer>) -> Result<()> {
     let (req, io) = p3::Request::from_http(store.data_mut().http().hooks, req);
     let req = store.data_mut().table.push(req)?;
     let call = guest.wasi_http_handler().func_handle().start_call_concurrent(&mut *store, (req,))?;

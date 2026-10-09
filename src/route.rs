@@ -199,18 +199,18 @@ impl Route {
 
     /// Fires the cron jobs, of every app, that match the minute `t`.
     async fn cron(self: Arc<Self>, t: u64) {
-        let apps = match self.store.dirs(&Path::from("apps")).await {
-            Ok(apps) => apps,
+        let apps = match self.store.list(&Path::from("apps")).await {
+            Ok(list) => list.common_prefixes,
             Err(e) => return tracing::warn!("cron: {e:#}"),
         };
-        for app in apps.into_iter().filter(|app| label(app)) {
-            let Ok(Some((release, _))) = self.store.json::<Release>(&store::app(&app, &["current"]), RELEASE_MAX).await
+        for app in apps.iter().filter_map(Path::filename).filter(|app| label(app)) {
+            let Ok(Some((release, _))) = self.store.json::<Release>(&store::app(app, &["current"]), RELEASE_MAX).await
             else {
                 continue;
             };
             let due = release.cron.into_iter().filter(|(fields, _)| Cron::parse(fields).is_ok_and(|c| c.matches(t)));
             for (_, path) in due {
-                let (route, app) = (self.clone(), app.clone());
+                let (route, app) = (self.clone(), app.to_owned());
                 tokio::spawn(async move { route.fire(&app, &path).await });
             }
         }
@@ -248,17 +248,13 @@ impl Route {
     /// once, and twice more if that fails. On Lambda, Lambda does: this delivers it once, and answers 503 if that
     /// failed, which fails the invocation. Then it sends the messages the event published.
     async fn outbox(self: Arc<Self>, req: hyper::Request<Incoming>) -> Response {
-        #[derive(Deserialize)]
-        struct Of {
-            app: String,
-        }
-        let (event, app) = match body::<Of>(req).await {
-            Ok((event, Of { app })) if label(&app) => (event, app),
+        let (event, app) = match body::<outbox::Event>(req).await {
+            Ok((event, e)) if label(&e.app) => (event, e.app),
             Ok(_) => return status(StatusCode::BAD_REQUEST),
             Err(code) => return status(code),
         };
         if self.serve.starts_with("arn:") {
-            let Delivered::Done(_published) = self.deliver(&app, event).await else {
+            let Ok(_published) = self.deliver(&app, event).await else {
                 return status(StatusCode::SERVICE_UNAVAILABLE);
             };
             #[cfg(feature = "ws")]
@@ -283,16 +279,16 @@ impl Route {
         match self.event(app, "/", "for=_tric", event).await {
             Ok(Some(res)) if res.status() == StatusCode::TOO_MANY_REQUESTS || res.status().is_server_error() => {
                 tracing::info!(app, "outbox: serve answered {}", res.status());
-                Delivered::Retry(outbox::retry_after(res.headers()))
+                Err(outbox::retry_after(res.headers()))
             }
-            Ok(Some(res)) => Delivered::Done(outbox::published(res).await),
+            Ok(Some(res)) => Ok(outbox::published(res).await),
             Ok(None) => {
                 tracing::info!(app, "outbox: dropped an event, as its app has no release");
-                Delivered::Done(vec![])
+                Ok(vec![])
             }
             Err(e) => {
                 tracing::info!(app, "outbox: {e:#}");
-                Delivered::Retry(None)
+                Err(None)
             }
         }
     }

@@ -6,6 +6,7 @@ use http::header::CONTENT_TYPE;
 use object_store::ClientOptions;
 use object_store::aws::{AmazonS3, AwsAuthorizer, AwsCredential, AwsCredentialProvider};
 use object_store::client::{HttpClient, HttpConnector, HttpRequest, HttpResponse};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use wasmtime::{Result, ensure};
 
@@ -52,14 +53,10 @@ struct AssumeRoleResult {
     credentials: Credentials,
 }
 
-/// `s` as a URL query or form value.
+/// `s` as a URL query or form value: all but RFC 3986's unreserved characters percent-encoded.
 pub fn query(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-            b => format!("%{b:02X}"),
-        })
-        .collect()
+    const RESERVED: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
+    utf8_percent_encode(s, RESERVED).to_string()
 }
 
 impl Aws {

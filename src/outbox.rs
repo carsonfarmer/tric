@@ -114,14 +114,10 @@ impl Held {
     }
 }
 
-/// How a delivery went.
-pub enum Delivered {
-    /// Every request was delivered, or the event was dropped: with the messages its publishes, which delivery takes
-    /// instead of sending, publish to channels of the app's sockets.
-    Done(Vec<(String, String)>),
-    /// A request failed, so the event is to be tried again, after the `Retry-After` given.
-    Retry(Option<Duration>),
-}
+/// How a delivery went: `Ok` if every request was delivered, or the event was dropped, with the messages its publishes,
+/// which delivery takes instead of sending, publish to channels of the app's sockets; `Err` if a request failed, so the
+/// event is to be tried again, after the `Retry-After` given.
+pub type Delivered = Result<Vec<(String, String)>, Option<Duration>>;
 
 /// Delivers the event `bytes` of `tric`'s app, if its commit landed with its digest: each request in order, until one
 /// fails, which a response of 5xx or 429 or a failed exchange is. A request to a host the app may not reach is done.
@@ -142,7 +138,7 @@ pub async fn deliver(tric: &Arc<Tric>, bytes: &[u8]) -> Delivered {
             Ok(_) => {}
             Err(err) => {
                 tracing::info!(app = e.app, commit = e.commit, "outbox: {err:#}");
-                return Delivered::Retry(None);
+                return Err(None);
             }
         }
         sleep(wait).await;
@@ -160,17 +156,15 @@ pub async fn deliver(tric: &Arc<Tric>, bytes: &[u8]) -> Delivered {
             published.extend(messages);
             continue;
         }
-        if let Err(after) = send(tric, &e, n).await {
-            return Delivered::Retry(after);
-        }
+        send(tric, &e, n).await?;
     }
     name::settle(&tric.store, &e.app, &e.name, &e.commit).await;
-    Delivered::Done(published)
+    Ok(published)
 }
 
 fn dropped(why: &str) -> Delivered {
     tracing::info!("outbox: dropped an event, as {why}");
-    Delivered::Done(vec![])
+    Ok(vec![])
 }
 
 /// Sends `e`'s `n`th request: `Ok` if it is done, or else the `Retry-After` its response gave.
@@ -211,16 +205,12 @@ pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
 /// then logs the event as lost. Gives the messages it published.
 pub async fn relay<F: Future<Output = Delivered>>(mut attempt: impl FnMut() -> F) -> Vec<(String, String)> {
     for wait in WAITS {
-        let after = match attempt().await {
-            Delivered::Done(published) => return published,
-            Delivered::Retry(after) => after,
-        };
-        sleep(after.unwrap_or_default().max(Duration::from_secs(wait)).min(WAIT_MAX)).await;
+        match attempt().await {
+            Ok(published) => return published,
+            Err(after) => sleep(after.unwrap_or_default().max(Duration::from_secs(wait)).min(WAIT_MAX)).await,
+        }
     }
-    match attempt().await {
-        Delivered::Done(published) => published,
-        Delivered::Retry(_) => (tracing::warn!("outbox: an event failed every try, so it is lost"), vec![]).1,
-    }
+    attempt().await.unwrap_or_else(|_| (tracing::warn!("outbox: an event failed every try, so it is lost"), vec![]).1)
 }
 
 /// The messages that serve's answer `res` to a delivery event says were published: no more than the event held, so

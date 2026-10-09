@@ -2,6 +2,7 @@
 //! every minute it matches. One may restrict the day of the month or of the week, not both: POSIX takes that as either,
 //! which EventBridge Scheduler, cron on AWS, has no way to say.
 use crate::tric::Tric;
+use chrono::{DateTime, Datelike, Timelike};
 use http_body_util::BodyExt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -40,17 +41,6 @@ fn set(field: &str, (lo, hi): (u32, u32)) -> Option<u64> {
     Some(bits)
 }
 
-/// The year, month and day of a day since 1970-01-01, in the proleptic Gregorian calendar (Howard Hinnant's algorithm).
-fn civil(days: u64) -> (u64, u64, u64) {
-    let z = days + 719_468;
-    let (era, doe) = (z / 146_097, z % 146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let (d, m) = (doy - (153 * mp + 2) / 5 + 1, if mp < 10 { mp + 3 } else { mp - 9 });
-    (yoe + era * 400 + u64::from(m <= 2), m, d)
-}
-
 impl Cron {
     pub fn parse(expr: &str) -> Result<Self> {
         let text: Vec<String> = expr.split_whitespace().map(str::to_owned).collect();
@@ -72,11 +62,10 @@ impl Cron {
 
     /// Whether it fires in the minute that holds the Unix second `t`.
     pub fn matches(&self, t: u64) -> bool {
-        let days = t / 86_400;
-        let (_, month, day) = civil(days);
-        let has = |i: usize, v: u64| self.sets[i] >> v & 1 == 1;
-        let dow = (days + 4) % 7; // 1970-01-01 was a Thursday
-        has(0, t / 60 % 60) && has(1, t / 3600 % 24) && has(2, day) && has(3, month) && has(4, dow)
+        let Some(t) = DateTime::from_timestamp(t as i64, 0) else { return false };
+        let has = |i: usize, v: u32| self.sets[i] >> v & 1 == 1;
+        let dow = t.weekday().num_days_from_sunday();
+        has(0, t.minute()) && has(1, t.hour()) && has(2, t.day()) && has(3, t.month()) && has(4, dow)
     }
 
     /// As EventBridge Scheduler's `cron(...)`: the same values, with Sunday as 1, and `?` for whichever day field isn't
@@ -131,14 +120,6 @@ mod tests {
 
     /// 2026-10-08, a Thursday, at 12:34 UTC.
     const T: u64 = 1_791_462_840;
-
-    #[test]
-    fn calendar() {
-        assert_eq!(civil(0), (1970, 1, 1));
-        assert_eq!(civil(T / 86_400), (2026, 10, 8));
-        assert_eq!(civil(11_016), (2000, 2, 29));
-        assert_eq!((T / 86_400 + 4) % 7, 4);
-    }
 
     #[test]
     fn matching() {

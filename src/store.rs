@@ -4,7 +4,7 @@ use bytes::Bytes;
 use object_store::aws::{AmazonS3, AmazonS3Builder, AwsCredential};
 use object_store::client::{HttpClient, HttpConnector, ReqwestConnector};
 use object_store::{
-    Certificate, ClientOptions, GetOptions, ObjectStore, ObjectStoreExt, PutMode, StaticCredentialProvider,
+    Certificate, ClientOptions, GetOptions, ListResult, ObjectStore, ObjectStoreExt, PutMode, StaticCredentialProvider,
 };
 use object_store::{UpdateVersion, memory::InMemory, path::Path};
 use serde::de::DeserializeOwned;
@@ -35,11 +35,6 @@ pub fn hash(bytes: &[u8]) -> String {
 /// 128 random bits, in hex.
 pub fn random() -> String {
     format!("{:032x}", rand::random::<u128>())
-}
-
-/// The write `base` allows: over that version, or, with none, where there is nothing yet.
-pub fn over(base: Option<UpdateVersion>) -> PutMode {
-    base.map_or(PutMode::Create, PutMode::Update)
 }
 
 /// The bucket `bucket` on S3, as the environment's `AWS_*` variables configure it, with `creds` if given, and else
@@ -78,8 +73,13 @@ impl HttpConnector for Shared {
     }
 }
 
-fn missing(e: &object_store::Error) -> bool {
-    matches!(e, object_store::Error::NotFound { .. } | object_store::Error::PermissionDenied { .. })
+/// `r`, with a missing object as `None`.
+fn found<T>(r: object_store::Result<T>) -> Result<Option<T>> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(object_store::Error::NotFound { .. } | object_store::Error::PermissionDenied { .. }) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 impl Store {
@@ -94,33 +94,18 @@ impl Store {
 
     /// Whether there is an object at `path`.
     pub async fn head(&self, path: &Path) -> Result<bool> {
-        match self.inner.head(path).await {
-            Ok(_) => Ok(true),
-            Err(e) if missing(&e) => Ok(false),
-            Err(e) => Err(e.into()),
-        }
+        Ok(found(self.inner.head(path).await)?.is_some())
     }
 
-    /// The names under `prefix`, one level down.
-    pub async fn dirs(&self, prefix: &Path) -> Result<Vec<String>> {
-        let list = self.inner.list_with_delimiter(Some(prefix)).await?;
-        Ok(list.common_prefixes.iter().filter_map(|p| p.filename().map(str::to_owned)).collect())
-    }
-
-    /// The names of the objects under `prefix`, one level down.
-    #[cfg(feature = "ws")]
-    pub async fn files(&self, prefix: &Path) -> Result<Vec<String>> {
-        let list = self.inner.list_with_delimiter(Some(prefix)).await?;
-        Ok(list.objects.iter().filter_map(|o| o.location.filename().map(str::to_owned)).collect())
+    /// What is under `prefix`, one level down.
+    pub async fn list(&self, prefix: &Path) -> Result<ListResult> {
+        Ok(self.inner.list_with_delimiter(Some(prefix)).await?)
     }
 
     /// The object at `path`, at `version` if one is given, if there is one; it must be `max` bytes or less.
     pub async fn get(&self, path: &Path, version: Option<String>, max: u64) -> Result<Option<(Bytes, UpdateVersion)>> {
-        let got = match self.inner.get_opts(path, GetOptions { version, ..Default::default() }).await {
-            Ok(got) => got,
-            Err(e) if missing(&e) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
+        let got = self.inner.get_opts(path, GetOptions { version, ..Default::default() }).await;
+        let Some(got) = found(got)? else { return Ok(None) };
         ensure!(got.meta.size <= max, "{path} is over {max} bytes");
         let version = UpdateVersion { e_tag: got.meta.e_tag.clone(), version: got.meta.version.clone() };
         Ok(Some((got.bytes().await?, version)))
@@ -147,7 +132,7 @@ impl Store {
     /// Deletes the object at `path`, in a versioned bucket only: elsewhere a snapshot may still read it.
     pub async fn delete(&self, path: &Path) -> Result<()> {
         match self.versioned {
-            true => self.inner.delete(path).await.or_else(|e| if missing(&e) { Ok(()) } else { Err(e.into()) }),
+            true => found(self.inner.delete(path).await).map(drop),
             false => Ok(()),
         }
     }

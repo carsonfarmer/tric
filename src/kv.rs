@@ -40,20 +40,6 @@ impl Cas {
     }
 }
 
-async fn get_many(bucket: &Bucket, keys: Vec<String>) -> R<Vec<(String, Option<Vec<u8>>)>> {
-    let mut values =
-        stream::iter(keys).map(|key| async move { Ok((bucket.get(&key).await?, key)) }).buffered(IN_FLIGHT);
-    let (mut out, mut bytes) = (vec![], 0);
-    while let Some((value, key)) = values.try_next().await? {
-        bytes += value.as_ref().map_or(0, Bytes::len);
-        if bytes > BATCH_MAX {
-            return Err(other(format!("get-many returns {BATCH_MAX} bytes or less")));
-        }
-        out.push((key, value.map(Into::into)));
-    }
-    Ok(out)
-}
-
 impl Host {
     fn bucket(&self, b: &Resource<Bucket>) -> R<Bucket> {
         self.table.get(b).cloned().map_err(other)
@@ -98,7 +84,18 @@ impl store::HostBucket for Host {
 
 impl wasi::keyvalue::batch::Host for Host {
     async fn get_many(&mut self, b: Resource<Bucket>, keys: Vec<String>) -> R<Vec<(String, Option<Vec<u8>>)>> {
-        get_many(&self.bucket(&b)?, keys).await
+        let bucket = &self.bucket(&b)?;
+        let mut values =
+            stream::iter(keys).map(|key| async move { Ok((bucket.get(&key).await?, key)) }).buffered(IN_FLIGHT);
+        let (mut out, mut bytes) = (vec![], 0);
+        while let Some((value, key)) = values.try_next().await? {
+            bytes += value.as_ref().map_or(0, Bytes::len);
+            if bytes > BATCH_MAX {
+                return Err(other(format!("get-many returns {BATCH_MAX} bytes or less")));
+            }
+            out.push((key, value.map(Into::into)));
+        }
+        Ok(out)
     }
     async fn set_many(&mut self, b: Resource<Bucket>, items: Vec<(String, Vec<u8>)>) -> R<()> {
         self.bucket(&b)?.write(items.into_iter().map(|(k, v)| (k, Some(v.into()))).collect())

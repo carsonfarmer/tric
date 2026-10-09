@@ -1,7 +1,7 @@
 //! Running an app: each request in a fresh instance. A request with an unsafe method to `/@<name>` is a turn on the
 //! name: its writes, and the requests it holds, commit if it answers anything but 5xx. A conflict runs it again.
 use crate::engine::App;
-use crate::name::{self, BUSY, Committed, Conditions, Refused, TooLarge, Turn};
+use crate::name::{self, BUSY, Committed, Conditions, TooLarge, Turn};
 use crate::outbound::{self, Allow, Fut, Sent};
 use crate::outbox::{self, Held, Sink};
 use crate::store::Store;
@@ -114,10 +114,7 @@ where
         let handle = handle.clone();
         tokio::spawn(async move {
             let svc = service_fn(move |req| handle(peer, req).map(Ok::<_, Infallible>));
-            let conn = http1::Builder::new().serve_connection(TokioIo::new(tcp), svc);
-            #[cfg(feature = "ws")]
-            let conn = conn.with_upgrades();
-            conn.await.ok();
+            http1::Builder::new().serve_connection(TokioIo::new(tcp), svc).with_upgrades().await.ok();
         });
     }
 }
@@ -221,8 +218,8 @@ impl Tric {
             let Some(body) = body.take() else { return later(StatusCode::SERVICE_UNAVAILABLE) }; // read, and lost
             let turn = match Turn::open(&self.store, &self.app, &name, claim, &conditions, until).await {
                 Ok(Ok(turn)) => turn,
-                Ok(Err(Refused::Busy)) => return later(StatusCode::TOO_MANY_REQUESTS),
-                Ok(Err(Refused::Precondition)) => return status(StatusCode::PRECONDITION_FAILED),
+                Ok(Err(StatusCode::TOO_MANY_REQUESTS)) => return later(StatusCode::TOO_MANY_REQUESTS),
+                Ok(Err(refused)) => return status(refused),
                 Err(e) => {
                     tracing::warn!(app = self.app, name, "{e:#}");
                     return later(StatusCode::SERVICE_UNAVAILABLE);
@@ -339,12 +336,7 @@ impl Ctx {
 }
 
 impl WasiHttpHooks for Outbound {
-    fn send_request(
-        &mut self,
-        request: Request,
-        _: Option<RequestOptions>,
-        _: Fut<()>,
-    ) -> Box<dyn Future<Output = Sent> + Send> {
+    fn send_request(&mut self, request: Request, _: Option<RequestOptions>, _: Fut<()>) -> Fut<(Response, Fut<()>)> {
         Box::new(self.0.clone().send(request))
     }
 }

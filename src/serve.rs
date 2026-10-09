@@ -5,7 +5,7 @@ use crate::deploy::{RELEASE_MAX, Release};
 use crate::engine::Engine;
 use crate::lambda;
 use crate::outbound::{self, Allow};
-use crate::outbox::{self, Delivered, Sink};
+use crate::outbox::{self, Sink};
 use crate::store::{self, Store};
 use crate::tric::{self, CREDENTIALS, Response, TENANT, Tric, app_at, forward, status};
 use bytes::Bytes;
@@ -178,11 +178,11 @@ async fn deliver(tric: &Arc<Tric>, body: WasiBody) -> Response {
         return status(StatusCode::PAYLOAD_TOO_LARGE);
     };
     match outbox::deliver(tric, &event.to_bytes()).await {
-        Delivered::Done(m) => {
+        Ok(m) => {
             let body = Full::new(Bytes::from(serde_json::to_vec(&m).unwrap_or_default())).map_err(|n| match n {});
             http::Response::builder().header(CONTENT_TYPE, "application/json").body(body.boxed_unsync()).unwrap()
         }
-        Delivered::Retry(after) => {
+        Err(after) => {
             let mut res = status(StatusCode::SERVICE_UNAVAILABLE);
             if let Some(after) = after {
                 res.headers_mut().insert(RETRY_AFTER, HeaderValue::from(after.as_secs()));

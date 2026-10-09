@@ -24,11 +24,8 @@ pub const RELEASE_MAX: u64 = 1 << 20;
 #[serde(deny_unknown_fields)]
 pub struct Release {
     pub component: String,
-    #[serde(default)]
     pub allowed_outbound_hosts: Vec<String>,
-    #[serde(default)]
     pub cron: BTreeMap<String, String>,
-    #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
 
