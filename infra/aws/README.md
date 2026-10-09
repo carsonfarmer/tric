@@ -25,6 +25,7 @@ while idle: the only standing costs are the domain's Route 53 zone and what the 
   - it can read and write its names, its values and `native/<app>/*`;
   - it can read the rest of `apps/<app>/*`;
   - it gets nothing at all outside its own app.
+  - The app role caps every session: no app's credentials can write a release or a component, whatever the router asks.
 - **serve's own role** has no storage access. It can write its logs and invoke the router's `outbox` alias, and
   nothing else, so an app that escapes the sandbox holds only its own tenant's credentials.
 - **The router** is the trusted core and runs no app code. It can:
@@ -101,7 +102,7 @@ nothing on AWS:
 - serve's tenancy;
 - the one function URL;
 - serve's and the router's permissions;
-- the app role's trust;
+- the app role's trust, and what it lets a session write;
 - Scheduler's target;
 - the outbox's async config;
 - the origin secret;

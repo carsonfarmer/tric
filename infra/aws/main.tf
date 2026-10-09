@@ -49,7 +49,8 @@ provider "aws" {
 data "aws_caller_identity" "current" {}
 
 data "aws_route53_zone" "domain" {
-  name = var.domain
+  name         = var.domain
+  private_zone = false
 }
 
 locals {
@@ -151,11 +152,18 @@ resource "aws_iam_role_policy" "app" {
   role = aws_iam_role.app.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject"]
-      Resource = ["${local.bucket}/apps/*", "${local.bucket}/native/*"]
-    }]
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:GetObjectVersion"]
+        Resource = ["${local.bucket}/apps/*", "${local.bucket}/native/*"]
+      },
+      { # never a release or a component, which only deploy writes
+        Effect   = "Allow"
+        Action   = ["s3:PutObject", "s3:DeleteObject"]
+        Resource = ["${local.bucket}/apps/*/names/*", "${local.bucket}/apps/*/values/*", "${local.bucket}/native/*"]
+      },
+    ]
   })
 }
 
@@ -392,10 +400,11 @@ resource "aws_cloudfront_distribution" "apps" {
 }
 
 resource "aws_route53_record" "apps" {
-  for_each = toset(["A", "AAAA"])
-  zone_id  = data.aws_route53_zone.domain.zone_id
-  name     = "*.${var.domain}"
-  type     = each.key
+  for_each        = toset(["A", "AAAA"])
+  zone_id         = data.aws_route53_zone.domain.zone_id
+  name            = "*.${var.domain}"
+  type            = each.key
+  allow_overwrite = true
   alias {
     name                   = aws_cloudfront_distribution.apps.domain_name
     zone_id                = aws_cloudfront_distribution.apps.hosted_zone_id

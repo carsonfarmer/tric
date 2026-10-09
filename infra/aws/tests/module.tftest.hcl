@@ -92,6 +92,14 @@ run "module" {
   }
   assert {
     condition = (
+      [for s in jsondecode(aws_iam_role_policy.app.policy).Statement : s.Resource if contains(s.Action, "s3:PutObject")]
+      == [["${aws_s3_bucket.store.arn}/apps/*/names/*", "${aws_s3_bucket.store.arn}/apps/*/values/*",
+      "${aws_s3_bucket.store.arn}/native/*"]]
+    )
+    error_message = "no app session can write a release or a component, whatever policy the router gives it"
+  }
+  assert {
+    condition = (
       [for s in jsondecode(aws_iam_role_policy.route.policy).Statement : s.Resource if s.Action == "s3:GetObject"]
       == ["${aws_s3_bucket.store.arn}/apps/*/current"]
     )
