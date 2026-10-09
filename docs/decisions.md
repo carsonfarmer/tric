@@ -31,7 +31,13 @@ reason.
   app's tenant for up to 30 s first, waiting for a commit to land. That costs money, and breaks nothing.
 - **Native code is the app's own.** `native/<app>/…` is written with the app's credentials, so tampered native code
   reaches only the tenant that wrote it. serve compiles again when the native code won't deserialize. Components are
-  checked against their digest when they are loaded.
+  checked against their digest when they are loaded. `<compat>` is a SHA-256 of Wasmtime's own compatibility hash
+  (its version, configuration and target), as Wasmtime's cache keys native code: Rust's `DefaultHasher` may change
+  from one release to the next.
+- **An outbound request goes to a public address only.** Besides the private and special IPv4 ranges, that rules out
+  IPv6 outside `2000::/3`, and the special-purpose blocks inside it, in IANA's registry: `2002::/16` (6to4, which
+  embeds an IPv4 address), `2001::/23` (Teredo's `2001::/32` is in it), `2001:db8::/32` and `3fff::/20`. An
+  IPv4-mapped IPv6 address is judged as its IPv4 address.
 - **The domain is exact,** port included. `<app>.localhost:3000` is an app; `<app>.localhost` is not. An unknown app
   gets 404, and serve is never called for it.
 - **Lambda's own permissions.** With `authorization_type = NONE`, the AWS provider grants `lambda:InvokeFunctionUrl`
@@ -53,6 +59,15 @@ reason.
 - **The router invokes serve with `InvokeWithResponseStream`.** It sends a function-URL event (payload format 2.0)
   carrying the tenant id. The answer is a JSON prelude, then 8 NULs, then the body. Failures come from
   `InvokeComplete`'s error code.
+- **A header value that isn't UTF-8 is passed on lossily,** with U+FFFD for the bad bytes: a function-URL event is
+  JSON, which holds text only. Refusing the request would fail a client over a header the app may never read.
+- **The event stream's CRCs go unchecked,** and its headers are read as strings only, the one type Lambda sends: TLS
+  already refuses a corrupted stream, and a header of any other type fails the answer.
+- **The router's concurrency is capped,** at `route_concurrency`, 200 by default, reserved from the account's 1,000.
+  Each router calls one serve, so a flood of client requests holds at most about 400 of the 1,000, and the rest stays
+  for cron and the outbox; requests past 200 get 429. Reserved concurrency is free and keeps nothing warm, so scale
+  to zero is untouched. AWS keeps at least 100 unreserved, so an account still at a new account's limit of 10 sets
+  `-1`. serve and `events` reserve none: they share what is left.
 - **A delivery that fails answers 503,** which `AWS_LWA_ERROR_STATUS_CODES` turns into a failed invocation, so
   Lambda retries it.
 - **Schedules are named for what they are,** as `<hash(app)[..24]>-<hash(body)[..39]>`. A changed schedule is a new
@@ -80,6 +95,9 @@ reason.
 
 - **The local store is RustFS,** pinned by digest. MinIO's community edition is archived, and its images are gone.
   It refuses a session token that is missing or tampered with, though with 500, not 403.
+- **The local store keeps a lifecycle rule,** as the bucket on AWS does. `tric dev` keeps its state in memory, so it
+  leaves nothing behind. The e2e suite's deploys and deletes on RustFS do, as noncurrent versions, which the rule
+  expires after a day. RustFS has no volume, so recreating its container clears it too.
 - **The local `router` user on RustFS is broader than the router's role on AWS.**
   - RustFS's `AssumeRole` takes no role: it narrows the caller's own policy, so the user holds what the app role holds
     on AWS.
@@ -89,7 +107,12 @@ reason.
 - **serve takes the scheme from the router's `Forwarded`.** `proto=https` gives `https`, and anything else gives
   `http`. The router sets `https` on AWS and `http` locally.
 - **A middleware `url`** is fetched when it is `http(s)`. Anything else is a path, relative to `tric.toml`'s
-  directory. Its `digest` is always required.
+  directory. Its `digest` is always required, so neither a redirect nor the host can change what runs.
+- **A middleware fetch goes as an app's request to any host would:** to a public address only, with no user name in
+  the URL. It follows redirects as the Fetch standard does (301, 302, 303, 307 and 308, and at most 20), checking
+  each hop again, and takes only a 2xx. So `tric dev` on someone else's project makes no request to your network.
+- **serve loads an app under that app's own lock,** so one app's slow compile holds up no other's. On AWS a serve
+  runs one app; locally one serve runs them all.
 
 ## JavaScript
 
@@ -133,3 +156,46 @@ reason.
   - Bounds: 1 MiB a message, from either side (1009 to a client that sends more); 2 MiB and 64 events an answer or
     items a publish; 16 channels a socket; 256 sockets, then 503; 30 s for a client to take a write; a socket that
     falls 256 publishes behind is closed (1013).
+
+## WebSockets on AWS: decided, not built
+
+A probe on AWS (API Gateway WebSocket behind CloudFront) settled these. They are built on a branch of their own, and
+`tric dev` changes with them, so that an app runs the same in both.
+- **The same URL.** CloudFront hides `Upgrade` from its functions, so the viewer-request function takes a request with
+  `Sec-WebSocket-Key` as an upgrade, sends it to API Gateway with `updateRequestOrigin`, at `/ws`, and puts the path
+  in `X-Forwarded-Path`. A separate host for sockets would be one more name to know.
+- **The origin secret is checked at `$connect`.** API Gateway WebSocket has no resource policy and no WAF of its own,
+  so the secret is the gate, as it is for the function URL.
+- **API Gateway invokes `events` through a `ws` alias,** buffered. The adapter passes a WebSocket event to the router
+  whole, and reads `{statusCode, body}` back, which a streaming function can't give.
+- **The route response is off.** The function's return is then dropped, so every message to a client goes one way:
+  as a publish. The `@connections` endpoint is built from the event's domain name and stage, with no configuration.
+- **A connection's record is in S3,** under `ws/<app>/…`, and only the router reads or writes it. There is no
+  DynamoDB. It holds the handshake headers, which are replayed on every event, as `tric dev` does. A `ws/` lifecycle
+  rule expires records after a day, past the 2-hour most a connection lasts.
+- **The client's address comes from `CloudFront-Viewer-Address`,** as on HTTP, and never from `X-Forwarded-For`:
+  CloudFront appends to what a client sends there, so its first element can be forged.
+- **Publishes are held requests only,** everywhere. They are sent after the turn's other held requests, at most once.
+- **A connection's messages run concurrently, and arrive unordered,** as API Gateway invokes them. An app that needs
+  order puts a sequence number in its messages. Ordering them would mean a lock or a queue tric would have to invent.
+- **`DISCONNECT` can arrive while earlier messages are still running.** It deletes the record, and a later publish to
+  the connection gets 410 and is dropped, with a log line.
+- **An answer to `OPEN` carries no messages.** On AWS, `$connect` can't send to its own connection before the
+  handshake completes, so they would be lost there and only there. One that does fails with 500, in both.
+- **The subprotocol is echoed.** The app's `OPEN` answer sets `Sec-WebSocket-Protocol`, and tric copies it to the
+  handshake's answer; a browser fails the handshake without it.
+- **Messages are text only.** A client's binary frame is closed with 1003. A message to a client that is not valid
+  UTF-8 is refused, with a log line, where API Gateway would mangle it silently.
+- **Sizes are API Gateway's:** 32 KB a frame and 128 KB a message, each closed with 1009. `tric dev` takes them as
+  its WebSocket library's settings, with no code of its own.
+- **Closing.** A close from the server reaches the client as 1000. `DISCONNECT` carries the client's own close code,
+  where there is one.
+- **Keep-alive is the app's.** API Gateway closes a connection idle for 10 minutes, and traffic either way resets
+  that, so an app message from either side at least every 9 minutes keeps it open. A connection lasts 2 hours at
+  most. `tric dev` keeps no timers.
+- **Caps.** `tric dev` keeps its own. On AWS, a stage throttle, a variable of 100 requests a second with a burst of
+  200, bounds the cost of a flood, as messages cost $1 a million.
+- **Tests** feed the router API Gateway-shaped events, against a stand-in for `@connections`. No emulator matches
+  API Gateway closely enough to be worth a container.
+- **A budget.** All the WebSocket code, `tric dev`'s and the router's, fits in what `src/ws.rs` is today (494
+  lines). No feature is removed now.
