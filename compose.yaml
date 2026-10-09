@@ -75,7 +75,7 @@ services:
     <<: *toolchain
     command: >-
       sh -c '[ "$$(uname -m)" = aarch64 ] || { echo "the package is for arm64: build it on an arm64 host"; exit 1; }
-      && cargo build --release --locked && rm -f dist/tric.zip && mkdir -p dist
+      && cargo build --release --locked --features ws && rm -f dist/tric.zip && mkdir -p dist
       && zip -j dist/tric.zip target/release/tric docker/bootstrap'
     profiles: [aws]
   # OpenTofu, in infra/aws: `run --rm tofu init`, then `test`. Credentials come from the environment.

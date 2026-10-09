@@ -8,14 +8,18 @@ while idle: the only standing costs are the domain's Route 53 zone and what the 
 - **The router.** These are two functions, built from one package and running as one role:
   - `tric-route` owns the function URL. CloudFront is its only caller, and the router refuses any request without
     CloudFront's secret, `X-Tric-Origin`.
-  - `tric-events` takes only events. Cron arrives from EventBridge Scheduler. Delivery events arrive through its
-    `outbox` alias, which retries twice, keeps an event for up to 6 hours, and then writes it to the bucket under
-    `aws/lambda/async/` (the dead letters).
+  - `tric-events` takes only events, each source's through an alias of its own. Cron arrives from EventBridge
+    Scheduler at `cron`. Sockets' events arrive from API Gateway at `ws`. Delivery events arrive at `outbox`, which
+    retries twice, keeps an event for up to 6 hours, and then writes it to the bucket under `aws/lambda/async/` (the
+    dead letters).
 - **serve** runs the apps, with one Lambda tenant per app. It has no URL, and only the router can invoke it.
+- **WebSockets**, an API Gateway WebSocket API. CloudFront sends it a request that opens a socket, at the app's own
+  URL. Its stage is throttled to `ws_rate` requests a second, 100 by default, with a burst of `ws_burst`, 200.
 - **One bucket**, versioned:
   - `apps/<app>/…` holds the releases, components and state;
   - `native/<app>/…` holds the compiled code;
-  - the lifecycle rules expire noncurrent versions after a day, and dead letters after 14 days.
+  - `ws/…` holds sockets' records and subscriptions, for the router alone;
+  - the lifecycle rules expire noncurrent versions after a day, dead letters after 14 days, and `ws/` after a day.
 - **CloudFront and DNS.** CloudFront serves `*.<domain>` with a wildcard certificate from ACM, and Route 53 aliases
   point the domain at it.
 
@@ -30,19 +34,22 @@ while idle: the only standing costs are the domain's Route 53 zone and what the 
   nothing else, so an app that escapes the sandbox holds only its own tenant's credentials.
 - **The router** is the trusted core and runs no app code. It can:
   - assume the app role, which trusts only the router;
-  - read `apps/*/current`;
-  - invoke serve.
-- **Scheduler** can invoke `tric-events` unqualified (cron only). It can never invoke it as `outbox`.
-- **Requests that bypass CloudFront** are refused. CloudFront replaces any `X-Tric-Origin` a viewer sends. The
-  router replaces every `Forwarded`, so `for=_cron` and `for=_tric` come only from tric.
+  - read `apps/*/current`, and read and write `ws/*`;
+  - invoke serve;
+  - send to and close the sockets of its own API's stage.
+- **Scheduler** can invoke `tric-events` as `cron` only, and **API Gateway** as `ws` only, from its own stage.
+- **Requests that bypass CloudFront** are refused, and so are sockets: the router checks the secret when one opens.
+  CloudFront replaces any `X-Tric-Origin` a viewer sends. The router replaces every `Forwarded`, so `for=_cron`,
+  `for=_tric` and `for=_ws` come only from tric.
 
 There are three things to know:
 - **The state file holds the origin secret** (`terraform.tfstate`, kept locally and git-ignored). Anyone with the
-  secret can reach the router directly and claim any client address. They still cannot reach another app's data, or
-  forge cron or tric's own calls.
+  secret can reach the router directly, or open sockets at API Gateway's own URL, and claim any client address.
+  They still cannot reach another app's data, or forge cron, tric's own calls or another socket's events.
 - **Apps share cookies across `*.<domain>`**, so use a domain for tric alone.
-- **Shared between apps:** the account's Lambda concurrency, the log groups and the router. One app that is busy, or
-  slow to answer, can use up the router's concurrency, and the others are then throttled.
+- **Shared between apps:** the account's Lambda concurrency, the log groups, the router and the sockets' stage
+  throttle. One app that is busy, or slow to answer, can use up the router's concurrency or the throttle, and the
+  others are then throttled.
 - **The router's concurrency is capped** at `route_concurrency`, 200 by default, which it reserves from the
   account's. A flood of client requests then holds at most 200 routers and the 200 serves they call, and further
   requests get 429, so about 600 of a 1,000 quota stays for cron and the outbox. Reserving costs nothing and keeps
@@ -82,7 +89,7 @@ All commands run from the repository's root.
    The region is `us-west-2` unless you add `-var region=<region>`. The first apply waits a few minutes for the
    certificate and the distribution.
 
-After a new package, run `apply` again: it updates the three functions.
+After a new package, run `apply` again: it updates the three functions. The package is built with WebSockets.
 
 ## Deploy an app
 
@@ -95,6 +102,8 @@ for k in TRIC_BUCKET TRIC_SCHEDULES TRIC_EVENTS TRIC_SCHEDULER_ROLE AWS_REGION; 
 done
 tric deploy path/to/app    # then https://<app>.example.com
 ```
+
+`TRIC_EVENTS` is the `cron` alias of `tric-events`, which the app's schedules invoke.
 
 The app's name must be a DNS label. On AWS, a cron expression may restrict the day of the month or the day of the
 week, but not both, because Scheduler can't express both. tric refuses it everywhere, so an app runs the same in
@@ -109,8 +118,9 @@ nothing on AWS:
 - the router's reserved concurrency;
 - serve's and the router's permissions;
 - the app role's trust, and what it lets a session write;
-- Scheduler's target;
+- Scheduler's target, and API Gateway's;
 - the outbox's async config;
+- the sockets' stage throttle, and that no route sends a response;
 - the origin secret;
 - the lifecycle rules.
 

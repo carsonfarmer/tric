@@ -1,7 +1,7 @@
 //! `tric route`: the router, tric's trusted core, which runs no app code. It takes the app from the `Host`, mints the
-//! app's storage credentials with STS, and sends serve the request with them, as the app's tenant. Locally, it ticks
-//! cron too, and relays the delivery events serve hands its outbox, which is a listener of its own. On Lambda, cron and
-//! the outbox are events, which the Lambda Web Adapter makes requests of, as it does a function URL's.
+//! app's storage credentials with STS, and sends serve the request with them, as the app's tenant. On Lambda, cron
+//! jobs, delivery events and sockets' events invoke aliases, which the Lambda Web Adapter makes requests of, as it does
+//! a function URL's. Locally, the router ticks cron itself, and takes the invocations on a listener of its own.
 use crate::aws::{Aws, LIFETIME};
 use crate::cron::{self, Cron};
 use crate::deploy::{RELEASE_MAX, Release};
@@ -32,15 +32,15 @@ const KNOWN_FOR: Duration = Duration::from_secs(5);
 /// Credentials are used until 15 minutes before they expire.
 const CREDS_FOR: Duration = Duration::from_secs(LIFETIME - 15 * 60);
 
-struct Route {
-    domain: String,
+pub(crate) struct Route {
+    pub(crate) domain: String,
     bucket: String,
     serve: String,
     role: Option<String>,
-    /// On Lambda, the secret CloudFront sends with every request, as `X-Tric-Origin`.
+    /// The secret CloudFront sends with every request, and every socket's opening, as `X-Tric-Origin`.
     origin: Option<String>,
-    store: Store,
-    aws: Aws,
+    pub(crate) store: Store,
+    pub(crate) aws: Aws,
     known: Cache<bool>,
     creds: Cache<HeaderValue>,
 }
@@ -69,7 +69,7 @@ async fn cached<V: Clone>(
 }
 
 /// Routes requests for `<app>.<domain>` on `listen` to serve, with credentials for `bucket` minted as `role`. serve is
-/// a Lambda function, by its ARN, or else at `host:port`, and then the router takes delivery events on `outbox`.
+/// a Lambda function, by its ARN, or else at `host:port`, and then the router takes invocations on `outbox`.
 pub async fn run(
     listen: SocketAddr,
     outbox: SocketAddr,
@@ -91,7 +91,7 @@ pub async fn run(
     let ticker = route.clone();
     tokio::spawn(cron::tick(move |t| _ = tokio::spawn(ticker.clone().cron(t))));
     let r = route.clone();
-    let events = tric::listen(TcpListener::bind(outbox).await?, move |_, req| r.clone().outbox(req, false));
+    let events = tric::listen(TcpListener::bind(outbox).await?, move |_, req| r.clone().lambda(req));
     let clients = tric::listen(clients, move |peer, req| {
         let host = req.headers().get(HOST).and_then(|h| h.to_str().ok()).unwrap_or_default().to_owned();
         route.clone().handle(peer.ip(), host, "http", req)
@@ -125,32 +125,33 @@ impl Route {
         res
     }
 
-    /// On Lambda, a request the Lambda Web Adapter makes of an invocation. A router with the origin secret is the
-    /// function whose URL CloudFront calls, with that secret, the viewer's host and the viewer's address, and takes
-    /// nothing else. One without takes only events: a delivery event if it came to the `outbox` alias, which only serve
-    /// may invoke, and a cron job if not.
+    /// A request the Lambda Web Adapter makes of an invocation, or one of the local listener that stands in for them.
+    /// A function URL's is CloudFront's, with the origin secret, the viewer's host and the viewer's address. Any other
+    /// is an event, by the alias invoked: `outbox`, which only serve may invoke; `cron`, which only Scheduler may; and
+    /// `ws`, which only API Gateway may.
     async fn lambda(self: Arc<Self>, req: hyper::Request<Incoming>) -> Response {
         let header = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or_default();
         let context = |name: &str| serde_json::from_str::<Value>(header(name)).unwrap_or_default();
         let http = context("x-amzn-request-context").get("http").is_some();
-        let Some(origin) = &self.origin else {
-            let outbox =
-                context("x-amzn-lambda-context")["invoked_function_arn"].as_str().map(|a| a.ends_with(":outbox"));
-            return match (http, outbox) {
-                (false, Some(true)) => self.outbox(req, true).await,
-                (false, Some(false)) => self.job(req).await,
-                _ => status(StatusCode::FORBIDDEN),
-            };
-        };
-        let hash = |s: &str| Sha256::digest(s); // compared as digests, which takes no longer for a closer guess
-        if !http || hash(origin) != hash(header("x-tric-origin")) {
-            return status(StatusCode::FORBIDDEN);
-        }
-        let viewer = header("cloudfront-viewer-address").rsplit_once(':');
-        let viewer = viewer.and_then(|(ip, _)| ip.trim_start_matches('[').trim_end_matches(']').parse().ok());
-        let Some(ip) = viewer else { return status(StatusCode::BAD_REQUEST) };
+        let (ok, ip) = (self.is_origin(header("x-tric-origin")), viewer(header("cloudfront-viewer-address")));
         let host = header("x-forwarded-host").to_owned();
-        self.handle(ip, host, "https", req).await
+        let arn = context("x-amzn-lambda-context")["invoked_function_arn"].as_str().unwrap_or_default().to_owned();
+        match (http, arn.splitn(8, ':').nth(7), ip) {
+            (true, ..) if !ok => status(StatusCode::FORBIDDEN),
+            (true, _, Some(ip)) => self.handle(ip, host, "https", req).await,
+            (true, _, None) => status(StatusCode::BAD_REQUEST),
+            (false, Some("outbox"), _) => self.outbox(req).await,
+            (false, Some("cron"), _) => self.job(req).await,
+            #[cfg(feature = "ws")]
+            (false, Some("ws"), _) => self.ws(req).await,
+            _ => status(StatusCode::FORBIDDEN),
+        }
+    }
+
+    /// Whether `secret` is the origin secret, which only CloudFront sends: compared as digests, which takes no longer
+    /// for a closer guess.
+    pub(crate) fn is_origin(&self, secret: &str) -> bool {
+        self.origin.as_deref().is_some_and(|origin| Sha256::digest(origin) == Sha256::digest(secret))
     }
 
     /// `app`'s credentials, as serve takes them, if it has a release, as it did up to `KNOWN_FOR` ago: minted with a
@@ -189,7 +190,7 @@ impl Route {
 
     /// Sends serve a `POST` of `body` to `path` of `app`, from tric itself, as `from` says; `None` if `app` has no
     /// release.
-    async fn event(&self, app: &str, path: &str, from: &'static str, body: Bytes) -> Result<Option<Response>> {
+    pub async fn event(&self, app: &str, path: &str, from: &'static str, body: Bytes) -> Result<Option<Response>> {
         let Some(creds) = self.tenant(app).await? else { return Ok(None) };
         let req = http::Request::post(path).header(HOST, format!("{app}.{}", self.domain));
         let req = req.header(FORWARDED, from).body(Full::new(body).map_err(|n| match n {}).boxed_unsync())?;
@@ -245,8 +246,8 @@ impl Route {
 
     /// Takes a delivery event that serve hands over, and relays it to the app it names, as Lambda does an event: at
     /// once, and twice more if that fails. On Lambda, Lambda does: this delivers it once, and answers 503 if that
-    /// failed, which fails the invocation.
-    async fn outbox(self: Arc<Self>, req: hyper::Request<Incoming>, lambda: bool) -> Response {
+    /// failed, which fails the invocation. Then it sends the messages the event published.
+    async fn outbox(self: Arc<Self>, req: hyper::Request<Incoming>) -> Response {
         #[derive(Deserialize)]
         struct Of {
             app: String,
@@ -256,16 +257,23 @@ impl Route {
             Ok(_) => return status(StatusCode::BAD_REQUEST),
             Err(code) => return status(code),
         };
-        if lambda {
-            return match self.deliver(&app, event).await {
-                Delivered::Done => status(StatusCode::NO_CONTENT),
-                Delivered::Retry(_) => status(StatusCode::SERVICE_UNAVAILABLE),
+        if self.serve.starts_with("arn:") {
+            let Delivered::Done(_published) = self.deliver(&app, event).await else {
+                return status(StatusCode::SERVICE_UNAVAILABLE);
             };
+            #[cfg(feature = "ws")]
+            crate::ws::Hub::Aws(&self).publish(&app, _published).await;
+            return status(StatusCode::NO_CONTENT);
         }
-        tokio::spawn(outbox::relay(move || {
-            let (route, app, event) = (self.clone(), app.clone(), event.clone());
-            async move { route.deliver(&app, event).await }
-        }));
+        tokio::spawn(async move {
+            let _published = outbox::relay(|| {
+                let (route, app, event) = (self.clone(), app.clone(), event.clone());
+                async move { route.deliver(&app, event).await }
+            })
+            .await;
+            #[cfg(feature = "ws")]
+            crate::ws::Hub::Aws(&self).publish(&app, _published).await;
+        });
         status(StatusCode::ACCEPTED)
     }
 
@@ -277,10 +285,10 @@ impl Route {
                 tracing::info!(app, "outbox: serve answered {}", res.status());
                 Delivered::Retry(outbox::retry_after(res.headers()))
             }
-            Ok(Some(_)) => Delivered::Done,
+            Ok(Some(res)) => Delivered::Done(outbox::published(res).await),
             Ok(None) => {
                 tracing::info!(app, "outbox: dropped an event, as its app has no release");
-                Delivered::Done
+                Delivered::Done(vec![])
             }
             Err(e) => {
                 tracing::info!(app, "outbox: {e:#}");
@@ -290,8 +298,14 @@ impl Route {
     }
 }
 
+/// The address in a `CloudFront-Viewer-Address`, `ip:port`, where an IPv6 one may be in brackets.
+pub(crate) fn viewer(address: &str) -> Option<IpAddr> {
+    let (ip, _) = address.rsplit_once(':')?;
+    ip.trim_start_matches('[').trim_end_matches(']').parse().ok()
+}
+
 /// A `POST`'s body, of up to `outbox::EVENT_MAX`, and the `T` it is as JSON; else the status to answer with.
-async fn body<T: DeserializeOwned>(req: hyper::Request<Incoming>) -> Result<(Bytes, T), StatusCode> {
+pub(crate) async fn body<T: DeserializeOwned>(req: hyper::Request<Incoming>) -> Result<(Bytes, T), StatusCode> {
     if req.method() != Method::POST {
         return Err(StatusCode::METHOD_NOT_ALLOWED);
     }

@@ -12,7 +12,7 @@ categories = ["wasm", "web-programming::http-server", "command-line-utilities"]
 include = ["/src", "/wit", "/README.md", "/LICENSE"]
 
 [features]
-# WebSockets, in `tric dev`: Pushpin's WebSocket-over-HTTP.
+# WebSockets, as Pushpin's WebSocket-over-HTTP: held by `tric dev`, or on AWS by API Gateway, for the router.
 ws = ["dep:hyper-util", "dep:tokio-tungstenite"]
 
 [dependencies]

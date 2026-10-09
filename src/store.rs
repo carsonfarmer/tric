@@ -16,7 +16,7 @@ use webpki_root_certs::TLS_SERVER_ROOT_CERTS;
 
 #[derive(Clone)]
 pub struct Store {
-    inner: Arc<dyn ObjectStore>,
+    pub(crate) inner: Arc<dyn ObjectStore>,
     /// Whether the bucket keeps versions, so a value read by its version id outlives its delete. The memory store
     /// keeps none, and never deletes.
     pub versioned: bool,
@@ -105,6 +105,13 @@ impl Store {
     pub async fn dirs(&self, prefix: &Path) -> Result<Vec<String>> {
         let list = self.inner.list_with_delimiter(Some(prefix)).await?;
         Ok(list.common_prefixes.iter().filter_map(|p| p.filename().map(str::to_owned)).collect())
+    }
+
+    /// The names of the objects under `prefix`, one level down.
+    #[cfg(feature = "ws")]
+    pub async fn files(&self, prefix: &Path) -> Result<Vec<String>> {
+        let list = self.inner.list_with_delimiter(Some(prefix)).await?;
+        Ok(list.objects.iter().filter_map(|o| o.location.filename().map(str::to_owned)).collect())
     }
 
     /// The object at `path`, at `version` if one is given, if there is one; it must be `max` bytes or less.

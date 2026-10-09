@@ -102,18 +102,30 @@ impl Held {
         let body = Full::new(Bytes::from(B64.decode(&self.body)?)).map_err(|n| match n {}).boxed_unsync();
         Ok(req.header("idempotency-key", format!("{commit}/{n}")).body(body)?)
     }
+
+    /// If this is a publish, a `POST` to `/publish/` at `host`, the app's own: the messages it publishes, which are
+    /// none if it is not well formed.
+    #[cfg(feature = "ws")]
+    fn publish(&self, host: &str) -> Option<Vec<(String, String)>> {
+        let uri = self.uri.parse::<http::Uri>().ok().filter(|u| self.method == "POST" && u.path() == "/publish/")?;
+        uri.authority().filter(|a| a.as_str().eq_ignore_ascii_case(host))?;
+        let messages = B64.decode(&self.body).ok().and_then(|body| crate::ws::messages(&body));
+        messages.or_else(|| (tracing::warn!("outbox: dropped a publish, as it is not well formed"), Some(vec![])).1)
+    }
 }
 
 /// How a delivery went.
 pub enum Delivered {
-    /// Every request was delivered, or the event was dropped.
-    Done,
+    /// Every request was delivered, or the event was dropped: with the messages its publishes, which delivery takes
+    /// instead of sending, publish to channels of the app's sockets.
+    Done(Vec<(String, String)>),
     /// A request failed, so the event is to be tried again, after the `Retry-After` given.
     Retry(Option<Duration>),
 }
 
 /// Delivers the event `bytes` of `tric`'s app, if its commit landed with its digest: each request in order, until one
 /// fails, which a response of 5xx or 429 or a failed exchange is. A request to a host the app may not reach is done.
+/// With the feature `ws`, a publish is taken, not sent, so it reaches sockets once, if at all, after all else.
 pub async fn deliver(tric: &Arc<Tric>, bytes: &[u8]) -> Delivered {
     let e = match serde_json::from_slice::<Event>(bytes) {
         Ok(e) if e.app == tric.app => e,
@@ -140,18 +152,25 @@ pub async fn deliver(tric: &Arc<Tric>, bytes: &[u8]) -> Delivered {
     if !head.is_some_and(|h| h.pending.get(&e.commit).is_some_and(|p| p.digest == digest)) {
         return dropped("its commit is not pending");
     }
+    #[cfg_attr(not(feature = "ws"), allow(unused_mut))]
+    let mut published = vec![];
     for n in 0..e.requests.len() {
+        #[cfg(feature = "ws")]
+        if let Some(messages) = e.requests[n].publish(&e.host) {
+            published.extend(messages);
+            continue;
+        }
         if let Err(after) = send(tric, &e, n).await {
             return Delivered::Retry(after);
         }
     }
     name::settle(&tric.store, &e.app, &e.name, &e.commit).await;
-    Delivered::Done
+    Delivered::Done(published)
 }
 
 fn dropped(why: &str) -> Delivered {
     tracing::info!("outbox: dropped an event, as {why}");
-    Delivered::Done
+    Delivered::Done(vec![])
 }
 
 /// Sends `e`'s `n`th request: `Ok` if it is done, or else the `Retry-After` its response gave.
@@ -189,15 +208,26 @@ pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
 }
 
 /// Tries a delivery `attempt` up to three times, waiting 1 s and then 2 s between tries, or what `Retry-After` asked;
-/// then logs the event as lost.
-pub async fn relay<F: Future<Output = Delivered>>(mut attempt: impl FnMut() -> F) {
+/// then logs the event as lost. Gives the messages it published.
+pub async fn relay<F: Future<Output = Delivered>>(mut attempt: impl FnMut() -> F) -> Vec<(String, String)> {
     for wait in WAITS {
-        let Delivered::Retry(after) = attempt().await else { return };
+        let after = match attempt().await {
+            Delivered::Done(published) => return published,
+            Delivered::Retry(after) => after,
+        };
         sleep(after.unwrap_or_default().max(Duration::from_secs(wait)).min(WAIT_MAX)).await;
     }
-    if let Delivered::Retry(_) = attempt().await {
-        tracing::warn!("outbox: an event failed every try, so it is lost");
+    match attempt().await {
+        Delivered::Done(published) => published,
+        Delivered::Retry(_) => (tracing::warn!("outbox: an event failed every try, so it is lost"), vec![]).1,
     }
+}
+
+/// The messages that serve's answer `res` to a delivery event says were published: no more than the event held, so
+/// `EVENT_MAX` at most.
+pub async fn published(res: Response) -> Vec<(String, String)> {
+    let body = Limited::new(res.into_body(), EVENT_MAX).collect().await;
+    body.ok().and_then(|body| serde_json::from_slice(&body.to_bytes()).ok()).unwrap_or_default()
 }
 
 #[cfg(test)]

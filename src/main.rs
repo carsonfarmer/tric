@@ -79,8 +79,8 @@ enum Cmd {
         /// The role whose sessions are the apps' credentials; none where STS takes none, as RustFS's
         #[arg(long, env = "TRIC_ROLE")]
         role: Option<String>,
-        /// On Lambda, the secret CloudFront sends as `X-Tric-Origin`, without which a request is refused; a router
-        /// without one takes only events
+        /// The secret CloudFront sends as `X-Tric-Origin`, without which a request, or a socket's opening, is refused;
+        /// a router without one takes only events
         #[arg(long, env = "TRIC_ORIGIN", hide_env_values = true)]
         origin: Option<String>,
     },
@@ -122,7 +122,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Serve { listen, domain, bucket, outbox } => serve::run(listen, domain, bucket, outbox).await,
         Cmd::Route { listen, outbox_listen, domain, bucket, serve, role, origin } => {
-            let origin = origin.filter(|o| !o.is_empty()); // an empty secret takes only events, as none does
+            let origin = origin.filter(|o| !o.is_empty()); // an empty secret is none
             route::run(listen, outbox_listen, domain, bucket, serve, role, origin).await
         }
     }

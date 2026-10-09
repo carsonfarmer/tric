@@ -10,7 +10,7 @@ use crate::store::{self, Store};
 use crate::tric::{self, CREDENTIALS, Response, TENANT, Tric, app_at, forward, status};
 use bytes::Bytes;
 use futures_util::FutureExt;
-use http::header::{FORWARDED, HOST, RETRY_AFTER};
+use http::header::{CONTENT_TYPE, FORWARDED, HOST, RETRY_AFTER};
 use http::{HeaderValue, Method, StatusCode};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
@@ -30,6 +30,8 @@ const COMPONENT_MAX: u64 = 64 << 20;
 const NATIVE_MAX: u64 = 256 << 20;
 /// How long the router's outbox has to take an event.
 const HAND: Duration = Duration::from_secs(10);
+/// The context of an invocation of the `outbox` alias, which the router's local events listener stands in for.
+const OUTBOX: &str = r#"{"invoked_function_arn":"arn:aws:lambda:local:0:function:events:outbox"}"#;
 
 struct Serve {
     engine: Engine,
@@ -90,6 +92,10 @@ impl Serve {
         let body = body.map_err(wasmtime_wasi_http::Error::from).boxed_unsync();
         if parts.method == Method::POST && from == "for=_tric" {
             return deliver(&tric, body).await;
+        }
+        #[cfg(feature = "ws")]
+        if parts.method == Method::POST && from == "for=_ws" {
+            return crate::ws::serve(&tric, body).await;
         }
         let https = from.to_str().is_ok_and(|f| f.split(';').any(|p| p.trim().eq_ignore_ascii_case("proto=https")));
         let pq = parts.uri.path_and_query().map_or("/", |pq| pq.as_str());
@@ -155,22 +161,27 @@ impl Serve {
     }
 }
 
-/// Hands a commit's delivery event to the router's outbox at `outbox`, which must take it within `HAND`.
+/// Hands a commit's delivery event to the router's outbox at `outbox`, which must take it within `HAND`, as Lambda
+/// would invoke its `outbox` alias.
 async fn hand(outbox: String, event: Bytes) -> Result<()> {
     let body = Full::new(event).map_err(|n| match n {}).boxed_unsync();
-    let req = http::Request::post("/").header(HOST, &outbox).body(body)?;
+    let req = http::Request::post("/").header(HOST, &outbox).header("x-amzn-lambda-context", OUTBOX).body(body)?;
     let (res, _) = timeout(HAND, outbound::internal(&outbox, req)).await?.map_err(|e| format_err!("outbox: {e:?}"))?;
     ensure!(res.status().is_success(), "the outbox answered {}", res.status());
     Ok(())
 }
 
-/// Delivers the event in `body`: 204 when that is done, and else 503, so the router tries again.
+/// Delivers the event in `body`: when that is done, 200 and the messages it published, as JSON; else 503, so the router
+/// tries again.
 async fn deliver(tric: &Arc<Tric>, body: WasiBody) -> Response {
     let Ok(event) = Limited::new(body, outbox::EVENT_MAX).collect().await else {
         return status(StatusCode::PAYLOAD_TOO_LARGE);
     };
     match outbox::deliver(tric, &event.to_bytes()).await {
-        Delivered::Done => status(StatusCode::NO_CONTENT),
+        Delivered::Done(m) => {
+            let body = Full::new(Bytes::from(serde_json::to_vec(&m).unwrap_or_default())).map_err(|n| match n {});
+            http::Response::builder().header(CONTENT_TYPE, "application/json").body(body.boxed_unsync()).unwrap()
+        }
         Delivered::Retry(after) => {
             let mut res = status(StatusCode::SERVICE_UNAVAILABLE);
             if let Some(after) = after {

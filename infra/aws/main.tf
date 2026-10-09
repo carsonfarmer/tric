@@ -1,6 +1,7 @@
 # tric on AWS, for a fresh account whose Route 53 already hosts the domain:
 # - the router, behind CloudFront at *.<domain>, as two functions from one package: `route`, the function URL, takes
-#   only CloudFront's requests; `events` takes only events: cron from Scheduler, and delivery events as `outbox`;
+#   only CloudFront's requests; `events` takes only events, by alias: `cron` from Scheduler, `outbox` from serve, and
+#   `ws`, sockets' events, from API Gateway, which holds the sockets that CloudFront sends it;
 # - serve, with a Lambda tenant per app and no URL;
 # - one bucket, versioned.
 # Nothing runs while idle. `docker compose run --rm package` builds the package; see infra/aws/README.md.
@@ -40,6 +41,18 @@ variable "route_concurrency" {
   default     = 200
 }
 
+variable "ws_rate" {
+  description = "Sockets' events a second, opening, messages and closing, across every app, as API Gateway throttles"
+  type        = number
+  default     = 100
+}
+
+variable "ws_burst" {
+  description = "Sockets' events at once, above `ws_rate`, as API Gateway throttles"
+  type        = number
+  default     = 200
+}
+
 provider "aws" {
   region = var.region
   default_tags { tags = { app = var.name } }
@@ -65,12 +78,17 @@ locals {
   serve    = "${local.function}-serve"
   events   = "${local.function}-events"
   outbox   = "${local.function}-events:outbox"
+  cron     = "${local.function}-events:cron"
   bucket   = aws_s3_bucket.store.arn
+  # API Gateway's, for sockets: its stage `ws`, which CloudFront sends upgrades to, and `@connections`'.
+  api = "${aws_apigatewayv2_api.ws.id}.execute-api.${var.region}.amazonaws.com"
+  ws  = "${aws_apigatewayv2_api.ws.execution_arn}/ws"
   # The Lambda Web Adapter, which turns invocations into HTTP requests to tric.
   adapter = "arn:aws:lambda:${var.region}:753240598075:layer:LambdaAdapterLayerArm64:30"
 }
 
-# The bucket: apps/ and native/, and Lambda's on-failure records under aws/lambda/async/, the dead letters.
+# The bucket: apps/ and native/; ws/, sockets' records, which only the router reads and writes; and Lambda's on-failure
+# records under aws/lambda/async/, the dead letters.
 resource "aws_s3_bucket" "store" {
   bucket_prefix = "${var.name}-"
   force_destroy = true
@@ -107,6 +125,13 @@ resource "aws_s3_bucket_lifecycle_configuration" "store" {
     filter { prefix = "aws/lambda/async/" }
     expiration { days = 14 }
   }
+  # A socket lasts 2 hours at most, so a record that its closing never deleted is gone a day on.
+  rule {
+    id     = "ws"
+    status = "Enabled"
+    filter { prefix = "ws/" }
+    expiration { days = 1 }
+  }
 }
 
 # The roles. Policies are written out, so that the module's tests read them as they are.
@@ -136,7 +161,14 @@ resource "aws_iam_role_policy" "route" {
       },
       { Effect = "Allow", Action = "sts:AssumeRole", Resource = aws_iam_role.app.arn },
       { Effect = "Allow", Action = "s3:GetObject", Resource = "${local.bucket}/apps/*/current" },
+      { Effect = "Allow", Action = ["s3:GetObject", "s3:DeleteObject"], Resource = "${local.bucket}/ws/*" },
       { Effect = "Allow", Action = "lambda:InvokeFunction", Resource = local.serve },
+      # Sends to, and closes, this API's sockets, and no other's.
+      {
+        Effect   = "Allow"
+        Action   = "execute-api:ManageConnections"
+        Resource = ["${local.ws}/POST/@connections/*", "${local.ws}/DELETE/@connections/*"]
+      },
       # The outbox alias's on-failure records, which Lambda writes as the function under `aws/lambda/async/`. Lambda
       # takes the destination only if the role may write the whole bucket.
       { Effect = "Allow", Action = "s3:PutObject", Resource = "${local.bucket}/*" },
@@ -190,7 +222,7 @@ resource "aws_iam_role_policy" "serve" {
   })
 }
 
-# Scheduler's, for the apps' cron: the events function, unqualified, which takes cron and not delivery events.
+# Scheduler's, for the apps' cron: the events function's `cron` alias, and no other.
 resource "aws_iam_role" "scheduler" {
   name = "${var.name}-scheduler"
   assume_role_policy = jsonencode({
@@ -213,7 +245,7 @@ resource "aws_iam_role_policy" "scheduler" {
   role = aws_iam_role.scheduler.id
   policy = jsonencode({
     Version   = "2012-10-17"
-    Statement = [{ Effect = "Allow", Action = "lambda:InvokeFunction", Resource = local.events }]
+    Statement = [{ Effect = "Allow", Action = "lambda:InvokeFunction", Resource = local.cron }]
   })
 }
 
@@ -228,11 +260,13 @@ resource "random_password" "origin" {
 }
 
 locals {
+  # The secret is the router's on both: CloudFront sends it with every request, and with every socket's opening.
   router = {
     TRIC_DOMAIN = var.domain
     TRIC_BUCKET = aws_s3_bucket.store.id
     TRIC_SERVE  = local.serve
     TRIC_ROLE   = aws_iam_role.app.arn
+    TRIC_ORIGIN = random_password.origin.result
   }
   functions = {
     # Clients' requests, which only CloudFront's secret lets in.
@@ -241,18 +275,16 @@ locals {
       handler = "route"
       memory  = 256
       timeout = 360
-      env = merge(local.router, {
-        TRIC_ORIGIN         = random_password.origin.result
-        AWS_LWA_INVOKE_MODE = "response_stream"
-      })
+      env     = merge(local.router, { AWS_LWA_INVOKE_MODE = "response_stream" })
     }
-    # Events only. A 5xx fails the invocation, so that Lambda retries a delivery.
+    # Events only, buffered, as API Gateway reads a socket's answer whole. A 5xx fails the invocation, so that Lambda
+    # retries a delivery. `TRIC_WS` is the stage's URL, where `@connections` is.
     events = {
       role    = aws_iam_role.route.arn
       handler = "route"
       memory  = 256
       timeout = 360
-      env     = merge(local.router, { AWS_LWA_ERROR_STATUS_CODES = "500-599" })
+      env     = merge(local.router, { TRIC_WS = "https://${local.api}/ws", AWS_LWA_ERROR_STATUS_CODES = "500-599" })
     }
     serve = {
       role    = aws_iam_role.serve.arn
@@ -316,6 +348,64 @@ resource "aws_lambda_function_event_invoke_config" "outbox" {
   }
 }
 
+# Scheduler invokes this alias with the apps' cron; the router takes no event that names no alias.
+resource "aws_lambda_alias" "cron" {
+  name             = "cron"
+  function_name    = aws_lambda_function.function["events"].function_name
+  function_version = "$LATEST"
+}
+
+# API Gateway invokes this alias with sockets' events, and nothing else may.
+resource "aws_lambda_alias" "ws" {
+  name             = "ws"
+  function_name    = aws_lambda_function.function["events"].function_name
+  function_version = "$LATEST"
+}
+
+resource "aws_lambda_permission" "ws" {
+  statement_id  = "ws"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.function["events"].function_name
+  qualifier     = aws_lambda_alias.ws.name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${local.ws}/*"
+}
+
+# The sockets, which API Gateway holds: every event goes to the router, whose answers carry no messages, as there is no
+# route response; every message to a client goes through `@connections`. Its own URL refuses an opening without the
+# origin secret, as the function URL does a request.
+resource "aws_apigatewayv2_api" "ws" {
+  name                       = "${var.name}-ws"
+  protocol_type              = "WEBSOCKET"
+  route_selection_expression = "$request.body.action"
+}
+
+resource "aws_apigatewayv2_integration" "ws" {
+  api_id             = aws_apigatewayv2_api.ws.id
+  integration_type   = "AWS_PROXY"
+  integration_method = "POST"
+  integration_uri    = aws_lambda_alias.ws.invoke_arn
+}
+
+resource "aws_apigatewayv2_route" "ws" {
+  for_each  = toset(["$connect", "$default", "$disconnect"])
+  api_id    = aws_apigatewayv2_api.ws.id
+  route_key = each.key
+  target    = "integrations/${aws_apigatewayv2_integration.ws.id}"
+}
+
+# Messages cost $1 a million, so the throttle bounds what a flood costs.
+resource "aws_apigatewayv2_stage" "ws" {
+  api_id      = aws_apigatewayv2_api.ws.id
+  name        = "ws"
+  auto_deploy = true
+  default_route_settings {
+    throttling_rate_limit  = var.ws_rate
+    throttling_burst_limit = var.ws_burst
+  }
+  depends_on = [aws_apigatewayv2_route.ws]
+}
+
 # Public, as CloudFront's origin: the provider grants InvokeFunctionUrl and, through the URL only, InvokeFunction.
 resource "aws_lambda_function_url" "route" {
   function_name      = aws_lambda_function.function["route"].function_name
@@ -350,15 +440,27 @@ resource "aws_acm_certificate_validation" "apps" {
   validation_record_fqdns = [aws_route53_record.validation.fqdn]
 }
 
-# The origin gets the function URL's Host, so the app's goes as X-Forwarded-Host, replacing any the viewer sent.
+# The origin gets the function URL's Host, so the app's goes as X-Forwarded-Host, replacing any the viewer sent. A
+# function can't see `Upgrade`, so a request with `Sec-WebSocket-Key` is taken as a socket's opening, and goes to API
+# Gateway's stage, with its path as X-Forwarded-Path; its query goes as it is.
 resource "aws_cloudfront_function" "host" {
   name    = "${var.name}-host"
   runtime = "cloudfront-js-2.0"
   publish = true
   code    = <<-EOT
+    import cf from 'cloudfront';
     function handler(event) {
-      event.request.headers["x-forwarded-host"] = { value: event.request.headers.host.value };
-      return event.request;
+      var request = event.request, headers = request.headers;
+      headers["x-forwarded-host"] = { value: headers.host.value };
+      if (headers["sec-websocket-key"]) {
+        headers["x-forwarded-path"] = { value: request.uri };
+        request.uri = "/ws";
+        cf.updateRequestOrigin({
+          domainName: "${local.api}",
+          customOriginConfig: { port: 443, protocol: "https", sslProtocols: ["TLSv1.2"] },
+        });
+      }
+      return request;
     }
   EOT
 }
@@ -431,7 +533,7 @@ output "TRIC_SCHEDULES" {
 }
 
 output "TRIC_EVENTS" {
-  value = aws_lambda_function.function["events"].arn
+  value = aws_lambda_alias.cron.arn
 }
 
 output "TRIC_SCHEDULER_ROLE" {

@@ -192,10 +192,6 @@ impl Tric {
 
     /// Runs `req` in an instance, as a turn if it is one.
     async fn dispatch(self: &Arc<Self>, req: Request, host: &str, chain: Vec<String>, depth: usize) -> Response {
-        #[cfg(feature = "ws")]
-        if crate::ws::publishes(&req) {
-            return crate::ws::publish(req).await;
-        }
         let ctx = |turn, chain| {
             let (tric, snaps, host) = (self.clone(), Mutex::default(), host.into());
             Arc::new(Ctx { tric, turn, snaps, host, chain, depth })

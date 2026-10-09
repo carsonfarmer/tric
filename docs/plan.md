@@ -29,8 +29,8 @@ This is a full rewrite. The target is the system described below, and nothing el
   `outbox` alias.
 - **Outbound requests default to none.** An app reaches only the hosts it lists. Private ranges and metadata
   endpoints are always blocked.
-- **`Forwarded` is the only internal marker.** The router replaces it on every request. `for=_cron` and `for=_tric`
-  can come only from tric.
+- **`Forwarded` is the only internal marker.** The router replaces it on every request. `for=_cron`, `for=_tric` and
+  `for=_ws` can come only from tric.
 - **Middleware runs with all of the app's capabilities.** A middleware component is pinned by `sha256:` digest.
 - **Background requests are stored until delivered, headers included.** They sit in Lambda's queue and, after failed
   retries, in a dead-letter prefix only the platform can read. Delivery is at least once.
@@ -85,7 +85,7 @@ This is a full rewrite. The target is the system described below, and nothing el
 - **WebSockets** are behind the cargo feature `ws`, using Pushpin's WebSocket-over-HTTP:
   - each message is a `POST` to `/@name` with `Content-Type: application/websocket-events`;
   - `tric dev` holds the sockets;
-  - on AWS, API Gateway WebSocket holds them (later).
+  - on AWS, API Gateway WebSocket holds them, at the same URL, and the router sends serve their events.
 
 ### `tric.toml`
 
@@ -109,6 +109,8 @@ apps/<app>/names/<name>          a head; changed only by If-Match / If-None-Matc
 apps/<app>/values/<unique>       a value too big to inline; written once, read by version id
 native/<app>/<compat>/<sha256>   compiled code, written by the app's own tenant on a miss
 aws/lambda/async/                the dead letters: Lambda's on-failure records, under its fixed prefix (platform only)
+ws/connections/<id>              a socket's record: its app, URL and handshake headers (router only)
+ws/channels/<app>/<channel>/<id> a socket's subscription to a channel (router only)
 ```
 
 - **A head** is plain JSON with three parts:
@@ -181,6 +183,8 @@ aws/lambda/async/                the dead letters: Lambda's on-failure records, 
 
   Any 5xx, 429 or network error answers 5xx. The router's invocation then fails, Lambda retries it twice, and then it
   goes to the dead letters.
+- **It handles a `POST` carrying `Forwarded: for=_ws` as a socket's event,** which only the router sends: the
+  socket's record, its id and the event. It runs the turn of it at the URL the socket opened at.
 - **At a turn's answer, with background requests:** invoke the router's `outbox` alias first, then commit, recording
   the digest in `pending`.
 - **It is a plain HTTP server.** On Lambda, the Lambda Web Adapter translates.
@@ -208,16 +212,19 @@ aws/lambda/async/                the dead letters: Lambda's on-failure records, 
 - **The router:** two functions from one package, on one role:
   - `route`, a function URL with streaming behind CloudFront at `*.<domain>`, which takes only requests carrying
     CloudFront's origin secret;
-  - `events`, which takes only events, plus an `outbox` alias. The alias carries the async config: two retries, a
-    6 h maximum event age, and the bucket as the on-failure destination.
+  - `events`, which takes only events, each source's by its own alias: `cron`, `outbox` and `ws`. The `outbox` alias
+    carries the async config: two retries, a 6 h maximum event age, and the bucket as the on-failure destination.
 - **serve:** per tenant (`PER_TENANT`), with no URL. Only the router may invoke it.
+- **Sockets:** API Gateway WebSocket, which CloudFront sends a request with `Sec-WebSocket-Key`. It invokes
+  `events:ws`, buffered, with no route response, behind a stage throttle.
 - **The roles:**
   - the app role, which trusts only the router's role;
-  - the router's role, which can assume the app role, HEAD `current` and invoke serve;
+  - the router's role, which can assume the app role, HEAD `current`, keep `ws/`, invoke serve, and send to and
+    close its own API's sockets;
   - serve's role, with its logs and `events:outbox` only;
-  - the Scheduler role, which can invoke `events`, unqualified.
-- **The bucket:** versioning, the lifecycle rules (noncurrent versions, delete markers, the dead letters), and short log
-  retention.
+  - the Scheduler role, which can invoke `events:cron` only.
+- **The bucket:** versioning, the lifecycle rules (noncurrent versions, delete markers, the dead letters, `ws/`), and
+  short log retention.
 - One `tofu apply` installs it all into a fresh account. The apply waits for the user's go-ahead.
 
 ## Changes the isolation forces on the approved design

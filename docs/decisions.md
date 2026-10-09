@@ -6,11 +6,14 @@ reason.
 ## Isolation
 
 - **The router is two functions on AWS,** built from one package and running as one role. `tric-route` holds the
-  function URL, and has the origin secret. `tric-events` has no secret and so takes only events:
-  - invoked as `outbox`, it takes delivery events;
-  - invoked unqualified, it takes cron, for an app with a release only.
+  function URL. `tric-events` has none, and takes only events, each source's by an alias that only it may invoke:
+  - `outbox`, delivery events, from serve;
+  - `cron`, cron jobs, from Scheduler, for an app with a release only;
+  - `ws`, sockets' events, from API Gateway.
 
-  A single function would take both kinds of input, and only a header would keep them apart.
+  An invocation of no alias, or of another, gets 403. Both have the origin secret: `events` checks it when a socket
+  opens, and an event shaped as a function URL's request needs it too. A single function would take both kinds of
+  input, and only a header would keep them apart.
 - **The origin is guarded by a shared secret, not by CloudFront's origin access control.** With OAC on a function
   URL, clients would have to send `x-amz-content-sha256` with every body. The router compares the secret's SHA-256
   digests, so a closer guess takes no longer to check, and an empty secret counts as none. A request that goes around
@@ -131,74 +134,92 @@ reason.
 
 ## WebSockets
 
-- **`tric dev` holds the sockets, behind the cargo feature `ws`.** Off, nothing changes and nothing more is compiled.
-  On, it adds tokio-tungstenite, for the handshake's key and the framing, and hyper-util, for the upgrade; hyper-util
-  is linked already, by reqwest. The app speaks Pushpin's WebSocket-over-HTTP, so a gateway that holds the sockets on
-  AWS can take tric's place with the app unchanged.
-- **An event is a turn.** A `5xx`, a busy name's `429`, an answer that is not well-formed events, or one that is late
-  (the engine's 10 s) ends the socket with 1011. The app is told `DISCONNECT` of a socket that ends without a `CLOSE`.
-  Any answer to `OPEN` that is not events is passed to the client, as Pushpin does.
-- **GRIP is a channel and a publish, and no more.** A channel is a name, and any socket may be published to by any
-  turn of the app: `tric dev` runs one app. A publish is taken in `dispatch`, so one sent with `Prefer: respond-async`
-  waits for its turn's commit in the outbox, as every held request does, and a direct one claims the turn like any
-  unsafe request. Messages are text: `content-bin`, other formats and `action` are refused with 400.
-- **Every handshake header is sent on every event,** less the upgrade's own, as Pushpin does. `Authorization` is one,
-  so the app can check it on every event. A client can vary only its own socket's headers.
-- **Threat model.** What only tric says to the app is never believed from anyone else, and nothing a client sends is
-  passed on as it is:
-  - `forward`, which every request passes, removes a client's `Connection-Id`, `Grip-` and `Meta-` headers, in either
-    spelling of their dash, and a `Content-Type` that mentions `websocket-events`. It does so with the feature or
-    without it, so an app written for sockets is not fooled where tric holds none, as on AWS. A plain request cannot
-    be an event, or a socket's, or GRIP's; the app answers it as any request, and `Forwarded` is still the only
-    marker.
-  - A socket's id is random, and an id alone speaks for no one: tric writes each event, from its own socket's frames.
-  - A publish is taken only with `Forwarded: for=_tric`, which a client cannot send, as `forward` replaces its own.
-    `tric serve` and `tric route` never take one.
-  - The app's answers are parsed whole and written out again: capitals, `CRLF`, a length of 1 to 8 hex digits, and
-    nothing else, or the socket ends. Control messages are `subscribe` and `unsubscribe` of a name, with no field more.
-  - Bounds: 1 MiB a message, from either side (1009 to a client that sends more); 2 MiB and 64 events an answer or
-    items a publish; 16 channels a socket; 256 sockets, then 503; 30 s for a client to take a write; a socket that
-    falls 256 publishes behind is closed (1013).
+An app speaks Pushpin's WebSocket-over-HTTP, and a little of GRIP, so it runs the same where `tric dev` holds the
+sockets and where API Gateway WebSocket does, on AWS. A probe on AWS, behind CloudFront, settled the AWS side.
 
-## WebSockets on AWS: decided, not built
-
-A probe on AWS (API Gateway WebSocket behind CloudFront) settled these. They are built on a branch of their own, and
-`tric dev` changes with them, so that an app runs the same in both.
+- **Behind the cargo feature `ws`.** Off, nothing changes and nothing more is compiled. On, `tric dev` adds
+  tokio-tungstenite, for the handshake's key and the framing, and hyper-util, for the upgrade; hyper-util is linked
+  already, by reqwest. The AWS package is built with it.
 - **The same URL.** CloudFront hides `Upgrade` from its functions, so the viewer-request function takes a request with
   `Sec-WebSocket-Key` as an upgrade, sends it to API Gateway with `updateRequestOrigin`, at `/ws`, and puts the path
   in `X-Forwarded-Path`. A separate host for sockets would be one more name to know.
 - **The origin secret is checked at `$connect`.** API Gateway WebSocket has no resource policy and no WAF of its own,
-  so the secret is the gate, as it is for the function URL.
-- **API Gateway invokes `events` through a `ws` alias,** buffered. The adapter passes a WebSocket event to the router
-  whole, and reads `{statusCode, body}` back, which a streaming function can't give.
-- **The route response is off.** The function's return is then dropped, so every message to a client goes one way:
-  as a publish. The `@connections` endpoint is built from the event's domain name and stage, with no configuration.
-- **A connection's record is in S3,** under `ws/<app>/…`, and only the router reads or writes it. There is no
-  DynamoDB. It holds the handshake headers, which are replayed on every event, as `tric dev` does. A `ws/` lifecycle
-  rule expires records after a day, past the 2-hour most a connection lasts.
+  so the secret is the gate, as it is for the function URL. `events` holds the secret for that alone, and still has
+  no URL.
+- **API Gateway invokes `events` through its `ws` alias,** buffered. The adapter passes a WebSocket event to the
+  router whole, and reads `{statusCode, headers}` back, which a streaming function can't give. Routes are selected by
+  `$request.body.action`, API Gateway's usual expression, which means nothing here: every route has the one
+  integration, and the router goes by the event's `eventType`.
+- **The route response is off.** The function's answer is then dropped, so every message to a client goes one way,
+  through `@connections`. Its URL, the stage's, is `TRIC_WS`, which the install sets on `events`: a publish comes
+  from a delivery event, which has no socket's event to build the URL from.
+- **The router sends serve each event,** as it does a delivery event: a `POST` with `Forwarded: for=_ws` and the
+  app's tenant credentials, of JSON `[record, id, event]`. serve takes it only for the Host's app, and runs the
+  app's turn of it. `tric dev` runs the same code, but holds the sockets and runs the turn itself.
+- **A socket's record and subscriptions are in the bucket,** under `ws/`, which only the router reads or writes.
+  There is no DynamoDB.
+  - The record is at `ws/connections/<id>`, by the id alone, as a message's event carries nothing more. It holds the
+    app, the URL and the handshake headers, which are replayed on every event.
+  - A subscription is an empty object at `ws/channels/<app>/<channel>/<id>`, and a publish lists the channel.
+  - Ids are base64url in keys, as API Gateway's may hold `/` and `=`.
+  - A `ws/` lifecycle rule expires both after a day, past the 2 hours a connection lasts at most; the local bucket's
+    lifecycle has it too. An end deletes the record. A subscription goes when a publish finds its socket gone, or
+    when it expires.
+  - The router's role may get and delete `ws/*`; it could already put and list.
+  - `tric dev` keeps them in memory, in a store of their own where a delete deletes, as no snapshot reads them.
+- **Opening.** The app accepts with `200` of events, `OPEN` first, then only subscriptions. An answer with a message
+  as well is refused with 502: `$connect` can't send to its own socket before the handshake completes, so the message
+  would be lost there and only there. Any other answer refuses the socket with the app's own 4xx or 5xx, else 502,
+  and no body. The subscriptions are written at once, and then the record, so an event finds a socket only once it is
+  whole. If a write fails, the app is told `DISCONNECT`, and the client gets 503.
+- **The query is rebuilt on AWS.** API Gateway gives `$connect` the query as a map only, so the router writes it out
+  again, sorted by name and percent-encoded, and `X-Forwarded-Path` is the path alone. An app that reads the query
+  as pairs sees the same in both.
 - **The client's address comes from `CloudFront-Viewer-Address`,** as on HTTP, and never from `X-Forwarded-For`:
   CloudFront appends to what a client sends there, so its first element can be forged.
-- **Publishes are held requests only,** everywhere. They are sent after the turn's other held requests, at most once.
-- **A connection's messages run concurrently, and arrive unordered,** as API Gateway invokes them. An app that needs
-  order puts a sequence number in its messages. Ordering them would mean a lock or a queue tric would have to invent.
-- **`DISCONNECT` can arrive while earlier messages are still running.** It deletes the record, and a later publish to
-  the connection gets 410 and is dropped, with a log line.
-- **An answer to `OPEN` carries no messages.** On AWS, `$connect` can't send to its own connection before the
-  handshake completes, so they would be lost there and only there. One that does fails with 500, in both.
+- **An event is a turn.** A `5xx`, a busy name's `429`, an answer that is not well-formed events, or one that is late
+  (the engine's 10 s) ends the socket. The app is told `CLOSE`, with the client's code if it gave one, of a socket
+  the client closed, and `DISCONNECT` of one that ended any other way but its own `CLOSE`.
+- **A socket's messages run concurrently, and arrive unordered,** as API Gateway invokes them; `tric dev` runs 16 of
+  one socket's at once. An app that needs order puts a sequence number in its messages. Ordering them would mean a
+  lock or a queue tric would have to invent. `DISCONNECT` can arrive while earlier messages still run: it deletes the
+  record, and an event after it finds no socket and is dropped, with a log line.
+- **GRIP is a channel and a publish, and no more.** A channel is a name, of the app. A publish is a `POST` to
+  `/publish/` at the app's own origin with `Prefer: respond-async`: held, as every background request is, and taken
+  after the turn's other held requests, at most once, if the turn commits. Without that header, it is a call to the
+  app like any other. Messages are text: `content-bin`, other formats and `action` drop the publish, with a log line.
 - **The subprotocol is echoed.** The app's `OPEN` answer sets `Sec-WebSocket-Protocol`, and tric copies it to the
   handshake's answer; a browser fails the handshake without it.
-- **Messages are text only.** A client's binary frame is closed with 1003. A message to a client that is not valid
-  UTF-8 is refused, with a log line, where API Gateway would mangle it silently.
-- **Sizes are API Gateway's:** 32 KB a frame and 128 KB a message, each closed with 1009. `tric dev` takes them as
-  its WebSocket library's settings, with no code of its own.
-- **Closing.** A close from the server reaches the client as 1000. `DISCONNECT` carries the client's own close code,
-  where there is one.
+- **Every handshake header is sent on every event,** less the upgrade's own but for the subprotocols offered, as
+  Pushpin does. `Authorization` is one, so the app can check it on every event. A client can vary only its own
+  socket's headers.
+- **Closing.** A close from the server, by the app's `CLOSE` or an answer that ends the socket, reaches the client
+  as 1000, as API Gateway's does. A client's binary frame closes its socket with 1003, and one too large with 1009.
+- **A socket that falls behind misses messages.** API Gateway gives no sign of it, so neither does `tric dev`: a
+  socket 64 messages behind loses what comes next, with a log line.
 - **Keep-alive is the app's.** API Gateway closes a connection idle for 10 minutes, and traffic either way resets
   that, so an app message from either side at least every 9 minutes keeps it open. A connection lasts 2 hours at
   most. `tric dev` keeps no timers.
-- **Caps.** `tric dev` keeps its own. On AWS, a stage throttle, a variable of 100 requests a second with a burst of
-  200, bounds the cost of a flood, as messages cost $1 a million.
-- **Tests** feed the router API Gateway-shaped events, against a stand-in for `@connections`. No emulator matches
-  API Gateway closely enough to be worth a container.
-- **A budget.** All the WebSocket code, `tric dev`'s and the router's, fits in what `src/ws.rs` is today (494
-  lines). No feature is removed now.
+- **Threat model.** What only tric says to the app is never believed from anyone else, and nothing a client sends is
+  passed on as it is:
+  - `forward`, which every request passes, removes a client's `Connection-Id`, `Grip-` and `Meta-` headers, in either
+    spelling of their dash, and a `Content-Type` that mentions `websocket-events`. A plain request cannot be a
+    socket's event, or GRIP's, and `Forwarded` is still the only marker.
+  - A socket's id speaks for no one: tric writes each event, from its own socket's frames or from API Gateway's
+    events. `tric dev`'s ids are random.
+  - `for=_ws` reaches serve only from the router, which replaces any `Forwarded` a client sends. Only API Gateway may
+    invoke `events:ws`, from its own stage, and an opening needs the origin secret, which `forward` removes, with
+    every `X-Tric-` header, before the app sees the headers.
+  - The app's answers are parsed whole and written out again: capitals, `CRLF`, a length of 1 to 8 hex digits, and
+    nothing else, or the socket ends. Control messages are `subscribe` and `unsubscribe` of a name, with no field more.
+  - Only the app subscribes a socket, so a socket's channels have no cap but an answer's: each is an empty object.
+  - Bounds: API Gateway's 32 KiB a frame and 128 KiB a message, from either side, which `tric dev` takes as its
+    WebSocket library's settings; 2 MiB and 64 events an answer, or items a publish; in `tric dev`, 256 sockets, then
+    503, and 30 s for a client to take a write. On AWS, a stage throttle, variables of 100 requests a second and a
+    burst of 200, bounds the cost of a flood, as messages cost $1 a million.
+- **Not here:** API Gateway's logs, which need an account-wide role and cost money; and an emulator of API Gateway,
+  as none matches it closely enough to be worth a container. The tests feed the router API Gateway's events, against
+  a stand-in for `@connections`.
+- **The size.** The budget was all the WebSocket code, `tric dev`'s and the router's, in what `src/ws.rs` was before
+  it (494 lines). `src/ws.rs` is 494 lines, and its hooks elsewhere add 63, most of them the outbox handing back what
+  a delivery published, so the budget is missed by 63. No feature was removed.

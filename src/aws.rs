@@ -79,8 +79,9 @@ impl Aws {
             .unwrap_or_else(|| format!("https://{service}.{}.amazonaws.com", self.region))
     }
 
-    /// Sends `service` a signed request, with `headers`, and returns its response as it comes. There is no time limit:
-    /// a response may stream for as long as the function that answers it runs.
+    /// Sends `service` a signed request at `path`, of its endpoint unless it is a URL, with `headers`, and returns its
+    /// response as it comes. There is no time limit: a response may stream for as long as the function that answers it
+    /// runs.
     pub async fn send(
         &self,
         service: &str,
@@ -90,7 +91,8 @@ impl Aws {
         body: Vec<u8>,
     ) -> Result<HttpResponse> {
         let cred = self.creds.get_credential().await?;
-        let uri = format!("{}{path}", self.endpoint(service).trim_end_matches('/'));
+        let base = if path.starts_with('/') { self.endpoint(service) } else { String::new() };
+        let uri = format!("{}{path}", base.trim_end_matches('/'));
         let req = headers.iter().fold(http::Request::builder().method(method).uri(uri), |r, (k, v)| r.header(*k, *v));
         let mut req: HttpRequest = req.body(body.into())?;
         AwsAuthorizer::new(&cred, service, &self.region).try_authorize(&mut req, None)?;

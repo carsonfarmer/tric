@@ -21,8 +21,6 @@ use wasmtime::Result;
 
 /// Serves the app at `path` on `listen`, with `env` as its environment and `allow` added to its allowed hosts.
 pub async fn run(path: &Path, allow: &[String], env: Vec<(String, String)>, listen: SocketAddr) -> Result<()> {
-    #[cfg(feature = "ws")]
-    crate::ws::init();
     let app = manifest::read(path, allow).await?;
     let engine = Engine::new()?;
     let code = Arc::new(engine.load(&engine.compile(&app.wasm)?, env)?);
@@ -35,10 +33,15 @@ pub async fn run(path: &Path, allow: &[String], env: Vec<(String, String)>, list
         let tric = tric.clone();
         let sink: Sink = Arc::new(move |event: Bytes| -> BoxFuture<'static, Result<()>> {
             if let Some(tric) = tric.upgrade() {
-                tokio::spawn(outbox::relay(move || {
-                    let (tric, event) = (tric.clone(), event.clone());
-                    async move { outbox::deliver(&tric, &event).await }
-                }));
+                tokio::spawn(async move {
+                    let _published = outbox::relay(|| {
+                        let (tric, event) = (tric.clone(), event.clone());
+                        async move { outbox::deliver(&tric, &event).await }
+                    })
+                    .await;
+                    #[cfg(feature = "ws")]
+                    crate::ws::Hub::Dev(&tric).publish(&tric.app, _published).await;
+                });
             }
             std::future::ready(Ok(())).boxed()
         });
@@ -69,7 +72,7 @@ async fn handle(tric: Arc<Tric>, peer: SocketAddr, req: hyper::Request<Incoming>
     forward(&mut parts.headers, from);
     #[cfg(feature = "ws")]
     if crate::ws::wants(&parts) {
-        return crate::ws::open(tric, host, parts).await;
+        return crate::ws::open(tric, parts).await;
     }
     let body = body.map_err(wasmtime_wasi_http::Error::from).boxed_unsync();
     tric.run(http::Request::from_parts(parts, body), &host).await

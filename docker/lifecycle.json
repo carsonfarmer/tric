@@ -6,6 +6,7 @@
       "expiration": {},
       "noncurrentVersionExpiration": { "noncurrentDays": 1 },
       "expiredObjectDeleteMarker": true
-    }
+    },
+    { "id": "ws", "status": "Enabled", "filter": { "prefix": "ws/" }, "expiration": { "days": 1 } }
   ]
 }

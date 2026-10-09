@@ -525,19 +525,27 @@ async fn fires_cron(kind: Kind) {
     assert_eq!(header(&echo, "forwarded"), Some("for=_cron"));
 }
 
-/// A stand-in for serve, which answers 204 to every request, and keeps their headers.
-async fn stand_in() -> (String, Arc<Mutex<Vec<HeaderMap>>>) {
+type Seen = Arc<Mutex<Vec<http::Request<Bytes>>>>;
+
+/// A stand-in for serve, or for API Gateway's `@connections`, which keeps every request, and answers 410 to one whose
+/// path has `gone` in it, and 204 to the rest.
+async fn stand_in() -> (String, Seen) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let seen = Arc::<Mutex<Vec<HeaderMap>>>::default();
+    let seen = Seen::default();
     let kept = seen.clone();
     tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
             let kept = kept.clone();
             let svc = service_fn(move |req: hyper::Request<Incoming>| {
-                kept.lock().unwrap().push(req.headers().clone());
-                let res = hyper::Response::builder().status(204).body(Full::new(Bytes::new()));
-                async { Ok::<_, Infallible>(res.unwrap()) }
+                let kept = kept.clone();
+                async move {
+                    let (parts, body) = req.into_parts();
+                    let code = if parts.uri.path().contains("gone") { 410 } else { 204 };
+                    let body = body.collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+                    kept.lock().unwrap().push(http::Request::from_parts(parts, body));
+                    Ok::<_, Infallible>(hyper::Response::builder().status(code).body(Full::new(Bytes::new())).unwrap())
+                }
             });
             tokio::spawn(hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(tcp), svc));
         }
@@ -575,7 +583,7 @@ async fn isolates_apps() {
     assert_eq!(tric.send("GET", "/", &claims).await.status, 204);
     let sent = seen.lock().unwrap().pop().expect("the router called serve");
     let one = |name: &str| {
-        let all: Vec<_> = sent.get_all(name).iter().collect();
+        let all: Vec<_> = sent.headers().get_all(name).iter().collect();
         assert_eq!(all.len(), 1, "{name}: {all:?}");
         all[0].to_str().unwrap().to_owned()
     };
@@ -664,13 +672,16 @@ async fn drops_forged_events() {
         "requests": [{ "method": "POST", "uri": format!("{me}/@h/echo"), "headers": [], "body": "" }],
     });
     let body = Bytes::from(event.to_string());
-    assert_eq!(exchange(&tric.outbox, &tric.outbox, "POST", "/", &[], body).await.status, 202);
+    let outbox =
+        [("x-amzn-lambda-context", r#"{"invoked_function_arn":"arn:aws:lambda:local:0:function:events:outbox"}"#)];
+    assert_eq!(exchange(&tric.outbox, &tric.outbox, "POST", "/", &outbox, body).await.status, 202);
     let line = "outbox: dropped an event, as its commit is not pending";
     assert!(tric.logged(line, Duration::from_secs(30)).await, "dropped");
     assert_eq!(tric.value("h", "echo").await, Value::Null);
 }
 
-/// WebSockets, with the feature `ws`: real clients of `tric dev`, and the app's `/chat` route.
+/// WebSockets, with the feature `ws`: real clients of `tric dev`, and the router as API Gateway invokes it; each with
+/// the app's `/chat` route.
 #[cfg(feature = "ws")]
 mod ws {
     use super::*;
@@ -690,7 +701,7 @@ mod ws {
         format!("/@{}/chat", unique())
     }
 
-    /// A socket at `target`, sent with `headers`, with the id that the app greets it with; or why it was refused.
+    /// A socket at `target`, sent with `headers`, with the id the app knows it by; or why it was refused.
     async fn open(tric: &Tric, target: &str, headers: &[(&str, &str)]) -> Result<(Client, String), Error> {
         let stream = TcpStream::connect(&tric.addr).await.unwrap();
         let mut req = format!("ws://{}{target}", tric.addr).into_client_request()?;
@@ -698,8 +709,14 @@ mod ws {
             req.headers_mut().append(http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
         }
         let (mut ws, _) = client_async(req, stream).await?;
-        let greeting = next(&mut ws).await;
-        Ok((ws, greeting.strip_prefix("id ").expect("a greeting").to_owned()))
+        let id = ask(&mut ws, "id").await;
+        Ok((ws, id.strip_prefix("id ").expect("an id").to_owned()))
+    }
+
+    /// Whether `ws` is closed with `code`, next.
+    async fn closed(ws: &mut Client, code: u16) -> bool {
+        let next = timeout(Duration::from_secs(10), ws.next()).await.expect("a close");
+        matches!(next, Some(Ok(Message::Close(Some(f)))) if u16::from(f.code) == code)
     }
 
     /// The status that refused a socket.
@@ -744,8 +761,6 @@ mod ws {
         let (tric, path) = (dev().await, room());
         let ((mut a, _), (mut b, _)) = (open(&tric, &path, &[]).await.unwrap(), open(&tric, &path, &[]).await.unwrap());
         assert_eq!(ask(&mut a, "hello").await, "hello");
-        a.send(Message::Binary(vec![0, 255, 13, 10].into())).await.unwrap();
-        assert_eq!(a.next().await.unwrap().unwrap(), Message::Binary(vec![0, 255, 13, 10].into()));
         assert_eq!(ask(&mut a, "count").await, "0");
 
         // What is said counts in the name's state, and goes to every socket in the room, the sender's too.
@@ -755,14 +770,18 @@ mod ws {
         assert_eq!(next(&mut a).await, "2: yo");
         assert_eq!(ask(&mut a, "count").await, "2");
 
-        // Another room has its own count, and hears nothing.
+        // Another room has its own count, and hears nothing. Binary messages are not taken, as on AWS.
         let (mut c, _) = open(&tric, &room(), &[]).await.unwrap();
         assert_eq!(ask(&mut c, "count").await, "0");
+        c.send(Message::Binary(vec![0, 255].into())).await.unwrap();
+        assert!(closed(&mut c, 1003).await);
 
         // An answer that is a failure is not committed, so is not counted, nor said; and it ends the socket.
         a.send(Message::text("boom no")).await.unwrap();
-        assert!(matches!(a.next().await, Some(Ok(Message::Close(Some(f)))) if u16::from(f.code) == 1011));
+        assert!(closed(&mut a, 1000).await);
         assert_eq!(ask(&mut b, "count").await, "2");
+        b.send(Message::text("bye")).await.unwrap();
+        assert!(closed(&mut b, 1000).await);
     }
 
     #[tokio::test]
@@ -779,33 +798,34 @@ mod ws {
     async fn refuses_what_the_app_refuses() {
         let (tric, path) = (dev().await, room());
         assert_eq!(refused(open(&tric, &format!("{path}?deny"), &[]).await), 403);
-        // An app that takes no socket there answers an upgrade as it does any request, and so does a path not a name's.
-        assert_eq!(refused(open(&tric, &path.replace("/chat", "/"), &[]).await), 200);
+        // An app that takes no socket there answers as it does any request, which API Gateway could not tell from
+        // accepting, so it is refused; and a path not a name's is not asked.
+        assert_eq!(refused(open(&tric, &path.replace("/chat", "/"), &[]).await), 502);
         assert_eq!(refused(open(&tric, "/chat", &[]).await), 400);
     }
 
     #[tokio::test]
     async fn tells_the_app_how_a_socket_ends() {
         let tric = dev().await;
-        let (closed, gone, broken, large) = (room(), room(), room(), room());
-        let (mut a, _) = open(&tric, &closed, &[]).await.unwrap();
+        let (shut, gone, broken, large) = (room(), room(), room(), room());
+        let (mut a, _) = open(&tric, &shut, &[]).await.unwrap();
         a.close(None).await.unwrap();
-        last_is(&tric, &closed, "close").await;
+        last_is(&tric, &shut, "close").await;
 
         drop(open(&tric, &gone, &[]).await.unwrap());
         last_is(&tric, &gone, "disconnect").await;
 
-        // An answer that is not events ends it, with an error.
+        // An answer that is not events ends it.
         let (mut b, _) = open(&tric, &broken, &[]).await.unwrap();
         b.send(Message::text("garbage")).await.unwrap();
-        assert!(matches!(b.next().await, Some(Ok(Message::Close(Some(f)))) if u16::from(f.code) == 1011));
+        assert!(closed(&mut b, 1000).await);
         last_is(&tric, &broken, "disconnect").await;
 
-        // So does a message past the limit, which is not read.
+        // So does a message past API Gateway's limit, which is not read.
         let (mut c, _) = open(&tric, &large, &[]).await.unwrap();
-        _ = c.send(Message::text("x".repeat((1 << 20) + 1))).await;
+        _ = c.send(Message::text("x".repeat((128 << 10) + 1))).await;
         while let Ok(Some(Ok(_))) = timeout(Duration::from_secs(10), c.next()).await {}
-        last_is(&tric, &large, "disconnect").await;
+        last_is(&tric, &large, "close").await;
     }
 
     #[tokio::test]
@@ -862,5 +882,143 @@ mod ws {
 
         // None of that was counted, nor said.
         assert_eq!(ask(&mut a, "count").await, "0");
+    }
+
+    /// The router, as API Gateway invokes its `ws` alias, in front of serve and the app as on AWS, and of a stand-in
+    /// for `@connections` at `TRIC_WS`: what it is sent, as (method, the socket's id, body).
+    struct Gateway {
+        tric: Tric,
+        seen: Seen,
+    }
+
+    impl Gateway {
+        async fn new() -> Self {
+            let app = deploy(&fixture("app"), &[]).await;
+            let ((fake, seen), log, [port, events]) = (stand_in().await, Log::default(), ports());
+            let (domain, events) = (format!("localhost:{port}"), format!("127.0.0.1:{events}"));
+            let (serve, at) = serve(&domain, &events, &log).await;
+            let mut route = Command::new(TRIC);
+            let listen = format!("127.0.0.1:{port}");
+            route.args(["route", "--listen", &listen, "--outbox-listen", &events, "--domain", &domain, "--serve", &at]);
+            route.args(["--origin", "secret"]).env("TRIC_WS", format!("http://{fake}/ws"));
+            let (route, addr) = start(&mut route, &log, "route: ").await;
+            let host = format!("{app}.{domain}");
+            let tric = Tric { addr, host, outbox: events, apps: vec![app], log, _children: vec![serve, route] };
+            Self { tric, seen }
+        }
+
+        /// Invokes the alias `alias` with API Gateway's event `kind` of the socket `id`, with `more`: the router's
+        /// status, and its answer's `statusCode`.
+        async fn invoke(&self, alias: &str, kind: &str, id: &str, more: Value) -> (u16, Value) {
+            let mut event = json!({ "requestContext": { "eventType": kind, "connectionId": id, "stage": "ws" } });
+            more.as_object().unwrap().iter().for_each(|(k, v)| event[k] = v.clone());
+            let arn = format!(r#"{{"invoked_function_arn":"arn:aws:lambda:local:0:function:events:{alias}"}}"#);
+            let at = &self.tric.outbox;
+            let res = exchange(at, at, "POST", "/", &[("x-amzn-lambda-context", &arn)], event.to_string().into()).await;
+            (res.status, if res.status == 200 { res.json()["statusCode"].clone() } else { Value::Null })
+        }
+
+        /// A socket `id` opening at `target` of `host`, with `origin` as the origin secret: its `statusCode`. Its query
+        /// is not in its path, but parsed, as API Gateway's is.
+        async fn connect(&self, id: &str, host: &str, target: &str, origin: &str) -> Value {
+            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            let query: serde_json::Map<_, _> =
+                query.split('&').filter(|q| !q.is_empty()).map(|q| (q.to_owned(), json!([""]))).collect();
+            let headers = json!({
+                "Host": ["abc.execute-api.us-west-2.amazonaws.com"],
+                "X-Tric-Origin": [origin],
+                "X-Forwarded-Host": [host],
+                "X-Forwarded-Path": [path],
+                "CloudFront-Viewer-Address": ["203.0.113.7:50000"],
+                "Sec-WebSocket-Key": ["dGhlIHNhbXBsZSBub25jZQ=="],
+                "Connection-Id": ["forged"],
+            });
+            let mut more = json!({ "multiValueHeaders": headers });
+            if !query.is_empty() {
+                more["multiValueQueryStringParameters"] = query.into();
+            }
+            self.invoke("ws", "CONNECT", id, more).await.1
+        }
+
+        async fn message(&self, id: &str, text: &str) -> Value {
+            self.invoke("ws", "MESSAGE", id, json!({ "body": text })).await.1
+        }
+
+        /// Waits up to ten seconds for the stand-in to have been sent `want`, in any order, which it then forgets.
+        async fn sent(&self, want: &[(&str, &str, &str)]) {
+            let mut want: Vec<_> =
+                want.iter().map(|&(method, id, body)| [method, id, body].map(str::to_owned)).collect();
+            want.sort();
+            let start = Instant::now();
+            loop {
+                let got = {
+                    let mut seen = self.seen.lock().unwrap();
+                    let id =
+                        |r: &http::Request<Bytes>| r.uri().path().replace("/ws/@connections/", "").replace("%3D", "=");
+                    let body = |r: &http::Request<Bytes>| String::from_utf8_lossy(r.body()).into_owned();
+                    let mut got: Vec<_> = seen.iter().map(|r| [r.method().to_string(), id(r), body(r)]).collect();
+                    got.sort();
+                    if got == want {
+                        return seen.clear();
+                    }
+                    got
+                };
+                assert!(start.elapsed() < Duration::from_secs(10), "sent {got:?}, not {want:?}");
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn routes_api_gateways_events() {
+        let g = Gateway::new().await;
+        let (tric, room) = (&g.tric, unique());
+        let (host, path) = (tric.host.as_str(), format!("/@{room}/chat"));
+        let [a, b, c] = [0, 1, 2].map(|_| format!("{}=", unique()));
+        let gone = format!("gone{}=", unique());
+
+        // Only CloudFront's, with the secret, at a name of an app that has a release, and that the app accepts.
+        assert_eq!(g.connect(&a, host, &path, "wrong").await, 403);
+        assert_eq!(g.connect(&a, host, &format!("{path}?deny"), "secret").await, 403);
+        let other = host.replacen(&tric.apps[0], &unique(), 1);
+        assert_eq!(g.connect(&a, &other, &path, "secret").await, 404);
+        assert_eq!(g.connect(&a, host, "/chat", "secret").await, 404);
+        assert_eq!(g.connect(&a, host, &path.replace("/chat", "/"), "secret").await, 502);
+        assert_eq!(g.invoke("nope", "CONNECT", &a, json!({})).await.0, 403);
+        for id in [&a, &b, &c, &gone] {
+            assert_eq!(g.connect(id, host, &path, "secret").await, 200);
+        }
+
+        // A message is sent to the app as the socket's, and its answer to the socket; one of a socket that never
+        // opened goes nowhere.
+        assert_eq!(g.message(&a, "id").await, 200);
+        g.sent(&[("POST", &a, &format!("id {a}"))]).await;
+        assert_eq!(g.message("never", "hello").await, 200);
+        assert_eq!(g.message(&a, "hello").await, 200);
+        g.sent(&[("POST", &a, "hello")]).await;
+
+        // What is said goes to every socket in the room, once its turn commits; a socket that is gone is forgotten.
+        assert_eq!(g.message(&a, "say hi").await, 200);
+        g.sent(&[("POST", &a, "1: hi"), ("POST", &b, "1: hi"), ("POST", &c, "1: hi"), ("POST", &gone, "1: hi")]).await;
+        assert_eq!(g.message(&b, "say yo").await, 200);
+        g.sent(&[("POST", &a, "2: yo"), ("POST", &b, "2: yo"), ("POST", &c, "2: yo")]).await;
+
+        // The app closes a socket, which is then gone; an answer not events ends one, and the app is told.
+        assert_eq!(g.message(&a, "bye").await, 200);
+        g.sent(&[("DELETE", &a, "")]).await;
+        assert_eq!(g.message(&a, "hello").await, 200);
+        assert_eq!(g.message(&b, "garbage").await, 200);
+        g.sent(&[("DELETE", &b, "")]).await;
+        assert_eq!(tric.value(&room, "last").await, "disconnect");
+
+        // A socket's end is told the app once.
+        let end =
+            json!({ "requestContext": { "eventType": "DISCONNECT", "connectionId": c, "disconnectStatusCode": 1000 } });
+        assert_eq!(g.invoke("ws", "DISCONNECT", &c, end.clone()).await.1, 200);
+        assert_eq!(tric.value(&room, "last").await, "close");
+        assert_eq!(g.message(&b, "garbage").await, 200);
+        assert_eq!(g.invoke("ws", "DISCONNECT", &c, end).await.1, 200);
+        assert_eq!(g.message(&c, "say late").await, 200);
+        g.sent(&[]).await;
     }
 }

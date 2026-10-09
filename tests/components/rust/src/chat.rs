@@ -1,12 +1,11 @@
 //! The `/chat` route: a room over Pushpin's WebSocket-over-HTTP, where the room is the name (`/@room/chat`) and its
 //! channel. Only a `POST` of `application/websocket-events` with a `Connection-Id` is a socket's; any other is 400.
-//! - `OPEN`: accepted, with GRIP, the socket subscribed to the room and told its `id`; with `plain` in the query,
-//!   without GRIP, so nothing is broadcast to it; with `deny`, refused with 403.
+//! - `OPEN`: accepted, with GRIP, the socket subscribed to the room; with `plain` in the query, without GRIP, so nothing
+//!   is broadcast to it; with `deny`, refused with 403.
 //! - `TEXT say T`: the room's `count`, in the name's state, goes up by one, and `<count>: T` is published to the room,
-//!   held until the turn commits. `count`: the count. `boom T`: as `say`, but the answer is 500. `garbage`: an answer
-//!   that is not events. Other text comes back as it is.
-//! - `BINARY`: comes back as it is. `CLOSE`: closed back, and the name's `last` is `close`; `DISCONNECT`: `last` is
-//!   `disconnect`.
+//!   held until the turn commits. `count`: the count. `id`: `id <the socket's id>`. `boom T`: as `say`, but the answer
+//!   is 500. `garbage`: an answer that is not events. `bye`: closed. Other text comes back as it is.
+//! - `CLOSE`: closed back, and the name's `last` is `close`; `DISCONNECT`: `last` is `disconnect`.
 use crate::kv;
 use serde_json::json;
 use std::collections::HashMap;
@@ -37,7 +36,6 @@ pub async fn respond(request: Request, name: &str, q: &HashMap<String, String>) 
                 if grip {
                     out.extend(event("TEXT", format!(r#"c:{{"type":"subscribe","channel":"{name}"}}"#).as_bytes()));
                 }
-                out.extend(text(&format!("id {id}")));
             }
             "TEXT" => {
                 let said = String::from_utf8_lossy(&content).into_owned();
@@ -48,11 +46,12 @@ pub async fn respond(request: Request, name: &str, q: &HashMap<String, String>) 
                         status = if command == "boom" { 500 } else { 200 };
                     }
                     _ if said == "count" => out.extend(text(&kv::incr(name, "count", 0).map_err(err)?.to_string())),
+                    _ if said == "id" => out.extend(text(&format!("id {id}"))),
+                    _ if said == "bye" => out.extend(b"CLOSE\r\n"),
                     _ if said == "garbage" => out.extend(b"TEXT 99\r\nx"),
                     _ => out.extend(text(&said)),
                 }
             }
-            "BINARY" => out.extend(event("BINARY", &[if grip { &b"m:"[..] } else { &[] }, &content].concat())),
             "CLOSE" => {
                 kv::keep(name, "last", b"close").map_err(err)?;
                 out.extend(event("CLOSE", &[0x03, 0xe8]));
