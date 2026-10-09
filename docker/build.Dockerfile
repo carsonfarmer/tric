@@ -4,7 +4,7 @@ FROM public.ecr.aws/amazonlinux/amazonlinux:2023 AS base
 RUN dnf install -y gcc gcc-c++ make cmake perl git tar gzip xz zip findutils clang && dnf clean all
 # The toolchain lives in the image; the cargo registry and target dir are named volumes mounted at run time.
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
-RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable \
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.0 \
  && rustup target add wasm32-wasip2 && rustup component add rustfmt clippy && rustc --version && ldd --version | head -1
 # Release binaries for wasm-tools and the wasmtime CLI. The CLI must match the Wasmtime version the host crate pins.
 RUN arch=$(uname -m) \
