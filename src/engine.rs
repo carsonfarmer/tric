@@ -2,8 +2,9 @@
 //! hard limits, with nothing granted but what tric provides.
 use crate::kv::Imports;
 use crate::tric::{Ctx, Outbound};
+use sha2::{Digest, Sha256};
 use std::future::poll_fn;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 use std::{sync::Arc, thread, time::Duration};
 use tokio::sync::{Semaphore, oneshot};
 use tokio::task::AbortHandle;
@@ -69,11 +70,21 @@ impl Engine {
         Component::new(&self.engine, wasm)
     }
 
-    /// Which engines' native code this one loads, in hex: those of the same Wasmtime, configuration and target.
+    /// Which engines' native code this one loads, in hex: those of the same Wasmtime, configuration and target. It is a
+    /// SHA-256, as Wasmtime's own cache keys native code: `DefaultHasher` may change from one Rust release to the next.
     pub fn compat(&self) -> String {
-        let mut hasher = DefaultHasher::new();
-        self.engine.precompile_compatibility_hash().hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
+        struct Sha(Sha256);
+        impl Hasher for Sha {
+            fn write(&mut self, bytes: &[u8]) {
+                self.0.update(bytes);
+            }
+            fn finish(&self) -> u64 {
+                unreachable!("read with `finalize`")
+            }
+        }
+        let mut sha = Sha(Sha256::new());
+        self.engine.precompile_compatibility_hash().hash(&mut sha);
+        format!("{:x}", sha.0.finalize())
     }
 
     /// The component whose native code `bytes` is.

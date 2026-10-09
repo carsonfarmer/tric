@@ -28,7 +28,6 @@ use wasmtime_wasi_http::WasiBody;
 const FRESH: Duration = Duration::from_secs(5);
 const COMPONENT_MAX: u64 = 64 << 20;
 const NATIVE_MAX: u64 = 256 << 20;
-const EVENT_MAX: usize = 2 << 20;
 /// How long the router's outbox has to take an event.
 const HAND: Duration = Duration::from_secs(10);
 
@@ -37,7 +36,8 @@ struct Serve {
     domain: String,
     bucket: String,
     sink: Sink,
-    apps: Mutex<HashMap<String, Loaded>>,
+    /// A lock per app, so that one app's loading holds up no other's.
+    apps: std::sync::Mutex<HashMap<String, Arc<Mutex<Option<Loaded>>>>>,
 }
 
 /// An app as loaded: with the credentials it was given and the release it read, and when it read it.
@@ -61,7 +61,7 @@ pub async fn run(listen: SocketAddr, domain: String, bucket: String, outbox: Str
         }
         false => Arc::new(move |event| hand(outbox.clone(), event).boxed()),
     };
-    let serve = Arc::new(Serve { engine: Engine::new()?, domain, bucket, sink, apps: Mutex::default() });
+    let serve = Arc::new(Serve { engine: Engine::new()?, domain, bucket, sink, apps: Default::default() });
     let listener = TcpListener::bind(listen).await?;
     eprintln!("serving at http://{}", listener.local_addr()?);
     tric::listen(listener, move |_, req| serve.clone().handle(req)).await
@@ -104,8 +104,9 @@ impl Serve {
     /// `app`, with `creds`: as loaded, if it read its release less than `FRESH` ago with these credentials; else with
     /// its release read again, and its code loaded again if that changed. `None` if it has no release.
     async fn load(&self, app: &str, creds: Credentials) -> Result<Option<Arc<Tric>>> {
-        let mut apps = self.apps.lock().await;
-        if let Some(l) = apps.get(app)
+        let slot = self.apps.lock().unwrap().entry(app.into()).or_default().clone();
+        let mut slot = slot.lock().await;
+        if let Some(l) = &*slot
             && l.creds == creds
             && l.read.elapsed() < FRESH
         {
@@ -113,10 +114,10 @@ impl Serve {
         }
         let store = Store::s3(store::s3(&self.bucket, Some(creds.clone().into()))?);
         let Some((release, _)) = store.get(&store::app(app, &["current"]), None, RELEASE_MAX).await? else {
-            apps.remove(app);
+            *slot = None;
             return Ok(None);
         };
-        let (code, allow) = match apps.get(app) {
+        let (code, allow) = match &*slot {
             Some(l) if l.release == release => (l.tric.code.clone(), l.tric.allow.clone()),
             _ => {
                 let r: Release = serde_json::from_slice(&release)?;
@@ -126,7 +127,7 @@ impl Serve {
             }
         };
         let tric = Arc::new(Tric { app: app.into(), store, code, allow, sink: self.sink.clone() });
-        apps.insert(app.into(), Loaded { creds, release, tric: tric.clone(), read: Instant::now() });
+        *slot = Some(Loaded { creds, release, tric: tric.clone(), read: Instant::now() });
         Ok(Some(tric))
     }
 
@@ -165,7 +166,7 @@ async fn hand(outbox: String, event: Bytes) -> Result<()> {
 
 /// Delivers the event in `body`: 204 when that is done, and else 503, so the router tries again.
 async fn deliver(tric: &Arc<Tric>, body: WasiBody) -> Response {
-    let Ok(event) = Limited::new(body, EVENT_MAX).collect().await else {
+    let Ok(event) = Limited::new(body, outbox::EVENT_MAX).collect().await else {
         return status(StatusCode::PAYLOAD_TOO_LARGE);
     };
     match outbox::deliver(tric, &event.to_bytes()).await {

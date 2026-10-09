@@ -11,10 +11,10 @@ use http::header::CONTENT_TYPE;
 use http::{Method, StatusCode};
 use object_store::PutMode;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use wasmtime::{Result, ensure};
+use wasmtime::{Result, ensure, error::Context};
 
 /// The most a release takes: it holds the app's environment.
 pub const RELEASE_MAX: u64 = 1 << 20;
@@ -84,25 +84,15 @@ async fn schedule(aws: &Aws, app: &str, cron: &BTreeMap<String, String>, s: &Sch
         }))?;
         want.insert(format!("{prefix}-{}", &store::hash(&body)[..39]), body);
     }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "PascalCase")]
-    struct Page {
-        schedules: Vec<Summary>,
-        next_token: Option<String>,
-    }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "PascalCase")]
-    struct Summary {
-        name: String,
-    }
     let path = format!("/schedules?ScheduleGroup={}&NamePrefix={prefix}-&MaxResults=100", query(&s.group));
-    let page: Page = serde_json::from_slice(&scheduler(aws, Method::GET, &path, vec![], StatusCode::OK).await?)?;
-    ensure!(page.next_token.is_none(), "{app} has over 100 schedules, after failed deploys: delete them by hand");
-    let have: BTreeSet<String> = page.schedules.into_iter().map(|s| s.name).collect();
-    for (name, body) in want.iter().filter(|(name, _)| !have.contains(*name)) {
+    let page: Value = serde_json::from_slice(&scheduler(aws, Method::GET, &path, vec![], StatusCode::OK).await?)?;
+    ensure!(page["NextToken"].is_null(), "{app} has over 100 schedules, after failed deploys: delete them by hand");
+    let have = page["Schedules"].as_array().context("Scheduler listed no `Schedules`")?;
+    let have: BTreeSet<&str> = have.iter().filter_map(|s| s["Name"].as_str()).collect();
+    for (name, body) in want.iter().filter(|(name, _)| !have.contains(name.as_str())) {
         scheduler(aws, Method::POST, &format!("/schedules/{name}"), body.clone(), StatusCode::CONFLICT).await?;
     }
-    for name in have.iter().filter(|name| !want.contains_key(*name)) {
+    for name in have.iter().filter(|name| !want.contains_key(**name)) {
         let path = format!("/schedules/{name}?groupName={}", query(&s.group));
         scheduler(aws, Method::DELETE, &path, vec![], StatusCode::NOT_FOUND).await?;
     }

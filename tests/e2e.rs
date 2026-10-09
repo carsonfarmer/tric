@@ -491,14 +491,16 @@ async fn runs_middleware(kind: Kind) {
     assert_eq!(env["env"]["GUARD_TOKEN"], "t", "the app and its middleware share one environment");
 }
 
+/// Middleware whose bytes are not the ones pinned, or that sits at a private address, is refused before it is run.
 #[tokio::test]
 async fn refuses_forged_middleware() {
     let digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-    let toml = format!("component = APP\nmiddleware = [{{ url = GUARD, digest = \"{digest}\" }}]\n");
-    let dir = manifest(&fixture("app"), &toml);
-    let out = Command::new(TRIC).arg("dev").arg(&dir).output().await.unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success() && err.contains("does not match its digest"), "{err}");
+    for (url, why) in [("GUARD", "does not match its digest"), ("\"http://127.0.0.1:9/\"", "DestinationIpProhibited")] {
+        let toml = format!("component = APP\nmiddleware = [{{ url = {url}, digest = \"{digest}\" }}]\n");
+        let out = Command::new(TRIC).arg("dev").arg(manifest(&fixture("app"), &toml)).output().await.unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && err.contains(why), "{url}: {err}");
+    }
 }
 
 async fn confines_outbound_requests(kind: Kind) {
@@ -595,16 +597,10 @@ async fn isolates_apps() {
     let as_a = AmazonS3Builder::from_env().with_bucket_name(std::env::var("TRIC_BUCKET").unwrap());
     let as_a = as_a.with_access_key_id(c["AccessKeyId"].as_str().unwrap());
     let as_a = as_a.with_secret_access_key(c["SecretAccessKey"].as_str().unwrap());
-    let as_a = as_a.with_token(c["SessionToken"].as_str().unwrap()).build().unwrap();
+    let as_a = &as_a.with_token(c["SessionToken"].as_str().unwrap()).build().unwrap();
     let denied = |r: object_store::Result<()>| matches!(r, Err(object_store::Error::PermissionDenied { .. }));
-    let put = |k: String| {
-        let as_a = &as_a;
-        async move { as_a.put(&key(k), PutPayload::from_static(b"{}")).await.map(|_| ()) }
-    };
-    let get = |k: String| {
-        let as_a = &as_a;
-        async move { as_a.get(&key(k)).await.map(|_| ()) }
-    };
+    let put = move |k: String| async move { as_a.put(&key(k), PutPayload::from_static(b"{}")).await.map(|_| ()) };
+    let get = move |k: String| async move { as_a.get(&key(k)).await.map(|_| ()) };
     for k in [format!("apps/{b}/current"), format!("apps/{b}/names/n"), format!("apps/{b}/values/v")] {
         assert!(denied(get(k.clone()).await), "read {k}");
         assert!(denied(put(k.clone()).await), "write {k}");

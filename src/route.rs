@@ -31,7 +31,6 @@ use wasmtime::{Result, format_err};
 const KNOWN_FOR: Duration = Duration::from_secs(5);
 /// Credentials are used until 15 minutes before they expire.
 const CREDS_FOR: Duration = Duration::from_secs(LIFETIME - 15 * 60);
-const EVENT_MAX: usize = 2 << 20;
 
 struct Route {
     domain: String,
@@ -42,8 +41,31 @@ struct Route {
     origin: Option<String>,
     store: Store,
     aws: Aws,
-    known: Mutex<HashMap<String, (bool, Instant)>>,
-    creds: Mutex<HashMap<String, (HeaderValue, Instant)>>,
+    known: Cache<bool>,
+    creds: Cache<HeaderValue>,
+}
+
+/// A value per app, and when it was begun.
+type Cache<V> = Mutex<HashMap<String, (V, Instant)>>;
+
+/// `app`'s value in `cache` if it was begun less than `ttl` ago, else the one `make` gives, which is kept.
+async fn cached<V: Clone>(
+    cache: &Cache<V>,
+    ttl: Duration,
+    app: &str,
+    make: impl Future<Output = Result<V>>,
+) -> Result<V> {
+    if let Some((v, at)) = cache.lock().unwrap().get(app)
+        && at.elapsed() < ttl
+    {
+        return Ok(v.clone());
+    }
+    let begun = Instant::now();
+    let v = make.await?;
+    let mut all = cache.lock().unwrap();
+    all.retain(|_, (_, at)| at.elapsed() < ttl);
+    all.insert(app.into(), (v.clone(), begun));
+    Ok(v)
 }
 
 /// Routes requests for `<app>.<domain>` on `listen` to serve, with credentials for `bucket` minted as `role`. serve is
@@ -137,34 +159,19 @@ impl Route {
 
     /// Whether `app` has a release, as it did up to `KNOWN_FOR` ago.
     async fn known(&self, app: &str) -> Result<bool> {
-        if let Some((known, at)) = self.known.lock().unwrap().get(app)
-            && at.elapsed() < KNOWN_FOR
-        {
-            return Ok(*known);
-        }
-        let known = self.store.head(&store::app(app, &["current"])).await?;
-        let mut all = self.known.lock().unwrap();
-        all.retain(|_, (_, at)| at.elapsed() < KNOWN_FOR);
-        all.insert(app.into(), (known, Instant::now()));
-        Ok(known)
+        cached(&self.known, KNOWN_FOR, app, self.store.head(&store::app(app, &["current"]))).await
     }
 
     /// `app`'s credentials, as serve takes them: minted with a session policy that reaches only `app`'s objects, and
     /// used for `CREDS_FOR`.
     async fn creds(&self, app: &str) -> Result<HeaderValue> {
-        if let Some((creds, at)) = self.creds.lock().unwrap().get(app)
-            && at.elapsed() < CREDS_FOR
-        {
-            return Ok(creds.clone());
-        }
-        let minted = Instant::now();
-        let creds = self.aws.assume(self.role.as_deref(), app, &policy(&self.bucket, app)).await?;
-        let mut creds = HeaderValue::try_from(serde_json::to_string(&creds)?)?;
-        creds.set_sensitive(true);
-        let mut all = self.creds.lock().unwrap();
-        all.retain(|_, (_, at)| at.elapsed() < CREDS_FOR);
-        all.insert(app.into(), (creds.clone(), minted));
-        Ok(creds)
+        cached(&self.creds, CREDS_FOR, app, async {
+            let creds = self.aws.assume(self.role.as_deref(), app, &policy(&self.bucket, app)).await?;
+            let mut creds = HeaderValue::try_from(serde_json::to_string(&creds)?)?;
+            creds.set_sensitive(true);
+            Ok(creds)
+        })
+        .await
     }
 
     /// Sends `req` to serve, as `app`'s tenant, with `app`'s credentials.
@@ -292,12 +299,12 @@ impl Route {
     }
 }
 
-/// A `POST`'s body, of up to `EVENT_MAX`, and the `T` it is as JSON; else the status to answer with.
+/// A `POST`'s body, of up to `outbox::EVENT_MAX`, and the `T` it is as JSON; else the status to answer with.
 async fn body<T: DeserializeOwned>(req: hyper::Request<Incoming>) -> Result<(Bytes, T), StatusCode> {
     if req.method() != Method::POST {
         return Err(StatusCode::METHOD_NOT_ALLOWED);
     }
-    let body = Limited::new(req.into_body(), EVENT_MAX).collect().await;
+    let body = Limited::new(req.into_body(), outbox::EVENT_MAX).collect().await;
     let body = body.map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?.to_bytes();
     let t = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
     Ok((body, t))

@@ -19,7 +19,6 @@ ws = ["dep:hyper-util", "dep:tokio-tungstenite"]
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
-crc32fast = "1" # as flate2 has it, for event streams
 futures-util = "0.3"
 http = "1"
 http-body-util = "0.1"
@@ -40,6 +39,7 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2" # as object_store has it, to follow a middleware URL's redirects
 wac-graph = "0.12"
 # Mozilla's roots, as whole certificates, which is how the S3 client takes them, and outbound too.
 webpki-root-certs = "1"

@@ -108,8 +108,8 @@ impl Aws {
         if let Some(role) = role {
             form += &format!("&RoleArn={}", query(role));
         }
-        let form = (form.into_bytes(), [(CONTENT_TYPE.as_str(), "application/x-www-form-urlencoded")]);
-        let res = self.send("sts", Method::POST, "/", &form.1, form.0).await?;
+        let headers = [(CONTENT_TYPE.as_str(), "application/x-www-form-urlencoded")];
+        let res = self.send("sts", Method::POST, "/", &headers, form.into_bytes()).await?;
         let (status, body) = (res.status(), res.into_body().bytes().await?);
         ensure!(status.is_success(), "AssumeRole answered {status}: {}", String::from_utf8_lossy(&body));
         let res: AssumeRoleResponse = quick_xml::de::from_reader(&body[..])?;

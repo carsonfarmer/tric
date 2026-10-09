@@ -47,7 +47,8 @@ impl Allow {
 }
 
 /// True for everything that is not a public address: private, loopback, link-local (the metadata endpoints), shared,
-/// reserved and multicast IPv4, and IPv6 outside 2000::/3. An IPv4-mapped IPv6 address is judged as its IPv4 address.
+/// reserved and multicast IPv4; IPv6 outside 2000::/3; and the special-purpose blocks inside it, in IANA's registry.
+/// An IPv4-mapped IPv6 address is judged as its IPv4 address.
 fn blocked(ip: IpAddr) -> bool {
     match ip.to_canonical() {
         IpAddr::V4(a) => {
@@ -57,8 +58,12 @@ fn blocked(ip: IpAddr) -> bool {
                 || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24
                 || (o[0] == 198 && o[1] & 0xfe == 18) // 198.18.0.0/15
         }
-        // 2002::/16 embeds an IPv4 address.
-        IpAddr::V6(a) => a.segments()[0] & 0xe000 != 0x2000 || a.segments()[0] == 0x2002,
+        IpAddr::V6(a) => match a.segments() {
+            [s, ..] if s & 0xe000 != 0x2000 || s == 0x2002 => true, // 2002::/16, 6to4, embeds an IPv4 address
+            [0x2001, t, ..] => t < 0x200 || t == 0xdb8, // 2001::/23, Teredo's 2001::/32 in it; 2001:db8::/32
+            [0x3fff, t, ..] => t < 0x1000,              // 3fff::/20
+            _ => false,
+        },
     }
 }
 
@@ -87,12 +92,9 @@ pub fn allowed(allow: &[Allow], uri: &Uri) -> Result<(), Error> {
     }
 }
 
-/// Sends `req` to a public address, over TLS for https.
+/// Sends `req`, which `allowed` has let go, to a public address, over TLS for https.
 pub async fn send(req: Request) -> Sent {
     let uri = req.uri();
-    if uri.authority().is_some_and(|a| a.as_str().contains('@')) {
-        return Err(Error::HttpRequestUriInvalid);
-    }
     let tls = uri.scheme_str() == Some("https");
     let host = uri.host().unwrap_or_default().trim_matches(['[', ']']); // `[::1]` to `::1`, as `lookup_host` takes it
     let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
@@ -169,6 +171,11 @@ mod tests {
             "198.18.0.1",
             "192.0.0.170",
             "::ffff:0:127.0.0.1",
+            "2001::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "2001:2::1",
+            "2001:db8::1",
+            "3fff::1",
         ];
         let ok = [
             "8.8.8.8",
@@ -182,6 +189,8 @@ mod tests {
             "198.20.0.1",
             "223.255.255.255",
             "2a00:1450:4001::1",
+            "2001:4860:4860::8888",
+            "3fff:1000::1",
         ];
         for s in bad {
             assert!(blocked(s.parse().unwrap()), "{s} must be blocked");

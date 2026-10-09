@@ -26,6 +26,8 @@ const LANDING: Duration = Duration::from_secs(30);
 /// One request's whole exchange, its response's body included.
 const EXCHANGE: Duration = Duration::from_secs(60);
 const BODY_MAX: usize = 1 << 20;
+/// The most a delivery event, as JSON, may be.
+pub const EVENT_MAX: usize = 2 << 20;
 /// The relay's waits between tries, unless a `Retry-After` asks for longer, up to `WAIT_MAX`.
 const WAITS: [u64; 2] = [1, 2];
 const WAIT_MAX: Duration = Duration::from_secs(60);
@@ -189,16 +191,13 @@ pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
 /// Tries a delivery `attempt` up to three times, waiting 1 s and then 2 s between tries, or what `Retry-After` asked;
 /// then logs the event as lost.
 pub async fn relay<F: Future<Output = Delivered>>(mut attempt: impl FnMut() -> F) {
-    for wait in WAITS.map(Some).into_iter().chain([None]) {
-        match (attempt().await, wait) {
-            (Delivered::Done, _) => return,
-            (Delivered::Retry(after), Some(wait)) => {
-                sleep(after.unwrap_or_default().max(Duration::from_secs(wait)).min(WAIT_MAX)).await
-            }
-            (Delivered::Retry(_), None) => {}
-        }
+    for wait in WAITS {
+        let Delivered::Retry(after) = attempt().await else { return };
+        sleep(after.unwrap_or_default().max(Duration::from_secs(wait)).min(WAIT_MAX)).await;
     }
-    tracing::warn!("outbox: an event failed every try, so it is lost");
+    if let Delivered::Retry(_) = attempt().await {
+        tracing::warn!("outbox: an event failed every try, so it is lost");
+    }
 }
 
 #[cfg(test)]

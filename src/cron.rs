@@ -150,21 +150,9 @@ mod tests {
             assert!(!m(no), "{no}");
         }
         assert!(Cron::parse("* * * * 7").unwrap().matches(T + 3 * 86_400), "7 is Sunday");
-        for bad in [
-            "",
-            "* * * *",
-            "* * * * * *",
-            "60 * * * *",
-            "* 24 * * *",
-            "* * 0 * *",
-            "* * * 13 *",
-            "* * * * 8",
-            "* * 1 * 4",
-        ] {
-            assert!(Cron::parse(bad).is_err(), "{bad:?}");
-        }
-        for bad in ["5/2 * * * *", "*/0 * * * *", "a * * * *", "1- * * * *", "5-1 * * * *", "-1 * * * *", "* * * JAN *"]
-        {
+        let bad = ["", "* * * *", "* * * * * *", "60 * * * *", "* 24 * * *", "* * 0 * *", "* * * 13 *", "* * * * 8"];
+        let more = ["* * 1 * 4", "5/2 * * * *", "*/0 * * * *", "a * * * *", "1- * * * *", "5-1 * * * *"];
+        for bad in bad.into_iter().chain(more).chain(["-1 * * * *", "* * * JAN *"]) {
             assert!(Cron::parse(bad).is_err(), "{bad:?}");
         }
     }
