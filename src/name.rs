@@ -120,13 +120,6 @@ fn etag(version: &UpdateVersion) -> Option<String> {
     version.e_tag.as_ref().map(|e| format!("\"{}\"", e.trim_matches('"')))
 }
 
-fn key_ok(key: &str) -> Result<(), Error> {
-    match key.len() {
-        1..=KEY_MAX => Ok(()),
-        _ => Err(other(format!("a key is 1 to {KEY_MAX} bytes"))),
-    }
-}
-
 /// Loads a value, if there is one.
 async fn load(store: &Store, app: &str, v: Option<&Value>) -> Result<Option<Bytes>, Error> {
     match v {
@@ -145,36 +138,6 @@ fn page<'a>(keys: impl Iterator<Item = &'a str>, cursor: Option<String>) -> KeyR
     let keys: Vec<String> =
         keys.filter(|k| cursor.as_deref().is_none_or(|c| *k > c)).take(PAGE).map(str::to_owned).collect();
     KeyResponse { cursor: (keys.len() == PAGE).then(|| keys[PAGE - 1].clone()), keys }
-}
-
-/// A name as a request read it, once.
-pub struct Snap {
-    store: Store,
-    app: String,
-    head: Head,
-    pub etag: Option<String>, // none when there is no head
-}
-
-impl Snap {
-    pub async fn read(store: &Store, app: &str, name: &str) -> Result<Self> {
-        let (head, etag) = match read(store, &path(app, name)).await? {
-            Some((head, version)) => (head, etag(&version)),
-            None => Default::default(),
-        };
-        Ok(Self { store: store.clone(), app: app.into(), head, etag })
-    }
-
-    pub async fn get(&self, key: &str) -> Result<Option<Bytes>, Error> {
-        load(&self.store, &self.app, self.head.values.get(key)).await
-    }
-
-    pub fn exists(&self, key: &str) -> bool {
-        self.head.values.contains_key(key)
-    }
-
-    pub fn list(&self, cursor: Option<String>) -> KeyResponse {
-        page(self.head.values.keys().map(String::as_str), cursor)
-    }
 }
 
 /// `If-Match` and `If-None-Match`, which a turn evaluates against the head's `ETag` before it runs.
@@ -226,6 +189,7 @@ pub enum Refused {
 }
 
 /// What a turn changes, under its lock.
+#[derive(Default)]
 struct State {
     head: Head,                  // as read, or as this turn's claim wrote it
     base: Option<UpdateVersion>, // the head's version, if there is a head
@@ -237,7 +201,8 @@ struct State {
     held_size: usize,
 }
 
-/// A request that may write one name: its writes are buffered, and committed or discarded once it answers.
+/// A request that may write one name: its writes are buffered, and committed or discarded once it answers. A snapshot
+/// is a turn that has answered: it reads the name as it was, and writes nothing.
 pub struct Turn {
     store: Store,
     app: String,
@@ -266,14 +231,16 @@ impl std::fmt::Display for TooLarge {
 
 impl State {
     fn write(&mut self, items: Vec<(String, Option<Bytes>)>) -> Result<(), Error> {
+        if self.answered {
+            return Err(Error::AccessDenied);
+        }
         for (k, v) in &items {
-            key_ok(k)?;
+            if !(1..=KEY_MAX).contains(&k.len()) {
+                return Err(other(format!("a key is 1 to {KEY_MAX} bytes")));
+            }
             if v.as_ref().is_some_and(|v| v.len() > VALUE_MAX) {
                 return Err(other(format!("a value is {VALUE_MAX} bytes or less")));
             }
-        }
-        if self.answered {
-            return Err(other("the name is read-only after the response"));
         }
         self.writes.extend(items);
         Ok(())
@@ -281,6 +248,19 @@ impl State {
 }
 
 impl Turn {
+    /// A turn on `name` with the head `read`, answered already if `answered`.
+    fn new(store: &Store, app: &str, name: &str, read: Option<(Head, UpdateVersion)>, answered: bool) -> Arc<Self> {
+        let (head, base) = read.map_or_else(Default::default, |(head, version)| (head, Some(version)));
+        let state = Mutex::new(State { head, base, answered, ..Default::default() });
+        let (app, name, path, settled) = (app.into(), name.into(), path(app, name), watch::Sender::new(None));
+        Arc::new(Self { store: store.clone(), app, name, path, state, claiming: Default::default(), settled })
+    }
+
+    /// A snapshot of `name`: as it is now, without waiting for anyone's claim.
+    pub async fn snap(store: &Store, app: &str, name: &str) -> Result<Arc<Self>> {
+        Ok(Self::new(store, app, name, read(store, &path(app, name)).await?, true))
+    }
+
     /// Opens a turn on `name`, once no one else's claim is live, if `conditions` hold, and claimed if `claim`; or
     /// refuses it at `until`.
     pub async fn open(
@@ -291,26 +271,14 @@ impl Turn {
         conditions: &Conditions,
         until: Instant,
     ) -> Result<Result<Arc<Self>, Refused>> {
-        let path = path(app, name);
         loop {
-            let (head, base) = match read(store, &path).await? {
-                Some((head, version)) => (head, Some(version)),
-                None => (Head::default(), None),
-            };
-            if !head.claim.as_ref().is_some_and(Claim::live) {
-                if !conditions.hold(base.as_ref().and_then(etag).as_deref()) {
-                    return Ok(Err(Refused::Precondition));
-                }
-                let (writes, held) = Default::default();
-                let state =
-                    State { head, base, writes, answered: false, claim: None, doomed: false, held, held_size: 0 };
-                let (app, name, settled) = (app.into(), name.into(), watch::Sender::new(None));
-                let (state, claiming) = (Mutex::new(state), Default::default());
-                let turn =
-                    Arc::new(Self { store: store.clone(), app, name, path: path.clone(), state, claiming, settled });
-                if !claim || turn.claim().await {
-                    return Ok(Ok(turn));
-                }
+            let turn = Self::new(store, app, name, read(store, &path(app, name)).await?, false);
+            let free = !turn.state().head.claim.as_ref().is_some_and(Claim::live);
+            if free && !conditions.hold(turn.etag().as_deref()) {
+                return Ok(Err(Refused::Precondition));
+            }
+            if free && (!claim || turn.claim().await) {
+                return Ok(Ok(turn));
             }
             if Instant::now() >= until {
                 return Ok(Err(Refused::Busy));
@@ -321,6 +289,11 @@ impl Turn {
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap()
+    }
+
+    /// The `ETag` of the head as the turn last read or wrote it; none if there is no head.
+    pub fn etag(&self) -> Option<String> {
+        self.state().base.as_ref().and_then(etag)
     }
 
     /// Claims the name, so that no other turn commits before this one, and returns whether it holds the claim. One that
@@ -465,8 +438,18 @@ impl Turn {
 
     /// Commits the turn, asked at `host`: its large values go to objects of their own, its held requests to `sink` as a
     /// delivery event whose digest the head keeps in `pending`, and its head over the version it read, if that is still
-    /// the head. The `ETag` it returns is the new head's, or the old one's when there was nothing to write.
+    /// the head. The `ETag` it returns is the new head's, or the old one's when there was nothing to write. A commit
+    /// that fails is discarded.
     pub async fn commit(&self, host: &str, sink: &Sink) -> Result<Committed> {
+        let committed = self.try_commit(host, sink).await;
+        if committed.is_err() {
+            self.discard().await;
+        }
+        self.settled.send_replace(Some(matches!(committed, Ok(Committed::Done(_)))));
+        committed
+    }
+
+    async fn try_commit(&self, host: &str, sink: &Sink) -> Result<Committed> {
         let _one = self.claiming.lock().await; // so a claim in flight lands first
         let (mut head, base, writes, held, claimed, doomed) = {
             let s = &mut *self.state();
@@ -475,11 +458,9 @@ impl Turn {
             (s.head.clone(), s.base.clone(), writes, held, s.claim.is_some(), s.doomed)
         };
         if doomed {
-            self.settled.send_replace(Some(false));
             return Ok(Committed::Conflict);
         }
         if writes.is_empty() && held.is_empty() && !claimed {
-            self.settled.send_replace(Some(true));
             return Ok(Committed::Done(base.as_ref().and_then(etag)));
         }
         let (mut made, mut gone) = (vec![], vec![]);
@@ -521,31 +502,14 @@ impl Turn {
             put(&self.store, &self.path, &head, base.clone()).await
         };
         let put = put.await;
-        let cleanup = match &put {
-            Ok(Some(_)) => std::mem::take(&mut gone),
-            _ => std::mem::take(&mut made),
-        };
+        let cleanup = if let Ok(Some(_)) = put { gone } else { made };
         let store = self.store.clone();
         tokio::spawn(async move {
             for path in cleanup {
                 _ = store.delete(&path).await;
             }
         });
-        match put {
-            Ok(Some(version)) => {
-                self.settled.send_replace(Some(true));
-                Ok(Committed::Done(etag(&version)))
-            }
-            Ok(None) => {
-                self.settled.send_replace(Some(false));
-                Ok(Committed::Conflict)
-            }
-            Err(e) => {
-                drop(_one);
-                self.discard().await;
-                Err(e)
-            }
-        }
+        Ok(put?.map_or(Committed::Conflict, |version| Committed::Done(etag(&version))))
     }
 
     /// Discards the turn, and its claim if it took one.

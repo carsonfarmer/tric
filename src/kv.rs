@@ -1,7 +1,7 @@
 //! `wasi:keyvalue@0.2.0-draft2` over names: a store is a name, open for writing to the turn on it, and a snapshot to
 //! everything else.
 use crate::engine::Host;
-use crate::name::{self, Snap, Turn};
+use crate::name::{self, Turn};
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use std::sync::Arc;
@@ -24,12 +24,8 @@ pub fn other(e: impl ToString) -> Error {
     Error::Other(e.to_string())
 }
 
-/// An opened store: the request's turn, or a snapshot of a name.
-#[derive(Clone)]
-pub enum Bucket {
-    Turn(Arc<Turn>),
-    Snap(Arc<Snap>),
-}
+/// An opened store: the request's turn, or a snapshot of a name, which is a turn that has answered.
+pub type Bucket = Arc<Turn>;
 
 /// What `cas::new` saw of a key.
 pub struct Cas {
@@ -38,61 +34,29 @@ pub struct Cas {
     current: Option<Bytes>,
 }
 
-impl Bucket {
-    async fn get(&self, key: &str) -> R<Option<Bytes>> {
-        match self {
-            Bucket::Turn(t) => t.get(key).await,
-            Bucket::Snap(s) => s.get(key).await,
-        }
-    }
-
-    fn exists(&self, key: &str) -> bool {
-        match self {
-            Bucket::Turn(t) => t.exists(key),
-            Bucket::Snap(s) => s.exists(key),
-        }
-    }
-
-    fn list(&self, cursor: Option<String>) -> KeyResponse {
-        match self {
-            Bucket::Turn(t) => t.list(cursor),
-            Bucket::Snap(s) => s.list(cursor),
-        }
-    }
-
-    fn turn(&self) -> R<&Turn> {
-        match self {
-            Bucket::Turn(t) => Ok(t),
-            Bucket::Snap(_) => Err(Error::AccessDenied),
-        }
-    }
-
-    fn write(&self, items: Vec<(String, Option<Bytes>)>) -> R<()> {
-        self.turn()?.write(items)
-    }
-
-    async fn get_many(&self, keys: Vec<String>) -> R<Vec<(String, Option<Vec<u8>>)>> {
-        let mut values =
-            stream::iter(keys).map(|key| async move { Ok((self.get(&key).await?, key)) }).buffered(IN_FLIGHT);
-        let (mut out, mut bytes) = (vec![], 0);
-        while let Some((value, key)) = values.try_next().await? {
-            bytes += value.as_ref().map_or(0, Bytes::len);
-            if bytes > BATCH_MAX {
-                return Err(other(format!("get-many returns {BATCH_MAX} bytes or less")));
-            }
-            out.push((key, value.map(Into::into)));
-        }
-        Ok(out)
-    }
-
-    async fn cas(&self, key: String) -> R<Cas> {
-        Ok(Cas { bucket: self.clone(), current: self.get(&key).await?, key })
+impl Cas {
+    async fn new(bucket: Bucket, key: String) -> R<Self> {
+        Ok(Self { current: bucket.get(&key).await?, bucket, key })
     }
 }
 
+async fn get_many(bucket: &Bucket, keys: Vec<String>) -> R<Vec<(String, Option<Vec<u8>>)>> {
+    let mut values =
+        stream::iter(keys).map(|key| async move { Ok((bucket.get(&key).await?, key)) }).buffered(IN_FLIGHT);
+    let (mut out, mut bytes) = (vec![], 0);
+    while let Some((value, key)) = values.try_next().await? {
+        bytes += value.as_ref().map_or(0, Bytes::len);
+        if bytes > BATCH_MAX {
+            return Err(other(format!("get-many returns {BATCH_MAX} bytes or less")));
+        }
+        out.push((key, value.map(Into::into)));
+    }
+    Ok(out)
+}
+
 impl Host {
-    fn bucket(&self, b: &Resource<Bucket>) -> R<&Bucket> {
-        self.table.get(b).map_err(other)
+    fn bucket(&self, b: &Resource<Bucket>) -> R<Bucket> {
+        self.table.get(b).cloned().map_err(other)
     }
 }
 
@@ -104,8 +68,8 @@ impl store::Host for Host {
         }
         let ctx = self.ctx.clone();
         let bucket = match &ctx.turn {
-            Some(t) if t.name == name => Bucket::Turn(t.clone()),
-            _ => Bucket::Snap(ctx.snap(&name).await.map_err(|e| other(format!("{e:#}")))?),
+            Some(t) if t.name == name => t.clone(),
+            _ => ctx.snap(&name).await.map_err(|e| other(format!("{e:#}")))?,
         };
         self.table.push(bucket).map_err(other)
     }
@@ -134,7 +98,7 @@ impl store::HostBucket for Host {
 
 impl wasi::keyvalue::batch::Host for Host {
     async fn get_many(&mut self, b: Resource<Bucket>, keys: Vec<String>) -> R<Vec<(String, Option<Vec<u8>>)>> {
-        self.bucket(&b)?.clone().get_many(keys).await
+        get_many(&self.bucket(&b)?, keys).await
     }
     async fn set_many(&mut self, b: Resource<Bucket>, items: Vec<(String, Vec<u8>)>) -> R<()> {
         self.bucket(&b)?.write(items.into_iter().map(|(k, v)| (k, Some(v.into()))).collect())
@@ -146,23 +110,22 @@ impl wasi::keyvalue::batch::Host for Host {
 
 impl atomics::Host for Host {
     async fn increment(&mut self, b: Resource<Bucket>, key: String, delta: i64) -> R<i64> {
-        self.bucket(&b)?.turn()?.increment(&key, delta)
+        self.bucket(&b)?.increment(&key, delta)
     }
     /// Within a turn nothing else writes the name, so a swap fails only when the turn itself wrote the key since.
     async fn swap(&mut self, c: Resource<Cas>, value: Vec<u8>) -> Result<(), CasError> {
         let cas = self.table.delete(c).map_err(|e| CasError::StoreError(other(e)))?;
-        let turn = cas.bucket.turn().map_err(CasError::StoreError)?;
-        if turn.swap(&cas.key, &cas.current, value.into()).map_err(CasError::StoreError)? {
+        if cas.bucket.swap(&cas.key, &cas.current, value.into()).map_err(CasError::StoreError)? {
             return Ok(());
         }
-        let fresh = cas.bucket.cas(cas.key).await.map_err(CasError::StoreError)?;
+        let fresh = Cas::new(cas.bucket, cas.key).await.map_err(CasError::StoreError)?;
         Err(self.table.push(fresh).map_or_else(|e| CasError::StoreError(other(e)), CasError::CasFailed))
     }
 }
 
 impl atomics::HostCas for Host {
     async fn new(&mut self, b: Resource<Bucket>, key: String) -> R<Resource<Cas>> {
-        let cas = self.bucket(&b)?.clone().cas(key).await?;
+        let cas = Cas::new(self.bucket(&b)?, key).await?;
         self.table.push(cas).map_err(other)
     }
     async fn current(&mut self, c: Resource<Cas>) -> R<Option<Vec<u8>>> {

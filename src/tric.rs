@@ -1,7 +1,7 @@
 //! Running an app: each request in a fresh instance. A request with an unsafe method to `/@<name>` is a turn on the
 //! name: its writes, and the requests it holds, commit if it answers anything but 5xx. A conflict runs it again.
 use crate::engine::App;
-use crate::name::{self, BUSY, Committed, Conditions, Refused, Snap, TooLarge, Turn};
+use crate::name::{self, BUSY, Committed, Conditions, Refused, TooLarge, Turn};
 use crate::outbound::{self, Allow, Fut, Sent};
 use crate::outbox::{self, Held, Sink};
 use crate::store::Store;
@@ -50,7 +50,7 @@ pub struct Tric {
 pub struct Ctx {
     tric: Arc<Tric>,
     pub turn: Option<Arc<Turn>>,
-    snaps: Mutex<HashMap<String, Arc<Snap>>>,
+    snaps: Mutex<HashMap<String, Arc<Turn>>>,
     host: String,
     chain: Vec<String>, // the names of the turns it is inside
     depth: usize,
@@ -209,7 +209,7 @@ impl Tric {
         if req.method().is_safe() {
             let ctx = ctx(None, chain);
             return match ctx.snap(&name).await {
-                Ok(snap) => tag(self.call(req, ctx).await, snap.etag.clone()),
+                Ok(snap) => tag(self.call(req, ctx).await, snap.etag()),
                 Err(e) => {
                     tracing::warn!(app = self.app, name, "{e:#}");
                     status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -292,12 +292,12 @@ impl Tric {
 
 impl Ctx {
     /// The name `name` as this request first read it.
-    pub async fn snap(&self, name: &str) -> wasmtime::Result<Arc<Snap>> {
+    pub async fn snap(&self, name: &str) -> wasmtime::Result<Arc<Turn>> {
         let mut snaps = self.snaps.lock().await;
         if let Some(snap) = snaps.get(name) {
             return Ok(snap.clone());
         }
-        let snap = Arc::new(Snap::read(&self.tric.store, &self.tric.app, name).await?);
+        let snap = Turn::snap(&self.tric.store, &self.tric.app, name).await?;
         snaps.insert(name.into(), snap.clone());
         Ok(snap)
     }

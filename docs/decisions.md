@@ -90,6 +90,9 @@ reason.
 - **`deploy` writes with the owner's credentials,** from the environment, not with an app's.
 - **A name over 1 MiB fails at its commit,** not at the write that took it over: the request answers 500, as for a
   trap, and its held requests are not sent. 413 would blame the client's request, and this is the app's doing.
+- **A snapshot is a turn that has answered.** Both read the name as it was, and neither writes, so one type serves
+  both. A write after the answer now fails with `access-denied`, the same as a write to a snapshot, where it used to
+  fail with `other`. `wasi:keyvalue` names `access-denied` for exactly this.
 
 ## Local
 
