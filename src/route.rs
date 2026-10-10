@@ -88,7 +88,7 @@ pub async fn run(
 ) -> Result<()> {
     ensure!(
         serve.starts_with("arn:") == retries.is_some(),
-        "retries are for a router whose serve is a Lambda function"
+        "a router has retries if, and only if, its serve is a Lambda function"
     );
     let s3 = store::s3(&bucket, None)?;
     let aws = Aws::new(&s3)?;
