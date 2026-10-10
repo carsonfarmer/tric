@@ -58,23 +58,10 @@ pub fn add_to_linker(linker: &mut Linker<Host>) -> wasmtime::Result<()> {
     preopens::add_to_linker::<Host, HasSelf<Host>>(linker, |h| h)
 }
 
-convert!(ErrorCode, DescriptorType);
+convert!(ErrorCode, DescriptorType, DescriptorStat, instant);
 
 fn instant(nanos: u64) -> Instant {
     Instant { seconds: (nanos / 1_000_000_000) as i64, nanoseconds: (nanos % 1_000_000_000) as u32 }
-}
-
-impl From<Stat> for DescriptorStat {
-    fn from(s: Stat) -> Self {
-        Self {
-            type_: s.kind.into(),
-            link_count: s.links,
-            size: s.size,
-            data_access_timestamp: Some(instant(s.atime)),
-            data_modification_timestamp: Some(instant(s.mtime)),
-            status_change_timestamp: Some(instant(s.ctime)),
-        }
-    }
 }
 
 /// The time to set. A time before the epoch is one the tree cannot hold.

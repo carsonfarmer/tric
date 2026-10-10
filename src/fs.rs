@@ -30,10 +30,11 @@
 //!   read, while the commit leaves it out.
 //! * What descriptors read after the answer is the tree as the commit left it, or as it was if the turn was discarded:
 //!   so a file that was made in a turn that was discarded is no more, and reads fail with `io`.
-/// The conversions of an [`Errno`] and a [`Kind`] to the error code and the descriptor type that a binding generates,
-/// which name the same codes and types, in types of their own.
+/// The conversions of an [`Errno`], a [`Kind`] and a [`Stat`] to the error code, the descriptor type and the stat that
+/// a binding generates, which name the same codes, types and fields, in types of their own. `$stamp` makes a timestamp
+/// of nanoseconds.
 macro_rules! convert {
-    ($code:ty, $type:ty) => {
+    ($code:ty, $type:ty, $stat:ty, $stamp:ident) => {
         impl From<Errno> for $code {
             fn from(e: Errno) -> Self {
                 match e {
@@ -66,6 +67,19 @@ macro_rules! convert {
                     Kind::Dir => Self::Directory,
                     Kind::File => Self::RegularFile,
                     Kind::Link => Self::SymbolicLink,
+                }
+            }
+        }
+
+        impl From<Stat> for $stat {
+            fn from(s: Stat) -> Self {
+                Self {
+                    type_: s.kind.into(),
+                    link_count: s.links,
+                    size: s.size,
+                    data_access_timestamp: Some($stamp(s.atime)),
+                    data_modification_timestamp: Some($stamp(s.mtime)),
+                    status_change_timestamp: Some($stamp(s.ctime)),
                 }
             }
         }
