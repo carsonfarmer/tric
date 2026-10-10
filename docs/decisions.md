@@ -357,6 +357,28 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   each app through the Scheduler, the router and serve, as a retry is, and never by an always-on process. It is bounded
   in each invocation and resumable, logs what it reclaimed, and has a live path that the check script can invoke.
   The design of that trigger is written here, in its own bullet, before any of it is built.
+- **The sweep's trigger is a daily schedule per app, in the cron group, and nothing else.** Deploy adds one schedule
+  to an app's cron entries, named and reconciled with them (its name has the hash of its body, so a change is a new
+  schedule made before the old one is deleted), with the input `{"app": "<app>", "sweep": true}` where a cron entry has
+  `{"app", "path"}`. It targets the events function's `cron` alias, as the cron entries do, so there is no new alias,
+  role, group or permission for it. Its time is a minute of the day taken from the SHA-256 of the app's name
+  (`sweep::at`, as `M H * * *` in UTC, and as `cron(M H * * ? *)` for Scheduler), so apps spread over the 1,440 minutes
+  and no flexible window is needed to avoid a herd; and it is the same time locally, where `Route::cron` fires it at
+  that minute, as it fires an app's cron entries. The router's `job` takes either shape and, for a sweep, sends serve
+  a `POST` with `Forwarded: for=_sweep` as the app's tenant, with credentials minted for one hour as for any request.
+  It answers 204 whatever serve says, as for a cron entry: a sweep that fails is logged and is tomorrow's, not a
+  retry. Serve dispatches `for=_sweep` after the credentials and the tenant are checked and before the app is loaded:
+  a sweep needs the store and none of the app's code, so it reads no release, compiles nothing and runs no guest, and
+  an app that never touches a file or a key costs one cold invocation a day that lists an empty prefix and writes
+  nothing. The check script, and anyone else who wants a run now, invokes the same alias with the same input:
+  `aws lambda invoke --function-name <name>-events --qualifier cron --cli-binary-format raw-in-base64-out --payload
+  '{"app":"<app>","sweep":true}' /dev/stdout` on AWS, and a `POST` of it with `x-amzn-lambda-context` naming the `cron`
+  alias to the events listener locally (`tests/e2e.rs` does that). That adds no endpoint, credential or route, none
+  that a client can reach, and it can only do what the schedule does. A run is bounded by its time (`RUN`, 240 s of
+  serve's 330) and resumable: names are taken in key order from a cursor, `apps/<app>/values/.sweep` (not a name's, as
+  names start with a letter or digit), which a run that stops early writes and a run that completes deletes, and which
+  a run with no cursor and nothing to do does not touch. A name that is larger than a run is skipped with a warning,
+  since its walk cannot complete, and so deletes nothing.
 - **The node cache is per process,** a byte-capped LRU (16 MiB, `CACHE_MAX`) of immutable nodes, keyed by the object's
   full path and its version (app, name, id, version), so it can never be stale and a hit is exactly the object that
   a read would fetch, and never one of another app's. A node a commit uploads is put in it, since the next request is
