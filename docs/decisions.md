@@ -8,6 +8,7 @@ reason.
 - **The router is two functions on AWS,** built from one package and running as one role. `tric-route` holds the
   function URL. `tric-events` has none, and takes only events, each source's by an alias that only it may invoke:
   - `outbox`, delivery events, from serve;
+  - `retry`, a failed delivery's next try, from Scheduler, in a group of its own;
   - `cron`, cron jobs, from Scheduler, for an app with a release only;
   - `ws`, sockets' events, from API Gateway.
 
@@ -31,7 +32,8 @@ reason.
   mints them.
 - **An escape from serve's sandbox can invoke the `outbox`,** as serve's role may, with events that name another app.
   They are delivered only if that app's head holds their digest, so they are dropped, but each may hold the other
-  app's tenant for up to 30 s first, waiting for a commit to land. That costs money, and breaks nothing.
+  app's tenant for up to 30 s first, waiting for a commit to land. That costs money, and breaks nothing. They leave
+  nothing behind either: serve drops them with a 2xx, and only a delivery that fails is kept and scheduled.
 - **Native code is the app's own.** `native/<app>/…` is written with the app's credentials, so tampered native code
   reaches only the tenant that wrote it. serve compiles again when the native code won't deserialize. Components are
   checked against their digest when they are loaded. `<compat>` is a SHA-256 of Wasmtime's own compatibility hash
@@ -52,10 +54,67 @@ reason.
 
 ## AWS
 
-- **The dead letters are under `aws/lambda/async/`.** That is the prefix Lambda's S3 failure destination always
-  writes to. Lambda takes the destination only if the router's role may write the whole bucket and list it, so it
-  may. That adds little: the router writes `apps/` and `native/` already, as any app, and a component is checked
-  against its digest when it is loaded. The router is trusted either way.
+- **A failed delivery is tried again for 24 hours, through Scheduler.** That is the window of EventBridge's default
+  [retry policy](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-rule-retry-policy.html), 24 hours with
+  exponential backoff and jitter, after which the event is dropped. Lambda's own queue holds an event 6 hours at most
+  and retries it twice, at its own pace, which a `Retry-After` can't change. The router tries once, in the `outbox`
+  invocation. If serve answers 5xx or 429, or the exchange fails, it keeps the event and creates a one-time schedule
+  that invokes its `retry` alias; every failed try schedules the next. It never sleeps, because Lambda bills the
+  wait, and nothing runs while nothing is due.
+- **The wait is a minute, doubling to an hour, and up to a quarter more.** Scheduler keeps time to the minute, so a
+  shorter wait would be no shorter, and the doubling makes 25 to 29 tries in 24 hours, as the jitter falls. The
+  jitter keeps events that failed together from coming back together. `Retry-After` (RFC 9110, 10.2.3) is a floor, in
+  seconds; its date form is not read. A wait that would end after the deadline ends the delivery. EventBridge's
+  default also stops at 185 tries; here only the time stops it. Only a 5xx, a 429 and a failed exchange are tried
+  again, and any other 4xx is an answer, which a retry would only repeat.
+- **A failed event waits in the bucket, and the schedule carries a reference to it.** Scheduler's input is 256 KB at
+  most, and an event may be 1 MB. The reference is the app, the commit, the number of tries and the deadline, which
+  the router sets once, at the first failure, to 24 hours on.
+  - The object is `outbox/<app>/<commit>`, written once by the router, and not again at each failure: in a versioned
+    bucket every write would leave a noncurrent version of up to 1 MB. It is deleted when the event is delivered or
+    lost. The lifecycle rule expires what is left after 2 days, the least that outlasts the window.
+  - The key is made from a label and 32 hex digits, which the router checks again in a reference. A reference is
+    only a way to name an object; it makes no other key.
+  - A missing object reads as done: an earlier try of the same schedule delivered it. S3 answers 403 for a missing key
+    when the caller can't list, and the router can't list `outbox/`, so a 403 reads as missing there too.
+- **The schedule's name is `<hash(app/commit)[..32]>-<tries>`.** It matches Scheduler's `[0-9a-zA-Z-_.]+` in 64
+  characters or fewer. It is the same each time it is made, so when Lambda runs an invocation again after it failed,
+  having created the schedule, Scheduler's 409 says it is made, and that is taken as done. It names the app, so one
+  app's can't be another's. A schedule deletes itself once it has run (`ActionAfterCompletion: DELETE`), because a
+  completed one counts against the quota until it does.
+- **The retries have a Scheduler group and a role of their own.** The retry role may invoke `events:retry` only, and
+  the cron role `events:cron` only. The router may create a schedule in the retry group only, and pass only the retry
+  role to Scheduler, so it can't make a schedule that runs as `cron`. serve may invoke `outbox` only, so it can make
+  none. The retry role's trust names the account and the group's ARN, as Scheduler's documentation asks, so no other
+  schedule can assume it. The router's two functions share its role, so `route` holds these grants as well; it takes
+  no event, and the grants are narrow.
+- **`PENDING_TTL` is the window and an hour.** serve drops an event whose commit isn't pending, so an entry must
+  outlast the last try. The hour covers Scheduler's minute, Lambda's own two retries of a try, and an event that
+  Lambda was late to hand over. A hand-over later than that loses the tail of the window, not the first tries.
+- **A name with too many commits pending refuses a new background request.** The retries keep an entry in `pending`
+  for up to 25 hours, where it was 6, so an app sending to a host that is down would fill its head, and every commit
+  would fail at the 1 MiB `HEAD_MAX`. At `PENDING_MAX`, 1,000 live entries, about 130 KB, an eighth of that, the
+  guest's `fetch` gets a plain `503` and the request is not held. It is checked against the turn's snapshot, which is
+  exact: a commit writes over the head it started from, and adds one entry.
+  - 503 and not 429: it is the outbox that is full, and not a rate the app exceeded (RFC 9110, 15.6.4). It is a
+    response, not an error, which would read as a fault of the app or of tric; `508` is the precedent.
+  - An old entry is never dropped to make room: serve would then drop its event, and the delivery would be lost with
+    no word. The request is never sent at once instead: it would no longer wait for the commit.
+  - Entries past their age don't count.
+- **When the router itself fails, an `outbox` or `retry` invocation is tried twice more and then dropped.** The S3
+  write or read, or creating the schedule, failing is that: the router answers 503, and Lambda keeps to its
+  configuration of two retries and 6 hours, with no destination. A failed `retry` loses the delivery with hours of its
+  window left. Lambda's S3 destination would keep the event, but needs `s3:PutObject` on the whole bucket and
+  `s3:ListBucket` for the router's role, which is more than it uses, and a record that only the platform reads. A
+  router that fails three times in a row is an outage; the logs say so.
+- **The router's S3 access is the prefixes it uses.** It gets, puts and deletes under `ws/` and `outbox/`, and
+  lists the bucket with `s3:prefix` like `ws/channels/*` only, because on AWS the only listing it does is of one
+  channel's sockets, which S3 matches against the request's prefix:
+  [S3's `s3:prefix` condition](https://docs.aws.amazon.com/AmazonS3/latest/userguide/amazon-s3-policy-keys.html).
+  The listing of `apps/` is the local router's cron.
+- **After the last try the router logs a warning** with the app and the commit, deletes the object, and leaves the
+  entry in `pending` to age out. Nothing is kept to replay: an event is delivered only while its commit is pending,
+  and that is as long as the window.
 - **serve and the router run behind the Lambda Web Adapter,** as plain HTTP servers. Their package carries its own
   `bootstrap`, which runs `tric <handler>`, because `provided.al2023` has no wrapper for that. The adapter's
   readiness check is a `GET /`. Any status below 500 counts as ready, including the router's 403.
@@ -74,8 +133,8 @@ reason.
   for cron and the outbox; requests past 200 get 429. Reserved concurrency is free and keeps nothing warm, so scale
   to zero is untouched. AWS keeps at least 100 unreserved, so an account still at a new account's limit of 10 sets
   `-1`. serve and `events` reserve none: they share what is left.
-- **A delivery that fails answers 503,** which `AWS_LWA_ERROR_STATUS_CODES` turns into a failed invocation, so
-  Lambda retries it.
+- **An `outbox` or `retry` invocation answers 204 once its event is delivered or scheduled again, and 503 only when
+  the router fails,** which `AWS_LWA_ERROR_STATUS_CODES` turns into a failed invocation, so Lambda tries it again.
 - **Schedules are named for what they are,** as `<hash(app)[..24]>-<hash(body)[..39]>`. A changed schedule is a new
   one: deploy creates the missing schedules first, then deletes the extras. They are in one group, which the install
   makes.
@@ -89,8 +148,8 @@ reason.
 
 - **A re-run claims its name when it opens.** A turn that runs past 1 s claims its name mid-run. A turn whose claim
   fails is doomed: on a conflict it re-runs, and on a busy name it answers 429.
-- **Clearing `pending` never writes over a claimed head,** because that would break the claim. The 6-hour age limit
-  clears what is left.
+- **Clearing `pending` never writes over a claimed head,** because that would break the claim. The age limit,
+  `PENDING_TTL`, clears what is left.
 - **A delivery event is dropped at once** when its turn's start version has moved on and its commit id isn't in
   `pending`.
 - **`deploy` writes with the owner's credentials,** from the environment, not with an app's.
@@ -116,8 +175,8 @@ reason.
   - RustFS's `AssumeRole` takes no role: it narrows the caller's own policy, so the user holds what the app role holds
     on AWS.
   - It may also list the bucket, because the local router ticks cron itself.
-- **The local router answers 202 to an outbox event,** then relays it with backoff, honouring `Retry-After`, as
-  Lambda's async invoke would.
+- **The local router answers 202 to an outbox event,** then relays it in a task, with the same backoff and 24 hour
+  window as on AWS, and in memory: it has no Scheduler and keeps no object, and a restart loses what waits.
 - **serve takes the scheme from the router's `Forwarded`.** `proto=https` gives `https`, and anything else gives
   `http`. The router sets `https` on AWS and `http` locally.
 - **A middleware `url`** is fetched when it is `http(s)`. Anything else is a path, relative to `tric.toml`'s

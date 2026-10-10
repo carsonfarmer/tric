@@ -115,7 +115,9 @@ There is no web platform under QuickJS (no `TextEncoder`, `URL`, `fetch` or `con
 - **Calls are fetches.** A request to the app's own origin runs in-process with `Forwarded: for=_tric`; a cycle
   answers 508.
 - **Background requests.** A request a turn sends with `Prefer: respond-async` is answered 202 at once, held, and sent
-  only if the turn commits, with an `Idempotency-Key`.
+  only if the turn commits, with an `Idempotency-Key`. A delivery that gets a 5xx or a 429, or fails, is tried again
+  for 24 hours, honouring `Retry-After`. A name with 1,000 commits still undelivered refuses a new one: the `fetch`
+  gets 503.
 - **`Forwarded`** is set by tric on every request, and is the only word on where it came from: the client, `for=_cron`
   or `for=_tric`.
 

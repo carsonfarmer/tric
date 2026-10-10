@@ -9,9 +9,17 @@ while idle: the only standing costs are the domain's Route 53 zone and what the 
   - `tric-route` owns the function URL. CloudFront is its only caller, and the router refuses any request without
     CloudFront's secret, `X-Tric-Origin`.
   - `tric-events` takes only events, each source's through an alias of its own. Cron arrives from EventBridge
-    Scheduler at `cron`. Sockets' events arrive from API Gateway at `ws`. Delivery events arrive at `outbox`, which
-    retries twice, keeps an event for up to 6 hours, and then writes it to the bucket under `aws/lambda/async/` (the
-    dead letters).
+    Scheduler at `cron`. Sockets' events arrive from API Gateway at `ws`. Delivery events arrive at `outbox`.
+- **Retries.** A background request that cannot be delivered (serve answers 5xx or 429, or cannot be reached) is tried
+  again for 24 hours, as EventBridge's default retry policy has it, with exponential backoff and jitter, honouring
+  `Retry-After`. The router keeps the event in the bucket as `outbox/<app>/<commit>` and creates a one-time schedule,
+  in a group of its own, that invokes the `retry` alias with a reference to it. Each failed try schedules the next,
+  and nothing runs in between. After 24 hours the router logs a warning with the app and the commit, and drops it.
+  - **If the router itself fails** on an `outbox` or a `retry` invocation, Lambda tries that invocation twice more, and
+    then drops the event. Both aliases are configured so (two retries, a 6 hour maximum event age), with no
+    destination: there is no dead-letter record of any kind. A delivery lost that way is lost with hours of its window
+    left, and the logs show the router's failures.
+  - A name with 1,000 commits still undelivered refuses a new background request: the app's `fetch` gets a `503`.
 - **serve** runs the apps, with one Lambda tenant per app. It has no URL, and only the router can invoke it.
 - **WebSockets**, an API Gateway WebSocket API. CloudFront sends it a request that opens a socket, at the app's own
   URL. Its stage is throttled to `ws_rate` requests a second, 100 by default, with a burst of `ws_burst`, 200.
@@ -19,7 +27,8 @@ while idle: the only standing costs are the domain's Route 53 zone and what the 
   - `apps/<app>/…` holds the releases, components and state;
   - `native/<app>/…` holds the compiled code;
   - `ws/…` holds sockets' records and subscriptions, for the router alone;
-  - the lifecycle rules expire noncurrent versions after a day, dead letters after 14 days, and `ws/` after a day.
+  - `outbox/<app>/<commit>` holds a delivery that is waiting for a retry, for the router alone;
+  - the lifecycle rules expire noncurrent versions after a day, `outbox/` after 2 days, and `ws/` after a day.
 - **CloudFront and DNS.** CloudFront serves `*.<domain>` with a wildcard certificate from ACM, and Route 53 aliases
   point the domain at it.
 
@@ -34,10 +43,13 @@ while idle: the only standing costs are the domain's Route 53 zone and what the 
   nothing else, so an app that escapes the sandbox holds only its own tenant's credentials.
 - **The router** is the trusted core and runs no app code. It can:
   - assume the app role, which trusts only the router;
-  - read `apps/*/current`, and read and write `ws/*`;
+  - read `apps/*/current`, and read, write and delete `ws/*` and `outbox/*`, and nothing else in the bucket but a
+    listing of `ws/channels/`;
   - invoke serve;
-  - send to and close the sockets of its own API's stage.
-- **Scheduler** can invoke `tric-events` as `cron` only, and **API Gateway** as `ws` only, from its own stage.
+  - send to and close the sockets of its own API's stage;
+  - create schedules in the retry group, and no other, and pass the retry role, and no other.
+- **Scheduler** can invoke `tric-events` as `cron` only, with the cron role; as `retry` only, with the retry role,
+  which the retry group's schedules alone may assume; and **API Gateway** as `ws` only, from its own stage.
 - **Requests that bypass CloudFront** are refused, and so are sockets: the router checks the secret when one opens.
   CloudFront replaces any `X-Tric-Origin` a viewer sends. The router replaces every `Forwarded`, so `for=_cron`,
   `for=_tric` and `for=_ws` come only from tric.
