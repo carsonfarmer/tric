@@ -405,7 +405,7 @@ async fn turns_commit_or_discard(kind: Kind) {
     assert_eq!(tric.value("c", "n").await, "3");
 
     // A value too big to inline is a value of its own, which a discarded turn leaves as it was.
-    let big = |c: &str| c.repeat(2000);
+    let big = |c: &str| c.repeat(5000);
     for c in ["x", "y"] {
         assert_eq!(tric.post(&format!("/@d/kv?op=set&key=k&value={}", big(c))).await.status, 200);
         assert_eq!(tric.value("d", "k").await, big(c));

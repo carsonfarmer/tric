@@ -1,6 +1,8 @@
 //! The bucket: one object store, in memory for `tric dev` and S3 everywhere else. S3 answers 403 for a missing key to a
 //! caller that cannot list, so a 403 reads as not found.
+use crate::tree::Cache;
 use bytes::Bytes;
+use futures_util::{StreamExt, stream};
 use object_store::aws::{AmazonS3, AmazonS3Builder, AwsCredential};
 use object_store::client::{HttpClient, HttpConnector, ReqwestConnector};
 use object_store::{
@@ -20,6 +22,8 @@ pub struct Store {
     /// Whether the bucket keeps versions, so a value read by its version id outlives its delete. The memory store
     /// keeps none, and never deletes.
     pub versioned: bool,
+    /// The tree nodes read, which a process keeps for the next request: those of S3 are shared by all its stores.
+    pub(crate) cache: Arc<Cache>,
 }
 
 /// `apps/<app>/<parts>`.
@@ -84,12 +88,12 @@ fn found<T>(r: object_store::Result<T>) -> Result<Option<T>> {
 
 impl Store {
     pub fn memory() -> Self {
-        Self { inner: Arc::new(InMemory::new()), versioned: false }
+        Self { inner: Arc::new(InMemory::new()), versioned: false, cache: Arc::default() }
     }
 
     /// `s3`, whose bucket must keep versions.
     pub fn s3(s3: AmazonS3) -> Self {
-        Self { inner: Arc::new(s3), versioned: true }
+        Self { inner: Arc::new(s3), versioned: true, cache: Cache::shared() }
     }
 
     /// Whether there is an object at `path`.
@@ -135,5 +139,22 @@ impl Store {
             true => found(self.inner.delete(path).await).map(drop),
             false => Ok(()),
         }
+    }
+
+    /// Deletes the objects at `paths`, in a versioned bucket only: elsewhere a snapshot may still read them. One that
+    /// is gone already, or that the role cannot see, is as good as deleted. The others are logged, not returned: what
+    /// a delete leaves behind is only space, and the sweep reclaims it.
+    pub async fn delete_many(&self, paths: Vec<Path>) {
+        if !self.versioned || paths.is_empty() {
+            return;
+        }
+        let gone = self.inner.delete_stream(stream::iter(paths.into_iter().map(Ok)).boxed());
+        gone.for_each(|r| async move {
+            match r {
+                Ok(_) | Err(object_store::Error::NotFound { .. } | object_store::Error::PermissionDenied { .. }) => {}
+                Err(e) => tracing::warn!("delete: {e}"),
+            }
+        })
+        .await;
     }
 }

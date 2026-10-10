@@ -66,16 +66,16 @@ impl store::HostBucket for Host {
         Ok(self.bucket(&b)?.get(&key).await?.map(Into::into))
     }
     async fn set(&mut self, b: Resource<Bucket>, key: String, value: Vec<u8>) -> R<()> {
-        self.bucket(&b)?.write(vec![(key, Some(value.into()))])
+        self.bucket(&b)?.write(vec![(key, Some(value.into()))]).await
     }
     async fn delete(&mut self, b: Resource<Bucket>, key: String) -> R<()> {
-        self.bucket(&b)?.write(vec![(key, None)])
+        self.bucket(&b)?.write(vec![(key, None)]).await
     }
     async fn exists(&mut self, b: Resource<Bucket>, key: String) -> R<bool> {
-        Ok(self.bucket(&b)?.exists(&key))
+        self.bucket(&b)?.exists(&key).await
     }
     async fn list_keys(&mut self, b: Resource<Bucket>, cursor: Option<String>) -> R<KeyResponse> {
-        Ok(self.bucket(&b)?.list(cursor))
+        self.bucket(&b)?.list(cursor).await
     }
     async fn drop(&mut self, b: Resource<Bucket>) -> wasmtime::Result<()> {
         Ok(self.table.delete(b).map(drop)?)
@@ -98,21 +98,21 @@ impl wasi::keyvalue::batch::Host for Host {
         Ok(out)
     }
     async fn set_many(&mut self, b: Resource<Bucket>, items: Vec<(String, Vec<u8>)>) -> R<()> {
-        self.bucket(&b)?.write(items.into_iter().map(|(k, v)| (k, Some(v.into()))).collect())
+        self.bucket(&b)?.write(items.into_iter().map(|(k, v)| (k, Some(v.into()))).collect()).await
     }
     async fn delete_many(&mut self, b: Resource<Bucket>, keys: Vec<String>) -> R<()> {
-        self.bucket(&b)?.write(keys.into_iter().map(|k| (k, None)).collect())
+        self.bucket(&b)?.write(keys.into_iter().map(|k| (k, None)).collect()).await
     }
 }
 
 impl atomics::Host for Host {
     async fn increment(&mut self, b: Resource<Bucket>, key: String, delta: i64) -> R<i64> {
-        self.bucket(&b)?.increment(&key, delta)
+        self.bucket(&b)?.increment(&key, delta).await
     }
     /// Within a turn nothing else writes the name, so a swap fails only when the turn itself wrote the key since.
     async fn swap(&mut self, c: Resource<Cas>, value: Vec<u8>) -> Result<(), CasError> {
         let cas = self.table.delete(c).map_err(|e| CasError::StoreError(other(e)))?;
-        if cas.bucket.swap(&cas.key, &cas.current, value.into()).map_err(CasError::StoreError)? {
+        if cas.bucket.swap(&cas.key, &cas.current, value.into()).await.map_err(CasError::StoreError)? {
             return Ok(());
         }
         let fresh = Cas::new(cas.bucket, cas.key).await.map_err(CasError::StoreError)?;

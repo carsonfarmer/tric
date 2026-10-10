@@ -6,7 +6,7 @@ use crate::outbound::{self, Allow, Fut, Sent};
 use crate::outbox::{self, Held, Sink};
 use crate::store::Store;
 use bytes::{Bytes, BytesMut};
-use futures_util::{FutureExt, StreamExt, stream};
+use futures_util::{FutureExt, StreamExt, future::join_all, stream};
 use http::header::{CONTENT_TYPE, ETAG, FORWARDED, RETRY_AFTER};
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use http_body_util::{BodyExt, BodyStream, StreamBody};
@@ -18,7 +18,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::{sync::Mutex, time::sleep};
+use tokio::{sync::Mutex, task::JoinHandle, time::sleep};
 use wasmtime_wasi_http::{RequestOptions, WasiBody, WasiHttpHooks, io::TokioIo};
 
 pub type Request = http::Request<WasiBody>;
@@ -187,8 +187,29 @@ impl Tric {
         self.dispatch(req, host, vec![], 0).await
     }
 
-    /// Runs `req` in an instance, as a turn if it is one.
+    /// Runs `req` in an instance, as a turn if it is one. The response ends once the objects that turns left behind are
+    /// deleted, so a Lambda that is frozen at the end of the response does not leave the deletes half done.
     async fn dispatch(self: &Arc<Self>, req: Request, host: &str, chain: Vec<String>, depth: usize) -> Response {
+        let mut reaping = vec![];
+        let res = self.attempts(req, host, chain, depth, &mut reaping).await;
+        match reaping.is_empty() {
+            true => res,
+            false => res.map(|body| {
+                let end = stream::once(join_all(reaping)).filter_map(|_| std::future::ready(None));
+                StreamBody::new(BodyStream::new(body).chain(end)).boxed_unsync()
+            }),
+        }
+    }
+
+    /// Runs `req` as often as a turn on its name takes, with the deletes it starts in `reaping`.
+    async fn attempts(
+        self: &Arc<Self>,
+        req: Request,
+        host: &str,
+        chain: Vec<String>,
+        depth: usize,
+        reaping: &mut Vec<JoinHandle<()>>,
+    ) -> Response {
         let ctx = |turn, chain| {
             let (tric, snaps, host) = (self.clone(), Mutex::default(), host.into());
             Arc::new(Ctx { tric, turn, snaps, host, chain, depth })
@@ -231,42 +252,58 @@ impl Tric {
                 timer.claim().await;
             });
             let req = http::Request::from_parts(parts.clone(), body);
-            let answer = self.code.call(req, ctx(Some(turn.clone()), chain.clone())).await;
-            if turn.doomed() {
-                // A claim failed, so another turn committed first: whatever this one answered, it runs again.
-                if let Ok((_, instance)) = &answer {
-                    instance.abort();
-                }
-                turn.discard().await;
-                claim = true;
-                continue;
+            let attempt = self.attempt(&turn, req, ctx(Some(turn.clone()), chain.clone()), host).await;
+            reaping.extend(turn.reaped());
+            match attempt {
+                Some(res) => return res,
+                None => claim = true,
             }
-            let (res, instance) = match answer {
-                Ok(answer) => answer,
-                Err(e) => {
-                    tracing::warn!(app = self.app, name, "{e:#}");
-                    turn.discard().await;
-                    return status(StatusCode::INTERNAL_SERVER_ERROR);
-                }
-            };
-            if res.status().is_server_error() {
-                turn.discard().await;
-                return res;
+        }
+    }
+
+    /// Runs `req` as the turn `turn`, and commits or discards it. The answer is none if the turn must run again.
+    async fn attempt(
+        &self,
+        turn: &Arc<Turn>,
+        req: http::Request<WasiBody>,
+        ctx: Arc<Ctx>,
+        host: &str,
+    ) -> Option<Response> {
+        let name = &turn.name;
+        let answer = self.code.call(req, ctx).await;
+        if turn.doomed() {
+            // A claim failed, so another turn committed first: whatever this one answered, it runs again.
+            if let Ok((_, instance)) = &answer {
+                instance.abort();
             }
-            match turn.commit(host, &self.sink).await {
-                Ok(Committed::Done(etag)) => return tag(res, etag),
-                Ok(Committed::Conflict) => {
-                    instance.abort();
-                    claim = true;
-                }
-                Err(e) => {
-                    instance.abort();
-                    tracing::warn!(app = self.app, name, "{e:#}");
-                    return match e.is::<TooLarge>() {
-                        true => status(StatusCode::INTERNAL_SERVER_ERROR),
-                        false => later(StatusCode::SERVICE_UNAVAILABLE),
-                    };
-                }
+            turn.discard().await;
+            return None;
+        }
+        let (res, instance) = match answer {
+            Ok(answer) => answer,
+            Err(e) => {
+                tracing::warn!(app = self.app, name, "{e:#}");
+                turn.discard().await;
+                return Some(status(StatusCode::INTERNAL_SERVER_ERROR));
+            }
+        };
+        if res.status().is_server_error() {
+            turn.discard().await;
+            return Some(res);
+        }
+        match turn.commit(host, &self.sink).await {
+            Ok(Committed::Done(etag)) => Some(tag(res, etag)),
+            Ok(Committed::Conflict) => {
+                instance.abort();
+                None
+            }
+            Err(e) => {
+                instance.abort();
+                tracing::warn!(app = self.app, name, "{e:#}");
+                Some(match e.is::<TooLarge>() {
+                    true => status(StatusCode::INTERNAL_SERVER_ERROR),
+                    false => later(StatusCode::SERVICE_UNAVAILABLE),
+                })
             }
         }
     }

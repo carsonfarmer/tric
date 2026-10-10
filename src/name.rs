@@ -3,21 +3,20 @@ use crate::engine::ANSWER;
 use crate::kv::{Error, KeyResponse, other};
 use crate::outbox::{Event, Held, Sink, WINDOW};
 use crate::store::{self, Store};
-use base64::{Engine as _, prelude::BASE64_STANDARD as B64};
+use crate::tree::{Full, Limits, Shape, Tree};
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 use object_store::{PutMode, UpdateVersion, path::Path};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::{sync::watch, time::sleep};
+use tokio::{sync::RwLock, sync::watch, task::JoinHandle, time::sleep};
 use wasmtime::{Result, ensure};
 
 const NAME_MAX: usize = 128;
 const KEY_MAX: usize = 256; // bytes
 const VALUE_MAX: usize = 1 << 20;
-const INLINE_MAX: usize = 1 << 10; // a larger value is an object of its own
 const HEAD_MAX: usize = 1 << 20;
 const HELD_MAX: usize = 1_000_000; // bytes of held requests, as JSON, so an event is within Lambda's 1 MB
 const PAGE: usize = 1000; // keys per `list-keys`
@@ -43,12 +42,12 @@ pub fn of(path: &str) -> Option<&str> {
     path.strip_prefix("/@").map(|rest| rest.split('/').next().unwrap_or_default())
 }
 
-/// A name's state.
+/// A name's state: its tree, with the root in the head, and the commits pending and the claim.
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Head {
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    values: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Shape::is_empty")]
+    tree: Shape,
     /// The commits whose background requests are not yet delivered.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pending: BTreeMap<String, Pending>,
@@ -68,18 +67,6 @@ impl Pending {
     fn live(&self, now: u64) -> bool {
         now.saturating_sub(self.at) < PENDING_TTL.as_millis() as u64
     }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase", deny_unknown_fields)]
-enum Value {
-    Data(String), // base64
-    /// A value too large to keep in the head: the object `apps/<app>/values/<key>` at `version`, in a versioned bucket.
-    Object {
-        key: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        version: Option<String>,
-    },
 }
 
 /// A turn's lease on a name, until a Unix millisecond.
@@ -102,10 +89,6 @@ fn now() -> u64 {
 
 pub fn path(app: &str, name: &str) -> Path {
     store::app(app, &["names", name])
-}
-
-fn value_path(app: &str, key: &str) -> Path {
-    store::app(app, &["values", key])
 }
 
 /// The head at `path`, with its version. Each read and write of a head logs, at debug, its `ETag` and what it took:
@@ -174,7 +157,6 @@ fn tags(list: &str) -> impl Iterator<Item = (bool, &str)> {
 struct State {
     head: Head,                  // as read, or as this turn's claim wrote it
     base: Option<UpdateVersion>, // the head's version, if there is a head
-    writes: BTreeMap<String, Option<Bytes>>,
     answered: bool,
     claim: Option<String>, // this turn's, once taken
     doomed: bool,          // a claim failed, so the commit will
@@ -182,16 +164,20 @@ struct State {
     held_size: usize,
 }
 
-/// A request that may write one name: its writes are buffered, and committed or discarded once it answers. A snapshot
-/// is a turn that has answered: it reads the name as it was, and writes nothing.
+/// A request that may write one name: its writes are in its tree, which is committed or discarded once it answers. A
+/// snapshot is a turn that has answered: it reads the name as it was, and writes nothing.
+///
+/// The locks are taken in the order `claiming`, `tree`, `state`; `state` is never held across an await.
 pub struct Turn {
     store: Store,
     app: String,
     pub name: String,
     path: Path,
     state: Mutex<State>,
+    tree: RwLock<Tree>,
     claiming: tokio::sync::Mutex<()>,
     settled: watch::Sender<Option<bool>>, // whether it committed, once it is known
+    reaping: Mutex<Vec<JoinHandle<()>>>,  // the deletes of objects no head names, which the response waits for
 }
 
 /// How a commit went.
@@ -200,7 +186,8 @@ pub enum Committed {
     Conflict,             // another turn changed the name first
 }
 
-/// Why a commit failed when its head would be over `HEAD_MAX`: the app wrote too much, so, as for a trap, it answers 500.
+/// Why a commit failed when its head would be over `HEAD_MAX`. The head is the root of the tree, at most `NODE_MAX`,
+/// and the pending commits, at most `PENDING_MAX` of them, so this is a backstop; it answers 500, as for a trap.
 #[derive(Debug)]
 pub struct TooLarge;
 
@@ -210,36 +197,53 @@ impl std::fmt::Display for TooLarge {
     }
 }
 
-impl State {
-    fn write(&mut self, items: Vec<(String, Option<Bytes>)>) -> Result<(), Error> {
-        if self.answered {
-            return Err(Error::AccessDenied);
-        }
-        for (k, v) in &items {
-            if !(1..=KEY_MAX).contains(&k.len()) {
-                return Err(other(format!("a key is 1 to {KEY_MAX} bytes")));
-            }
-            if v.as_ref().is_some_and(|v| v.len() > VALUE_MAX) {
-                return Err(other(format!("a value is {VALUE_MAX} bytes or less")));
-            }
-        }
-        self.writes.extend(items);
-        Ok(())
+/// The key of `key` in the tree: the keys of the keyvalue store are under `k/`.
+fn tree_key(key: &str) -> String {
+    format!("k/{key}")
+}
+
+/// What the guest is told of a tree error: that a limit was hit, which it can act on, and else only that the name
+/// failed, as the rest is the host's to know.
+fn fail(e: wasmtime::Error) -> Error {
+    if let Some(full) = e.downcast_ref::<Full>() {
+        return other(full);
     }
+    tracing::warn!("name: {e:#}");
+    other("the name could not be read or written")
+}
+
+fn check(items: &[(String, Option<Bytes>)]) -> Result<(), Error> {
+    for (k, v) in items {
+        if !(1..=KEY_MAX).contains(&k.len()) {
+            return Err(other(format!("a key is 1 to {KEY_MAX} bytes")));
+        }
+        if v.as_ref().is_some_and(|v| v.len() > VALUE_MAX) {
+            return Err(other(format!("a value is {VALUE_MAX} bytes or less")));
+        }
+    }
+    Ok(())
 }
 
 impl Turn {
     /// A turn on `name` with the head `read`, answered already if `answered`.
-    fn new(store: &Store, app: &str, name: &str, read: Option<(Head, UpdateVersion)>, answered: bool) -> Arc<Self> {
+    fn new(
+        store: &Store,
+        app: &str,
+        name: &str,
+        read: Option<(Head, UpdateVersion)>,
+        answered: bool,
+    ) -> Result<Arc<Self>> {
         let (head, base) = read.map_or_else(Default::default, |(head, version)| (head, Some(version)));
+        let tree = RwLock::new(Tree::open(store, app, name, &head.tree, Limits::default())?);
         let state = Mutex::new(State { head, base, answered, ..Default::default() });
         let (app, name, path, settled) = (app.into(), name.into(), path(app, name), watch::Sender::new(None));
-        Arc::new(Self { store: store.clone(), app, name, path, state, claiming: Default::default(), settled })
+        let (claiming, reaping) = (Default::default(), Default::default());
+        Ok(Arc::new(Self { store: store.clone(), app, name, path, state, tree, claiming, settled, reaping }))
     }
 
     /// A snapshot of `name`: as it is now, without waiting for anyone's claim.
     pub async fn snap(store: &Store, app: &str, name: &str) -> Result<Arc<Self>> {
-        Ok(Self::new(store, app, name, read(store, &path(app, name)).await?, true))
+        Self::new(store, app, name, read(store, &path(app, name)).await?, true)
     }
 
     /// Opens a turn on `name`, once no one else's claim is live, if `conditions` hold, and claimed if `claim`; or
@@ -253,7 +257,7 @@ impl Turn {
         until: Instant,
     ) -> Result<Result<Arc<Self>, StatusCode>> {
         loop {
-            let turn = Self::new(store, app, name, read(store, &path(app, name)).await?, false);
+            let turn = Self::new(store, app, name, read(store, &path(app, name)).await?, false)?;
             let free = !turn.state().head.claim.as_ref().is_some_and(Claim::live);
             if free && !conditions.hold(turn.etag().as_deref()) {
                 return Ok(Err(StatusCode::PRECONDITION_FAILED));
@@ -362,86 +366,96 @@ impl Turn {
     }
 
     pub async fn get(&self, key: &str) -> Result<Option<Bytes>, Error> {
-        let v = {
-            let s = self.state();
-            match s.writes.get(key) {
-                Some(w) => return Ok(w.clone()),
-                None => s.head.values.get(key).cloned(),
-            }
-        };
-        match v {
-            None => Ok(None),
-            Some(Value::Data(b64)) => Ok(Some(B64.decode(b64).map_err(other)?.into())),
-            Some(Value::Object { key, version }) => {
-                let got = self.store.get(&value_path(&self.app, &key), version, VALUE_MAX as u64).await;
-                let got = got.map_err(|e| other(format!("{e:#}")))?.ok_or_else(|| other("the value is missing"))?;
-                Ok(Some(got.0))
-            }
-        }
+        let tree = self.tree.read().await;
+        let Some(item) = tree.get(&tree_key(key)).await.map_err(fail)? else { return Ok(None) };
+        Ok(Some(tree.value(&item).await.map_err(fail)?))
     }
 
-    pub fn exists(&self, key: &str) -> bool {
-        let s = self.state();
-        s.writes.get(key).map_or_else(|| s.head.values.contains_key(key), Option::is_some)
+    pub async fn exists(&self, key: &str) -> Result<bool, Error> {
+        Ok(self.tree.read().await.get(&tree_key(key)).await.map_err(fail)?.is_some())
     }
 
-    pub fn list(&self, cursor: Option<String>) -> KeyResponse {
-        let s = self.state();
-        let mut keys: BTreeSet<&str> = s.head.values.keys().map(String::as_str).collect();
-        for (k, w) in &s.writes {
-            match w {
-                Some(_) => keys.insert(k),
-                None => keys.remove(k.as_str()),
-            };
-        }
+    pub async fn list(&self, cursor: Option<String>) -> Result<KeyResponse, Error> {
         // One page: the first `PAGE` keys after `cursor`, which is the last key of the page before.
-        let keys: Vec<String> = keys
-            .into_iter()
-            .filter(|k| cursor.as_deref().is_none_or(|c| *k > c))
-            .take(PAGE)
-            .map(str::to_owned)
-            .collect();
-        KeyResponse { cursor: (keys.len() == PAGE).then(|| keys[PAGE - 1].clone()), keys }
+        let after = cursor.map(|c| tree_key(&c));
+        let found = self.tree.read().await.scan("k/", after.as_deref(), PAGE).await.map_err(fail)?;
+        let keys: Vec<String> = found.iter().filter_map(|k| k.strip_prefix("k/")).map(str::to_owned).collect();
+        Ok(KeyResponse { cursor: (keys.len() == PAGE).then(|| keys[PAGE - 1].clone()), keys })
     }
 
-    /// Buffers writes, `None` deleting, all or none of them.
-    pub fn write(&self, items: Vec<(String, Option<Bytes>)>) -> Result<(), Error> {
-        self.state().write(items)
+    /// The write lock on the tree, if the turn has not answered. Commit sets `answered` before it takes the lock, so a
+    /// write that holds the lock and sees the turn open lands before the commit.
+    async fn writable(&self) -> Result<tokio::sync::RwLockWriteGuard<'_, Tree>, Error> {
+        let open = || (!self.state().answered).then_some(()).ok_or(Error::AccessDenied);
+        open()?;
+        let tree = self.tree.write().await;
+        open()?;
+        Ok(tree)
+    }
+
+    /// Writes, `None` deleting, all or none of them.
+    pub async fn write(&self, items: Vec<(String, Option<Bytes>)>) -> Result<(), Error> {
+        check(&items)?;
+        let mut tree = self.writable().await?;
+        let edits = items.into_iter().map(|(k, v)| (tree_key(&k), v.map(|v| tree.item(v)))).collect();
+        tree.write(edits).await.map_err(fail)
     }
 
     /// Adds `delta` to the counter at `key`, 0 if there is none: 8 bytes, little-endian, as Spin keeps one.
-    pub fn increment(&self, key: &str, delta: i64) -> Result<i64, Error> {
-        let mut s = self.state();
-        let now = match s.writes.get(key) {
-            Some(v) => v.clone(),
-            None => match s.head.values.get(key) {
-                Some(Value::Data(b64)) => Some(B64.decode(b64).map_err(other)?.into()),
-                Some(Value::Object { .. }) => return Err(other("not a counter")),
-                None => None,
-            },
+    pub async fn increment(&self, key: &str, delta: i64) -> Result<i64, Error> {
+        check(&[(key.into(), None)])?;
+        let mut tree = self.writable().await?;
+        let key = tree_key(key);
+        let now = match tree.get(&key).await.map_err(fail)? {
+            None => 0,
+            Some(item) if item.len() == 8 => {
+                let value = tree.value(&item).await.map_err(fail)?;
+                value.as_ref().try_into().map(i64::from_le_bytes).map_err(|_| other("not a counter"))?
+            }
+            Some(_) => return Err(other("not a counter")),
         };
-        let now =
-            now.map_or(Ok(0), |v| v.as_ref().try_into().map(i64::from_le_bytes)).map_err(|_| other("not a counter"))?;
         let next = now.checked_add(delta).ok_or_else(|| other("overflow"))?;
-        s.write(vec![(key.into(), Some(Bytes::copy_from_slice(&next.to_le_bytes())))])?;
+        let item = tree.item(Bytes::copy_from_slice(&next.to_le_bytes()));
+        tree.write(vec![(key, Some(item))]).await.map_err(fail)?;
         Ok(next)
     }
 
-    /// Writes `value` at `key` if it still holds `seen`, and returns whether it did. A key the turn has not written
-    /// holds what it did when the turn opened, which is what `seen` was read from.
-    pub fn swap(&self, key: &str, seen: &Option<Bytes>, value: Bytes) -> Result<bool, Error> {
-        let mut s = self.state();
-        if s.writes.get(key).is_some_and(|w| w != seen) {
+    /// Writes `value` at `key` if it still holds `seen`, and returns whether it did.
+    pub async fn swap(&self, key: &str, seen: &Option<Bytes>, value: Bytes) -> Result<bool, Error> {
+        check(&[(key.into(), Some(value.clone()))])?;
+        let mut tree = self.writable().await?;
+        let key = tree_key(key);
+        let now = match tree.get(&key).await.map_err(fail)? {
+            Some(item) => Some(tree.value(&item).await.map_err(fail)?),
+            None => None,
+        };
+        if now != *seen {
             return Ok(false);
         }
-        s.write(vec![(key.into(), Some(value))])?;
+        let item = tree.item(value);
+        tree.write(vec![(key, Some(item))]).await.map_err(fail)?;
         Ok(true)
     }
 
-    /// Commits the turn, asked at `host`: its large values go to objects of their own, its held requests to `sink` as a
-    /// delivery event whose digest the head keeps in `pending`, and its head over the version it read, if that is still
-    /// the head. The `ETag` it returns is the new head's, or the old one's when there was nothing to write. A commit
-    /// that fails is discarded.
+    /// Deletes `paths`, which no head names, in the background; the response waits for it, in `reaped`.
+    fn reap(&self, paths: Vec<Path>) {
+        if paths.is_empty() {
+            return;
+        }
+        let store = self.store.clone();
+        self.reaping.lock().unwrap().push(tokio::spawn(async move { store.delete_many(paths).await }));
+    }
+
+    /// The deletes the turn has started, to wait for before the response ends: a Lambda that is frozen does not finish
+    /// them.
+    pub fn reaped(&self) -> Vec<JoinHandle<()>> {
+        std::mem::take(&mut *self.reaping.lock().unwrap())
+    }
+
+    /// Commits the turn, asked at `host`: its tree is uploaded, its held requests go to `sink` as a delivery event
+    /// whose digest the head keeps in `pending`, and its head goes over the version it read, if that is still the
+    /// head. The `ETag` it returns is the new head's, or the old one's when there was nothing to write. A commit that
+    /// fails is discarded.
     pub async fn commit(&self, host: &str, sink: &Sink) -> Result<Committed> {
         let committed = self.try_commit(host, sink).await;
         if committed.is_err() {
@@ -453,35 +467,23 @@ impl Turn {
 
     async fn try_commit(&self, host: &str, sink: &Sink) -> Result<Committed> {
         let _one = self.claiming.lock().await; // so a claim in flight lands first
-        let (mut head, base, writes, held, claimed, doomed) = {
+        let (mut head, base, held, claimed, doomed) = {
             let s = &mut *self.state();
             s.answered = true;
-            let (writes, held) = (std::mem::take(&mut s.writes), std::mem::take(&mut s.held));
-            (s.head.clone(), s.base.clone(), writes, held, s.claim.is_some(), s.doomed)
+            let held = std::mem::take(&mut s.held);
+            (s.head.clone(), s.base.clone(), held, s.claim.is_some(), s.doomed)
         };
+        let mut tree = self.tree.write().await; // after the writes that were in flight
         if doomed {
+            self.reap(tree.lost());
             return Ok(Committed::Conflict);
         }
-        if writes.is_empty() && held.is_empty() && !claimed {
+        if !tree.edited() && held.is_empty() && !claimed {
             return Ok(Committed::Done(base.as_ref().and_then(etag)));
         }
-        let (mut made, mut gone) = (vec![], vec![]);
-        let put = async {
-            for (key, w) in writes {
-                let old = match w {
-                    Some(v) if v.len() > INLINE_MAX => {
-                        let k = store::random();
-                        let path = value_path(&self.app, &k);
-                        let version = self.store.put(&path, v, PutMode::Overwrite).await?.and_then(|v| v.version);
-                        made.push(path);
-                        head.values.insert(key, Value::Object { key: k, version })
-                    }
-                    Some(v) => head.values.insert(key, Value::Data(B64.encode(v))),
-                    None => head.values.remove(&key),
-                };
-                if let Some(Value::Object { key: k, .. }) = old {
-                    gone.push(value_path(&self.app, &k));
-                }
+        let ready = async {
+            if tree.edited() {
+                head.tree = tree.finish().await?;
             }
             let now = now();
             head.pending.retain(|_, p| p.live(now));
@@ -501,17 +503,31 @@ impl Turn {
                 ensure!(serde_json::to_vec(&head)?.len() <= HEAD_MAX, TooLarge); // or the event would be sent in vain
                 sink(bytes).await?;
             }
-            put(&self.store, &self.path, &head, base.clone()).await
+            Ok::<(), wasmtime::Error>(())
         };
-        let put = put.await;
-        let cleanup = if let Ok(Some(_)) = put { gone } else { made };
-        let store = self.store.clone();
-        tokio::spawn(async move {
-            for path in cleanup {
-                _ = store.delete(&path).await;
+        if let Err(e) = ready.await {
+            self.reap(tree.lost());
+            return Err(e);
+        }
+        match put(&self.store, &self.path, &head, base).await {
+            Ok(Some(version)) => {
+                self.reap(tree.landed());
+                Ok(Committed::Done(etag(&version)))
             }
-        });
-        Ok(put?.map_or(Committed::Conflict, |version| Committed::Done(etag(&version))))
+            Ok(None) => {
+                self.reap(tree.lost());
+                Ok(Committed::Conflict)
+            }
+            // The head was too large, so it did not go. Else it may have landed, and then it names what the tree made.
+            Err(e) if e.is::<TooLarge>() => {
+                self.reap(tree.lost());
+                Err(e)
+            }
+            Err(e) => {
+                tree.lost();
+                Err(e)
+            }
+        }
     }
 
     /// Discards the turn, and its claim if it took one.
@@ -520,10 +536,10 @@ impl Turn {
         let (mut head, base, claimed) = {
             let s = &mut *self.state();
             s.answered = true; // so the claim timer takes no claim after
-            s.writes.clear();
             s.held.clear();
             (s.head.clone(), s.base.clone(), s.claim.take())
         };
+        self.reap(self.tree.write().await.lost());
         self.settled.send_replace(Some(false));
         if claimed.is_some() {
             head.claim = None;
@@ -550,7 +566,6 @@ pub async fn settle(store: &Store, app: &str, name: &str, commit: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_body_util::{BodyExt, Empty};
 
     #[test]
     fn names() {
@@ -600,15 +615,12 @@ mod tests {
 
     #[tokio::test]
     async fn too_large() {
-        let store = Store::memory();
-        let turn =
-            Turn::open(&store, "a", "n", false, &Default::default(), Instant::now()).await.unwrap().ok().unwrap();
-        let v = Bytes::from(vec![0; INLINE_MAX]);
-        turn.write((0..800).map(|k| (k.to_string(), Some(v.clone()))).collect()).unwrap();
-        let body = Empty::new().map_err(|n| match n {}).boxed_unsync();
-        turn.hold(Held::of(http::Request::new(body)).await.ok().unwrap()).unwrap();
-        let sink: Sink = Arc::new(|_| panic!("an event of a commit that fails is not sent"));
-        assert!(turn.commit("h", &sink).await.err().unwrap().is::<TooLarge>());
+        let (store, mut head) = (Store::memory(), Head::default());
+        for _ in 0..10_000 {
+            head.pending.insert(store::random(), Pending { digest: store::hash(&[]), at: now() });
+        }
+        let put = put(&store, &path("a", "n"), &head, None).await;
+        assert!(put.err().unwrap().is::<TooLarge>());
         assert!(read(&store, &path("a", "n")).await.unwrap().is_none());
     }
 }

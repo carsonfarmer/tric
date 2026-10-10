@@ -1,0 +1,1528 @@
+//! A name's data: one copy-on-write B+tree of keys and values, as LMDB and bbolt keep theirs. The root is in the name's
+//! head; every other node, and every value too large to sit in a node, is an immutable object under
+//! `apps/<app>/values/<name>/`, which its parent names by a [`Link`]: the object's id, its S3 version, its SHA-256 and
+//! its length. A read follows links and checks each object against its link, so a changed object is an error, not data.
+//!
+//! A turn edits the tree directly. A node it touches becomes a copy in memory, and the rest stay links. When the
+//! copies, and the large values held for upload, pass their budget, they are uploaded and become links again, as LMDB
+//! spills dirty pages. The commit uploads what is left, bottom-up, and its caller swaps in the head that names the new
+//! root. A node left under a quarter full merges with a neighbour, and a root with one child gives way to it, as in
+//! bbolt.
+//!
+//! Every object the turn uploads is `made`, and every object its edits replace is `dead`. A commit that lands deletes
+//! the dead, and one that does not deletes what was made, so nothing leaks but what a crash leaves behind.
+use crate::store::{self, Store};
+use base64::{Engine as _, prelude::BASE64_STANDARD as B64};
+use bytes::Bytes;
+use futures_util::future::{BoxFuture, try_join_all};
+use object_store::{PutMode, path::Path};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, LazyLock, Mutex};
+use tokio::sync::Semaphore;
+use wasmtime::{Result, bail, ensure, error::Context};
+
+/// The most a node is as JSON.
+pub const NODE_MAX: usize = 64 << 10;
+/// The most a value is, to sit in its node. A larger one is an object of its own.
+pub const INLINE_MAX: usize = 4 << 10;
+/// The most a turn holds in memory that is not yet uploaded: nodes it changed, and values it has not uploaded.
+pub const BUDGET: usize = 8 << 20;
+/// The most keys a name holds.
+pub const ENTRIES_MAX: u64 = 4 << 20;
+/// The most bytes of values a name holds.
+pub const DATA_MAX: u64 = 16 << 30;
+/// The most a value that is an object of its own is.
+pub const BLOB_MAX: u64 = 1 << 20;
+/// The most of the nodes read, as a process keeps them for the next request, in bytes of JSON.
+const CACHE_MAX: usize = 16 << 20;
+/// How many uploads a turn has in flight.
+const PUTS: usize = 16;
+/// The longest S3 version id a link may hold: S3 and RustFS give 32 and 36 characters.
+const VERSION_MAX: usize = 64;
+/// What a link is as JSON, at most, when its version id is not yet known.
+const LINK_SIZE: usize = 144 + VERSION_MAX;
+/// What a node is as JSON beyond its entries.
+const OVERHEAD: usize = 16;
+
+/// What bounds a name's tree. The tests use tiny ones, so that a few keys make a deep tree.
+#[derive(Clone, Copy)]
+pub struct Limits {
+    /// The most a node is as JSON.
+    pub node: usize,
+    /// The most a value is, to sit in its node.
+    pub inline: usize,
+    /// The most a turn holds in memory that is not yet uploaded.
+    pub budget: usize,
+    /// The most keys.
+    pub entries: u64,
+    /// The most bytes of values.
+    pub data: u64,
+    /// The most a value that is an object of its own is.
+    pub blob: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            node: NODE_MAX,
+            inline: INLINE_MAX,
+            budget: BUDGET,
+            entries: ENTRIES_MAX,
+            data: DATA_MAX,
+            blob: BLOB_MAX,
+        }
+    }
+}
+
+/// Why a write was refused: the name would hold more than its limits allow. The guest is told, as it can act on it.
+#[derive(Debug)]
+pub struct Full(String);
+
+impl fmt::Display for Full {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// An object in the tree: where it is, which of its versions, and what it must hold.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Link {
+    id: String, // 128 random bits, in hex
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    v: Option<String>, // the S3 version
+    h: String,  // the SHA-256, in hex
+    n: u64,     // the length
+}
+
+impl Link {
+    /// Whether the link is well-formed, so that the path it leads to is under the name's own and nowhere else.
+    fn check(&self) -> Result<()> {
+        let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        let plain =
+            |v: &str| v.len() <= VERSION_MAX && v.bytes().all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\');
+        ensure!(hex(&self.id, 32) && hex(&self.h, 64) && self.v.as_deref().is_none_or(plain), "a link is malformed");
+        Ok(())
+    }
+
+    /// What the link is as JSON, at most.
+    fn wire(&self) -> usize {
+        48 + self.id.len() + self.v.as_ref().map_or(0, String::len) + self.h.len()
+    }
+}
+
+/// What a key holds.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase", deny_unknown_fields)]
+pub enum Item {
+    /// A value of `INLINE_MAX` bytes or less, in base64.
+    Inline(String),
+    /// A larger value, which is an object.
+    Object(Link),
+    /// A larger value that is not yet uploaded. It is only ever in memory, and counts against the budget.
+    #[serde(skip)]
+    Held(Bytes),
+}
+
+impl Item {
+    fn of(bytes: Bytes, inline: usize) -> Self {
+        match bytes.len() <= inline {
+            true => Self::Inline(B64.encode(&bytes)),
+            false => Self::Held(bytes),
+        }
+    }
+
+    /// The length of the value.
+    pub fn len(&self) -> u64 {
+        match self {
+            Self::Inline(s) => {
+                (s.len() / 4 * 3).saturating_sub(s.bytes().rev().take_while(|b| *b == b'=').count()) as u64
+            }
+            Self::Object(link) => link.n,
+            Self::Held(bytes) => bytes.len() as u64,
+        }
+    }
+
+    /// What the item is as JSON, at most.
+    fn wire(&self) -> usize {
+        match self {
+            Self::Inline(s) => s.len() + 14,
+            Self::Object(link) => link.wire() + 12,
+            Self::Held(_) => LINK_SIZE + 12, // what it will be, once it is uploaded
+        }
+    }
+
+    /// The bytes it holds in memory, for the budget.
+    fn held(&self) -> usize {
+        match self {
+            Self::Held(bytes) => bytes.len(),
+            _ => 0,
+        }
+    }
+}
+
+/// A node as the object, and the head's root, hold it.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase", deny_unknown_fields)]
+enum Wire {
+    Leaf(Vec<(String, Item)>),
+    /// Each child under the least key it may hold, which the first child's is not held to.
+    Branch(Vec<(String, Link)>),
+}
+
+impl Default for Wire {
+    fn default() -> Self {
+        Self::Leaf(vec![])
+    }
+}
+
+impl Wire {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Leaf(es) => es.is_empty(),
+            Self::Branch(ks) => ks.is_empty(),
+        }
+    }
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// A tree as a head holds it: the root, and the totals the limits are held to.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Shape {
+    #[serde(default, skip_serializing_if = "Wire::is_empty")]
+    root: Wire,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    bytes: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    entries: u64,
+}
+
+impl Shape {
+    pub fn is_empty(&self) -> bool {
+        self.root.is_empty() && self.bytes == 0 && self.entries == 0
+    }
+}
+
+/// A node in memory. `size` is its JSON, at most, and `held` the bytes of values in it not yet uploaded.
+#[derive(Clone)]
+struct Node {
+    body: Body,
+    size: usize,
+    held: usize,
+}
+
+#[derive(Clone)]
+enum Body {
+    Leaf(Vec<(String, Item)>),
+    Branch(Vec<Child>),
+}
+
+#[derive(Clone)]
+struct Child {
+    key: String,
+    at: At,
+}
+
+#[derive(Clone)]
+enum At {
+    Clean(Link),
+    Dirty(Box<Node>),
+}
+
+/// What `s` is as a JSON string.
+fn json_len(s: &str) -> usize {
+    let one = |c: char| match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if c < ' ' => 6,
+        c => c.len_utf8(),
+    };
+    2 + s.chars().map(one).sum::<usize>()
+}
+
+fn entry(key: &str, item: &Item) -> usize {
+    json_len(key) + item.wire() + 4
+}
+
+fn child(kid: &Child) -> usize {
+    json_len(&kid.key) + 4 + if let At::Clean(link) = &kid.at { link.wire() } else { LINK_SIZE }
+}
+
+/// Where to cut `len` entries of the sizes `sizes`, `total` as a node, so that each side has about half.
+fn cut(sizes: impl Iterator<Item = usize>, total: usize, len: usize) -> usize {
+    let mut seen = OVERHEAD;
+    for (i, size) in sizes.enumerate() {
+        seen += size;
+        if seen >= total / 2 {
+            return (i + 1).clamp(1, len - 1);
+        }
+    }
+    len - 1
+}
+
+/// The child of `kids` that may hold `key`. The first child's key is not looked at, as keys below the second's are the
+/// first's, and it can be more than keys that were added to it since.
+fn slot(kids: &[Child], key: &str) -> usize {
+    kids[1..].partition_point(|c| c.key.as_str() <= key)
+}
+
+impl Node {
+    fn leaf() -> Self {
+        Self { body: Body::Leaf(vec![]), size: OVERHEAD, held: 0 }
+    }
+
+    fn measured(body: Body) -> Self {
+        let mut node = Self { body, size: 0, held: 0 };
+        node.measure();
+        node
+    }
+
+    fn of(wire: Wire) -> Result<Self> {
+        Ok(Self::measured(match wire {
+            Wire::Leaf(es) => Body::Leaf(es),
+            Wire::Branch(ks) => {
+                ensure!(!ks.is_empty(), "a branch has no children");
+                Body::Branch(ks.into_iter().map(|(key, link)| Child { key, at: At::Clean(link) }).collect())
+            }
+        }))
+    }
+
+    /// The node as the head holds it, once all its children are links.
+    fn wire(&self) -> Result<Wire> {
+        Ok(match &self.body {
+            Body::Leaf(es) => Wire::Leaf(es.clone()),
+            Body::Branch(kids) => Wire::Branch(
+                kids.iter()
+                    .map(|k| match &k.at {
+                        At::Clean(link) => Ok((k.key.clone(), link.clone())),
+                        At::Dirty(_) => bail!("a node still has a child in memory"),
+                    })
+                    .collect::<Result<_>>()?,
+            ),
+        })
+    }
+
+    /// The node as the object holds it, once all its children are links.
+    fn json(&self) -> Result<Vec<u8>> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "lowercase")]
+        enum Ref<'a> {
+            Leaf(&'a [(String, Item)]),
+            Branch(Vec<(&'a str, &'a Link)>),
+        }
+        let wire = match &self.body {
+            Body::Leaf(es) => Ref::Leaf(es),
+            Body::Branch(kids) => Ref::Branch(
+                kids.iter()
+                    .map(|k| match &k.at {
+                        At::Clean(link) => Ok((k.key.as_str(), link)),
+                        At::Dirty(_) => bail!("a node still has a child in memory"),
+                    })
+                    .collect::<Result<_>>()?,
+            ),
+        };
+        Ok(serde_json::to_vec(&wire)?)
+    }
+
+    fn measure(&mut self) {
+        (self.size, self.held) = match &self.body {
+            Body::Leaf(es) => {
+                (OVERHEAD + es.iter().map(|(k, i)| entry(k, i)).sum::<usize>(), es.iter().map(|(_, i)| i.held()).sum())
+            }
+            Body::Branch(kids) => (OVERHEAD + kids.iter().map(child).sum::<usize>(), 0),
+        };
+    }
+
+    fn is_empty(&self) -> bool {
+        match &self.body {
+            Body::Leaf(es) => es.is_empty(),
+            Body::Branch(kids) => kids.is_empty(),
+        }
+    }
+
+    fn first_key(&self) -> &str {
+        match &self.body {
+            Body::Leaf(es) => es.first().map_or("", |e| e.0.as_str()),
+            Body::Branch(kids) => kids.first().map_or("", |k| k.key.as_str()),
+        }
+    }
+
+    /// What the node and all it has in memory hold in memory.
+    fn dirty(&self) -> usize {
+        let below = match &self.body {
+            Body::Leaf(_) => 0,
+            Body::Branch(kids) => {
+                kids.iter().filter_map(|k| if let At::Dirty(n) = &k.at { Some(n.dirty()) } else { None }).sum()
+            }
+        };
+        self.size + self.held + below
+    }
+
+    /// Cuts off the second half of the node, which is over its size.
+    fn split_off(&mut self) -> Result<Self> {
+        let body = match &mut self.body {
+            Body::Leaf(es) if es.len() > 1 => {
+                Body::Leaf(es.split_off(cut(es.iter().map(|(k, i)| entry(k, i)), self.size, es.len())))
+            }
+            Body::Branch(kids) if kids.len() > 1 => {
+                Body::Branch(kids.split_off(cut(kids.iter().map(child), self.size, kids.len())))
+            }
+            _ => bail!("a node of one entry is over its size"),
+        };
+        self.measure();
+        Ok(Self::measured(body))
+    }
+
+    /// Adds the entries of `right`, the node next to this one on its right.
+    fn append(&mut self, right: Self) -> Result<()> {
+        match (&mut self.body, right.body) {
+            (Body::Leaf(a), Body::Leaf(b)) => a.extend(b),
+            (Body::Branch(a), Body::Branch(b)) => a.extend(b),
+            _ => bail!("the tree is not as deep on one side"),
+        }
+        self.measure();
+        Ok(())
+    }
+}
+
+/// The nodes read, for the next request in the same process. They are immutable, and named by the object's full path
+/// and version, which hold the app, the name and an id nobody else gets, so a hit is the node a read would fetch.
+#[derive(Default)]
+pub struct Cache(Mutex<Lru>);
+
+type CacheKey = (Path, Option<String>);
+
+#[derive(Default)]
+struct Lru {
+    nodes: HashMap<CacheKey, (Arc<Node>, u64)>,
+    bytes: usize,
+    tick: u64,
+}
+
+impl Cache {
+    /// The cache a process shares among its stores of S3.
+    pub fn shared() -> Arc<Self> {
+        static SHARED: LazyLock<Arc<Cache>> = LazyLock::new(Default::default);
+        SHARED.clone()
+    }
+
+    fn get(&self, key: &CacheKey) -> Option<Arc<Node>> {
+        let lru = &mut *self.0.lock().unwrap();
+        lru.tick += 1;
+        let (node, used) = lru.nodes.get_mut(key)?;
+        *used = lru.tick;
+        Some(node.clone())
+    }
+
+    fn put(&self, key: CacheKey, node: Arc<Node>) {
+        let lru = &mut *self.0.lock().unwrap();
+        lru.tick += 1;
+        lru.bytes += node.size;
+        if let Some((old, _)) = lru.nodes.insert(key, (node, lru.tick)) {
+            lru.bytes -= old.size;
+        }
+        if lru.bytes > CACHE_MAX {
+            let mut by_use: Vec<_> = lru.nodes.iter().map(|(k, (_, used))| (*used, k.clone())).collect();
+            by_use.sort();
+            for (_, key) in by_use {
+                if lru.bytes <= CACHE_MAX / 8 * 7 {
+                    break;
+                }
+                if let Some((node, _)) = lru.nodes.remove(&key) {
+                    lru.bytes -= node.size;
+                }
+            }
+        }
+    }
+}
+
+/// What a turn did with the bucket, for the debug log.
+#[derive(Default)]
+struct Stats {
+    gets: AtomicU64,
+    hits: AtomicU64,
+    read: AtomicU64,
+    puts: AtomicU64,
+    written: AtomicU64,
+    depth: AtomicUsize,
+}
+
+/// Where a name's objects are, and how to read them.
+struct Reader {
+    store: Store,
+    app: String,
+    name: String,
+    limits: Limits,
+    stats: Stats,
+}
+
+impl Reader {
+    fn path(&self, id: &str) -> Path {
+        store::app(&self.app, &["values", &self.name, id])
+    }
+
+    fn key(&self, link: &Link) -> CacheKey {
+        (self.path(&link.id), link.v.clone())
+    }
+
+    /// The object `link` names, which must be `max` bytes or less, and be what the link says.
+    async fn fetch(&self, link: &Link, max: u64) -> Result<Bytes> {
+        link.check()?;
+        ensure!(link.n <= max, "an object is over {max} bytes");
+        let path = self.path(&link.id);
+        let got = self.store.get(&path, link.v.clone(), max).await?;
+        let (bytes, _) = got.with_context(|| format!("{path} is missing"))?;
+        self.stats.gets.fetch_add(1, Relaxed);
+        self.stats.read.fetch_add(bytes.len() as u64, Relaxed);
+        ensure!(bytes.len() as u64 == link.n && store::hash(&bytes) == link.h, "{path} is not what its link says");
+        Ok(bytes)
+    }
+
+    async fn node(&self, link: &Link) -> Result<Arc<Node>> {
+        link.check()?;
+        let key = self.key(link);
+        if let Some(node) = self.store.cache.get(&key) {
+            self.stats.hits.fetch_add(1, Relaxed);
+            return Ok(node);
+        }
+        let bytes = self.fetch(link, self.limits.node as u64).await?;
+        let wire = serde_json::from_slice(&bytes).with_context(|| format!("{}", key.0))?;
+        let node = Arc::new(Node::of(wire)?);
+        self.store.cache.put(key, node.clone());
+        Ok(node)
+    }
+}
+
+/// The value at `key`, below `node`.
+fn find<'a>(r: &'a Reader, node: &'a Node, key: &'a str, depth: usize) -> BoxFuture<'a, Result<Option<Item>>> {
+    Box::pin(async move {
+        r.stats.depth.fetch_max(depth, Relaxed);
+        match &node.body {
+            Body::Leaf(es) => Ok(es.binary_search_by(|(k, _)| k.as_str().cmp(key)).ok().map(|i| es[i].1.clone())),
+            Body::Branch(kids) => match &kids[slot(kids, key)].at {
+                At::Dirty(below) => find(r, below, key, depth + 1).await,
+                At::Clean(link) => find(r, &*r.node(link).await?, key, depth + 1).await,
+            },
+        }
+    })
+}
+
+/// Adds to `out` the keys below `node` that start with `prefix`, and follow `after` if there is one, up to `limit`.
+fn walk<'a>(
+    r: &'a Reader,
+    node: &'a Node,
+    (prefix, after, limit): (&'a str, Option<&'a str>, usize),
+    out: &'a mut Vec<String>,
+    depth: usize,
+) -> BoxFuture<'a, Result<()>> {
+    Box::pin(async move {
+        r.stats.depth.fetch_max(depth, Relaxed);
+        match &node.body {
+            Body::Leaf(es) => {
+                let before = |k: &str| k < prefix || after.is_some_and(|a| k <= a);
+                for (k, _) in &es[es.partition_point(|(k, _)| before(k))..] {
+                    if out.len() >= limit || !k.starts_with(prefix) {
+                        break;
+                    }
+                    out.push(k.clone());
+                }
+            }
+            Body::Branch(kids) => {
+                let first = slot(kids, after.map_or(prefix, |a| a.max(prefix)));
+                for (i, kid) in kids.iter().enumerate().skip(first) {
+                    // The least key of a child, but the first, is a bound: past the prefix, so is all after.
+                    let past = i > first && kid.key.as_str() > prefix && !kid.key.starts_with(prefix);
+                    if out.len() >= limit || past {
+                        break;
+                    }
+                    match &kid.at {
+                        At::Dirty(below) => walk(r, below, (prefix, after, limit), &mut *out, depth + 1).await?,
+                        At::Clean(link) => {
+                            walk(r, &*r.node(link).await?, (prefix, after, limit), &mut *out, depth + 1).await?
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// What editing a tree changes besides its nodes.
+#[derive(Default)]
+struct Work {
+    bytes: u64,
+    entries: u64,
+    /// The objects the edits have replaced or dropped, to delete once the commit lands.
+    dead: Vec<Path>,
+    splits: u32,
+    merges: u32,
+    collapses: u32,
+}
+
+impl Work {
+    /// The node `at` leads to, in memory and ready to change: a link is loaded, and the object it names is dead.
+    async fn dirty<'a>(&mut self, r: &Reader, at: &'a mut At) -> Result<&'a mut Node> {
+        if let At::Clean(link) = at {
+            let loaded = r.node(link).await?;
+            self.dead.push(r.path(&link.id));
+            *at = At::Dirty(Box::new((*loaded).clone()));
+        }
+        match at {
+            At::Dirty(node) => Ok(node),
+            At::Clean(_) => bail!("a node was not loaded"),
+        }
+    }
+
+    /// Sets `key` to `item` below `node`, or removes it if `item` is none. A node that grows past its size is split,
+    /// and its second half, with the least key of it, is for the parent to take.
+    fn edit<'a>(
+        &'a mut self,
+        r: &'a Reader,
+        node: &'a mut Node,
+        key: &'a str,
+        item: Option<Item>,
+        depth: usize,
+    ) -> BoxFuture<'a, Result<Option<(String, Node)>>> {
+        Box::pin(async move {
+            r.stats.depth.fetch_max(depth, Relaxed);
+            match &mut node.body {
+                Body::Leaf(es) => match (es.binary_search_by(|(k, _)| k.as_str().cmp(key)), item) {
+                    (Ok(i), Some(new)) => {
+                        node.size = node.size + new.wire() - es[i].1.wire();
+                        node.held = node.held + new.held() - es[i].1.held();
+                        self.bytes = self.bytes + new.len() - es[i].1.len();
+                        let old = std::mem::replace(&mut es[i].1, new);
+                        self.gone(r, old);
+                    }
+                    (Err(i), Some(new)) => {
+                        node.size += entry(key, &new);
+                        node.held += new.held();
+                        self.bytes += new.len();
+                        self.entries += 1;
+                        es.insert(i, (key.to_owned(), new));
+                    }
+                    (Ok(i), None) => {
+                        let (k, old) = es.remove(i);
+                        node.size -= entry(&k, &old);
+                        node.held -= old.held();
+                        self.bytes -= old.len();
+                        self.entries -= 1;
+                        self.gone(r, old);
+                    }
+                    (Err(_), None) => {}
+                },
+                Body::Branch(kids) => {
+                    let i = slot(kids, key);
+                    let link = if let At::Clean(link) = &kids[i].at { Some(link.wire()) } else { None };
+                    let below = self.dirty(r, &mut kids[i].at).await?;
+                    node.size = node.size + link.map_or(0, |_| LINK_SIZE) - link.unwrap_or(0);
+                    if let Some((least, right)) = self.edit(r, below, key, item, depth + 1).await? {
+                        node.size += json_len(&least) + LINK_SIZE + 4;
+                        kids.insert(i + 1, Child { key: least, at: At::Dirty(Box::new(right)) });
+                    }
+                }
+            }
+            if node.size <= r.limits.node {
+                return Ok(None);
+            }
+            self.splits += 1;
+            let right = node.split_off()?;
+            Ok(Some((right.first_key().to_owned(), right)))
+        })
+    }
+
+    /// Notes that `item` is gone from the tree.
+    fn gone(&mut self, r: &Reader, item: Item) {
+        if let Item::Object(link) = item {
+            self.dead.push(r.path(&link.id));
+        }
+    }
+
+    /// Merges what is under a quarter full below `node`, as bbolt does: a child with a neighbour, and with the sides
+    /// shared out again if they do not fit in one. A child that is empty is dropped.
+    fn fix<'a>(&'a mut self, r: &'a Reader, node: &'a mut Node) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let Body::Branch(kids) = &mut node.body else { return Ok(()) };
+            for kid in kids.iter_mut() {
+                if let At::Dirty(below) = &mut kid.at {
+                    self.fix(r, below).await?;
+                }
+            }
+            kids.retain(|k| !matches!(&k.at, At::Dirty(n) if n.is_empty()));
+            let (thin, mut i) = (r.limits.node / 4, 0);
+            while i < kids.len() {
+                if kids.len() < 2 || !matches!(&kids[i].at, At::Dirty(n) if n.size < thin) {
+                    i += 1;
+                    continue;
+                }
+                let (a, b) = if i > 0 { (i - 1, i) } else { (0, 1) };
+                self.dirty(r, &mut kids[a].at).await?;
+                self.dirty(r, &mut kids[b].at).await?;
+                let least = kids[b].key.clone();
+                let At::Dirty(mut right) = kids.remove(b).at else { bail!("a node was not loaded") };
+                if let Body::Branch(firsts) = &mut right.body {
+                    firsts[0].key = least; // the first child's key is a bound now, as it was the parent's
+                }
+                let At::Dirty(left) = &mut kids[a].at else { bail!("a node was not loaded") };
+                left.append(*right)?;
+                self.merges += 1;
+                i = a;
+                if left.size > r.limits.node {
+                    let right = left.split_off()?;
+                    kids.insert(a + 1, Child { key: right.first_key().to_owned(), at: At::Dirty(Box::new(right)) });
+                    i = a + 2;
+                }
+            }
+            node.measure();
+            Ok(())
+        })
+    }
+}
+
+/// An upload of what the turn holds, and of the nodes it changed.
+struct Flush<'a> {
+    reader: &'a Reader,
+    made: &'a Mutex<Vec<Path>>,
+    permits: Semaphore,
+    nodes: bool, // the nodes too, and not only the values
+}
+
+impl Flush<'_> {
+    /// Uploads a value, and returns the link.
+    async fn upload(&self, bytes: Bytes) -> Result<Link> {
+        let id = store::random();
+        let path = self.reader.path(&id);
+        self.made.lock().unwrap().push(path.clone()); // before the upload, as a failed one may have landed
+        let h = store::hash(&bytes);
+        let _permit = self.permits.acquire().await?;
+        let v = self.reader.store.put(&path, bytes.clone(), PutMode::Overwrite).await?.and_then(|v| v.version);
+        self.reader.stats.puts.fetch_add(1, Relaxed);
+        self.reader.stats.written.fetch_add(bytes.len() as u64, Relaxed);
+        let link = Link { id, v, h, n: bytes.len() as u64 };
+        link.check()?;
+        Ok(link)
+    }
+
+    /// Uploads the values held in `node`, and, if `nodes`, the nodes below it that are in memory, so each is a link.
+    /// Those left empty are dropped. The node itself is for the caller to upload.
+    fn node<'a>(&'a self, node: &'a mut Node) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            match &mut node.body {
+                Body::Leaf(es) => {
+                    let held = es.iter_mut().filter(|(_, i)| matches!(i, Item::Held(_)));
+                    try_join_all(held.map(|(_, item)| async move {
+                        let Item::Held(bytes) = &*item else { return Ok::<_, wasmtime::Error>(()) };
+                        let link = self.upload(bytes.clone()).await?;
+                        *item = Item::Object(link);
+                        Ok(())
+                    }))
+                    .await?;
+                }
+                Body::Branch(kids) => {
+                    try_join_all(kids.iter_mut().map(|kid| self.child(kid))).await?;
+                    if self.nodes {
+                        kids.retain(|k| !matches!(&k.at, At::Dirty(n) if n.is_empty()));
+                    }
+                }
+            }
+            node.measure();
+            Ok(())
+        })
+    }
+
+    async fn child(&self, kid: &mut Child) -> Result<()> {
+        let At::Dirty(node) = &mut kid.at else { return Ok(()) };
+        self.node(node).await?;
+        if !self.nodes || node.is_empty() {
+            return Ok(());
+        }
+        let json = node.json()?;
+        ensure!(json.len() <= self.reader.limits.node, "a node is over {} bytes", self.reader.limits.node);
+        let link = self.upload(json.into()).await?;
+        let key = self.reader.key(&link);
+        let At::Dirty(node) = std::mem::replace(&mut kid.at, At::Clean(link)) else { bail!("a node was not loaded") };
+        self.reader.store.cache.put(key, Arc::new(*node)); // what the next request will read
+        Ok(())
+    }
+}
+
+/// A name's tree, as one turn edits it.
+pub struct Tree {
+    reader: Arc<Reader>,
+    base: (Node, u64, u64), // as opened: the root, and the bytes and entries
+    root: Node,
+    work: Work,
+    /// Every object uploaded since the tree was opened or reset.
+    made: Mutex<Vec<Path>>,
+    poisoned: bool, // an edit failed half way, so the tree cannot be committed
+    edited: bool,
+    sealed: bool, // the tree was finished, so what was made may be in a head by now
+}
+
+impl Tree {
+    pub fn open(store: &Store, app: &str, name: &str, shape: &Shape, limits: Limits) -> Result<Self> {
+        let reader =
+            Reader { store: store.clone(), app: app.into(), name: name.into(), limits, stats: Stats::default() };
+        let root = Node::of(shape.root.clone())?;
+        let work = Work { bytes: shape.bytes, entries: shape.entries, ..Default::default() };
+        let base = (root.clone(), shape.bytes, shape.entries);
+        Ok(Self {
+            reader: reader.into(),
+            base,
+            root,
+            work,
+            made: Default::default(),
+            poisoned: false,
+            edited: false,
+            sealed: false,
+        })
+    }
+
+    /// The item at `key`.
+    pub async fn get(&self, key: &str) -> Result<Option<Item>> {
+        find(&self.reader, &self.root, key, 1).await
+    }
+
+    /// The value `item` holds.
+    pub async fn value(&self, item: &Item) -> Result<Bytes> {
+        match item {
+            Item::Inline(s) => Ok(B64.decode(s)?.into()),
+            Item::Object(link) => self.reader.fetch(link, self.reader.limits.blob).await,
+            Item::Held(bytes) => Ok(bytes.clone()),
+        }
+    }
+
+    /// `bytes` as an item: inline if it is small.
+    pub fn item(&self, bytes: Bytes) -> Item {
+        Item::of(bytes, self.reader.limits.inline)
+    }
+
+    /// The first `limit` keys that start with `prefix` and follow `after`, if given.
+    pub async fn scan(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Vec<String>> {
+        let mut keys = vec![];
+        walk(&self.reader, &self.root, (prefix, after, limit), &mut keys, 1).await?;
+        Ok(keys)
+    }
+
+    /// Whether the tree was changed.
+    pub fn edited(&self) -> bool {
+        self.edited
+    }
+
+    /// Sets and removes keys, all or none: a batch over the limits is refused with [`Full`], and changes nothing. One
+    /// that fails otherwise leaves a tree that cannot be committed.
+    pub async fn write(&mut self, edits: Vec<(String, Option<Item>)>) -> Result<()> {
+        ensure!(!self.poisoned, "an earlier change to the name failed");
+        let limits = self.reader.limits;
+        let (adds, size) = edits.iter().filter_map(|(_, i)| i.as_ref()).fold((0, 0), |(n, b), i| (n + 1, b + i.len()));
+        if self.work.entries + adds > limits.entries || self.work.bytes + size > limits.data {
+            // Possibly over: count again, as the batch replaces and removes too.
+            let (mut entries, mut bytes) = (self.work.entries as i64, self.work.bytes as i64);
+            let mut seen: HashMap<&str, Option<u64>> = HashMap::new();
+            for (key, item) in &edits {
+                let was = match seen.get(key.as_str()) {
+                    Some(was) => *was,
+                    None => self.get(key).await?.map(|i| i.len()),
+                };
+                let now = item.as_ref().map(Item::len);
+                entries += i64::from(now.is_some()) - i64::from(was.is_some());
+                bytes += now.unwrap_or(0) as i64 - was.unwrap_or(0) as i64;
+                seen.insert(key, now);
+            }
+            ensure!(entries <= limits.entries as i64, Full(format!("a name holds {} keys or fewer", limits.entries)));
+            ensure!(bytes <= limits.data as i64, Full(format!("a name holds {} bytes or fewer", limits.data)));
+        }
+        let applied = self.apply(edits).await;
+        self.poisoned = applied.is_err();
+        applied
+    }
+
+    async fn apply(&mut self, edits: Vec<(String, Option<Item>)>) -> Result<()> {
+        for (key, item) in edits {
+            if item.is_none() && self.get(&key).await?.is_none() {
+                continue; // nothing to remove, so nothing to copy
+            }
+            self.edited = true;
+            if let Some((least, right)) = self.work.edit(&self.reader, &mut self.root, &key, item, 1).await? {
+                let left = std::mem::replace(&mut self.root, Node::leaf());
+                let first = Child { key: left.first_key().to_owned(), at: At::Dirty(Box::new(left)) };
+                let second = Child { key: least, at: At::Dirty(Box::new(right)) };
+                self.root = Node::measured(Body::Branch(vec![first, second]));
+            }
+        }
+        let limit = self.reader.limits.budget;
+        if self.root.dirty() > limit {
+            self.flush(false).await?; // the values first, which are the most
+            if self.root.dirty() > limit {
+                self.flush(true).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self, nodes: bool) -> Result<()> {
+        let flush = Flush { reader: &self.reader, made: &self.made, permits: Semaphore::new(PUTS), nodes };
+        flush.node(&mut self.root).await?;
+        if matches!(&self.root.body, Body::Branch(kids) if kids.is_empty()) {
+            self.root = Node::leaf();
+        }
+        Ok(())
+    }
+
+    /// Readies the tree for a head: merges what is thin, uploads what is changed, and returns the shape of it. The head
+    /// must land before `landed`, or `lost` follows.
+    pub async fn finish(&mut self) -> Result<Shape> {
+        ensure!(!self.poisoned, "an earlier change to the name failed");
+        let finished = self.seal().await;
+        self.poisoned = finished.is_err();
+        finished
+    }
+
+    async fn seal(&mut self) -> Result<Shape> {
+        let r = &*self.reader;
+        self.work.fix(r, &mut self.root).await?;
+        while let Body::Branch(kids) = &mut self.root.body {
+            match kids.len() {
+                0 => self.root = Node::leaf(),
+                1 => {
+                    let Some(Child { mut at, .. }) = kids.pop() else { break };
+                    let only = self.work.dirty(r, &mut at).await?;
+                    self.root = std::mem::replace(only, Node::leaf());
+                    self.work.collapses += 1;
+                }
+                _ => break,
+            }
+        }
+        let flush = Flush { reader: r, made: &self.made, permits: Semaphore::new(PUTS), nodes: true };
+        flush.node(&mut self.root).await?;
+        self.sealed = true;
+        ensure!(self.root.size <= r.limits.node, "the root is over {} bytes", r.limits.node);
+        Ok(Shape { root: self.root.wire()?, bytes: self.work.bytes, entries: self.work.entries })
+    }
+
+    /// The head landed: what the tree replaced is no more, and the tree is as it was committed. Returns the objects to
+    /// delete.
+    pub fn landed(&mut self) -> Vec<Path> {
+        self.made.get_mut().unwrap().clear();
+        std::mem::take(&mut self.work.dead)
+    }
+
+    /// The head did not land, or the turn is discarded: the tree is as it was opened. Returns the objects to delete.
+    pub fn lost(&mut self) -> Vec<Path> {
+        let (root, bytes, entries) = self.base.clone();
+        self.root = root;
+        self.work = Work { bytes, entries, ..Default::default() };
+        (self.poisoned, self.edited, self.sealed) = (false, false, false);
+        std::mem::take(self.made.get_mut().unwrap())
+    }
+
+    /// How often the tree split, merged and gave up a level of its root.
+    #[cfg(test)]
+    fn rebalanced(&self) -> (u32, u32, u32) {
+        (self.work.splits, self.work.merges, self.work.collapses)
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        let (r, w) = (&self.reader, &self.work);
+        let s = &r.stats;
+        let (gets, hits, puts) = (s.gets.load(Relaxed), s.hits.load(Relaxed), s.puts.load(Relaxed));
+        if gets + hits + puts > 0 {
+            let (read, written, depth) = (s.read.load(Relaxed), s.written.load(Relaxed), s.depth.load(Relaxed));
+            let (splits, merges, collapses) = (w.splits, w.merges, w.collapses);
+            tracing::debug!(
+                app = r.app,
+                name = r.name,
+                gets,
+                hits,
+                puts,
+                read,
+                written,
+                depth,
+                splits,
+                merges,
+                collapses,
+                "tree"
+            );
+        }
+        // What a turn that went away made is no one's, unless it was committing, when it may be the head's.
+        let made = std::mem::take(self.made.get_mut().unwrap());
+        if let (false, false, Ok(runtime)) = (self.sealed, made.is_empty(), tokio::runtime::Handle::try_current()) {
+            let store = r.store.clone();
+            runtime.spawn(async move { store.delete_many(made).await });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::stream::BoxStream;
+    use futures_util::{StreamExt, TryStreamExt};
+    use object_store::memory::InMemory;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::Ordering::SeqCst;
+
+    /// Limits that make a few keys a deep tree: a branch holds a few nodes, and a leaf as many values that are objects.
+    fn tiny() -> Limits {
+        Limits { node: 1400, inline: 8, budget: 2048, entries: 1000, data: 100_000, blob: 100 }
+    }
+
+    fn versioned() -> Store {
+        Store { versioned: true, ..Store::memory() }
+    }
+
+    /// The same sequence from a seed, as a test needs.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+
+        /// A value: mostly one that stays in its node, and else one that is an object.
+        fn value(&mut self) -> Vec<u8> {
+            let n = if self.below(10) < 6 { self.below(9) } else { 9 + self.below(92) };
+            (0..n).map(|_| self.below(256) as u8).collect()
+        }
+    }
+
+    fn at(store: &Store, shape: &Shape) -> Tree {
+        Tree::open(store, "a", "n", shape, tiny()).unwrap()
+    }
+
+    async fn set(tree: &mut Tree, key: &str, value: &[u8]) {
+        let item = tree.item(Bytes::copy_from_slice(value));
+        tree.write(vec![(key.into(), Some(item))]).await.unwrap();
+    }
+
+    /// Commits `tree`, as a turn does: the new shape, and the objects it replaced deleted.
+    async fn commit(store: &Store, tree: &mut Tree) -> Shape {
+        let shape = tree.finish().await.unwrap();
+        store.delete_many(tree.landed()).await;
+        shape
+    }
+
+    /// What a tree holds, and that it is a well-formed one.
+    #[derive(Default)]
+    struct Audit {
+        items: BTreeMap<String, Item>,
+        ids: BTreeSet<String>,
+        depth: usize,
+    }
+
+    /// Checks `node`, at `level`, which may hold only keys from `lo` up to, not including, `hi`, and what is below it.
+    fn dig<'a>(
+        r: &'a Reader,
+        node: &'a Node,
+        level: usize,
+        (lo, hi): (Option<&'a str>, Option<&'a str>),
+        out: &'a mut Audit,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let json = node.json().unwrap();
+            assert!(json.len() <= node.size, "a node is {} bytes, and was thought {}", json.len(), node.size);
+            if level > 0 {
+                assert!(json.len() <= r.limits.node, "a node is {} bytes", json.len());
+                assert!(!node.is_empty(), "an empty node");
+            }
+            match &node.body {
+                Body::Leaf(es) => {
+                    assert!(out.depth == 0 || out.depth == level + 1, "leaves are at different depths");
+                    out.depth = level + 1;
+                    assert!(es.windows(2).all(|w| w[0].0 < w[1].0), "keys are not in order");
+                    for (k, item) in es {
+                        assert!(
+                            lo.is_none_or(|lo| k.as_str() >= lo) && hi.is_none_or(|hi| k.as_str() < hi),
+                            "{k} strays"
+                        );
+                        assert!(!matches!(item, Item::Held(_)), "a value is still in memory");
+                        if let Item::Object(link) = item {
+                            assert!(out.ids.insert(link.id.clone()), "an object is named twice");
+                        }
+                        out.items.insert(k.clone(), item.clone());
+                    }
+                }
+                Body::Branch(kids) => {
+                    let seps: Vec<_> = kids[1..].iter().map(|k| k.key.as_str()).collect();
+                    assert!(seps.windows(2).all(|w| w[0] < w[1]), "separators are not in order: {seps:?}");
+                    assert!(
+                        seps.iter().all(|k| lo.is_none_or(|lo| *k >= lo) && hi.is_none_or(|hi| *k < hi)),
+                        "{seps:?}"
+                    );
+                    assert!(level > 0 || kids.len() > 1, "a root has one child");
+                    for (i, kid) in kids.iter().enumerate() {
+                        let At::Clean(link) = &kid.at else { panic!("a node has a child in memory") };
+                        assert!(out.ids.insert(link.id.clone()), "an object is named twice");
+                        let child = r.node(link).await.unwrap();
+                        let lo = if i == 0 { lo } else { Some(kid.key.as_str()) };
+                        let hi = kids.get(i + 1).map(|k| k.key.as_str()).or(hi);
+                        dig(r, &child, level + 1, (lo, hi), &mut *out).await;
+                    }
+                }
+            }
+        })
+    }
+
+    async fn audit(store: &Store, shape: &Shape) -> Audit {
+        let r = Reader {
+            store: store.clone(),
+            app: "a".into(),
+            name: "n".into(),
+            limits: tiny(),
+            stats: Default::default(),
+        };
+        let root = Node::of(shape.root.clone()).unwrap();
+        let mut out = Audit::default();
+        dig(&r, &root, 0, (None, None), &mut out).await;
+        assert_eq!(out.items.len() as u64, shape.entries);
+        assert_eq!(out.items.values().map(Item::len).sum::<u64>(), shape.bytes);
+        out
+    }
+
+    /// The ids of the objects in the store.
+    async fn stored(store: &Store) -> BTreeSet<String> {
+        let all = store.inner.list(Some(&store::app("a", &["values", "n"])));
+        all.map_ok(|m| m.location.filename().unwrap().to_owned()).try_collect().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn matches_a_map() {
+        let limits = Limits { entries: 5000, data: 1 << 20, ..tiny() };
+        let (mut store, mut rng) = (versioned(), Rng(0x5EED));
+        let (mut model, mut shape) = (BTreeMap::<String, Vec<u8>>::new(), Shape::default());
+        let (mut splits, mut merges, mut collapses, mut deepest) = (0, 0, 0, 0);
+        for round in 0..300 {
+            if rng.below(2) == 0 {
+                store.cache = Arc::default(); // a cold cache, as on another instance
+            }
+            let mut tree = Tree::open(&store, "a", "n", &shape, limits).unwrap();
+            let mut staged = model.clone();
+            if round % 9 == 3 {
+                // Thin it out, so that nodes merge and the root gives way.
+                let most = 1 + rng.below(34);
+                let keep = rng.below(most);
+                let gone: Vec<_> = staged.keys().filter(|_| rng.below(40) >= keep).cloned().collect();
+                for chunk in gone.chunks(25) {
+                    tree.write(chunk.iter().map(|k| (k.clone(), None)).collect()).await.unwrap();
+                }
+                staged.retain(|k, _| !gone.contains(k));
+            }
+            for _ in 0..=rng.below(120) {
+                let key = format!("k/{:04}", rng.below(3000));
+                match rng.below(10) {
+                    0..=3 => {
+                        let value = rng.value();
+                        set(&mut tree, &key, &value).await;
+                        staged.insert(key, value);
+                    }
+                    4..=5 => {
+                        let mut edits = vec![];
+                        for _ in 0..=rng.below(5) {
+                            let key = format!("k/{:04}", rng.below(3000));
+                            let value = (rng.below(3) > 0).then(|| rng.value());
+                            match &value {
+                                Some(v) => staged.insert(key.clone(), v.clone()),
+                                None => staged.remove(&key),
+                            };
+                            edits.push((key, value.map(|v| tree.item(v.into()))));
+                        }
+                        tree.write(edits).await.unwrap();
+                    }
+                    6 => {
+                        let end = format!("k/{:04}", key[2..].parse::<u64>().unwrap() + rng.below(40));
+                        let range: Vec<_> = staged.range(key.clone()..end).map(|(k, _)| k.clone()).collect();
+                        tree.write(range.iter().map(|k| (k.clone(), None)).collect()).await.unwrap();
+                        range.iter().for_each(|k| drop(staged.remove(k)));
+                    }
+                    7 => {
+                        tree.write(vec![(key.clone(), None)]).await.unwrap();
+                        staged.remove(&key);
+                    }
+                    8 => {
+                        let got = match tree.get(&key).await.unwrap() {
+                            Some(item) => Some(tree.value(&item).await.unwrap().to_vec()),
+                            None => None,
+                        };
+                        assert_eq!(got, staged.get(&key).cloned(), "{key}");
+                    }
+                    _ => {
+                        let (prefix, limit) = (format!("k/{}", rng.below(3)), 1 + rng.below(30) as usize);
+                        let after = (rng.below(2) == 0).then(|| format!("k/{:04}", rng.below(3000)));
+                        let want: Vec<_> = staged
+                            .keys()
+                            .filter(|k| k.starts_with(&prefix) && after.as_ref().is_none_or(|a| *k > a))
+                            .take(limit)
+                            .cloned()
+                            .collect();
+                        assert_eq!(tree.scan(&prefix, after.as_deref(), limit).await.unwrap(), want);
+                    }
+                }
+            }
+            // It commits, or is ready to and loses the race, or is thrown away as it is.
+            let outcome = rng.below(10);
+            let finished = if tree.edited() && outcome < 9 { Some(tree.finish().await.unwrap()) } else { None };
+            let (a, b, c) = tree.rebalanced();
+            (splits, merges, collapses) = (splits + a, merges + b, collapses + c);
+            if outcome < 7 {
+                shape = finished.unwrap_or(shape);
+                store.delete_many(tree.landed()).await;
+                model = staged;
+                // It serves what it committed.
+                for (k, v) in model.iter().take(20) {
+                    let item = tree.get(k).await.unwrap().unwrap();
+                    assert_eq!(tree.value(&item).await.unwrap().as_ref(), v.as_slice());
+                }
+            } else {
+                store.delete_many(tree.lost()).await;
+            }
+            drop(tree);
+
+            let audit = audit(&store, &shape).await;
+            deepest = deepest.max(audit.depth);
+            assert_eq!(audit.items.keys().collect::<Vec<_>>(), model.keys().collect::<Vec<_>>(), "round {round}");
+            let fresh = Tree::open(&store, "a", "n", &shape, limits).unwrap();
+            for (k, v) in &model {
+                let item = fresh.get(k).await.unwrap().unwrap();
+                assert_eq!(fresh.value(&item).await.unwrap().as_ref(), v.as_slice(), "{k}");
+            }
+            assert_eq!(fresh.scan("k/", None, usize::MAX).await.unwrap(), model.keys().cloned().collect::<Vec<_>>());
+            let stored = stored(&store).await;
+            let (leaked, lost): (Vec<_>, Vec<_>) =
+                (stored.difference(&audit.ids).collect(), audit.ids.difference(&stored).collect());
+            assert!(
+                leaked.is_empty() && lost.is_empty(),
+                "round {round}: {leaked:?} are leaked, and {lost:?} are lost"
+            );
+        }
+        assert!(deepest >= 4, "the tree was {deepest} deep");
+        assert!(splits > 0 && merges > 0 && collapses > 0, "{splits} splits, {merges} merges, {collapses} collapses");
+    }
+
+    #[test]
+    fn json_is_measured() {
+        for s in ["", "abc", "a\"b\\c", "\n\r\t\u{8}\u{c}", "\u{0}\u{1f}\u{7f}", "é€𝄞", "k/001"] {
+            assert_eq!(json_len(s), serde_json::to_string(s).unwrap().len(), "{s:?}");
+        }
+        let link = Link { id: "a".repeat(32), v: Some("v".repeat(VERSION_MAX)), h: "b".repeat(64), n: u64::MAX };
+        assert_eq!(link.wire(), serde_json::to_string(&link).unwrap().len());
+        assert_eq!(LINK_SIZE, link.wire());
+        for n in 0..40 {
+            let bytes = Bytes::from(vec![7; n]);
+            for item in [Item::of(bytes.clone(), 16), Item::of(bytes, 0)] {
+                assert_eq!(item.len(), n as u64);
+                let wire = Item::Object(Link { id: "a".repeat(32), v: None, h: "b".repeat(64), n: 1 });
+                assert!(serde_json::to_string(&wire).unwrap().len() <= wire.wire());
+                if let Item::Inline(_) = item {
+                    assert!(serde_json::to_string(&item).unwrap().len() <= item.wire());
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Counts {
+        gets: AtomicUsize,
+        puts: AtomicUsize,
+        deletes: AtomicUsize,
+        allow: AtomicUsize, // the puts that succeed, in all
+    }
+
+    /// A store that counts what is asked of it, and fails the puts past `allow`.
+    #[derive(Debug)]
+    struct Counting {
+        inner: InMemory,
+        counts: Arc<Counts>,
+    }
+
+    impl fmt::Display for Counting {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("counting")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for Counting {
+        async fn put_opts(&self, at: &Path, payload: PutPayload, opts: PutOptions) -> object_store::Result<PutResult> {
+            if self.counts.puts.fetch_add(1, SeqCst) >= self.counts.allow.load(SeqCst) {
+                return Err(object_store::Error::Generic { store: "counting", source: "a put that fails".into() });
+            }
+            self.inner.put_opts(at, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            at: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(at, opts).await
+        }
+
+        async fn get_opts(&self, at: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
+            self.counts.gets.fetch_add(1, SeqCst);
+            self.inner.get_opts(at, opts).await
+        }
+
+        fn delete_stream(
+            &self,
+            paths: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            let counts = self.counts.clone();
+            let counted = paths.inspect(move |_| {
+                counts.deletes.fetch_add(1, SeqCst);
+            });
+            self.inner.delete_stream(counted.boxed())
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    fn counting() -> (Store, Arc<Counts>) {
+        let counts = Arc::new(Counts { allow: AtomicUsize::new(usize::MAX), ..Default::default() });
+        let inner = Counting { inner: InMemory::new(), counts: counts.clone() };
+        (Store { inner: Arc::new(inner), versioned: true, cache: Arc::default() }, counts)
+    }
+
+    /// A tree of 400 keys, in the store, and its shape.
+    async fn grown(store: &Store) -> Shape {
+        let mut tree = at(store, &Shape::default());
+        for i in 0..400 {
+            set(&mut tree, &format!("k/{i:03}"), &[i as u8; 5]).await;
+        }
+        commit(store, &mut tree).await
+    }
+
+    #[tokio::test]
+    async fn costs_what_it_touches() {
+        let (mut store, counts) = counting();
+        let shape = grown(&store).await;
+        let levels = audit(&store, &shape).await.depth;
+        assert!(levels >= 3, "{levels} levels");
+        let below = levels - 1; // the root is in the head
+
+        // A cold read is a GET for each node below the root; a warm one is none.
+        store.cache = Arc::default();
+        counts.gets.store(0, SeqCst);
+        let tree = at(&store, &shape);
+        assert!(tree.get("k/077").await.unwrap().is_some());
+        assert_eq!(counts.gets.load(SeqCst), below);
+        assert!(tree.get("k/077").await.unwrap().is_some());
+        assert_eq!(counts.gets.load(SeqCst), below, "a node is read once");
+        assert_eq!(tree.reader.stats.hits.load(Relaxed) as usize, below);
+        drop(tree);
+
+        // A turn that wrote nothing writes nothing, and one that removes what is not there copies nothing.
+        counts.puts.store(0, SeqCst);
+        let mut tree = at(&store, &shape);
+        tree.write(vec![("k/zzz".into(), None)]).await.unwrap();
+        assert!(!tree.edited() && tree.work.dead.is_empty());
+        drop(tree);
+        assert_eq!(counts.puts.load(SeqCst), 0);
+
+        // One value changed is a copy of the nodes from it to the root, which the head holds.
+        store.cache = Arc::default();
+        counts.gets.store(0, SeqCst);
+        let mut tree = at(&store, &shape);
+        set(&mut tree, "k/077", &[9; 5]).await;
+        assert_eq!(counts.gets.load(SeqCst), below);
+        let shape = tree.finish().await.unwrap();
+        assert_eq!(counts.puts.load(SeqCst), below);
+        assert_eq!(tree.landed().len(), below, "the nodes it replaced");
+        assert_eq!(tree.reader.stats.depth.load(Relaxed), levels);
+        let after = audit(&store, &shape).await;
+        assert_eq!(after.depth, levels);
+        drop(tree);
+    }
+
+    #[tokio::test]
+    async fn a_failed_upload_leaves_nothing() {
+        let (store, counts) = counting();
+        let shape = grown(&store).await;
+        let kept = audit(&store, &shape).await.ids;
+        assert_eq!(stored(&store).await, kept);
+
+        // A put fails after `allowed` more: at the first, the next, and so on, until the commit gets through.
+        let mut failed = 0;
+        for allowed in 0..200 {
+            let mut tree = Tree::open(&store, "a", "n", &shape, Limits { budget: 1 << 20, ..tiny() }).unwrap();
+            for i in 0..30 {
+                set(&mut tree, &format!("k/{:03}", i * 13), &[1; 60]).await;
+            }
+            counts.allow.store(counts.puts.load(SeqCst) + allowed, SeqCst);
+            let finished = tree.finish().await;
+            if finished.is_err() {
+                failed += 1;
+                assert!(tree.finish().await.is_err(), "a tree that failed is not committed");
+            }
+            store.delete_many(tree.lost()).await;
+            counts.allow.store(usize::MAX, SeqCst);
+            assert_eq!(stored(&store).await, kept, "{allowed} uploads allowed");
+            assert_eq!(audit(&store, &shape).await.items.len(), 400);
+            if finished.is_ok() {
+                break;
+            }
+        }
+        assert!(failed >= 30, "{failed} commits failed");
+    }
+
+    #[tokio::test]
+    async fn spills_when_it_holds_too_much() {
+        let (store, counts) = counting();
+        let mut tree = at(&store, &Shape::default());
+        for i in 0..150 {
+            set(&mut tree, &format!("k/{i:03}"), &[i as u8; 100]).await;
+            assert!(tree.root.dirty() <= tiny().budget, "{} bytes held", tree.root.dirty());
+        }
+        assert!(counts.puts.load(SeqCst) > 0, "it spilled");
+        let first = tree.get("k/000").await.unwrap().unwrap();
+        assert_eq!(tree.value(&first).await.unwrap().as_ref(), &[0; 100]);
+        // Dropped, it deletes what it made.
+        let made = tree.made.lock().unwrap().len();
+        assert_eq!(made, counts.puts.load(SeqCst));
+        drop(tree);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(stored(&store).await.is_empty(), "{} left", stored(&store).await.len());
+        assert_eq!(counts.deletes.load(SeqCst), made);
+    }
+
+    #[tokio::test]
+    async fn refuses_what_is_over_its_limits() {
+        let store = versioned();
+        let mut tree = at(&store, &Shape::default());
+        let edits: Vec<_> =
+            (0..1001).map(|i| (format!("k/{i:04}"), Some(tree.item(Bytes::from_static(b"v"))))).collect();
+        let full = tree.write(edits).await.unwrap_err();
+        assert!(full.is::<Full>(), "{full:#}");
+        assert!(!tree.edited() && tree.root.is_empty(), "nothing was written");
+
+        let edits: Vec<_> = (0..900).map(|i| (format!("k/{i:04}"), Some(tree.item(vec![0; 120].into())))).collect();
+        assert!(tree.write(edits).await.unwrap_err().is::<Full>());
+        assert!(!tree.edited());
+
+        // What a batch replaces or removes does not count against it.
+        for i in 0..900 {
+            set(&mut tree, &format!("k/{i:04}"), &[0; 100]).await;
+        }
+        let edits: Vec<_> = (0..900).map(|i| (format!("k/{i:04}"), Some(tree.item(vec![1; 100].into())))).collect();
+        tree.write(edits).await.unwrap();
+        let edits: Vec<_> = (0..900).map(|i| (format!("k/{i:04}"), Some(tree.item(vec![1; 50].into())))).collect();
+        tree.write(edits).await.unwrap();
+        set(&mut tree, "k/zzz", &[1; 100]).await;
+        assert!(tree.finish().await.is_ok(), "it is not poisoned");
+    }
+
+    #[tokio::test]
+    async fn is_not_fooled_by_a_changed_object() {
+        let mut store = versioned();
+        let mut tree = at(&store, &Shape::default());
+        for i in 0..40 {
+            set(&mut tree, &format!("k/{i:02}"), &[i as u8; 50]).await;
+        }
+        let shape = commit(&store, &mut tree).await;
+        let seen = audit(&store, &shape).await;
+        let path = |id: &str| store::app("a", &["values", "n", id]);
+
+        let Wire::Branch(kids) = &shape.root else { panic!("a tree of one node") };
+        let node = &kids[0].1;
+        let Some(Item::Object(blob)) = seen.items.values().next().cloned() else { panic!("no object") };
+        for (link, what) in [(node.clone(), "a node"), (blob, "a value")] {
+            let at = path(&link.id);
+            let (good, _) = store.get(&at, None, 1 << 20).await.unwrap().unwrap();
+            for bad in [vec![b' '; good.len()], good[1..].to_vec()] {
+                store.put(&at, bad.into(), PutMode::Overwrite).await.unwrap();
+                store.cache = Arc::default();
+                let tree = at_shape(&store, &shape);
+                let got = match tree.get("k/00").await {
+                    Ok(Some(item)) => tree.value(&item).await.map(drop),
+                    Ok(None) => Ok(()),
+                    Err(e) => Err(e),
+                };
+                let err = got.unwrap_err();
+                assert!(format!("{err:#}").contains("is not what its link says"), "{what}: {err:#}");
+            }
+            store.put(&at, good, PutMode::Overwrite).await.unwrap();
+        }
+    }
+
+    fn at_shape(store: &Store, shape: &Shape) -> Tree {
+        at(store, shape)
+    }
+
+    #[tokio::test]
+    async fn keeps_to_its_own_objects() {
+        let (store, counts) = counting();
+        let good = Link { id: "a".repeat(32), v: Some("3sL4kqtJlcpXroDTDmJ.rmSpXd".into()), h: "b".repeat(64), n: 5 };
+        assert!(good.check().is_ok());
+        let bad = |f: fn(&mut Link)| {
+            let mut link = good.clone();
+            f(&mut link);
+            link
+        };
+        let bads = [
+            bad(|l| l.id = "../names/n".into()),
+            bad(|l| l.id = format!("{}/{}", "a".repeat(15), "a".repeat(16))),
+            bad(|l| l.id = "A".repeat(32)),
+            bad(|l| l.id = "a".repeat(31)),
+            bad(|l| l.id = String::new()),
+            bad(|l| l.h = "g".repeat(64)),
+            bad(|l| l.v = Some("a\"b".into())),
+            bad(|l| l.v = Some("a\\b".into())),
+            bad(|l| l.v = Some("a b".into())),
+            bad(|l| l.v = Some("v".repeat(VERSION_MAX + 1))),
+        ];
+        for link in bads {
+            assert!(link.check().is_err(), "{link:?}");
+            let shape = Shape { root: Wire::Branch(vec![(String::new(), link.clone())]), bytes: 0, entries: 0 };
+            let tree = at(&store, &shape);
+            let err = tree.get("k/a").await.unwrap_err();
+            assert!(format!("{err:#}").contains("malformed"), "{err:#}");
+            let err = tree.value(&Item::Object(link)).await.unwrap_err();
+            assert!(format!("{err:#}").contains("malformed"), "{err:#}");
+        }
+        assert_eq!(counts.gets.load(SeqCst), 0, "nothing was asked of the store");
+
+        // The head's own words about a link are kept to as well.
+        assert!(serde_json::from_str::<Link>(r#"{"id":"a","h":"b","n":1,"x":2}"#).is_err());
+        assert!(serde_json::from_str::<Shape>(r#"{"entries":1,"x":2}"#).is_err());
+    }
+
+    #[test]
+    fn an_empty_tree_is_not_in_the_head() {
+        assert_eq!(serde_json::to_string(&Shape::default()).unwrap(), "{}");
+        assert!(Shape::default().is_empty());
+        let shape: Shape = serde_json::from_str("{}").unwrap();
+        assert!(shape.is_empty());
+    }
+}
