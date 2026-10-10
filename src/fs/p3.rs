@@ -238,7 +238,7 @@ impl<U> types::HostDescriptorWithStore<U> for HasSelf<Host> {
         _length: Filesize,
         _advice: Advice,
     ) -> Result<(), Fault> {
-        match store.fd(&fd)?.kind() {
+        match store.fd(&fd)?.kind {
             Kind::File => Ok(()),
             _ => Err(Errno::BadDescriptor.into()),
         }
@@ -251,10 +251,10 @@ impl<U> types::HostDescriptorWithStore<U> for HasSelf<Host> {
     async fn get_flags(store: &Accessor<U, Self>, fd: Resource<Handle>) -> Result<DescriptorFlags, Fault> {
         let file = store.fd(&fd)?;
         let mut flags = DescriptorFlags::empty();
-        if file.readable() {
+        if file.read {
             flags |= DescriptorFlags::READ;
         }
-        if file.writable() {
+        if file.write {
             flags |= DescriptorFlags::WRITE;
         }
         if file.mutates() {
@@ -264,7 +264,7 @@ impl<U> types::HostDescriptorWithStore<U> for HasSelf<Host> {
     }
 
     async fn get_type(store: &Accessor<U, Self>, fd: Resource<Handle>) -> Result<DescriptorType, Fault> {
-        Ok(store.fd(&fd)?.kind().into())
+        Ok(store.fd(&fd)?.kind.into())
     }
 
     async fn set_size(store: &Accessor<U, Self>, fd: Resource<Handle>, size: Filesize) -> Result<(), Fault> {

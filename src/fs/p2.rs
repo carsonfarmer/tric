@@ -155,7 +155,7 @@ impl types::HostDescriptor for Host {
         _length: Filesize,
         _advice: Advice,
     ) -> Result<(), Fault> {
-        match self.fd(&fd)?.kind() {
+        match self.fd(&fd)?.kind {
             Kind::File => Ok(()),
             _ => Err(Errno::BadDescriptor.into()),
         }
@@ -168,10 +168,10 @@ impl types::HostDescriptor for Host {
     async fn get_flags(&mut self, fd: Resource<Handle>) -> Result<DescriptorFlags, Fault> {
         let file = self.fd(&fd)?;
         let mut flags = DescriptorFlags::empty();
-        if file.readable() {
+        if file.read {
             flags |= DescriptorFlags::READ;
         }
-        if file.writable() {
+        if file.write {
             flags |= DescriptorFlags::WRITE;
         }
         if file.mutates() {
@@ -181,7 +181,7 @@ impl types::HostDescriptor for Host {
     }
 
     async fn get_type(&mut self, fd: Resource<Handle>) -> Result<DescriptorType, Fault> {
-        Ok(self.fd(&fd)?.kind().into())
+        Ok(self.fd(&fd)?.kind.into())
     }
 
     async fn set_size(&mut self, fd: Resource<Handle>, size: Filesize) -> Result<(), Fault> {

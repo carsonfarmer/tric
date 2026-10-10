@@ -417,18 +417,6 @@ impl Handle {
         Self { pin: Pin::new(turn, ROOT), kind: Kind::Dir, read: true, write: false, mutate: true }
     }
 
-    pub fn kind(&self) -> Kind {
-        self.kind
-    }
-
-    pub fn readable(&self) -> bool {
-        self.read
-    }
-
-    pub fn writable(&self) -> bool {
-        self.write
-    }
-
     /// Whether the directory can have its entries changed: if the turn is open.
     pub fn mutable(&self) -> bool {
         self.pin.turn.is_open()
