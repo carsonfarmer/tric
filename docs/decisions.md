@@ -228,6 +228,22 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   - A commit would need a diff and hash of the directory, and then upload changed files whole.
 
   It is the least code, and fails laziness, per-attempt rollback and isolation between turns.
+- **Amazon S3 Files is rejected,** though Lambda mounts it over NFS and it keeps each file as an object of the same key.
+  Sources: <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-files-synchronization.html> and
+  <https://docs.aws.amazon.com/lambda/latest/dg/configuration-filesystem-s3files.html>.
+  - A turn can't be discarded. A write lands on the shared file system at once, where every environment sees it, and
+    reaches the bucket a file at a time, after 60 seconds without writes to it. Nothing commits several files, or a file
+    and a key, together, so a 5xx can't discard a turn and a lost race can't re-run one.
+  - A conflict goes to the bucket, and the file system's version to a lost-and-found directory, where tric's
+    compare-and-swap re-runs the turn.
+  - The mount is the function's: one access point, mounted with the execution role's `s3files:ClientMount`. Every app
+    runs in the serve function, and tenancy doesn't change what it mounts, so a guest that broke out of Wasmtime would
+    have every app's files. The router's session policy scopes S3 requests, not an NFS mount.
+  - The function must be in a VPC with a mount target in each of its subnets. It then reaches the internet only
+    through a NAT gateway, which bills by the hour while idle ($0.045 in us-west-2, from AWS's price list,
+    <https://b0.p.awsstatic.com/pricing/2.0/meteredUnitMaps/ec2/USD/current/natgateway.json>), or over IPv6 alone.
+    Scale to zero forbids the first, and an app's `wasi:http` requests go to hosts that may have no IPv6 address.
+  - It is AWS's alone, so `tric dev` and the RustFS stack couldn't run it.
 - **Prolly trees and the AT Protocol's MST are rejected.** Sources:
   <https://docs.dolthub.com/architecture/storage-engine/prolly-tree> and <https://atproto.com/specs/repository>.
   Their shape depends on their contents alone, so replicas converge and diff cheaply. tric has one writer at a time to
