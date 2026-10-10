@@ -53,6 +53,9 @@ wasmtime = { version = "=49.0.2", default-features = false, features = [
 ] }
 # p2 too, as Rust's standard library on wasm32-wasip2 imports it.
 wasmtime-wasi = { version = "=49.0.2", default-features = false, features = ["p2", "p3"] }
+# The wasi:io bindings, which wasmtime-wasi does not re-export: the linker takes the stock interfaces minus filesystem,
+# and the filesystem's own bindings share these resources.
+wasmtime-wasi-io = { version = "=49.0.2", default-features = false, features = ["std"] }
 # No `default-send-request`: that is the built-in outbound client, which resolves names after any check on them.
 wasmtime-wasi-http = { version = "=49.0.2", default-features = false, features = ["component-model-async", "p3"] }
 

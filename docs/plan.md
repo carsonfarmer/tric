@@ -122,7 +122,7 @@ ws/channels/<app>/<channel>/<id> a socket's subscription to a channel (router on
   - `tree`, which is absent while the name is empty, and holds:
     - `root`: the name's tree, its top node held inline (see "Files and state");
     - `bytes` and `entries`: the name's budgets, exact at each commit;
-    - `ino`: the next inode number (from the stage with the file system);
+    - `seq`: the last inode number given out, which no inode is given again (absent until a file is made);
   - `pending`: commit id → {SHA-256 of its delivery event, time};
   - an optional claim.
 - **Objects.** Each node, block or large value is immutable, named by a random id under its name, and read by the
@@ -165,20 +165,22 @@ f/<ino>/<block>      a block of a file's data
 d/<dir>/<name>       a directory entry: the inode it names, and that inode's kind
 ```
 
-- `<ino>`, `<dir>` and `<block>` are 16 hex digits, so they sort as numbers. Inode 1 is the root directory, empty
-  until written. New inodes count up from the head's `ino` and are never reused, so a number names one file for the
-  life of the name, which `is-same-object` and a stale descriptor both rely on.
+- `<ino>` and `<dir>` are decimal and `<block>` is 16 hex digits, so the blocks of a file sort as numbers. (Nothing
+  depends on the order of inode numbers: a prefix ends in its `/`.) Inode 1 is the root directory, empty until written.
+  New inodes count up from the head's `seq` and are never reused, so a number names one file for the life of the name,
+  which `is-same-object` and a stale descriptor both rely on. A name emptied by deletes keeps its `seq`, so its head
+  is `{"seq": N}`, not empty.
 - An inode sits next to its blocks, and a directory's entries sit together, so an `open` and the first reads of a small
   file touch one leaf, and a `readdir` is a range scan. A guest's file names live inside leaves, never in object keys.
 - A **leaf** is a sorted list of (key, item), and a **branch** a sorted list of (separator, link) to its children: the
   separator of a child is at most every key in it and above every key in the child before; the first child's is not
-  looked at. Each node is JSON of at most 64 KiB (`NODE_MAX`). An item is data (base64, inline up to 4 KiB), a link, an
-  inode or a dirent.
+  looked at. Each node is JSON of at most 64 KiB (`NODE_MAX`). An item is data (base64, inline up to 4 KiB) or a link;
+  an inode and a dirent are JSON, so inline.
 - A **link** is `{id, v, h, n}`: a random 128-bit id (the object is `values/<name>/<id>`), the S3 version id (none in
   the local memory store), and the SHA-256 and length of the bytes. An object is read at its version and checked for
   both, so the head pins every node and block below it by hash. A link read from a head or a node is checked before it
   is used: the id is 32 lowercase hex digits, so it can't name another prefix, and the version is short and plain.
-- A **head** is `{tree: {root, bytes, entries, ino}, pending, claim}`. The root node is inline, so the top of every
+- A **head** is `{tree: {root, bytes, entries, seq}, pending, claim}`. The root node is inline, so the top of every
   lookup costs no request. `bytes` counts the data in values and blocks, and `entries` the keys, both exact: a commit
   lands only over the head it read, so the deltas it counts while editing are the totals.
 - A turn's size estimates a link at its longest (208 bytes), so a node never encodes to more than the size it was
@@ -222,16 +224,22 @@ changed nothing puts nothing.
 - File data is in fixed blocks of 256 KiB (`BLOCK`). A hole is an absent block and reads as zeros, and a short block
   is zero-padded to the file's size. So growing a file rewrites nothing, and truncating rewrites the one block at the
   new end and drops those beyond it. A write of a whole block reads nothing; a partial one reads its block first.
-- Hard links join files only, within the one tree, with a link count. A directory reports a link count of 1, as btrfs
-  does. `is-same-object` and `metadata-hash` come from the inode number. Times are the host's clock, and a file's
-  access time is its modification time unless `set-times` set it. `sync`, `sync-data` and `advise` succeed and do
-  nothing: durability is the commit's.
+- Hard links join files (and symlinks) only, within the one tree, with a link count. A directory reports a link count
+  of 1, as btrfs does. `is-same-object` and `metadata-hash` come from the inode number. Times are the host's clock:
+  an inode has a creation, modification and change time, and the access time is the creation's unless `set-times`
+  set it, as a read changes nothing. `sync`, `sync-data` and `advise` succeed and do nothing: the commit is the
+  durability.
 - **A file unlinked while open** is as on Linux. Its inode stays in the tree at a link count of 0, and is read and
   written through the descriptors that hold it. The last close in the turn removes it. The commit leaves out an inode
   still at 0.
-- **A descriptor open after the answer** reads through the root the attempt ended with, held by an `Arc`: no copy, no
-  cap on links, and no `io` for a large file. It reads blocks by version, which a delete marker does not hide.
-- After the answer, a write fails with `read-only`, and so does any write to a snapshot.
+- **A descriptor still open on such a file at the answer** keeps reading it. The commit forks its tree (a root and
+  the shared objects, nothing copied) before it removes the orphans, and, once the head has landed, those descriptors
+  read through the fork. So there is no copy of the file and no cap on links. The fork reads blocks by version, which a
+  delete marker does not hide, so it is exact in a versioned bucket; the memory store, which deletes nothing, reads
+  anyway. If the turn is discarded, or loses its race, what the turn made is gone and they get `io`.
+- After the answer, a write fails with `read-only`, and so does any write to a snapshot. A change that was admitted
+  before the answer lands before the commit does; one after it fails. A stream's write is admitted when the guest
+  makes it.
 - A write fails early with `insufficient-space` when the name's data or entries pass their budgets, counted exactly
   from the tree and the turn's edits. A batch over a budget changes nothing.
 
@@ -302,13 +310,13 @@ could upload in `TOTAL`, and of a commit whose outcome was unknown.
 | Node | 64 KiB | the root is in the head, which every turn reads; a write rewrites one leaf |
 | Inline | 4 KiB | a value or file this small costs no request of its own |
 | A key's value | 1 MiB | as now (`VALUE_MAX`); one object |
-| A file | 4 GiB | 16,384 blocks; reads and writes stream |
+| A file | 16 GiB | as much as the name holds (`DATA_MAX`); reads and writes stream |
 | A name's data | 16 GiB | 64 Ki blocks, in under a thousand leaves |
 | A name's entries | 4 Mi | three levels |
 | Name, path, target | 255, 4,096, 4,096 bytes | POSIX's `NAME_MAX` and `PATH_MAX` |
 | Symlink follows | 40 | Linux's |
 | Held and copied, per turn | 8 MiB | memory, per turn: spilled when passed |
-| Descriptors | 256 | the engine's `RESOURCES` |
+| Descriptors | 256 | the engine's `RESOURCES`; one more is `insufficient-memory` |
 
 These two are the numbers to revisit once they are measured: the block, node and inline sizes, and the 16 GiB and 4 Mi
 budgets. A turn has no cap on its changes: it spills.
@@ -338,34 +346,40 @@ without the file system: for 0.3, `cli`, `clocks`, `random` and `sockets` `add_t
 
 | File | What | Lines |
 |---|---|---|
-| `src/tree.rs` | nodes, links, edits, spill, merge, scans, the cache, garbage lists | 960 (built) |
+| `src/tree.rs` | nodes, links, edits, spill, merge, scans, the cache, garbage lists | 1,040 (built) |
 | `src/name.rs`, `src/tric.rs`, `src/store.rs` | the turn over the tree; the joined deletes | +70 (built) |
-| `src/fs.rs` | the core: paths, inodes, blocks, directories, rename, errors | 800 |
-| `src/fs/p2.rs` | 0.2: the descriptor's methods, streams, preopens | 450 |
-| `src/fs/p3.rs` | 0.3: the same, async, with `stream` and `future` | 450 |
+| `src/fs.rs` | the core: descriptors, the gate, orphans, and the paths over the operations | 600 (built) |
+| `src/fs/ops.rs` | inodes, blocks, directories, rename, errors, on the tree | 800 (built) |
+| `src/fs/p2.rs` | 0.2: the descriptor's methods, streams, preopens | 620 (built) |
+| `src/fs/p3.rs` | 0.3: the same, async, with `stream` and `future` | 600 |
 | the sweep | listing, walk, delete, the trigger | 300 |
 
-The tree came to 1,030 lines with the changes it takes from `name.rs`, against an estimate of 800, because spilling,
-merging, the cache and the log are in it. The whole is about 3,000 lines of runtime code, plus or minus a fifth, on the
-4,289 in `src` at the start. Tests come to about 1,000 more. The tree and `name.rs` came first and alone: the key tests'
-assertions hold on them, which tests the tree before any file exists. The main risk is 0.3's `stream` and `future`
-plumbing, modelled on wasmtime-wasi's own. If it costs more than the estimate, that is reported, not cut.
+The tree came to 1,040 lines, against an estimate of 800, because spilling, merging, the cache and the log are in it.
+The core and the 0.2 binding came to 2,020 against 1,250: the gate that keeps a stream's write from being lost to the
+answer, the orphans, a mapping of every failure to an errno, and the streams that outlive their calls are most of the
+difference. The whole is about 4,100 lines of runtime code on the 4,289 in `src` at the start. Tests come to well over
+a thousand more. The tree and `name.rs` came first and alone: the key tests' assertions hold on them, which tests the
+tree before any file exists. The main risk is 0.3's `stream` and `future` plumbing, modelled on wasmtime-wasi's own. If
+it costs more than the estimate, that is reported, not cut.
 
 **Stages.** Each is committed on its own and passes the whole gate:
-- (a) the tree, with `wasi:keyvalue` on it;
-- (b) the file system core and the 0.2 binding, with the testsuite's wasip1 modules and the end-to-end file cases;
+- (a) the tree, with `wasi:keyvalue` on it (done);
+- (b) the file system core and the 0.2 binding, with the testsuite's wasip1 modules and the end-to-end file cases
+  (done);
 - (c) the 0.3 binding, with its 14 components;
 - (d) the sweep.
 
 **Conformance:**
-- **The WebAssembly testsuite** (`wasi-testsuite`, branch `prod/testsuite-base`, pinned by commit). Its prebuilt
-  wasm32-wasip1 modules (about 35 file system tests) are made into components with `wasm-tools component new` and the
-  command adapter from `wasi-preview1-component-adapter-provider` 49.0.2, and run against the 0.2 binding. Its 14 0.3
-  `filesystem-*` components run against the 0.3 binding. `build.sh` fetches both as pinned tarballs checked by sha256,
-  not as Cargo dependencies.
-- **The harness** is a `#[cfg(test)]` module in the binary, using the production linker and a turn over the memory
-  store, with the testsuite's preopen (`fs-tests.dir`, holding `a.txt` and `b.txt`) seeded. A skip-list names each test
-  not run, and why.
+- **The WebAssembly testsuite** (`wasi-testsuite`, pinned by commit). The toolchain image fetches it as a tarball
+  checked by sha256 (`docker/build.Dockerfile`), with the preview 1 adapter of Wasmtime's 49.0.2 release, also by
+  hash: neither is a Cargo dependency. Its prebuilt wasm32-wasip1 modules that name a directory to preopen (42 in Rust
+  and 7 in C) are made into components with `wasm-tools component new --adapt`, and run against the 0.2 binding. Its
+  14 0.3 `filesystem-*` components run against the 0.3 binding.
+- **The harness** is a `#[cfg(test)]` module in the binary (`src/fs/conformance.rs`), using the production linker, host
+  and limits, and a turn over the memory store, which holds the test's own `fs-tests.dir`; the turn is committed
+  after the test. Wasmtime's runner expects every one of these to pass on Linux, and so does the harness: a `FAILS`
+  list names each that does not, and why, and a test that is listed and passes fails the run. It is skipped without
+  `TRIC_CONFORMANCE`, the directory of the fetched files.
 - **Our own tests:** the tree against a `BTreeMap`, over random operations with tiny nodes so that it splits, merges and
   collapses, and grows to four levels, with what is in the store checked against what the tree names after every round;
   request counts with a counting `ObjectStore`, to show that a write puts only what it changed, and that a failed

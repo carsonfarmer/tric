@@ -247,13 +247,22 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   differ in being async and in `stream` and `future`, and not in what a call does, so each binding is a thin layer
   that converts types and errors, and the rules live once.
 - **A standard suite tests it, as well as our own tests.** The WebAssembly `wasi-testsuite`
-  (<https://github.com/WebAssembly/wasi-testsuite>), branch `prod/testsuite-base`, pinned at
-  `e0aa527fab67f2f311882bcee4f62cc755433b73`, has prebuilt wasm32-wasip1 modules (about 35 for the file system) and 14
-  0.3 `filesystem-*` components. The modules are made components with `wasm-tools component new` and the command
-  adapter that Wasmtime 49.0.2 ships in `wasi-preview1-component-adapter-provider`. `build.sh` fetches both as tarballs
-  checked by sha256, which is not a Cargo dependency. The harness is a `#[cfg(test)]` module in the binary, because
-  only the binary holds the production linker. Wasmtime's own `test-programs` could be a second suite, but they need
-  building for wasm32-wasip2 first, so they are optional.
+  (<https://github.com/WebAssembly/wasi-testsuite>), pinned at `e0aa527fab67f2f311882bcee4f62cc755433b73`, has prebuilt
+  wasm32-wasip1 modules (42 in Rust and 7 in C that name a directory to preopen) and 14 0.3 `filesystem-*` components.
+  The modules are made components with `wasm-tools component new --adapt` and the command adapter of Wasmtime's
+  49.0.2 release (`wasi_snapshot_preview1.command.wasm`, a release asset, so the one Wasmtime's own runner uses).
+  Both are fetched by the toolchain image (`docker/build.Dockerfile`, a `conformance` stage) as tarballs checked by
+  sha256, which is not a Cargo dependency and puts 103 MB in the image. The harness is a `#[cfg(test)]` module in the
+  binary (`src/fs/conformance.rs`), because only the binary holds the production linker, and it runs `wasm-tools` as a
+  subprocess, so the `wit-component` crate is not a dev-dependency either. Without `TRIC_CONFORMANCE`, the directory
+  of the fetched files, the test is skipped, so a build outside the image is not broken by it. The host needs an
+  `App` to be a `Tric`, so it takes the built fixture.
+- **The conformance run is Wasmtime's own configuration:** the directory as `/`, no environment beyond the test's and
+  no skip-list. All 49 pass, and `FAILS`, the list of those that do not, is empty and has a rule: a listed test that
+  passes fails the run, so a reason cannot outlive its cause. `TESTS` pins the count, so a change of commit is noticed.
+  The harness was shown to be able to fail: with `rmdir` made to succeed on a non-empty directory,
+  `remove_nonempty_directory` failed. Wasmtime's own `test-programs` could be a second suite, but they need building
+  for wasm32-wasip2 first, so they are not used.
 - **Objects are put at a random id, over any object there.** A put that is retried would get 412 on its own object
   under create-if-absent, and 128 random bits won't collide. The link's version id and hash would catch it if they did.
 - **A link pins a version and a hash.** The version means a reader gets the object it was pointed at, however the key
@@ -287,14 +296,21 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   line to change.
 - **Inode numbers are never reused.** `is-same-object` and a descriptor held across an unlink would otherwise name a
   new file. A counter in the head costs nothing, and a `u64` can't run out.
-- **A file's access time is its modification time,** unless `set-times` set it, and **`sync` and `advise` do nothing.**
-  Updating an access time on every read would turn a read into a write, and durability is the commit's.
+- **A file's access time is set when it is made, and by `set-times`: never by a read.** Updating an access time on
+  every read would turn a read into a write, and a snapshot can't write. An inode has a creation, a modification and
+  a change time, in Unix nanoseconds, and a time that does not fit one is `overflow`. **`sync`, `sync-data` and
+  `advise` do nothing,** as durability is the commit's.
 - **A file unlinked while open is as on Linux.** Its inode stays in the tree at a link count of 0, and is read and
   written through the descriptors that hold it, as Linux does. The last close in the turn removes it. The commit
   leaves out an inode still at 0, so it and its blocks are garbage by the usual lists. A descriptor that outlives the
-  answer (a body that streams a file after it) reads through the root the attempt ended with, which it holds by an
-  `Arc`, and the blocks by version, which a delete marker doesn't hide. So there is no copy, no cap on how many
-  links it can hold and no `io` for a large file, and a temporary file unlinked at once works.
+  answer (a body that streams a file after it) keeps reading through a fork: a copy of the tree's root that shares its
+  reader and its objects, made by the commit before it purges the orphans, and used once the head has landed. The fork
+  reads blocks by version, which a delete marker doesn't hide. So there is no copy of the file, no cap on how many
+  links it can hold and no `io` for a large file, and a temporary file unlinked at once works. A fork has no `made`
+  list and deletes nothing when dropped. This relies on the bucket being versioned, as the sweep and the lifecycle
+  rule do: a non-versioned store, the memory store of `tric dev` and the tests, never deletes an object, so it reads
+  anyway. If the turn is discarded or loses its race, the descriptors read the tree as it was, and what the turn made
+  is gone, so they get `io`.
 - **A turn edits the tree directly, as LMDB and bbolt do,** and has no overlay and no cap on its changes. An overlay
   applied at the commit would be a second structure that every read and `readdir` had to merge with the tree, and
   would need a cap to stay in memory, which the guest would hit as an error that no file system gives. Here the nodes
@@ -358,6 +374,67 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   against a `BTreeMap` of the same operations, and the store checked after every round against what the tree names, so
   that a leaked or lost object fails the test. Two mutations (a skipped separator fix, a skipped delete of a replaced
   node) were each shown to fail it.
+- **A change is admitted through a gate, so the answer cannot lose one.** Every change to the tree takes a permit from
+  an `RwLock` (held shared while the change is made) and only then checks that the turn has not answered. The commit
+  marks the turn answered, and then waits for the lock exclusively before it reads the tree. A change that saw the
+  turn open therefore holds a permit the commit waits for, so it is in the commit, and one that comes later fails with
+  `read-only`: none falls between. A stream's write is admitted when the guest makes it, not when
+  it is later flushed to the tree, and the task that applies it is detached and never aborted, as an abort could leave
+  half a write. Lock order, to avoid a deadlock: the claim, the gate, the tree, the turn's state.
+- **A directory is as mutable as its mount.** `MUTATE_DIRECTORY` is reported by `get-flags` and nothing more: a change
+  fails when the turn is a snapshot or has answered (`read-only`), and not otherwise. The descriptor flags a guest
+  passes to `open-at` narrow what that descriptor can do (a read without `read` is `bad-descriptor`) and never widen it.
+- **Every failure is an errno, and the detail is in the log.** A tree error maps to the nearest errno (over a budget is
+  `insufficient-space`, a name that cannot be read `io`, a lost inode after a discard `io`), and the app's storage
+  details, the bucket and the key, are logged and never returned. Of the errnos the WIT names, `busy` is used for
+  `rename` of `.` or `..`, `overflow` for a time that does not fit, `insufficient-memory` for a full descriptor
+  table, and `bad-descriptor` for a read or write on a descriptor that was opened without the right to.
+- **Paths cannot leave the mount.** A walk is lexical (above), a leading `/` is refused, a symlink's target may not be
+  absolute (refused at creation with `not-permitted`, which is the only place to refuse it that does not depend on
+  where the link is read from), a relative target is followed at most 40 times and at most 1 KiB long, and a name is at
+  most 255 bytes and a path 4,096. `..` past the handle the walk began at is `not-permitted`. A test builds handles
+  at several depths with symlinks that try to climb out, and was shown to fail when the check was removed.
+- **Hard links join files and symlinks, not directories.** A link made with `symlink-follow` is `invalid`, since a
+  link to what a symlink points at would need a second resolution at the link.
+- **A file is as large as the name: `FILE_MAX = DATA_MAX`** (16 GiB). A smaller cap would be a second limit to explain,
+  and the name's own budget, which is exact, already stops a write.
+- **An operation is one atomic batch of tree edits,** so that a failure leaves the tree as it was, with two exceptions:
+  a `write` longer than 4 MiB (`WRITE_MAX`) is done in chunks and returns the short count if a later chunk fails, and
+  the purge of a removed file's blocks and the drop of a truncated file's blocks are done a page (1,000) at a time. A
+  tree edit that fails for any reason but a budget, or whose caller goes away half way, poisons the tree: every later
+  change fails and the turn cannot be committed, as the tree may be half-edited. A budget error (`Full`) changes
+  nothing and does not.
+- **Streams outlive the call that made them.** A stream from `read-via-stream` reads ahead 64 KiB and from
+  `write-via-stream` has 256 KiB of capacity (a `write` of more traps, as the WIT says), and a read is at most 1 MiB
+  (`READ_MAX`). They hold their own handle on the inode and the turn, not a borrow of the descriptor, so closing a
+  descriptor does not break a stream made from it. The `read` call's `end-of-stream` is true when fewer than
+  `min(len, READ_MAX)` bytes came back. Locking is described in the module documentation of `src/fs.rs`.
+- **After a discard, a descriptor on an inode that is gone gets `io`.** A directory can be an orphan, as on Linux, and
+  making a name inside a directory with no links is `no-entry`. A full descriptor table is `insufficient-memory`, and
+  `get-directories` on a full table traps, as its WIT type has no error to say it with.
+- **A name emptied by deletes keeps its `seq`,** so its head is `{"seq": N}` and not an empty tree. An inode number is
+  never given twice (above), and an empty head would start the count again.
+- **A request with no name has no preopens,** and the preopen of a request that has one is the turn's own name
+  (`Ctx::mount()`), which for a safe method reuses the snapshot that was read, so a GET that touches a file costs no
+  second read of the head.
+- **Blocks are verified and cached like nodes.** They go through the same fetch (the hash is checked against the link,
+  the version is pinned) and the same cache, keyed by the full path and version, so an unchanged file read again, in
+  a later request of the same environment, costs no GET. The cache can
+  hide an object that was lost until the process ends, so the tests that check for lost objects use a handle with no
+  cache.
+- **Writing 4 KiB to a large file rewrites a block.** A 256 KiB block is put whole, so a program that writes a
+  large file in 4 KiB pieces puts a block each time it moves on from one, which is up to 64 times the bytes if the
+  pieces are not merged. A turn holds a dirty block until the budget spills it or the commit uploads it, so pieces
+  that land in the same block in one turn put one object, and the measurement bears this out (release build, memory
+  store, 64 MiB written in one turn: 4 KiB pieces 333 ms, 64 KiB 173 ms, 1 MiB 166 ms; a 5-byte patch in a 64 MiB file
+  4 ms). The latency of S3 PUTs, 256 of them for 64 MiB, is not in these; it will be measured on a live run.
+- **The 0.2 binding has its own error type, `Fault`,** because the orphan rules stop the core's error converting into
+  the bindgen's `ErrorCode` and the `wasmtime::Error` of a trap in one place. `wasmtime-wasi-io` is a new direct
+  dependency (`=49.0.2`, which was already in the lock file as wasmtime-wasi's): the bindgen shares its stream
+  resources through `with:`, and its `async_trait` is the one the host traits are declared with, so the runtime code
+  uses that and not a dependency of its own. `async-trait` itself stays a dev-dependency.
+- **The end-to-end file cases run on the Rust app,** as the JavaScript app has no file routes: the QuickJS bindings
+  are by hand and the files are the subject of the tests, not the language.
 - **Only a turn's own name is mounted,** as `/`. A snapshot is mounted read-only, and a request without a name has no
   preopens, with no request made. Mounting others would need a path convention, and an app can read another name's
   keys already.

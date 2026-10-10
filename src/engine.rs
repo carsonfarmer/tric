@@ -1,5 +1,6 @@
 //! The Wasmtime engine, and apps on it: one `wasi:http/handler@0.3` component each, a fresh instance per request, under
 //! hard limits, with nothing granted but what tric provides.
+use crate::fs;
 use crate::kv::Imports;
 use crate::tric::{Ctx, Outbound, Request, Response};
 use sha2::{Digest, Sha256};
@@ -12,9 +13,17 @@ use tokio::time::timeout;
 use tracing::Instrument;
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Config, Result, Store, StoreLimits, StoreLimitsBuilder, bail};
+use wasmtime_wasi::cli::{WasiCli, WasiCliView};
+use wasmtime_wasi::clocks::{WasiClocks, WasiClocksView};
+use wasmtime_wasi::p2::bindings::{cli, clocks, random, sockets};
+use wasmtime_wasi::random::{WasiRandom, WasiRandomView};
+use wasmtime_wasi::sockets::{WasiSockets, WasiSocketsView};
+#[cfg(test)]
+use wasmtime_wasi::{I32Exit, p2::bindings::Command};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView, p2::pipe::MemoryOutputPipe};
 use wasmtime_wasi_http::p3::bindings::{Service, ServicePre};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView, p3};
+use wasmtime_wasi_io::IoView;
 
 /// One epoch tick. A guest yields once per tick, so this bounds how long a runaway holds up the others.
 const TICK: Duration = Duration::from_millis(10);
@@ -58,9 +67,15 @@ impl Engine {
             }
         });
         let mut linker = Linker::new(&engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?; // as Rust's standard library on wasm32-wasip2 imports it
-        wasmtime_wasi::p3::add_to_linker(&mut linker)?;
+        // The stock interfaces but the file system, which is tric's own. They are linked one by one, as no stock
+        // function leaves one out.
+        link_p2(&mut linker)?; // as Rust's standard library on wasm32-wasip2 imports them
+        wasmtime_wasi::p3::cli::add_to_linker(&mut linker)?;
+        wasmtime_wasi::p3::clocks::add_to_linker(&mut linker)?;
+        wasmtime_wasi::p3::random::add_to_linker(&mut linker)?;
+        wasmtime_wasi::p3::sockets::add_to_linker(&mut linker)?;
         p3::add_to_linker(&mut linker)?;
+        fs::p2::add_to_linker(&mut linker)?;
         Imports::add_to_linker::<Host, HasSelf<Host>>(&mut linker, |h| h)?; // `wasi:keyvalue`
         Ok(Self { engine, linker })
     }
@@ -103,6 +118,63 @@ impl Engine {
     }
 }
 
+#[cfg(test)]
+impl Engine {
+    /// Runs the `wasi:cli/command` component `command` to its end, as an app would run, under `ctx`; and returns its
+    /// exit code, and what it wrote to stdout and to stderr. For the tests of the file system, whose conformance tests
+    /// are commands.
+    pub async fn run_command(
+        &self,
+        command: &Component,
+        ctx: Arc<Ctx>,
+        args: &[String],
+        env: &[(String, String)],
+    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        let (out, err) = (MemoryOutputPipe::new(LOG_MAX), MemoryOutputPipe::new(LOG_MAX));
+        let wasi = WasiCtx::builder().stdout(out.clone()).stderr(err.clone()).args(args).envs(env).build();
+        let mut store = store(&self.engine, wasi, ctx);
+        let guest = Command::instantiate_async(&mut store, command, &self.linker).await?;
+        let code = match guest.wasi_cli_run().call_run(&mut store).await {
+            Ok(Ok(())) => 0,
+            Ok(Err(())) => 1,
+            Err(e) => match e.downcast_ref::<I32Exit>() {
+                Some(&I32Exit(code)) => code,
+                None => return Err(e),
+            },
+        };
+        Ok((code, out.contents().to_vec(), err.contents().to_vec()))
+    }
+}
+
+/// The interfaces that `wasmtime_wasi::p2::add_to_linker_async` links, less `wasi:filesystem`.
+fn link_p2(l: &mut Linker<Host>) -> Result<()> {
+    wasmtime_wasi_io::add_to_linker_async(l)?;
+    clocks::wall_clock::add_to_linker::<Host, WasiClocks>(l, Host::clocks)?;
+    clocks::monotonic_clock::add_to_linker::<Host, WasiClocks>(l, Host::clocks)?;
+    random::random::add_to_linker::<Host, WasiRandom>(l, Host::random)?;
+    random::insecure::add_to_linker::<Host, WasiRandom>(l, Host::random)?;
+    random::insecure_seed::add_to_linker::<Host, WasiRandom>(l, Host::random)?;
+    cli::exit::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
+    cli::environment::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
+    cli::stdin::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
+    cli::stdout::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
+    cli::stderr::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
+    cli::terminal_input::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
+    cli::terminal_output::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
+    cli::terminal_stdin::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
+    cli::terminal_stdout::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
+    cli::terminal_stderr::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
+    let net = &sockets::network::LinkOptions::default();
+    sockets::tcp_create_socket::add_to_linker::<Host, WasiSockets>(l, Host::sockets)?;
+    sockets::instance_network::add_to_linker::<Host, WasiSockets>(l, Host::sockets)?;
+    sockets::network::add_to_linker::<Host, WasiSockets>(l, net, Host::sockets)?;
+    sockets::tcp::add_to_linker::<Host, WasiSockets>(l, Host::sockets)?;
+    sockets::udp::add_to_linker::<Host, WasiSockets>(l, Host::sockets)?;
+    sockets::udp_create_socket::add_to_linker::<Host, WasiSockets>(l, Host::sockets)?;
+    sockets::ip_name_lookup::add_to_linker::<Host, WasiSockets>(l, Host::sockets)?;
+    Ok(())
+}
+
 /// An app: a component ready to instantiate, its environment and its slots for requests in flight.
 pub struct App {
     engine: wasmtime::Engine,
@@ -127,6 +199,12 @@ impl WasiView for Host {
     }
 }
 
+impl IoView for Host {
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
+}
+
 impl WasiHttpView for Host {
     fn http(&mut self) -> WasiHttpCtxView<'_> {
         WasiHttpCtxView { ctx: &mut self.http, table: &mut self.table, hooks: &mut self.hooks }
@@ -134,6 +212,21 @@ impl WasiHttpView for Host {
 }
 
 type Answer = Result<Response>;
+
+/// A store for one instance, under the limits of any app, and yielding at every tick: the deadlines of its caller end a
+/// runaway.
+fn store(engine: &wasmtime::Engine, wasi: WasiCtx, ctx: Arc<Ctx>) -> Store<Host> {
+    let hooks = Outbound(ctx.clone());
+    let limits = StoreLimitsBuilder::new().memory_size(MEMORY).memories(MEMORIES).instances(INSTANCES).tables(TABLES);
+    let limits = limits.table_elements(TABLE_MAX).build();
+    let mut host = Host { table: ResourceTable::new(), wasi, http: WasiHttpCtx::new(), hooks, ctx, limits };
+    host.table.set_max_capacity(RESOURCES);
+    let mut store = Store::new(engine, host);
+    store.limiter(|h| &mut h.limits);
+    store.set_hostcall_fuel(HOSTCALL_FUEL);
+    store.epoch_deadline_async_yield_and_update(1);
+    store
+}
 
 impl App {
     /// Runs one request in a fresh instance, with `ctx` for its state and its outbound requests, and returns the
@@ -144,16 +237,7 @@ impl App {
         let permit = self.permits.clone().acquire_owned().await?;
         let (out, err) = (MemoryOutputPipe::new(LOG_MAX), MemoryOutputPipe::new(LOG_MAX));
         let wasi = WasiCtx::builder().stdout(out.clone()).stderr(err.clone()).envs(&self.env).build();
-        let hooks = Outbound(ctx.clone());
-        let limits =
-            StoreLimitsBuilder::new().memory_size(MEMORY).memories(MEMORIES).instances(INSTANCES).tables(TABLES);
-        let limits = limits.table_elements(TABLE_MAX).build();
-        let mut host = Host { table: ResourceTable::new(), wasi, http: WasiHttpCtx::new(), hooks, ctx, limits };
-        host.table.set_max_capacity(RESOURCES);
-        let mut store = Store::new(&self.engine, host);
-        store.limiter(|h| &mut h.limits);
-        store.set_hostcall_fuel(HOSTCALL_FUEL);
-        store.epoch_deadline_async_yield_and_update(1); // yield at every tick; the deadlines below end a runaway
+        let mut store = store(&self.engine, wasi, ctx);
         let (pre, (tx, rx)) = (self.pre.clone(), oneshot::channel::<Answer>());
         let span = tracing::Span::current();
         let task = tokio::spawn(

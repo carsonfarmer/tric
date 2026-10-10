@@ -114,7 +114,9 @@ resource "aws_s3_bucket_versioning" "store" {
 resource "aws_s3_bucket_lifecycle_configuration" "store" {
   bucket     = aws_s3_bucket.store.id
   depends_on = [aws_s3_bucket_versioning.store]
-  # What a commit or a deploy replaced is kept a day, for the heads that still name it: there is no GC code.
+  # What a commit or a deploy replaced is kept a day, for the readers and heads that still name it: the committer
+  # deletes what its commit replaced, which in a versioned bucket leaves the version. The objects of a host that died
+  # are left, and nothing collects them yet.
   rule {
     id     = "noncurrent"
     status = "Enabled"

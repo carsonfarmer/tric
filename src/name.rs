@@ -1,5 +1,6 @@
 //! Names: each name's state is one object, its head, which a turn changes with a compare-and-swap when it commits.
 use crate::engine::ANSWER;
+use crate::fs;
 use crate::kv::{Error, KeyResponse, other};
 use crate::outbox::{Event, Held, Sink, WINDOW};
 use crate::store::{self, Store};
@@ -167,7 +168,8 @@ struct State {
 /// A request that may write one name: its writes are in its tree, which is committed or discarded once it answers. A
 /// snapshot is a turn that has answered: it reads the name as it was, and writes nothing.
 ///
-/// The locks are taken in the order `claiming`, `tree`, `state`; `state` is never held across an await.
+/// The locks are taken in the order `claiming`, the file system's gate (which a commit takes and lets go of at once),
+/// `tree`, `state`; `state` is never held across an await.
 pub struct Turn {
     store: Store,
     app: String,
@@ -175,6 +177,8 @@ pub struct Turn {
     path: Path,
     state: Mutex<State>,
     tree: RwLock<Tree>,
+    /// What the file system keeps: the descriptors open on it, and the gate its changes pass.
+    pub fs: fs::State,
     claiming: tokio::sync::Mutex<()>,
     settled: watch::Sender<Option<bool>>, // whether it committed, once it is known
     reaping: Mutex<Vec<JoinHandle<()>>>,  // the deletes of objects no head names, which the response waits for
@@ -238,7 +242,8 @@ impl Turn {
         let state = Mutex::new(State { head, base, answered, ..Default::default() });
         let (app, name, path, settled) = (app.into(), name.into(), path(app, name), watch::Sender::new(None));
         let (claiming, reaping) = (Default::default(), Default::default());
-        Ok(Arc::new(Self { store: store.clone(), app, name, path, state, tree, claiming, settled, reaping }))
+        let fs = Default::default();
+        Ok(Arc::new(Self { store: store.clone(), app, name, path, state, tree, fs, claiming, settled, reaping }))
     }
 
     /// A snapshot of `name`: as it is now, without waiting for anyone's claim.
@@ -341,6 +346,11 @@ impl Turn {
 
     pub fn is_open(&self) -> bool {
         !self.state().answered
+    }
+
+    /// The tree, which the file system reads and changes by its own rules.
+    pub fn tree(&self) -> &RwLock<Tree> {
+        &self.tree
     }
 
     /// Whether the name has `PENDING_MAX` commits pending, so that the turn's commit would be one too many for its
@@ -473,6 +483,7 @@ impl Turn {
             let held = std::mem::take(&mut s.held);
             (s.head.clone(), s.base.clone(), held, s.claim.is_some(), s.doomed)
         };
+        self.fs.drain().await; // so the file system's changes that were admitted land first
         let mut tree = self.tree.write().await; // after the writes that were in flight
         if doomed {
             self.reap(tree.lost());
@@ -482,7 +493,9 @@ impl Turn {
             return Ok(Committed::Done(base.as_ref().and_then(etag)));
         }
         let ready = async {
+            let mut kept = None;
             if tree.edited() {
+                kept = self.fs.settle(&mut tree).await?;
                 head.tree = tree.finish().await?;
             }
             let now = now();
@@ -503,15 +516,21 @@ impl Turn {
                 ensure!(serde_json::to_vec(&head)?.len() <= HEAD_MAX, TooLarge); // or the event would be sent in vain
                 sink(bytes).await?;
             }
-            Ok::<(), wasmtime::Error>(())
+            Ok::<_, wasmtime::Error>(kept)
         };
-        if let Err(e) = ready.await {
-            self.reap(tree.lost());
-            return Err(e);
-        }
+        let kept = match ready.await {
+            Ok(kept) => kept,
+            Err(e) => {
+                self.reap(tree.lost());
+                return Err(e);
+            }
+        };
         match put(&self.store, &self.path, &head, base).await {
             Ok(Some(version)) => {
                 self.reap(tree.landed());
+                if let Some(kept) = kept {
+                    self.fs.keep(kept); // under the write lock, so a read sees it from the first
+                }
                 Ok(Committed::Done(etag(&version)))
             }
             Ok(None) => {
@@ -539,6 +558,7 @@ impl Turn {
             s.held.clear();
             (s.head.clone(), s.base.clone(), s.claim.take())
         };
+        self.fs.drain().await;
         self.reap(self.tree.write().await.lost());
         self.settled.send_replace(Some(false));
         if claimed.is_some() {

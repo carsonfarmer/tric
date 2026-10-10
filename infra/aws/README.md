@@ -24,7 +24,8 @@ while idle: the only standing costs are the domain's Route 53 zone and what the 
 - **WebSockets**, an API Gateway WebSocket API. CloudFront sends it a request that opens a socket, at the app's own
   URL. Its stage is throttled to `ws_rate` requests a second, 100 by default, with a burst of `ws_burst`, 200.
 - **One bucket**, versioned:
-  - `apps/<app>/…` holds the releases, components and state;
+  - `apps/<app>/…` holds the releases, components and state: a name's head is `names/<name>`, and its keys and files
+    are the objects of a tree under `values/<name>/`;
   - `native/<app>/…` holds the compiled code;
   - `ws/…` holds sockets' records and subscriptions, for the router alone;
   - `outbox/<app>/<commit>` holds a delivery that is waiting for a retry, for the router alone;
