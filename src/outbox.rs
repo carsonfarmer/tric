@@ -28,9 +28,12 @@ const EXCHANGE: Duration = Duration::from_secs(60);
 const BODY_MAX: usize = 1 << 20;
 /// The most a delivery event, as JSON, may be.
 pub const EVENT_MAX: usize = 2 << 20;
-/// The relay's waits between tries, unless a `Retry-After` asks for longer, up to `WAIT_MAX`.
-const WAITS: [u64; 2] = [1, 2];
-const WAIT_MAX: Duration = Duration::from_secs(60);
+/// How long a delivery is tried again, from its first failure.
+pub const WINDOW: Duration = Duration::from_secs(24 * 3600);
+/// The wait after a delivery's first failure, which doubles with each, up to `WAIT_MAX`. EventBridge Scheduler keeps
+/// time to the minute, so a shorter one would be no shorter.
+const FIRST: Duration = Duration::from_secs(60);
+const WAIT_MAX: Duration = Duration::from_secs(3600);
 
 /// Where a commit hands its delivery event, the event's JSON, before it writes the head.
 pub type Sink = Arc<dyn Fn(Bytes) -> BoxFuture<'static, Result<()>> + Send + Sync>;
@@ -201,16 +204,31 @@ pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     headers.get(RETRY_AFTER)?.to_str().ok()?.trim().parse().ok().map(Duration::from_secs)
 }
 
-/// Tries a delivery `attempt` up to three times, waiting 1 s and then 2 s between tries, or what `Retry-After` asked;
-/// then logs the event as lost. Gives the messages it published.
+/// How long to wait after a delivery's `tries`th failed try, the first being 1: `FIRST`, doubled for each try before,
+/// up to `WAIT_MAX`, or, if it is longer, what `Retry-After` asked, up to `WINDOW`; and up to a quarter more, so that
+/// the events that failed together do not come back together.
+pub fn backoff(tries: u32, after: Option<Duration>) -> Duration {
+    let wait = FIRST.saturating_mul(2u32.saturating_pow(tries.saturating_sub(1))).min(WAIT_MAX);
+    wait.max(after.unwrap_or_default().min(WINDOW)).mul_f64(rand::random_range(1.0..=1.25))
+}
+
+/// Tries a delivery `attempt` until it is done or `WINDOW` is over, waiting as `backoff` says between tries; then logs
+/// the event as lost. Gives the messages it published. On Lambda, Scheduler does this: see `retry.rs`.
 pub async fn relay<F: Future<Output = Delivered>>(mut attempt: impl FnMut() -> F) -> Vec<(String, String)> {
-    for wait in WAITS {
-        match attempt().await {
+    let deadline = Instant::now() + WINDOW;
+    for tries in 1.. {
+        let after = match attempt().await {
             Ok(published) => return published,
-            Err(after) => sleep(after.unwrap_or_default().max(Duration::from_secs(wait)).min(WAIT_MAX)).await,
+            Err(after) => after,
+        };
+        let wait = backoff(tries, after);
+        if Instant::now() + wait > deadline {
+            break;
         }
+        sleep(wait).await;
     }
-    attempt().await.unwrap_or_else(|_| (tracing::warn!("outbox: an event failed every try, so it is lost"), vec![]).1)
+    tracing::warn!("outbox: an event failed every try for {WINDOW:?}, so it is lost");
+    vec![]
 }
 
 /// The messages that serve's answer `res` to a delivery event says were published: no more than the event held, so
@@ -242,5 +260,17 @@ mod tests {
         for no in [&[][..], &["wait=10"], &["respond-asyncx"], &["x=respond-async"]] {
             assert!(!h(no), "{no:?}");
         }
+    }
+
+    #[test]
+    fn backoff_doubles_to_a_cap_and_keeps_to_retry_after() {
+        let within = |wait: Duration, base: u64| (base as f64..=base as f64 * 1.25).contains(&wait.as_secs_f64());
+        for (tries, base) in [(1, 60), (2, 120), (3, 240), (6, 1920), (7, 3600), (30, 3600), (u32::MAX, 3600)] {
+            assert!(within(backoff(tries, None), base), "{tries}");
+        }
+        let hours = |h: u64| Some(Duration::from_secs(h * 3600));
+        assert!(within(backoff(1, hours(2)), 7200));
+        assert!(within(backoff(9, hours(0)), 3600));
+        assert!(within(backoff(1, Some(Duration::MAX)), 24 * 3600)); // no more than the window
     }
 }

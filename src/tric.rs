@@ -302,8 +302,9 @@ impl Ctx {
         }
     }
 
-    /// Sends an outbound request: held for the outbox if it asks to be and the turn is open; to the app itself
-    /// in-process; and, if it is unsafe and the request a turn, once the turn's name is claimed.
+    /// Sends an outbound request: held for the outbox if it asks to be and the turn is open, or else refused with 503
+    /// if the name has too many commits pending; to the app itself in-process; and, if it is unsafe and the request a
+    /// turn, once the turn's name is claimed.
     async fn send(self: Arc<Self>, mut req: Request) -> Sent {
         let me = req.uri().authority().is_some_and(|a| a.as_str().eq_ignore_ascii_case(&self.host));
         if !me {
@@ -315,6 +316,9 @@ impl Ctx {
             && turn.is_open()
             && outbox::respond_async(req.headers())
         {
+            if turn.backlogged() {
+                return Ok((status(StatusCode::SERVICE_UNAVAILABLE), done)); // refused, and not sent at once
+            }
             turn.hold(Held::of(req).await?).map_err(|e| internal(&e))?;
             return Ok((outbox::accepted(), done));
         }

@@ -1,7 +1,7 @@
 //! Names: each name's state is one object, its head, which a turn changes with a compare-and-swap when it commits.
 use crate::engine::ANSWER;
 use crate::kv::{Error, KeyResponse, other};
-use crate::outbox::{Event, Held, Sink};
+use crate::outbox::{Event, Held, Sink, WINDOW};
 use crate::store::{self, Store};
 use base64::{Engine as _, prelude::BASE64_STANDARD as B64};
 use bytes::Bytes;
@@ -25,8 +25,12 @@ const PAGE: usize = 1000; // keys per `list-keys`
 pub const BUSY: Duration = Duration::from_secs(5);
 /// A claim outlives the deadline of the turn that took it, by the time a commit may take.
 const CLAIM_TTL: Duration = ANSWER.saturating_add(Duration::from_secs(5));
-/// How long a commit stays pending: Lambda's longest wait for an event.
-const PENDING_TTL: Duration = Duration::from_secs(6 * 3600);
+/// How long a commit stays pending: the window its delivery is tried in, and an hour more, for an event that Lambda
+/// was late to hand over.
+const PENDING_TTL: Duration = WINDOW.saturating_add(Duration::from_secs(3600));
+/// The most commits a name may have pending, at some 130 bytes each in its head. At that, a turn's background requests
+/// are refused, so the head stays far under `HEAD_MAX`, and no pending commit is dropped before its time.
+const PENDING_MAX: usize = 1000;
 
 /// Whether `s` is a name: 1 to 128 of `A-Za-z0-9._~:-`, starting with a letter or digit.
 pub fn is_name(s: &str) -> bool {
@@ -58,6 +62,12 @@ pub struct Head {
 pub struct Pending {
     pub digest: String,
     at: u64,
+}
+
+impl Pending {
+    fn live(&self, now: u64) -> bool {
+        now.saturating_sub(self.at) < PENDING_TTL.as_millis() as u64
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -329,6 +339,13 @@ impl Turn {
         !self.state().answered
     }
 
+    /// Whether the name has `PENDING_MAX` commits pending, so that the turn's commit would be one too many for its
+    /// background requests.
+    pub fn backlogged(&self) -> bool {
+        let now = now();
+        self.state().head.pending.values().filter(|p| p.live(now)).count() >= PENDING_MAX
+    }
+
     /// Holds `held` for the outbox, unless the turn is answered or holds too much.
     pub fn hold(&self, held: Held) -> Result<(), String> {
         let n = serde_json::to_vec(&held).map_err(|e| e.to_string())?.len();
@@ -467,7 +484,7 @@ impl Turn {
                 }
             }
             let now = now();
-            head.pending.retain(|_, p| now.saturating_sub(p.at) < PENDING_TTL.as_millis() as u64);
+            head.pending.retain(|_, p| p.live(now));
             head.claim = None;
             if !held.is_empty() {
                 let commit = store::random();
@@ -564,6 +581,21 @@ mod tests {
         assert!(!c(None, Some("W/\"abc\"")).hold(e), "If-None-Match compares weakly");
         assert!(c(None, Some("\"x\"")).hold(e));
         assert!(c(None, None).hold(None));
+    }
+
+    #[tokio::test]
+    async fn a_name_with_too_many_commits_pending_is_backlogged() {
+        for (live, backlogged) in [(PENDING_MAX, true), (PENDING_MAX - 1, false)] {
+            let (store, mut head) = (Store::memory(), Head::default());
+            for i in 0..=PENDING_MAX {
+                let at = if i < live { now() } else { 0 }; // the rest have expired, and do not count
+                head.pending.insert(store::random(), Pending { digest: store::hash(&[]), at });
+            }
+            assert!(serde_json::to_vec(&head).unwrap().len() < HEAD_MAX / 4, "the head stays far under its limit");
+            put(&store, &path("a", "n"), &head, None).await.unwrap().unwrap();
+            let turn = Turn::open(&store, "a", "n", false, &Default::default(), Instant::now()).await;
+            assert_eq!(turn.unwrap().ok().unwrap().backlogged(), backlogged, "{live} live");
+        }
     }
 
     #[tokio::test]

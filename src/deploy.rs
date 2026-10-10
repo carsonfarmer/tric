@@ -29,8 +29,8 @@ pub struct Release {
     pub env: BTreeMap<String, String>,
 }
 
-/// On AWS, where apps' cron is: a schedule group, the router's events function, by its ARN, which the schedules invoke,
-/// and the role they do so as.
+/// On AWS, where schedules are: a schedule group, the router's events function or alias, by its ARN, which they invoke,
+/// and the role they do so as. Apps' cron has one, and the router's retries another.
 pub struct Scheduler {
     pub group: String,
     pub target: String,
@@ -97,7 +97,7 @@ async fn schedule(aws: &Aws, app: &str, cron: &BTreeMap<String, String>, s: &Sch
 }
 
 /// Calls EventBridge Scheduler, for which `done`, besides a success, means it's done already.
-async fn scheduler(aws: &Aws, method: Method, path: &str, body: Vec<u8>, done: StatusCode) -> Result<Bytes> {
+pub(crate) async fn scheduler(aws: &Aws, method: Method, path: &str, body: Vec<u8>, done: StatusCode) -> Result<Bytes> {
     let res = aws.send("scheduler", method, path, &[(CONTENT_TYPE.as_str(), "application/json")], body).await?;
     let (status, body) = (res.status(), res.into_body().bytes().await?);
     ensure!(status.is_success() || status == done, "Scheduler answered {status}: {}", String::from_utf8_lossy(&body));

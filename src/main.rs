@@ -10,6 +10,7 @@ mod manifest;
 mod name;
 mod outbound;
 mod outbox;
+mod retry;
 mod route;
 mod serve;
 mod store;
@@ -83,6 +84,15 @@ enum Cmd {
         /// a router without one takes only events
         #[arg(long, env = "TRIC_ORIGIN", hide_env_values = true)]
         origin: Option<String>,
+        /// On AWS, the EventBridge Scheduler group that a failed delivery's retries are scheduled in
+        #[arg(long, env = "TRIC_RETRIES", requires_all = ["retry", "retry_role"])]
+        retries: Option<String>,
+        /// On AWS, the router's `retry` alias, by its ARN, which the retries invoke
+        #[arg(long, env = "TRIC_RETRY", requires = "retries")]
+        retry: Option<String>,
+        /// On AWS, the role the retries invoke it as
+        #[arg(long, env = "TRIC_RETRY_ROLE", requires = "retries")]
+        retry_role: Option<String>,
     },
 }
 
@@ -121,9 +131,11 @@ async fn main() -> Result<()> {
             deploy::run(&app.path, &app.allow, app.e, &bucket, scheduler).await
         }
         Cmd::Serve { listen, domain, bucket, outbox } => serve::run(listen, domain, bucket, outbox).await,
-        Cmd::Route { listen, outbox_listen, domain, bucket, serve, role, origin } => {
+        Cmd::Route { listen, outbox_listen, domain, bucket, serve, role, origin, retries, retry, retry_role } => {
             let origin = origin.filter(|o| !o.is_empty()); // an empty secret is none
-            route::run(listen, outbox_listen, domain, bucket, serve, role, origin).await
+            let retries = retries.zip(retry.zip(retry_role));
+            let retries = retries.map(|(group, (target, role))| deploy::Scheduler { group, target, role });
+            route::run(listen, outbox_listen, domain, bucket, serve, role, origin, retries).await
         }
     }
 }

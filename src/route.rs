@@ -1,13 +1,15 @@
 //! `tric route`: the router, tric's trusted core, which runs no app code. It takes the app from the `Host`, mints the
 //! app's storage credentials with STS, and sends serve the request with them, as the app's tenant. On Lambda, cron
-//! jobs, delivery events and sockets' events invoke aliases, which the Lambda Web Adapter makes requests of, as it does
-//! a function URL's. Locally, the router ticks cron itself, and takes the invocations on a listener of its own.
+//! jobs, delivery events, their retries and sockets' events invoke aliases, which the Lambda Web Adapter makes requests
+//! of, as it does a function URL's. Locally, the router ticks cron itself, and takes the invocations on a listener of
+//! its own.
 use crate::aws::{Aws, LIFETIME};
 use crate::cron::{self, Cron};
-use crate::deploy::{RELEASE_MAX, Release};
+use crate::deploy::{RELEASE_MAX, Release, Scheduler};
 use crate::lambda;
 use crate::outbound;
 use crate::outbox::{self, Delivered};
+use crate::retry::Waiting;
 use crate::store::{self, Store};
 use crate::tric::{self, CREDENTIALS, Request, Response, TENANT, app_at, forward, forwarded, label, status};
 use bytes::Bytes;
@@ -25,7 +27,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use wasmtime::{Result, format_err};
+use wasmtime::{Result, ensure, format_err};
 
 /// How long whether an app has a release is taken as known.
 const KNOWN_FOR: Duration = Duration::from_secs(5);
@@ -39,6 +41,8 @@ pub(crate) struct Route {
     role: Option<String>,
     /// The secret CloudFront sends with every request, and every socket's opening, as `X-Tric-Origin`.
     origin: Option<String>,
+    /// On Lambda, where a delivery that fails waits to be tried again.
+    pub(crate) retries: Option<Scheduler>,
     pub(crate) store: Store,
     pub(crate) aws: Aws,
     known: Cache<bool>,
@@ -69,7 +73,9 @@ async fn cached<V: Clone>(
 }
 
 /// Routes requests for `<app>.<domain>` on `listen` to serve, with credentials for `bucket` minted as `role`. serve is
-/// a Lambda function, by its ARN, or else at `host:port`, and then the router takes invocations on `outbox`.
+/// a Lambda function, by its ARN, and then `retries` is where deliveries wait, or else at `host:port`, and then the
+/// router takes invocations on `outbox`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     listen: SocketAddr,
     outbox: SocketAddr,
@@ -78,11 +84,17 @@ pub async fn run(
     serve: String,
     role: Option<String>,
     origin: Option<String>,
+    retries: Option<Scheduler>,
 ) -> Result<()> {
+    ensure!(
+        serve.starts_with("arn:") == retries.is_some(),
+        "retries are for a router whose serve is a Lambda function"
+    );
     let s3 = store::s3(&bucket, None)?;
     let aws = Aws::new(&s3)?;
     let (known, creds) = (Mutex::default(), Mutex::default());
-    let route = Arc::new(Route { domain, bucket, serve, role, origin, store: Store::s3(s3), aws, known, creds });
+    let route =
+        Arc::new(Route { domain, bucket, serve, role, origin, retries, store: Store::s3(s3), aws, known, creds });
     let clients = TcpListener::bind(listen).await?;
     // Locally, events have a listener of their own, which is up before the router says it is.
     let events = match route.serve.starts_with("arn:") {
@@ -132,8 +144,8 @@ impl Route {
 
     /// A request the Lambda Web Adapter makes of an invocation, or one of the local listener that stands in for them.
     /// A function URL's is CloudFront's, with the origin secret, the viewer's host and the viewer's address. Any other
-    /// is an event, by the alias invoked: `outbox`, which only serve may invoke; `cron`, which only Scheduler may; and
-    /// `ws`, which only API Gateway may.
+    /// is an event, by the alias invoked: `outbox`, which only serve may invoke; `cron` and `retry`, which only
+    /// Scheduler may, each as a role of its own; and `ws`, which only API Gateway may.
     async fn lambda(self: Arc<Self>, req: hyper::Request<Incoming>) -> Response {
         let header = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or_default();
         let context = |name: &str| serde_json::from_str::<Value>(header(name)).unwrap_or_default();
@@ -147,6 +159,7 @@ impl Route {
             (true, _, None) => status(StatusCode::BAD_REQUEST),
             (false, Some("outbox"), _) => self.outbox(req).await,
             (false, Some("cron"), _) => self.job(req).await,
+            (false, Some("retry"), _) => self.retry(req).await,
             #[cfg(feature = "ws")]
             (false, Some("ws"), _) => self.ws(req).await,
             _ => status(StatusCode::FORBIDDEN),
@@ -249,23 +262,23 @@ impl Route {
         true
     }
 
-    /// Takes a delivery event that serve hands over, and relays it to the app it names, as Lambda does an event: at
-    /// once, and twice more if that fails. On Lambda, Lambda does: this delivers it once, and answers 503 if that
-    /// failed, which fails the invocation. Then it sends the messages the event published.
+    /// Takes a delivery event that serve hands over, and delivers it to the app it names, and sends the messages it
+    /// published. On Lambda, that is once; if it fails, the event waits to be tried again, as `retry.rs` says, and 503
+    /// answers only a failure of the router itself. Locally, the router tries again itself, in a task.
     async fn outbox(self: Arc<Self>, req: hyper::Request<Incoming>) -> Response {
-        let (event, app) = match body::<outbox::Event>(req).await {
-            Ok((event, e)) if label(&e.app) => (event, e.app),
+        let (event, e) = match body::<outbox::Event>(req).await {
+            Ok((event, e)) if label(&e.app) => (event, e),
             Ok(_) => return status(StatusCode::BAD_REQUEST),
             Err(code) => return status(code),
         };
-        if self.serve.starts_with("arn:") {
-            let Ok(_published) = self.deliver(&app, event).await else {
-                return status(StatusCode::SERVICE_UNAVAILABLE);
-            };
-            #[cfg(feature = "ws")]
-            crate::ws::Hub::Aws(&self).publish(&app, _published).await;
-            return status(StatusCode::NO_CONTENT);
+        if let Some(retries) = &self.retries {
+            let w = Waiting::new(e.app.clone(), e.commit);
+            if !w.valid() {
+                return status(StatusCode::BAD_REQUEST);
+            }
+            return self.answer(&e.app, self.first(retries, w, event).await).await;
         }
+        let app = e.app;
         tokio::spawn(async move {
             let _published = outbox::relay(|| {
                 let (route, app, event) = (self.clone(), app.clone(), event.clone());
@@ -280,7 +293,7 @@ impl Route {
 
     /// Sends serve `app`'s delivery event: done once serve has it delivered, or dropped, and to be tried again after a
     /// 429, a 5xx or a failed exchange.
-    async fn deliver(&self, app: &str, event: Bytes) -> Delivered {
+    pub(crate) async fn deliver(&self, app: &str, event: Bytes) -> Delivered {
         match self.event(app, "/", "for=_tric", event).await {
             Ok(Some(res)) if res.status() == StatusCode::TOO_MANY_REQUESTS || res.status().is_server_error() => {
                 tracing::info!(app, "outbox: serve answered {}", res.status());
