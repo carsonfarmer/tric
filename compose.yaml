@@ -34,6 +34,7 @@ services:
     command: >-
       sh -c 'CARGO_TARGET_DIR=/src/target/fixtures tests/components/build.sh
       && cargo fmt --check
+      && cargo fmt --check --manifest-path tests/components/rust/Cargo.toml
       && cargo clippy --locked --all-targets -- -D warnings
       && cargo clippy --locked --all-targets --features ws -- -D warnings
       && cargo test --locked

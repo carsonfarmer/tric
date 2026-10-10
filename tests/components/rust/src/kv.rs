@@ -9,7 +9,10 @@
 //! - `get-many` is `[[key, value or null], ..]`, and `set-many` stores V under each of `keys`, as `delete-many` deletes them.
 use serde_json::{Value, json};
 use std::{collections::HashMap, fmt::Debug};
-use wasi::keyvalue::{atomics::{self, Cas, CasError}, batch, store};
+use wasi::keyvalue::{
+    atomics::{self, Cas, CasError},
+    batch, store,
+};
 
 wit_bindgen::generate!({
     inline: "package tric:fixture; world kv { include wasi:keyvalue/imports@0.2.0-draft2; }",
@@ -89,8 +92,12 @@ fn run(store: &str, q: &HashMap<String, String>) -> Result<Value, String> {
             }
             json!(retries)
         }
-        "get-many" => json!(batch::get_many(b, &keys).map_err(e)?.into_iter().map(|(k, v)| (k, text(v))).collect::<Vec<_>>()),
-        "set-many" => json!(batch::set_many(b, &keys.iter().map(|k| (k.clone(), value.to_vec())).collect::<Vec<_>>()).map_err(e)?),
+        "get-many" => {
+            json!(batch::get_many(b, &keys).map_err(e)?.into_iter().map(|(k, v)| (k, text(v))).collect::<Vec<_>>())
+        }
+        "set-many" => {
+            json!(batch::set_many(b, &keys.iter().map(|k| (k.clone(), value.to_vec())).collect::<Vec<_>>()).map_err(e)?)
+        }
         "delete-many" => json!(batch::delete_many(b, &keys).map_err(e)?),
         op => return Err(format!("unknown op {op:?}")),
     })

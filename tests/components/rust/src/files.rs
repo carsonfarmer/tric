@@ -91,7 +91,13 @@ fn run(q: &HashMap<String, String>) -> Result<Value, String> {
         }
         "stat" => {
             let meta = fs::symlink_metadata(path).map_err(e)?;
-            let kind = if meta.is_dir() { "dir" } else if meta.is_symlink() { "symlink" } else { "file" };
+            let kind = if meta.is_dir() {
+                "dir"
+            } else if meta.is_symlink() {
+                "symlink"
+            } else {
+                "file"
+            };
             json!({ "type": kind, "len": meta.len() })
         }
         "mkdir" => json!(fs::create_dir(path).map_err(e)?),
