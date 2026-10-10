@@ -589,8 +589,21 @@ overlay applied at the commit.
 - lifecycle expires noncurrent versions and `outbox/`.
 
 **The remote test, after the user says go:**
-- an app answers through CloudFront, and streams;
-- two apps run in different tenants, and neither one's credentials read the other's data;
+- an app answers through CloudFront, and streams, and `for=` is the viewer's address;
+- two apps run in different tenants, and neither one's credentials read the other's data: IAM's policy simulator
+  shows it for the minted session policy, and for the role alone that no release or component is writable;
+- a direct call to the router can't forge `_cron`, `_tric`, `_sweep` or credentials;
 - the outbox, its retries and cron work;
-- a direct call to the router can't forge `_cron`, `_tric` or credentials;
-- `for=` is the viewer's address.
+- files, through both `wasi:filesystem` 0.2 and 0.3, on S3:
+  - keys and files commit together or not at all;
+  - outside a turn on it, a name's files are read-only, and no other name has them;
+  - a file of several blocks, written across a block's end and cut short, reads back by its hash;
+  - a path can't leave the tree;
+  - racing turns each count once;
+- each app's daily sweep is in the cron group at its minute, and one sweep, through the cron alias, runs as the app's
+  tenant: it keeps what a tree names and what is under an hour old, and reports what it did; nothing else can ask
+  for one;
+- the lifecycle rules, roles and environments are as the module says;
+- for decisions to come, the run keeps the heads' reads and writes in a mix of turns, and what each turn fetched and
+  put;
+- the run deletes what it made, and a later pass finds the minted policy in CloudTrail.
