@@ -261,7 +261,10 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   wasmtime-wasi's `src/p3/mod.rs`), and for 0.2 each interface's `bindings::...::add_to_linker`, with our `bindgen!`
   sharing the stock `wasi:io` stream resources through `with:`. A new stock interface that appears in a Wasmtime
   upgrade then isn't linked until someone adds it, which fails loudly at instantiation and not quietly in an app.
-- **0.2 and 0.3 share one core.** Rust's standard library and wasi-libc import 0.2, and tric's HTTP is 0.3. The two
+- **0.2 and 0.3 share one core.** An app's toolchain, not the app, picks the version, and each has its users (checked
+  2026-10-10). Rust's `std::fs` imports `wasi:filesystem` 0.2 on `wasm32-wasip2`, stable Rust's target until 1.100,
+  and 0.3 on `wasm32-wasip3`, stable from 1.100 (due 12 November 2026), which imports nothing of 0.2 at all and runs
+  on Wasmtime 49.0.2. A componentize-qjs component imports the 0.2 file system whether it uses files or not. The two
   differ in being async and in `stream` and `future`, and not in what a call does, so each binding is a thin layer
   that converts types and errors, and the rules live once: opening (`Handle::open_as`), the writer and the preopens
   of a host, the count a write reports (`wrote`), directory paging (`Entries`) and read-ahead (`Ahead`) are all in
