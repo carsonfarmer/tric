@@ -228,6 +228,7 @@ impl Route {
                 continue;
             };
             if Cron::parse(&sweep::schedule(app)).is_ok_and(|c| c.matches(t)) {
+                tracing::info!(app, "cron: sweep due");
                 let (route, app) = (self.clone(), app.to_owned());
                 tokio::spawn(async move { route.sweep(&app).await });
             }

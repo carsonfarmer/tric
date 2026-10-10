@@ -394,8 +394,11 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   guest's call to its own origin runs in-process with `for=_tric` and never reaches serve's `handle`. The e2e tests
   send it every way: `drops_forged_events` sends `for=_sweep` in a public `GET` and `POST` (answered by the app, as
   any request is) and in events for each alias, for none and for ones that are none, and asserts that the log shows
-  no sweep and so no list and no delete; `isolates_apps` sends it to serve with no credentials, with no tenant and with
-  the wrong tenant, and gets a 403 each time.
+  no sweep and so no list and no delete. (Locally the router's own tick sweeps an app at its minute of the day, which
+  could be a minute the test runs in. The tick logs `cron: sweep due` before it asks, so the test counts the lines of
+  a sweep less those: each tick accounts for one of each kind, and the count does not depend on the time of day.
+  Nothing in the code is there for the test.) `isolates_apps` sends it to serve with no credentials, with no tenant
+  and with the wrong tenant, and gets a 403 each time.
 - **Only a key a tree could have made is deleted.** A candidate is `apps/<app>/values/<name>/<id>`, where `<name>`
   passes `is_name` and `<id>` is 32 lowercase hex digits, and where the key is equal to the one `tree::object` builds
   for that name and id, the one place that builds a `values/` path. A listed key of any other shape (the `.sweep`
@@ -443,13 +446,42 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   full, and takes 25 to 50 s. A name passes the valve only with more than 100,000 nodes, which is 3 to 6 GiB of keys,
   links and inline values in its nodes; the structural extreme, 16 GiB of 4 KiB inline values, is 262,000 to 524,000
   nodes, which no run reads. The set of ids is about 24 bytes an id, and a name has 4 Mi ids at most, so about 100 MB
-  in serve's 1,024 MB; the nodes in flight are 16 of 64 KiB. The listing is the other bound: S3 lists 1,000 keys a
-  request, in sequence, so the 100,000 objects of a large name take 100 requests, and the 4 Mi of the extreme take
-  4,200, which is longer than a run. So the valve has two parts: a name with more than `NODES_MAX` nodes is not walked,
-  and a name that is the first of a run and takes longer than the run is passed over, each with a warning that names
-  the app and the name, and each deleting nothing, as its walk did not complete. Neither is expected to fire, and a
-  name that makes one is at its limits. If one ever does, the way to raise the bound is to list the sixteen prefixes of
-  the id's first digit at once; nothing is built for that.
+  in serve's 1,024 MB; the nodes in flight are 16 of 64 KiB. The valve has two parts: a name with more than
+  `NODES_MAX` nodes is not walked, and a name that is the first of a run and takes longer than the run is passed over,
+  each with a warning that names the app and the name, and each deleting nothing, as its walk did not complete.
+  Neither is expected to fire, and a name that makes one is at its limits.
+- **A name's objects are listed sixteen ways at once.** S3 lists 1,000 keys a request, in sequence. A name near
+  `DATA_MAX` in values just over the 4 KiB inline limit has 4 Mi objects: 4,200 requests one after another, some 5
+  minutes at 75 ms each, which is longer than a run, so such a name would be passed over every day. An id is 128
+  random bits in hex, so a name's objects are spread evenly over the 16 digits an id may begin with, and
+  `sweep::unnamed` lists each digit's on its own, all at once. The listing of a digit begins after `<before>g`, where
+  `before` is the digit before it (`list_with_offset`, which S3 does with `start-after`), and the stream is dropped
+  at the first key from `<digit>g`. An id has a hex digit second and `g` follows `f` in key order, so every id of the
+  digit lies between those keys and none of another digit does. Each listing is then 263 requests for the 4 Mi, some
+  13 to 26 s at 50 to 100 ms, with 16 requests under way at a time. These figures are assumptions, not measurements.
+  The digit is also checked of each id, so that an id is in one listing and only one whichever way a store treats the
+  offset, and a key that is no id is passed over, as it was. A listing that errors fails its name, and nothing is
+  deleted from it. The unit test puts ids at both ends of every digit's range and in the middle, with keys that are
+  no ids among them, and shows that each id is found once, that no listing reads past its range (it reads the keys
+  there are and one more for each digit), and that a run deletes each once. The price is that a name costs 16 listing
+  requests where it cost 1, whatever its size: $0.00008 a name where it was $0.000005 (S3 Standard, $0.005 for 1,000),
+  so $0.12 a day for an app whose run is full of names (below), and less for a smaller one. Reading the first page
+  alone, and the rest sixteen ways only if it is not the last, would save that, and is not built.
+- **The number of names an app has bounds a run, and that is a known limit.** A sweep lists the app's `values/` for the
+  names that have objects (a delimiter listing, 1,000 prefixes a request, which `object_store` cannot begin part of
+  the way through) and `names/` for their heads, both at once, and holds both: about 130 bytes a name, so 1M names are
+  130 MB of serve's 1,024. At 75 ms a request, which is an assumption, 1M names are 1,000 requests, some 75 s of a
+  run's 240, and every run lists them again; 3M names are a run, and leave no time to sweep. The sweep of a name is
+  the nearer limit: its head, a node or more and its listings are four or five requests in sequence, some 150 ms, so
+  a run sweeps about 1,500 names. An app with a thousand is swept every day; one with 100,000 is gone through in some
+  65 days, a pass at a time from the cursor; one with 1M in some 900, as a third of each run is its listing. Nothing
+  is lost by that, as what a sweep leaves is only space, and nothing is built for it, as no app is there. When one is,
+  the remedies are to sweep several names at once (the walk and the listing are concurrent already; the loop over the
+  names is not) and to list `values/` from the cursor, which needs a request of our own to `ListObjectsV2` with
+  `start-after` and a delimiter. `names/` could be listed from the cursor now, with `list_with_offset`, and is not: it
+  saves no time while `values/` is listed whole beside it, and it is not exact. The cursor is a name, in the order of
+  names, and a listing is in the order of keys, where a `~` in a name is `%7e`; an offset made from the cursor could
+  pass over the head of a name that follows it, and a head that is not listed is a tree whose objects are all deleted.
 - **The sweep schedule lives and dies with an app's others.** `deploy::wanted` makes the schedules an app is to have,
   its cron entries and its sweep, and `deploy::changes` compares them with those that exist: it creates what is missing
   first and then deletes what is extra, so the first deploy makes the sweep and later ones leave it. There is no command

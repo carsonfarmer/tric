@@ -909,13 +909,15 @@ async fn drops_forged_events() {
     // A sweep lists an app's names and deletes objects, and serve takes the router's `Forwarded: for=_sweep` as the ask
     // for one. Only the `cron` alias's `{app, sweep}`, which only Scheduler may invoke, makes the router say it, so
     // nothing may carry it in: not a client's request, whose `Forwarded` the router replaces with its own, nor an
-    // event, for which the router writes its own, whatever alias it is for. (The router's own daily sweep, locally,
-    // could fall in this test's seconds, at about one run in ten thousand, and would show in the counts below.)
-    // What serve and the router log of a sweep, once each, whether it went well or not.
+    // event, for which the router writes its own, whatever alias it is for.
+    // What serve and the router log of a sweep, once each, whether it went well or not, less the sweeps that the
+    // router sent itself: locally it sweeps an app at its minute of the day, which could be one of this test's, and
+    // says it is due before it asks, so each of those is a line of each kind that is accounted for.
     let sweeps = || {
         let log = plain(&tric.log.lock().unwrap());
+        let due = log.matches("tric::route: cron: sweep due").count();
         ["tric::route: sweep", "tric::serve: swept", "tric::serve: sweep:", "tric::sweep"]
-            .map(|l| log.matches(l).count())
+            .map(|l| log.matches(l).count().saturating_sub(due))
     };
     let app = &tric.apps[0];
     let ask = json!({ "app": app, "sweep": true }).to_string();

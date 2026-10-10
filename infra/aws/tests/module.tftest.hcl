@@ -141,8 +141,8 @@ run "module" {
       if contains(flatten([s.Action]), "s3:ListBucket")]
       == [{
         Effect    = "Allow"
-        Action    = ["s3:ListBucket"]
-        Resource  = [aws_s3_bucket.store.arn]
+        Action    = "s3:ListBucket"
+        Resource  = aws_s3_bucket.store.arn
         Condition = { StringLike = { "s3:prefix" = "ws/channels/*" } }
       }]
     )

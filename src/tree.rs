@@ -1221,6 +1221,7 @@ pub(crate) mod counting {
         pub delay: AtomicU64,    // how long a get takes, in milliseconds
         pub flight: AtomicUsize, // the gets under way
         pub peak: AtomicUsize,   // the most gets that were ever under way together
+        pub listed: AtomicUsize, // the keys that listings have given, as a listing is read
     }
 
     /// A store that counts what is asked of it, and fails the puts past `allow`.
@@ -1233,6 +1234,20 @@ pub(crate) mod counting {
     impl fmt::Display for Counting {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             f.write_str("counting")
+        }
+    }
+
+    impl Counting {
+        fn counted(
+            &self,
+            listing: BoxStream<'static, object_store::Result<ObjectMeta>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            let counts = self.counts.clone();
+            listing
+                .inspect(move |_| {
+                    counts.listed.fetch_add(1, SeqCst);
+                })
+                .boxed()
         }
     }
 
@@ -1278,7 +1293,16 @@ pub(crate) mod counting {
         }
 
         fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-            self.inner.list(prefix)
+            self.counted(self.inner.list(prefix))
+        }
+
+        /// Gives only the keys after `offset`, as S3 does, so that what is counted is what a request would return.
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.counted(self.inner.list_with_offset(prefix, offset))
         }
 
         async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {

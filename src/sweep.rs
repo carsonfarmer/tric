@@ -8,6 +8,7 @@ use crate::name::{self, is_name};
 use crate::store::{self, Store};
 use crate::tree;
 use futures_util::TryStreamExt;
+use futures_util::future::{try_join, try_join_all};
 use object_store::{PutMode, path::Path};
 use percent_encoding::percent_decode_str;
 use std::collections::{BTreeSet, HashSet};
@@ -77,9 +78,9 @@ async fn sweep(store: &Store, app: &str, (now, until): (SystemTime, Instant), no
     let cutoff = now.checked_sub(GRACE).and_then(|t| t.duration_since(UNIX_EPOCH).ok()).filter(|_| store.versioned);
     let Some(cutoff) = cutoff.map(|t| t.as_millis() as u64) else { return Ok(report) };
     // The heads are listed before any is read, and the age is set before they are listed: a name that has none yet has
-    // objects of turns that are not yet over, which are younger than the age.
-    let heads = heads(store, app).await?;
-    let names = names(store, app).await?;
+    // objects of turns that are not yet over, which are younger than the age. (The names are listed at the same time:
+    // a list of them is of the objects there are, and the heads decide which of those a tree names.)
+    let (heads, names) = try_join(heads(store, app), names(store, app)).await?;
     let from = cursor(store, app).await;
     let todo = names.range::<str, _>((from.as_deref().map_or(Unbounded, Excluded), Unbounded));
     let mut last = None;
@@ -161,17 +162,52 @@ async fn survey(
             None => return Ok(None),
         }
     }
+    Ok(Some(unnamed(store, app, name, (cutoff, &live)).await?))
+}
+
+/// The objects of `name` that are not in `live` and were made at `cutoff` or before, with their sizes. S3 lists 1,000
+/// keys a request, in sequence, so a name of millions would take longer than a run to list. Its ids are random, so
+/// they are spread evenly over the 16 digits they may begin with: each digit's are listed on their own, all at once.
+async fn unnamed(
+    store: &Store,
+    app: &str,
+    name: &str,
+    (cutoff, live): (u64, &HashSet<u128>),
+) -> Result<Vec<(Path, u64)>> {
+    let listings = (0..16).map(|digit| partition(store, app, name, digit, (cutoff, live)));
+    Ok(try_join_all(listings).await?.concat())
+}
+
+/// What `unnamed` finds among the ids of `name` that begin with `digit` (0 to 15). The listing begins after the key
+/// `<before>g`, where `before` is the digit before, and ends at the first key from `<digit>g`: an id has a hex digit
+/// second, and `g` follows `f`, so the ids of `digit` lie between, and those of no other digit do. The digit is also
+/// checked of each id, so that an id is in one listing only, whatever a store does with the offset; S3 lists in key
+/// order, so the end of a listing passes by no id of its digit.
+async fn partition(
+    store: &Store,
+    app: &str,
+    name: &str,
+    digit: u32,
+    (cutoff, live): (u64, &HashSet<u128>),
+) -> Result<Vec<(Path, u64)>> {
+    let prefix = store::app(app, &["values", name]);
+    let after = digit.checked_sub(1).map(|before| prefix.clone().join(format!("{before:x}g")));
+    let end = prefix.clone().join(format!("{digit:x}g"));
     let mut garbage = vec![];
-    let mut objects = store.objects(&store::app(app, &["values", name]));
+    let mut objects = store.objects(&prefix, after.as_ref());
     while let Some(meta) = objects.try_next().await? {
+        if meta.location >= end {
+            break;
+        }
         if u64::try_from(meta.last_modified.timestamp_millis()).unwrap_or_default() > cutoff {
             continue;
         }
-        if candidate(app, name, &meta.location).is_some_and(|id| !live.contains(&id)) {
+        let id = candidate(app, name, &meta.location);
+        if id.is_some_and(|id| id >> 124 == u128::from(digit) && !live.contains(&id)) {
             garbage.push((meta.location, meta.size));
         }
     }
-    Ok(Some(garbage))
+    Ok(garbage)
 }
 
 /// The id of the object at `path`, if it is one the tree of `name` could have made, and so one the sweep may delete:
@@ -267,7 +303,7 @@ mod tests {
 
     /// The objects of `name`, as `a` has them.
     async fn held(store: &Store, name: &str) -> BTreeSet<Path> {
-        let objects = store.objects(&store::app("a", &["values", name])).try_collect::<Vec<_>>().await.unwrap();
+        let objects = store.objects(&store::app("a", &["values", name]), None).try_collect::<Vec<_>>().await.unwrap();
         objects.into_iter().map(|o| o.location).collect()
     }
 
@@ -590,6 +626,41 @@ mod tests {
         let warned: Vec<_> = text.lines().filter(|line| line.contains("WARN")).collect();
         assert_eq!(warned.len(), 1, "{text}");
         assert!(warned[0].contains("app=\"a\"") && warned[0].contains("name=\"big\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_name_is_listed_by_the_first_digit_of_its_ids_in_full_and_once() {
+        let (store, counts) = counting();
+        // Ids at both ends of every digit's range and one in the middle, so that every boundary has an id beside it on
+        // each side; and keys that no tree made, which sort among them: after each range, and outside them all.
+        let ids: Vec<String> =
+            (0..16).flat_map(|digit| ["0", "8", "f"].map(|x| format!("{digit:x}{}", x.repeat(31)))).collect();
+        let mut odd: Vec<String> = (0..16)
+            .flat_map(|d| [format!("{d:x}g"), format!("{d:x}g{}", "0".repeat(30)), format!("{d:x}{}g", "f".repeat(30))])
+            .collect();
+        odd.extend(["A", "g", "-"].map(|c| format!("{c}{}", "0".repeat(31))));
+        let at = |key: &String| tree::object("a", "n", key);
+        for key in ids.iter().chain(&odd) {
+            store.put(&at(key), Bytes::from_static(b"x"), PutMode::Overwrite).await.unwrap();
+        }
+
+        // What a tree names is not found, and the rest is, each once, whichever digit it begins with.
+        let live: HashSet<u128> = ids.iter().filter(|id| id.ends_with('8')).filter_map(|id| tree::number(id)).collect();
+        counts.listed.store(0, SeqCst);
+        let mut found = unnamed(&store, "a", "n", (u64::MAX, &live)).await.unwrap();
+        found.sort();
+        let want: Vec<_> = ids.iter().filter(|id| !id.ends_with('8')).map(|id| (at(id), 1)).collect();
+        assert_eq!(want.len(), 32);
+        assert_eq!(found, want);
+        // Each listing is read to the end of its range, and no further: every key once, and a key past each range.
+        let (keys, read) = (ids.len() + odd.len(), counts.listed.load(SeqCst));
+        assert!(read <= keys + 16, "{read} keys were read of {keys}: a listing went past its range");
+
+        // A run deletes every id of a name with no head, each once, and not a key that no tree made.
+        let report = run(&store, "a", later(), long()).await.unwrap();
+        assert_eq!(report, Report { swept: 1, deleted: 48, bytes: 48, done: true, ..Default::default() });
+        assert_eq!(counts.deletes.load(SeqCst), 48, "each once");
+        assert_eq!(held(&store, "n").await, odd.iter().map(at).collect());
     }
 
     /// Names `n1` to `n4`, each with a head, a tree whose root the head holds, and an object that nothing names. A read

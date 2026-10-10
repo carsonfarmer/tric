@@ -293,7 +293,8 @@ delete is a current object of an attempt whose host died mid-attempt (killed, or
 could upload in `TOTAL`, and of a commit whose outcome was unknown.
 
 *The sweep* is a mark-and-sweep with a grace period, run by serve with the app's own credentials:
-- It lists the app's names, and for each walks the tree from its head, lists `values/<name>/`, and deletes what is
+- It lists the app's names, and for each walks the tree from its head, lists `values/<name>/` (as 16 listings at once,
+  one for each first digit of an id, so that a name of millions of objects takes less than a run), and deletes what is
   older than the grace period (an hour at least) and unreachable. No later head can refer to such an object, as no
   attempt lasts an hour, which the build asserts against the limits of a turn. Only a key a tree could have made is
   ever deleted, and a head is read fresh.
@@ -356,18 +357,18 @@ without the file system: for 0.3, `cli`, `clocks`, `random` and `sockets` `add_t
 | `src/fs/ops.rs` | inodes, blocks, directories, rename, errors, on the tree | 850 (built) |
 | `src/fs/p2.rs` | 0.2: the descriptor's methods, streams, preopens | 560 (built) |
 | `src/fs/p3.rs` | 0.3: the same, async, with `stream` and `future` | 650 (built) |
-| `src/sweep.rs`, and the trigger | listing, walk, delete, the cursor; the schedule, the router, serve | 440 (built) |
+| `src/sweep.rs`, and the trigger | listing, walk, delete, the cursor; the schedule, the router, serve | 480 (built) |
 
 The tree came to 1,080 lines, against an estimate of 800, because spilling, merging, the cache and the log are in it.
 The core and the 0.2 binding came to 2,200 against 1,250: the gate that keeps a stream's write from being lost to the
 answer, the orphans, a mapping of every failure to an errno, read-ahead, and the streams that outlive their calls are
 most of the difference. The 0.3 binding came to 650 against 600, its `stream` and `future` plumbing (a producer for a
-read, one for a directory listing and a consumer for a write) being about a third of it. The sweep came to about 440
-against 300, the walk and its cap, the shape of the keys it may delete, the cursor, the router's and serve's part, and
-the reconciling of an app's schedules, which gave deploy its first tests, being the difference. The whole is about
-4,400 lines of runtime code, on the 4,289 in `src` at the start. Tests come to well over two thousand more. The tree
-and `name.rs` came first and alone: the key tests' assertions hold on them, which tests the tree before any file
-exists.
+read, one for a directory listing and a consumer for a write) being about a third of it. The sweep came to about 480
+against 300, the walk and its cap, the shape of the keys it may delete, the listing by digit, the cursor, the router's
+and serve's part, and the reconciling of an app's schedules, which gave deploy its first tests, being the difference.
+The whole is about 4,400 lines of runtime code, on the 4,289 in `src` at the start. Tests come to well over two
+thousand more. The tree and `name.rs` came first and alone: the key tests' assertions hold on them, which tests the
+tree before any file exists.
 
 **Stages.** Each is committed on its own and passes the whole gate:
 - (a) the tree, with `wasi:keyvalue` on it (done);

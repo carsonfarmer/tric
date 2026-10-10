@@ -162,9 +162,14 @@ impl Store {
         deleted
     }
 
-    /// Every object under `prefix`, however deep.
-    pub fn objects(&self, prefix: &Path) -> BoxStream<'static, Result<ObjectMeta>> {
-        self.inner.list(Some(prefix)).map(|r| r.map_err(Into::into)).boxed()
+    /// Every object under `prefix`, however deep, in key order: those after the key `after`, if there is one (the
+    /// listing then begins there, where S3 lists, and need not go through the keys before it).
+    pub fn objects(&self, prefix: &Path, after: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        let listed = match after {
+            Some(after) => self.inner.list_with_offset(Some(prefix), after),
+            None => self.inner.list(Some(prefix)),
+        };
+        listed.map(|r| r.map_err(Into::into)).boxed()
     }
 }
 
@@ -189,7 +194,7 @@ mod tests {
         assert_eq!(store.delete_many(vec![]).await, 0);
         assert_eq!(counts.deletes.load(SeqCst), 0, "nothing asked of the store for nothing");
         assert_eq!(store.delete_many(paths[..3].to_vec()).await, 3);
-        assert_eq!(store.objects(&app("a", &["values", "n"])).try_collect::<Vec<_>>().await.unwrap().len(), 2);
+        assert_eq!(store.objects(&app("a", &["values", "n"]), None).try_collect::<Vec<_>>().await.unwrap().len(), 2);
 
         // The memory store keeps no versions, so a snapshot may still read what it holds: it deletes nothing.
         let memory = Store::memory();
