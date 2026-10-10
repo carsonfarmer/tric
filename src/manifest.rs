@@ -17,8 +17,9 @@ const MANIFEST: &str = "tric.toml";
 const MIDDLEWARE_MAX: usize = 64 << 20;
 /// The redirects a fetch follows, as in the Fetch standard.
 const REDIRECTS: usize = 20;
-/// An app's cron jobs: so deploy finds all its schedules, and a failed deploy's too, in one page of Scheduler's 100.
-const CRON_MAX: usize = 50;
+/// An app's cron jobs, which with its sweep are 50 schedules: so deploy finds all of them, and a failed deploy's too,
+/// in one page of Scheduler's 100.
+const CRON_MAX: usize = 49;
 
 /// `MANIFEST`. Paths in it are relative to its directory.
 #[derive(Default, Deserialize)]

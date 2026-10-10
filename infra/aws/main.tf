@@ -116,7 +116,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "store" {
   depends_on = [aws_s3_bucket_versioning.store]
   # What a commit or a deploy replaced is kept a day, for the readers and heads that still name it: the committer
   # deletes what its commit replaced, which in a versioned bucket leaves the version. The objects of a host that died
-  # are left, and nothing collects them yet.
+  # are left, and the sweep, once a day for each app, deletes those: that leaves the version too, for this rule.
   rule {
     id     = "noncurrent"
     status = "Enabled"
@@ -226,6 +226,13 @@ resource "aws_iam_role_policy" "app" {
         Effect   = "Allow"
         Action   = ["s3:PutObject", "s3:DeleteObject"]
         Resource = ["${local.bucket}/apps/*/names/*", "${local.bucket}/apps/*/values/*", "${local.bucket}/native/*"]
+      },
+      # Lists its names and its values, for the sweep, and no more: a list shows the keys under its prefix.
+      {
+        Effect    = "Allow"
+        Action    = ["s3:ListBucket"]
+        Resource  = [local.bucket]
+        Condition = { StringLike = { "s3:prefix" = ["apps/*/names/*", "apps/*/values/*"] } }
       },
     ]
   })

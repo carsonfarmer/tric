@@ -109,6 +109,19 @@ run "module" {
   }
   assert {
     condition = (
+      [for s in jsondecode(aws_iam_role_policy.app.policy).Statement : s
+      if length(setintersection(flatten([s.Action]), ["s3:ListBucket", "s3:ListBucketVersions", "s3:*"])) > 0]
+      == [{
+        Effect    = "Allow"
+        Action    = ["s3:ListBucket"]
+        Resource  = [aws_s3_bucket.store.arn]
+        Condition = { StringLike = { "s3:prefix" = ["apps/*/names/*", "apps/*/values/*"] } }
+      }]
+    )
+    error_message = "no app session can list more than its names and its values, whatever policy the router gives it"
+  }
+  assert {
+    condition = (
       [for s in jsondecode(aws_iam_role_policy.route.policy).Statement : s.Resource
       if contains(flatten([s.Action]), "s3:GetObject")]
       == ["${aws_s3_bucket.store.arn}/apps/*/current",
@@ -128,8 +141,8 @@ run "module" {
       if contains(flatten([s.Action]), "s3:ListBucket")]
       == [{
         Effect    = "Allow"
-        Action    = "s3:ListBucket"
-        Resource  = aws_s3_bucket.store.arn
+        Action    = ["s3:ListBucket"]
+        Resource  = [aws_s3_bucket.store.arn]
         Condition = { StringLike = { "s3:prefix" = "ws/channels/*" } }
       }]
     )

@@ -7,6 +7,7 @@ use crate::lambda;
 use crate::outbound::{self, Allow};
 use crate::outbox::{self, Sink};
 use crate::store::{self, Store};
+use crate::sweep;
 use crate::tric::{self, CREDENTIALS, Response, TENANT, Tric, app_at, forward, status};
 use bytes::Bytes;
 use futures_util::FutureExt;
@@ -18,7 +19,7 @@ use object_store::{PutMode, path::Path};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::{net::TcpListener, sync::Mutex, time::timeout};
 use wasmtime::component::Component;
 use wasmtime::{Result, ensure, error::Context, format_err};
@@ -80,6 +81,10 @@ impl Serve {
         let (Some(creds), true) = (creds, parts.headers.get(TENANT).is_some_and(|t| t == app.as_str())) else {
             return status(StatusCode::FORBIDDEN);
         };
+        // A sweep needs the store and none of the app's code, so it reads no release and runs no guest.
+        if parts.method == Method::POST && parts.headers.get(FORWARDED).is_some_and(|f| f == "for=_sweep") {
+            return self.sweep(&app, creds).await;
+        }
         let tric = match self.load(&app, creds).await {
             Ok(Some(tric)) => tric,
             Ok(None) => return status(StatusCode::NOT_FOUND),
@@ -105,6 +110,31 @@ impl Serve {
         parts.uri = uri;
         forward(&mut parts.headers, from);
         tric.run(http::Request::from_parts(parts, body), &host).await
+    }
+
+    /// Sweeps `app`'s names for the objects that nothing names (see `sweep`), as far as `sweep::RUN` takes: 204 when it
+    /// went well, whether or not it went through every name; else 503, which the router does not retry: a sweep that
+    /// fails is tomorrow's.
+    async fn sweep(&self, app: &str, creds: Credentials) -> Response {
+        let store = match store::s3(&self.bucket, Some(creds.into())) {
+            Ok(s3) => Store::s3(s3),
+            Err(e) => {
+                tracing::warn!(app, "sweep: {e:#}");
+                return status(StatusCode::SERVICE_UNAVAILABLE);
+            }
+        };
+        match sweep::run(&store, app, SystemTime::now(), tokio::time::Instant::now() + sweep::RUN).await {
+            Ok(r) => {
+                let (swept, deleted, bytes) = (r.swept, r.deleted, r.bytes);
+                let (skipped, failed, done) = (r.skipped, r.failed, r.done);
+                tracing::info!(app, swept, deleted, bytes, skipped, failed, done, "swept");
+                status(StatusCode::NO_CONTENT)
+            }
+            Err(e) => {
+                tracing::warn!(app, "sweep: {e:#}");
+                status(StatusCode::SERVICE_UNAVAILABLE)
+            }
+        }
     }
 
     /// `app`, with `creds`: as loaded, if it read its release less than `FRESH` ago with these credentials; else with

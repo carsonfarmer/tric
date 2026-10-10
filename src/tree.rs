@@ -15,9 +15,10 @@ use crate::store::{self, Store};
 use base64::{Engine as _, prelude::BASE64_STANDARD as B64};
 use bytes::Bytes;
 use futures_util::future::{BoxFuture, try_join_all};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use object_store::{PutMode, path::Path};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -100,14 +101,35 @@ pub struct Link {
     n: u64,     // the length
 }
 
+/// Whether `s` is `n` lowercase hex digits.
+fn hex(s: &str, n: usize) -> bool {
+    s.len() == n && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// An object's id as a number, if it is one: 128 bits, as it is 32 lowercase hex digits. A key listed in the bucket is
+/// compared with the ids a tree names as numbers, in 16 bytes where the string takes 56 or more.
+pub fn number(id: &str) -> Option<u128> {
+    hex(id, 32).then(|| u128::from_str_radix(id, 16).ok()).flatten()
+}
+
+/// Where the object `id` of a name's tree is: every one is directly under the name's own prefix.
+pub fn object(app: &str, name: &str, id: &str) -> Path {
+    store::app(app, &["values", name, id])
+}
+
 impl Link {
     /// Whether the link is well-formed, so that the path it leads to is under the name's own and nowhere else.
     fn check(&self) -> Result<()> {
-        let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
         let plain =
             |v: &str| v.len() <= VERSION_MAX && v.bytes().all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\');
         ensure!(hex(&self.id, 32) && hex(&self.h, 64) && self.v.as_deref().is_none_or(plain), "a link is malformed");
         Ok(())
+    }
+
+    /// The id as a number: see [`number`].
+    fn number(&self) -> Result<u128> {
+        self.check()?;
+        number(&self.id).context("a link is malformed")
     }
 
     /// What the link is as JSON, at most.
@@ -544,7 +566,7 @@ struct Reader {
 
 impl Reader {
     fn path(&self, id: &str) -> Path {
-        store::app(&self.app, &["values", &self.name, id])
+        object(&self.app, &self.name, id)
     }
 
     fn key(&self, link: &Link) -> CacheKey {
@@ -565,6 +587,12 @@ impl Reader {
     }
 
     async fn node(&self, link: &Link) -> Result<Arc<Node>> {
+        self.load(link, true).await
+    }
+
+    /// The node `link` names, from the cache if it is there, else read and checked against the link, and then kept if
+    /// `keep`. A read of a whole name passes `false`, so as not to push out what requests are using.
+    async fn load(&self, link: &Link, keep: bool) -> Result<Arc<Node>> {
         link.check()?;
         let key = self.key(link);
         if let Some(node) = self.store.cache.nodes.lock().unwrap().get(&key, &link.h) {
@@ -574,7 +602,9 @@ impl Reader {
         let bytes = self.fetch(link, self.limits.node as u64).await?;
         let wire = serde_json::from_slice(&bytes).with_context(|| format!("{}", key.0))?;
         let node = Arc::new(Node::of(wire)?);
-        self.store.cache.nodes.lock().unwrap().put(key, node.clone(), link.h.clone(), node.size);
+        if keep {
+            self.store.cache.nodes.lock().unwrap().put(key, node.clone(), link.h.clone(), node.size);
+        }
         Ok(node)
     }
 
@@ -686,6 +716,28 @@ fn walk<'a, T: Send>(
         }
         Ok(())
     })
+}
+
+/// Adds to `ids` the objects `node` names, and to `next` the links of its children that are nodes.
+fn refs(node: &Node, ids: &mut HashSet<u128>, next: &mut Vec<Link>) -> Result<()> {
+    match &node.body {
+        Body::Leaf(es) => {
+            for (_, item) in es {
+                if let Item::Object(link) = item {
+                    ids.insert(link.number()?);
+                }
+            }
+        }
+        Body::Branch(kids) => {
+            for kid in kids {
+                let At::Clean(link) = &kid.at else { bail!("a node has a child in memory") };
+                if ids.insert(link.number()?) {
+                    next.push(link.clone());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What editing a tree changes besides its nodes.
@@ -983,6 +1035,28 @@ impl Tree {
         Ok(entries)
     }
 
+    /// The ids of the objects the tree is made of below its root: its nodes, and the values that are objects of their
+    /// own. They are found by reading every node, `IN_FLIGHT` at once and one level after another, each checked against
+    /// its link as any read is, and kept out of the cache; one that is missing or is not what its link says is an
+    /// error, so a set is of a tree that was whole. `None` if the tree has more than `max` nodes, which is not read.
+    pub async fn reachable(&self, max: usize) -> Result<Option<HashSet<u128>>> {
+        let (mut ids, mut next, mut nodes) = (HashSet::new(), vec![], 0);
+        refs(&self.root, &mut ids, &mut next)?;
+        while !next.is_empty() {
+            nodes += next.len();
+            if nodes > max {
+                return Ok(None);
+            }
+            let (r, links) = (&*self.reader, std::mem::take(&mut next));
+            let reads = stream::iter(links).map(|link| async move { r.load(&link, false).await });
+            let mut reads = reads.buffer_unordered(IN_FLIGHT);
+            while let Some(node) = reads.try_next().await? {
+                refs(&node, &mut ids, &mut next)?;
+            }
+        }
+        Ok(Some(ids))
+    }
+
     /// A new inode number, for the file system: the root is 1, and the others count up, never reused.
     pub fn alloc(&mut self) -> u64 {
         self.work.seq = self.work.seq.max(1) + 1;
@@ -1228,7 +1302,7 @@ mod tests {
     use super::counting::counting;
     use super::*;
     use futures_util::TryStreamExt;
-    use object_store::ObjectStore;
+    use object_store::{ObjectStore, ObjectStoreExt};
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::Ordering::SeqCst;
     use std::time::Duration;
@@ -1477,6 +1551,8 @@ mod tests {
                 assert_eq!(fresh.value(&item).await.unwrap().as_ref(), v.as_slice(), "{k}");
             }
             assert_eq!(fresh.scan("k/", None, usize::MAX).await.unwrap(), model.keys().cloned().collect::<Vec<_>>());
+            let live: HashSet<u128> = audit.ids.iter().map(|id| number(id).unwrap()).collect();
+            assert_eq!(fresh.reachable(usize::MAX).await.unwrap(), Some(live), "round {round}");
             let stored = stored(&store).await;
             let (leaked, lost): (Vec<_>, Vec<_>) =
                 (stored.difference(&audit.ids).collect(), audit.ids.difference(&stored).collect());
@@ -1517,6 +1593,75 @@ mod tests {
             set(&mut tree, &format!("k/{i:03}"), &[i as u8; 5]).await;
         }
         commit(store, &mut tree).await
+    }
+
+    /// The ids that `audit` found, as the numbers `reachable` gives.
+    fn numbers(audit: &Audit) -> HashSet<u128> {
+        audit.ids.iter().map(|id| number(id).unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn reachable_is_every_object_of_the_tree_read_once_and_kept_out_of_the_cache() {
+        let (mut store, counts) = counting();
+        let shape = grown(&store).await;
+        let audit = audit(&store, &shape).await;
+        let all = numbers(&audit);
+        assert!(all.len() > 16, "{} nodes are too few to read at once", all.len());
+        store.cache = Arc::default();
+        let tree = at(&store, &shape);
+
+        // Every node below the root is read once, a few at once and no more than IN_FLIGHT, and none is kept.
+        counts.gets.store(0, SeqCst);
+        counts.delay.store(5, SeqCst);
+        assert_eq!(tree.reachable(usize::MAX).await.unwrap(), Some(all.clone()));
+        assert_eq!(counts.gets.load(SeqCst), all.len());
+        let peak = counts.peak.load(SeqCst);
+        assert!((2..=IN_FLIGHT).contains(&peak), "{peak} at once");
+        counts.delay.store(0, SeqCst);
+        counts.gets.store(0, SeqCst);
+        assert!(tree.get("k/077").await.unwrap().is_some());
+        assert_eq!(counts.gets.load(SeqCst), audit.depth - 1, "the walk left nothing in the cache");
+
+        // Over `max` nodes it is not read at all past the level that went over, and says so.
+        assert_eq!(tree.reachable(all.len()).await.unwrap(), Some(all.clone()));
+        counts.gets.store(0, SeqCst);
+        assert_eq!(tree.reachable(all.len() - 1).await.unwrap(), None);
+        assert!(counts.gets.load(SeqCst) < all.len());
+        assert_eq!(tree.reachable(0).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn reachable_fails_when_the_tree_is_not_whole() {
+        for damage in ["missing", "changed", "emptied"] {
+            let mut store = versioned();
+            let shape = grown(&store).await;
+            let audit = audit(&store, &shape).await;
+            // A node below the root, and one that is not a leaf if the tree has any: its loss costs the most.
+            let id = audit.ids.iter().next().unwrap();
+            let path = object("a", "n", id);
+            match damage {
+                "missing" => store.inner.delete(&path).await.unwrap(),
+                "changed" => drop(store.put(&path, Bytes::from_static(b"{}"), PutMode::Overwrite).await.unwrap()),
+                _ => drop(store.put(&path, Bytes::new(), PutMode::Overwrite).await.unwrap()),
+            }
+            store.cache = Arc::default(); // a node in the cache was whole when it was put there
+            let fresh = Tree::open(&store, "a", "n", &shape, tiny()).unwrap();
+            assert!(fresh.reachable(usize::MAX).await.is_err(), "a {damage} node is no tree");
+        }
+    }
+
+    #[tokio::test]
+    async fn reachable_includes_values_that_are_objects() {
+        let store = versioned();
+        let mut tree = at(&store, &Shape::default());
+        set(&mut tree, "small", b"abc").await;
+        set(&mut tree, "big", &[7; 90]).await; // inline is 8, so this is an object of its own
+        let shape = commit(&store, &mut tree).await;
+        let audit = audit(&store, &shape).await;
+        assert_eq!(audit.ids.len(), 1, "a root of two keys has no node below it, and one value is an object");
+        let fresh = Tree::open(&store, "a", "n", &shape, tiny()).unwrap();
+        assert_eq!(fresh.reachable(usize::MAX).await.unwrap(), Some(numbers(&audit)));
+        assert_eq!(stored(&store).await, audit.ids, "the object is all there is");
     }
 
     #[tokio::test]

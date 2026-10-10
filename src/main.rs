@@ -15,6 +15,7 @@ mod retry;
 mod route;
 mod serve;
 mod store;
+mod sweep;
 mod tree;
 mod tric;
 #[cfg(feature = "ws")]

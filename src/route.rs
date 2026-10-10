@@ -11,6 +11,7 @@ use crate::outbound;
 use crate::outbox::{self, Delivered};
 use crate::retry::Waiting;
 use crate::store::{self, Store};
+use crate::sweep;
 use crate::tric::{self, CREDENTIALS, Request, Response, TENANT, app_at, forward, forwarded, label, status};
 use bytes::Bytes;
 use http::header::{FORWARDED, HOST};
@@ -215,7 +216,7 @@ impl Route {
         Ok(Some(self.send(app, creds, req).await))
     }
 
-    /// Fires the cron jobs, of every app, that match the minute `t`.
+    /// Fires the cron jobs, of every app, that match the minute `t`, and sweeps the apps whose day it is.
     async fn cron(self: Arc<Self>, t: u64) {
         let apps = match self.store.list(&Path::from("apps")).await {
             Ok(list) => list.common_prefixes,
@@ -226,6 +227,10 @@ impl Route {
             else {
                 continue;
             };
+            if Cron::parse(&sweep::schedule(app)).is_ok_and(|c| c.matches(t)) {
+                let (route, app) = (self.clone(), app.to_owned());
+                tokio::spawn(async move { route.sweep(&app).await });
+            }
             let due = release.cron.into_iter().filter(|(fields, _)| Cron::parse(fields).is_ok_and(|c| c.matches(t)));
             for (_, path) in due {
                 let (route, app) = (self.clone(), app.to_owned());
@@ -234,19 +239,18 @@ impl Route {
         }
     }
 
-    /// Fires the cron job, `{app, path}`, that Scheduler sends.
+    /// Fires the cron job, `{app, path}`, or the sweep, `{app, sweep: true}`, that Scheduler sends.
     async fn job(self: Arc<Self>, req: hyper::Request<Incoming>) -> Response {
-        #[derive(Deserialize)]
-        struct Job {
-            app: String,
-            path: String,
-        }
         let job = match body::<Job>(req).await {
-            Ok((_, job)) if label(&job.app) && job.path.starts_with('/') => job,
+            Ok((_, job)) if job.valid() => job,
             Ok(_) => return status(StatusCode::BAD_REQUEST),
             Err(code) => return status(code),
         };
-        match self.fire(&job.app, &job.path).await {
+        let fired = match &job {
+            Job::Cron(Fire { app, path }) => self.fire(app, path).await,
+            Job::Sweep(Sweep { app, .. }) => self.sweep(app).await,
+        };
+        match fired {
             true => status(StatusCode::NO_CONTENT),
             false => status(StatusCode::NOT_FOUND), // an app with no release has no tenant
         }
@@ -258,6 +262,18 @@ impl Route {
             Ok(Some(res)) => tracing::info!(app, path, status = res.status().as_u16(), "cron"),
             Ok(None) => return false,
             Err(e) => tracing::warn!(app, path, "cron: {e:#}"),
+        }
+        true
+    }
+
+    /// Has serve sweep `app` (see `sweep`), and logs how it went; false if `app` has no release. The sweep runs in
+    /// serve, with `app`'s own credentials, as `app`'s tenant; serve answers when it is done, and it is not tried
+    /// again if it fails: tomorrow's sweep does what this one did not.
+    async fn sweep(&self, app: &str) -> bool {
+        match self.event(app, "/", "for=_sweep", Bytes::new()).await {
+            Ok(Some(res)) => tracing::info!(app, status = res.status().as_u16(), "sweep"),
+            Ok(None) => return false,
+            Err(e) => tracing::warn!(app, "sweep: {e:#}"),
         }
         true
     }
@@ -312,6 +328,39 @@ impl Route {
     }
 }
 
+/// What Scheduler sends the `cron` alias: an app's cron job, `{app, path}`, or its sweep, `{app, sweep: true}`. A body
+/// of any other shape, one with a field of the other's included, is no job.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Job {
+    Cron(Fire),
+    Sweep(Sweep),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Fire {
+    app: String,
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Sweep {
+    app: String,
+    sweep: bool,
+}
+
+impl Job {
+    /// Whether the job is for an app that can exist, and is what it says.
+    fn valid(&self) -> bool {
+        match self {
+            Job::Cron(Fire { app, path }) => label(app) && path.starts_with('/'),
+            Job::Sweep(Sweep { app, sweep }) => label(app) && *sweep,
+        }
+    }
+}
+
 /// The address in a `CloudFront-Viewer-Address`, `ip:port`, where an IPv6 one may be in brackets.
 pub(crate) fn viewer(address: &str) -> Option<IpAddr> {
     let (ip, _) = address.rsplit_once(':')?;
@@ -329,11 +378,13 @@ pub(crate) async fn body<T: DeserializeOwned>(req: hyper::Request<Incoming>) -> 
     Ok((body, t))
 }
 
-/// The session policy of `app`'s credentials: its names, values and native code to read and write, and the rest of its
-/// objects to read.
+/// The session policy of `app`'s credentials: its names, values and native code to read and write, the rest of its
+/// objects to read, and to list its names and its values, and nothing else of the bucket: a list names the keys under
+/// its prefix, which here are `app`'s own. The sweep lists, and that is all it lists for.
 fn policy(bucket: &str, app: &str) -> String {
     let arn = |p: &str| format!("arn:aws:s3:::{bucket}/{p}");
     let rw = ["apps/{app}/names/*", "apps/{app}/values/*", "native/{app}/*"].map(|p| arn(&p.replace("{app}", app)));
+    let listed = ["apps/{app}/names/*", "apps/{app}/values/*"].map(|p| p.replace("{app}", app));
     serde_json::json!({
         "Version": "2012-10-17",
         "Statement": [
@@ -347,7 +398,63 @@ fn policy(bucket: &str, app: &str) -> String {
                 "Action": ["s3:GetObject", "s3:GetObjectVersion"],
                 "Resource": [arn(&format!("apps/{app}/*"))],
             },
+            {
+                "Effect": "Allow",
+                "Action": ["s3:ListBucket"],
+                "Resource": [format!("arn:aws:s3:::{bucket}")],
+                "Condition": { "StringLike": { "s3:prefix": listed } },
+            },
         ],
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(json: &str) -> Option<Job> {
+        serde_json::from_str(json).ok().filter(Job::valid)
+    }
+
+    #[test]
+    fn a_job_is_a_cron_job_or_a_sweep_and_nothing_else() {
+        assert!(matches!(job(r#"{"app":"shop","path":"/run"}"#), Some(Job::Cron(_))));
+        assert!(matches!(job(r#"{"app":"shop","sweep":true}"#), Some(Job::Sweep(_))));
+        // A sweep that is not one, a shape of both, a shape of neither, and an app that cannot be.
+        assert!(job(r#"{"app":"shop","sweep":false}"#).is_none());
+        assert!(job(r#"{"app":"shop","path":"/run","sweep":true}"#).is_none());
+        assert!(job(r#"{"app":"shop","path":"/run","sweep":false}"#).is_none());
+        assert!(job(r#"{"app":"shop"}"#).is_none());
+        assert!(job(r#"{"app":"shop","sweep":"true"}"#).is_none());
+        assert!(job(r#"{"app":"shop","sweep":true,"more":1}"#).is_none());
+        assert!(job(r#"{"app":"shop","path":"run"}"#).is_none());
+        assert!(job(r#"{"app":"Shop","sweep":true}"#).is_none());
+        assert!(job(r#"{"app":"a/b","sweep":true}"#).is_none());
+        assert!(job(r#"{"app":"*","sweep":true}"#).is_none());
+        assert!(job(r#"{"sweep":true}"#).is_none());
+    }
+
+    #[test]
+    fn credentials_list_the_apps_own_names_and_values_and_nothing_else() {
+        let policy: Value = serde_json::from_str(&policy("b", "shop")).unwrap();
+        let statements = policy["Statement"].as_array().unwrap();
+        let lists = |s: &&Value| s["Action"].as_array().unwrap().iter().any(|a| a.as_str().unwrap().contains("List"));
+        let listing: Vec<_> = statements.iter().filter(lists).collect();
+        // Exactly one statement lists: on the bucket, for those two prefixes only.
+        assert_eq!(listing.len(), 1);
+        assert_eq!(listing[0]["Effect"], "Allow");
+        assert_eq!(listing[0]["Action"], serde_json::json!(["s3:ListBucket"]));
+        assert_eq!(listing[0]["Resource"], serde_json::json!(["arn:aws:s3:::b"]));
+        assert_eq!(
+            listing[0]["Condition"],
+            serde_json::json!({ "StringLike": { "s3:prefix": ["apps/shop/names/*", "apps/shop/values/*"] } })
+        );
+        // The statements that read and write are as they were: objects of the app, and no list.
+        for s in statements.iter().filter(|s| !lists(s)) {
+            assert!(s["Condition"].is_null());
+            let resources = s["Resource"].as_array().unwrap();
+            assert!(resources.iter().all(|r| r.as_str().unwrap().starts_with("arn:aws:s3:::b/")));
+        }
+    }
 }

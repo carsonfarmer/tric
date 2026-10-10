@@ -20,6 +20,13 @@
       "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
       "Resource": ["arn:aws:s3:::tric/ws/*"]
     },
-    { "Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": ["arn:aws:s3:::tric"] }
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::tric"],
+      "Condition": {
+        "StringLike": { "s3:prefix": ["apps/", "apps/*/names/*", "apps/*/values/*", "ws/channels/*"] }
+      }
+    }
   ]
 }

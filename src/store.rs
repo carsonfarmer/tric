@@ -2,11 +2,13 @@
 //! caller that cannot list, so a 403 reads as not found.
 use crate::tree::Cache;
 use bytes::Bytes;
+use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 use object_store::aws::{AmazonS3, AmazonS3Builder, AwsCredential};
 use object_store::client::{HttpClient, HttpConnector, ReqwestConnector};
 use object_store::{
-    Certificate, ClientOptions, GetOptions, ListResult, ObjectStore, ObjectStoreExt, PutMode, StaticCredentialProvider,
+    Certificate, ClientOptions, GetOptions, ListResult, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode,
+    StaticCredentialProvider,
 };
 use object_store::{UpdateVersion, memory::InMemory, path::Path};
 use serde::de::DeserializeOwned;
@@ -143,18 +145,56 @@ impl Store {
 
     /// Deletes the objects at `paths`, in a versioned bucket only: elsewhere a snapshot may still read them. One that
     /// is gone already, or that the role cannot see, is as good as deleted. The others are logged, not returned: what
-    /// a delete leaves behind is only space, and the sweep reclaims it.
-    pub async fn delete_many(&self, paths: Vec<Path>) {
+    /// a delete leaves behind is only space, and the sweep reclaims it. Returns how many were deleted.
+    pub async fn delete_many(&self, paths: Vec<Path>) -> usize {
         if !self.versioned || paths.is_empty() {
-            return;
+            return 0;
         }
-        let gone = self.inner.delete_stream(stream::iter(paths.into_iter().map(Ok)).boxed());
-        gone.for_each(|r| async move {
+        let mut gone = self.inner.delete_stream(stream::iter(paths.into_iter().map(Ok)).boxed());
+        let mut deleted = 0;
+        while let Some(r) = gone.next().await {
             match r {
-                Ok(_) | Err(object_store::Error::NotFound { .. } | object_store::Error::PermissionDenied { .. }) => {}
+                Ok(_) => deleted += 1,
+                Err(object_store::Error::NotFound { .. } | object_store::Error::PermissionDenied { .. }) => {}
                 Err(e) => tracing::warn!("delete: {e}"),
             }
-        })
-        .await;
+        }
+        deleted
+    }
+
+    /// Every object under `prefix`, however deep.
+    pub fn objects(&self, prefix: &Path) -> BoxStream<'static, Result<ObjectMeta>> {
+        self.inner.list(Some(prefix)).map(|r| r.map_err(Into::into)).boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree::counting::counting;
+    use futures_util::TryStreamExt;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    async fn put(store: &Store, path: &Path) {
+        store.put(path, Bytes::from_static(b"x"), PutMode::Overwrite).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_many_counts_what_it_deleted_and_only_in_a_versioned_bucket() {
+        let paths: Vec<_> = (0..5).map(|i| app("a", &["values", "n", &format!("{i:032x}")])).collect();
+        let (store, counts) = counting();
+        for path in &paths {
+            put(&store, path).await;
+        }
+        assert_eq!(store.delete_many(vec![]).await, 0);
+        assert_eq!(counts.deletes.load(SeqCst), 0, "nothing asked of the store for nothing");
+        assert_eq!(store.delete_many(paths[..3].to_vec()).await, 3);
+        assert_eq!(store.objects(&app("a", &["values", "n"])).try_collect::<Vec<_>>().await.unwrap().len(), 2);
+
+        // The memory store keeps no versions, so a snapshot may still read what it holds: it deletes nothing.
+        let memory = Store::memory();
+        put(&memory, &paths[0]).await;
+        assert_eq!(memory.delete_many(vec![paths[0].clone()]).await, 0);
+        assert!(memory.head(&paths[0]).await.unwrap());
     }
 }

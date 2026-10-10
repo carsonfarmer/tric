@@ -9,7 +9,7 @@ use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 use object_store::{PutMode, UpdateVersion, path::Path};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::{sync::RwLock, sync::watch, task::JoinHandle, time::sleep};
@@ -54,6 +54,15 @@ pub struct Head {
     pub pending: BTreeMap<String, Pending>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claim: Option<Claim>,
+}
+
+impl Head {
+    /// The ids of the objects the head's tree is made of, with the name's own `app` and `name`: see
+    /// [`Tree::reachable`]. The head is the one root of a name's objects: its `pending` holds digests of events and
+    /// its claim a lease, and neither names an object.
+    pub async fn reachable(&self, store: &Store, app: &str, name: &str, max: usize) -> Result<Option<HashSet<u128>>> {
+        Tree::open(store, app, name, &self.tree, Limits::default())?.reachable(max).await
+    }
 }
 
 /// A commit's delivery event, by its SHA-256, and when the commit landed, in Unix milliseconds.
@@ -453,7 +462,9 @@ impl Turn {
             return;
         }
         let store = self.store.clone();
-        self.reaping.lock().unwrap().push(tokio::spawn(async move { store.delete_many(paths).await }));
+        self.reaping.lock().unwrap().push(tokio::spawn(async move {
+            store.delete_many(paths).await;
+        }));
     }
 
     /// The deletes the turn has started, to wait for before the response ends: a Lambda that is frozen does not finish

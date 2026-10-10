@@ -30,7 +30,7 @@ const TICK: Duration = Duration::from_millis(10);
 /// From instantiation to the response's head.
 pub const ANSWER: Duration = Duration::from_secs(10);
 /// From instantiation to the end of everything the instance does, its response's body included.
-const TOTAL: Duration = Duration::from_secs(300);
+pub const TOTAL: Duration = Duration::from_secs(300);
 const MEMORY: usize = 256 << 20; // one linear memory
 const MEMORIES: usize = 4; // per store, as are the next two
 const INSTANCES: usize = 16;

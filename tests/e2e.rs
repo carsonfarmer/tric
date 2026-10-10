@@ -822,6 +822,23 @@ async fn isolates_apps() {
         get(k.clone()).await.unwrap_or_else(|e| panic!("read {k}: {e}"));
         as_a.delete(&key(k.clone())).await.unwrap_or_else(|e| panic!("delete {k}: {e}"));
     }
+    // A list names the keys under its prefix, so it is a read of them: a's credentials list a's names and a's values,
+    // for the sweep, and nothing else, not even what they can read: the rest of a's, b's, any other app's, the bucket.
+    let list = move |prefix: Option<String>| async move {
+        let prefix = prefix.map(key);
+        let one = as_a.list_with_delimiter(prefix.as_ref()).await.map(|_| ());
+        let all = as_a.list(prefix.as_ref()).try_collect::<Vec<_>>().await.map(|_| ());
+        one.and(all)
+    };
+    for p in [format!("apps/{a}/names"), format!("apps/{a}/values"), format!("apps/{a}/values/n")] {
+        list(Some(p.clone())).await.unwrap_or_else(|e| panic!("list {p}: {e}"));
+    }
+    let own = ["apps/{a}", "apps/{a}/components", "apps/{a}/current", "native/{a}", "apps", "native", "ws"];
+    let other = ["apps/{b}", "apps/{b}/names", "apps/{b}/values", "apps/{b}/values/v", "native/{b}"];
+    for p in own.iter().chain(&other).map(|p| p.replace("{a}", &a).replace("{b}", &b)).map(Some).chain([None]) {
+        let refused = list(p.clone()).await.err().map(|e| e.to_string());
+        assert!(refused.is_some_and(|e| e.contains("403")), "list {p:?}");
+    }
 
     // 3: serve, with no credentials of its own, runs a request only as the tenant its host names, with credentials.
     let domain = format!("localhost:{port}");
@@ -837,6 +854,17 @@ async fn isolates_apps() {
     assert_eq!(tric.send("GET", "/", &wrong).await.status, 403, "a's credentials, as b");
     let right = [from, ("x-amz-tenant-id", &a), ("x-tric-credentials", &creds)];
     assert_eq!(tric.send("GET", "/", &right).await.body, "hello");
+    // The word that asks serve for a sweep is no way in: it takes a sweep as it takes any request, as a tenant, with
+    // credentials, and so only from the router. The tenant of a request is the app its host names.
+    let sweep = ("forwarded", "for=_sweep");
+    for headers in [
+        vec![sweep],
+        vec![sweep, ("x-amz-tenant-id", &a)],
+        vec![sweep, ("x-amz-tenant-id", &b), ("x-tric-credentials", &creds)],
+    ] {
+        assert_eq!(tric.send("POST", "/", &headers).await.status, 403, "{headers:?}");
+    }
+    assert!(!log.lock().unwrap().contains("swept"), "serve swept");
     // a's credentials, at b's host and as b's tenant, cannot read b's release.
     tric.host = format!("{b}.{domain}");
     let as_b = [from, ("x-amz-tenant-id", &b), ("x-tric-credentials", &creds)];
@@ -877,6 +905,105 @@ async fn drops_forged_events() {
     let line = "outbox: dropped an event, as its commit is not pending";
     assert!(tric.logged(line, Duration::from_secs(30)).await, "dropped");
     assert_eq!(tric.value("h", "echo").await, Value::Null);
+
+    // A sweep lists an app's names and deletes objects, and serve takes the router's `Forwarded: for=_sweep` as the ask
+    // for one. Only the `cron` alias's `{app, sweep}`, which only Scheduler may invoke, makes the router say it, so
+    // nothing may carry it in: not a client's request, whose `Forwarded` the router replaces with its own, nor an
+    // event, for which the router writes its own, whatever alias it is for. (The router's own daily sweep, locally,
+    // could fall in this test's seconds, at about one run in ten thousand, and would show in the counts below.)
+    // What serve and the router log of a sweep, once each, whether it went well or not.
+    let sweeps = || {
+        let log = plain(&tric.log.lock().unwrap());
+        ["tric::route: sweep", "tric::serve: swept", "tric::serve: sweep:", "tric::sweep"]
+            .map(|l| log.matches(l).count())
+    };
+    let app = &tric.apps[0];
+    let ask = json!({ "app": app, "sweep": true }).to_string();
+    let forged = ("forwarded", "for=_sweep");
+    for method in ["GET", "POST"] {
+        let res = tric.send(method, "/", &[forged]).await;
+        assert_eq!((res.status, &*res.body), (200, "hello"), "{method}: a request like any other");
+    }
+    let alias = |alias: &str| format!(r#"{{"invoked_function_arn":"arn:aws:lambda:local:0:function:events:{alias}"}}"#);
+    let events = async |context: Option<&str>, body: &str| {
+        let mut headers = vec![forged];
+        headers.extend(context.map(|c| ("x-amzn-lambda-context", c)));
+        exchange(&tric.outbox, &tric.outbox, "POST", "/", &headers, Bytes::from(body.to_owned())).await.status
+    };
+    let (outbox, retry, nobody) = (alias("outbox"), alias("retry"), alias("nobody"));
+    assert_eq!(events(None, &ask).await, 403, "no alias");
+    assert_eq!(events(Some(&nobody), &ask).await, 403, "an alias that is none");
+    assert_eq!(events(Some(&retry), &ask).await, 403, "an alias that is not here");
+    assert_eq!(events(Some(&outbox), &ask).await, 400, "a delivery that is none");
+    assert_eq!(events(Some(&outbox), &event.to_string()).await, 202, "a delivery, which is dropped as above");
+
+    // The `cron` alias takes a sweep as it is, and refuses what is none.
+    let cron = alias("cron");
+    for body in [json!({ "app": app }), json!({ "app": app, "sweep": false }), json!({ "app": "A/b", "sweep": true })] {
+        assert_eq!(events(Some(&cron), &body.to_string()).await, 400, "{body}");
+    }
+    assert_eq!(events(Some(&cron), &json!({ "app": app, "sweep": true, "path": "/" }).to_string()).await, 400);
+    assert_eq!(events(Some(&cron), &json!({ "app": unique(), "sweep": true }).to_string()).await, 404, "no release");
+    assert_eq!(sweeps(), [0; 4], "nothing swept, and nothing tried to");
+
+    // And the sweep that is asked for is one, and the answer comes after serve has logged it.
+    assert_eq!(events(Some(&cron), &ask).await, 204);
+    let once = until(Duration::from_secs(30), async || (sweeps() == [1, 1, 0, 0]).then_some(())).await;
+    assert!(once.is_some(), "{:?}", sweeps());
+}
+
+/// What a sweep keeps. It deletes what no tree names that is older than an hour, and nothing here is: so what the
+/// sweep shows is that it goes through every name, whole, and takes nothing that it should not; what it deletes, and
+/// when, is for the unit tests, which have a clock of their own.
+#[tokio::test]
+async fn sweeps_the_names() {
+    let tric = Tric::app(Kind { stack: true, app: "app" }).await;
+    let (app, s3) = (&tric.apps[0], owner());
+    let n = 1_000_000;
+    assert_eq!(tric.files("POST", "s", &format!("op=big&path=/big&n={n}")).await, json!({ "ok": n }));
+    assert_eq!(tric.post("/@s/kv?op=set&key=k&value=v").await.status, 200);
+    // Objects that no tree names: as an app's turn that died would leave, at a name with a head and at one with none.
+    let id = "0123456789abcdef0123456789abcdef";
+    let strays = [format!("apps/{app}/values/s/{id}"), format!("apps/{app}/values/ghost/{id}")];
+    for k in &strays {
+        s3.put(&Key::from(k.as_str()), PutPayload::from_static(b"{}")).await.unwrap();
+    }
+    let all = async || {
+        let mut keys: Vec<_> =
+            s3.list(Some(&Key::from(format!("apps/{app}")))).map_ok(|m| m.location).try_collect().await.unwrap();
+        keys.sort();
+        keys
+    };
+    let before = all().await;
+    for k in &strays {
+        assert!(before.contains(&Key::from(k.as_str())), "{k}");
+    }
+
+    let cron = r#"{"invoked_function_arn":"arn:aws:lambda:local:0:function:events:cron"}"#;
+    let body = Bytes::from(json!({ "app": app, "sweep": true }).to_string());
+    let res = exchange(&tric.outbox, &tric.outbox, "POST", "/", &[("x-amzn-lambda-context", cron)], body).await;
+    assert_eq!(res.status, 204);
+    assert!(tric.logged("swept", Duration::from_secs(30)).await, "swept");
+    let log = plain(&tric.log.lock().unwrap());
+    for field in ["swept=2", "deleted=0", "skipped=0", "failed=0", "done=true"] {
+        assert!(log.contains(field), "{field}: {log}");
+    }
+    assert_eq!(all().await, before, "all there, the cursor not left");
+    assert_eq!(tric.files("GET", "s", "op=sum&path=/big").await["ok"]["len"], n);
+    assert_eq!(tric.value("s", "k").await, "v");
+}
+
+/// `log` without the escape sequences that colour it.
+fn plain(log: &str) -> String {
+    let mut plain = String::new();
+    let mut chars = log.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => _ = chars.by_ref().find(|c| *c == 'm'),
+            c => plain.push(c),
+        }
+    }
+    plain
 }
 
 /// WebSockets, with the feature `ws`: real clients of `tric dev`, and the router as API Gateway invokes it; each with

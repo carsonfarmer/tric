@@ -38,6 +38,8 @@ while idle: the only standing costs are the domain's Route 53 zone and what the 
 - **An app** gets credentials from the router, and those credentials reach only its own data:
   - it can read and write its names, its values and `native/<app>/*`;
   - it can read the rest of `apps/<app>/*`;
+  - it can list its `names/` and its `values/`, for the daily sweep that deletes the objects no name refers to, and
+    no other prefix: not the rest of its own, not another app's, not the bucket's root;
   - it gets nothing at all outside its own app.
   - The app role caps every session: no app's credentials can write a release or a component, whatever the router asks.
 - **serve's own role** has no storage access. It can write its logs and invoke the router's `outbox` alias, and
@@ -53,7 +55,7 @@ while idle: the only standing costs are the domain's Route 53 zone and what the 
   which the retry group's schedules alone may assume; and **API Gateway** as `ws` only, from its own stage.
 - **Requests that bypass CloudFront** are refused, and so are sockets: the router checks the secret when one opens.
   CloudFront replaces any `X-Tric-Origin` a viewer sends. The router replaces every `Forwarded`, so `for=_cron`,
-  `for=_tric` and `for=_ws` come only from tric.
+  `for=_tric`, `for=_ws` and `for=_sweep` come only from tric.
 
 There are three things to know:
 - **The state file holds the origin secret** (`terraform.tfstate`, kept locally and git-ignored). Anyone with the
@@ -104,7 +106,8 @@ After a new package, run `apply` again: it updates the three functions. The pack
 
 ## Deploy an app
 
-`tric deploy` writes the app's component and release to the bucket, then syncs its cron to Scheduler. Install `tric`
+`tric deploy` writes the app's component and release to the bucket, then syncs its schedules to Scheduler: its cron,
+and its sweep, once a day at a minute of its own. Install `tric`
 with `cargo install --locked --path .` in a checkout, then take its settings from the install's outputs:
 
 ```bash
@@ -123,7 +126,8 @@ week, but not both, because Scheduler can't express both. tric refuses it everyw
 ## Checks
 
 `docker compose run --rm tofu test` checks the module's isolation properties, as `tests/module.tftest.hcl` lists them,
-against mock providers: it reaches nothing on AWS.
+against mock providers: it reaches nothing on AWS. Among them, that no app's session can list more than its names and
+its values.
 
 ## Remove
 

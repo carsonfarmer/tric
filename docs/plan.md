@@ -293,14 +293,18 @@ delete is a current object of an attempt whose host died mid-attempt (killed, or
 could upload in `TOTAL`, and of a commit whose outcome was unknown.
 
 *The sweep* is a mark-and-sweep with a grace period, run by serve with the app's own credentials:
-- It lists `values/<name>/`, walks the tree from the head, and deletes what is older than the grace period (an hour at
-  least) and unreachable. No later head can refer to such an object, as no attempt lasts an hour.
-- It needs `s3:ListBucket` on the app's `values/*` only, by an `s3:prefix` condition, in the router's policy
-  (`src/route.rs`), `infra/aws/main.tf`, `docker/router-policy.json` and the module's test, with assertions.
+- It lists the app's names, and for each walks the tree from its head, lists `values/<name>/`, and deletes what is
+  older than the grace period (an hour at least) and unreachable. No later head can refer to such an object, as no
+  attempt lasts an hour, which the build asserts against the limits of a turn. Only a key a tree could have made is
+  ever deleted, and a head is read fresh.
+- It needs `s3:ListBucket` on the app's `names/*` and `values/*` only, by an `s3:prefix` condition, in the router's
+  policy (`src/route.rs`), `infra/aws/main.tf`, `docker/router-policy.json` and the module's test, with assertions.
+  `names/` is there because a missing head can't be told from a refused read by a GET, and can be by the listing.
 - It runs once a day for each app, from the Scheduler through the router and into serve, as a retry does, and never
-  always-on. It deletes nothing from a name unless that name's walk completed. A run is bounded, and resumes where the
-  last stopped. It logs what it reclaimed. A request to serve makes it run on demand for the check script.
-- The design of the trigger is in `docs/decisions.md`.
+  always-on. It deletes nothing from a name unless that name's walk completed. A run is bounded (240 s), and resumes
+  where the last stopped. It logs what it reclaimed. A request to the events function's `cron` alias, with
+  `{"app", "sweep": true}`, runs it on demand.
+- The design of the trigger, and the arguments for its safety, are in `docs/decisions.md`.
 
 **Limits.** All are policy: the representation has none of its own.
 
@@ -327,8 +331,8 @@ budgets. A turn has no cap on its changes: it spills.
 - Path walks can't leave the tree (above), and a hard link can't cross trees, as there is one.
 - Objects are under `apps/<app>/values/<name>/`, written and read with the app's own credentials. The name passes
   `is_name`, so it holds no `/`, and an id is random: nothing the guest controls forms a key. A link read back is
-  checked before it is used, so a changed head or node can't point outside the prefix. No IAM changes in the build up
-  to the sweep.
+  checked before it is used, so a changed head or node can't point outside the prefix. The sweep's `ListBucket` on
+  `names/` and `values/` is the only IAM change, and lists no other prefix.
 - Reads are checked against the link's hash and length. A mismatch is an error, and the object, version and detail are
   logged and never given to the guest.
 - Nothing is content-addressed, so there is no deduplication, within an app or between apps, and no way to learn from a
@@ -352,23 +356,25 @@ without the file system: for 0.3, `cli`, `clocks`, `random` and `sockets` `add_t
 | `src/fs/ops.rs` | inodes, blocks, directories, rename, errors, on the tree | 850 (built) |
 | `src/fs/p2.rs` | 0.2: the descriptor's methods, streams, preopens | 560 (built) |
 | `src/fs/p3.rs` | 0.3: the same, async, with `stream` and `future` | 650 (built) |
-| the sweep | listing, walk, delete, the trigger | 300 |
+| `src/sweep.rs`, and the trigger | listing, walk, delete, the cursor; the schedule, the router, serve | 440 (built) |
 
 The tree came to 1,080 lines, against an estimate of 800, because spilling, merging, the cache and the log are in it.
 The core and the 0.2 binding came to 2,200 against 1,250: the gate that keeps a stream's write from being lost to the
 answer, the orphans, a mapping of every failure to an errno, read-ahead, and the streams that outlive their calls are
 most of the difference. The 0.3 binding came to 650 against 600, its `stream` and `future` plumbing (a producer for a
-read, one for a directory listing and a consumer for a write) being about a third of it. The whole is about 4,000
-lines of runtime code so far, on the 4,289 in `src` at the start, and the sweep to come. Tests come to well over
-two thousand more. The tree and `name.rs` came first and alone: the key tests' assertions hold on them, which tests
-the tree before any file exists.
+read, one for a directory listing and a consumer for a write) being about a third of it. The sweep came to about 440
+against 300, the walk and its cap, the shape of the keys it may delete, the cursor, the router's and serve's part, and
+the reconciling of an app's schedules, which gave deploy its first tests, being the difference. The whole is about
+4,400 lines of runtime code, on the 4,289 in `src` at the start. Tests come to well over two thousand more. The tree
+and `name.rs` came first and alone: the key tests' assertions hold on them, which tests the tree before any file
+exists.
 
 **Stages.** Each is committed on its own and passes the whole gate:
 - (a) the tree, with `wasi:keyvalue` on it (done);
 - (b) the file system core and the 0.2 binding, with the testsuite's wasip1 modules and the end-to-end file cases
   (done);
 - (c) the 0.3 binding, with its 14 components (done);
-- (d) the sweep.
+- (d) the sweep, with its trigger (done).
 
 **Conformance:**
 - **The WebAssembly testsuite** (`wasi-testsuite`, pinned by commit). The toolchain image fetches it as a tarball
@@ -395,7 +401,7 @@ wasmtime-wasi; prolly trees; a file system component over `wasi:keyvalue`; separ
 overlay applied at the commit.
 
 **Decided,** by the choices behind the design (each with its reason in `docs/decisions.md`):
-1. **The sweep is built,** last, for the leaks above, with `s3:ListBucket` limited to the app's `values/` prefix.
+1. **The sweep is built,** last, for the leaks above, with `s3:ListBucket` limited to the app's `names/` and `values/`.
 2. **The numbers** above, to be revisited once measured.
 3. **Only a turn's own name is mounted.** Mounting other names would need a path convention.
 4. **A turn edits the tree and spills at its budget,** with no cap on its changes.

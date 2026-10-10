@@ -111,7 +111,9 @@ reason.
   lists the bucket with `s3:prefix` like `ws/channels/*` only, because on AWS the only listing it does is of one
   channel's sockets, which S3 matches against the request's prefix:
   [S3's `s3:prefix` condition](https://docs.aws.amazon.com/AmazonS3/latest/userguide/amazon-s3-policy-keys.html).
-  The listing of `apps/` is the local router's cron.
+  The listing of `apps/` is the local router's cron. Locally the one policy is also the ceiling of an app's session,
+  so it lists `apps/*/names/*` and `apps/*/values/*` as well, for the sweep, which an app's session may list only for
+  its own app.
 - **After the last try the router logs a warning** with the app and the commit, deletes the object, and leaves the
   entry in `pending` to age out. Nothing is kept to replay: an event is delivered only while its commit is pending,
   and that is as long as the window.
@@ -138,9 +140,9 @@ reason.
 - **Schedules are named for what they are,** as `<hash(app)[..24]>-<hash(body)[..39]>`. A changed schedule is a new
   one: deploy creates the missing schedules first, then deletes the extras. They are in one group, which the install
   makes.
-- **An app has 50 cron jobs at most,** so deploy reads its schedules in one page of 100, a failed deploy's extras
-  included, and needs no paging: Scheduler applies the name prefix before it pages, as a probe of a group of 104 showed.
-  More than 100 fails the deploy, which says to delete them by hand.
+- **An app has 49 cron jobs at most,** and its sweep makes 50 schedules, so deploy reads its schedules in one page of
+  100, a failed deploy's extras included, and needs no paging: Scheduler applies the name prefix before it pages, as
+  a probe of a group of 104 showed. More than 100 fails the deploy, which says to delete them by hand.
 - **A cron expression can't restrict both the day of the month and the day of the week.** POSIX cron runs a job
   when either one matches, and Scheduler can't say that, so tric refuses it everywhere.
 
@@ -347,38 +349,120 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   A turn that can't tell which of its objects are live must not guess, since deleting a live node is data loss and
   keeping a dead one is a day's storage.
 - **The sweep is built, last.** What leaks is the objects of an attempt whose host died, and of a commit of unknown
-  outcome: a trap, a timeout, a lost race and a failed commit are all seen and cleaned. The sweep LISTs the name's
-  prefix, walks the tree from the head, and deletes what is older than the grace period (an hour at least) and not
-  reached. It is safe, as no later head can refer to such an object (a head's objects are the last head's and ones
-  made since, and no attempt lasts an hour), and fails safe, as it deletes nothing from a name unless that name's walk
-  completed. It runs in serve with the app's own credentials, so it needs `s3:ListBucket` on `apps/<app>/values/*`
-  alone, by an `s3:prefix` condition, in four places (the router's policy in `src/route.rs`, `infra/aws/main.tf`,
-  `docker/router-policy.json` and the module's test, with assertions on the condition). It is triggered once a day for
-  each app through the Scheduler, the router and serve, as a retry is, and never by an always-on process. It is bounded
-  in each invocation and resumable, logs what it reclaimed, and has a live path that the check script can invoke.
-  The design of that trigger is written here, in its own bullet, before any of it is built.
+  outcome: a trap, a timeout, a lost race and a failed commit are all seen and cleaned. The sweep lists the app's
+  names, and for each one walks its tree from its head, lists its objects, and deletes those that are older than the
+  grace period (an hour at least) and not reached. It is safe, as no later head can refer to such an object (a head's
+  objects are the last head's and ones made since, and no attempt lasts an hour: see the bullet on the grace), and
+  fails safe, as it deletes nothing from a name unless that name's walk completed with every node verified. It runs in
+  serve with the app's own credentials, so it needs `s3:ListBucket` on `apps/<app>/names/*` and `apps/<app>/values/*`
+  and no more, by an `s3:prefix` condition, in four places (the router's policy in `src/route.rs`,
+  `infra/aws/main.tf`, `docker/router-policy.json` and the module's test, with assertions on the condition; and
+  `isolates_apps` in `tests/e2e.rs` lists what an app's credentials can and cannot list). It is triggered once a day
+  for each app through the Scheduler, the router and serve, as a retry is, and never by an always-on process. It is
+  bounded in each invocation and resumable, and logs what it reclaimed. No check script exists to run it from; its live
+  path is the invocation in the bullet after the trigger, and `sweeps_the_names` in `tests/e2e.rs` runs it that way
+  against RustFS. That test cannot show a deletion, as nothing in it is an hour old; the unit tests in `src/sweep.rs`,
+  which pass the clock in, do.
 - **The sweep's trigger is a daily schedule per app, in the cron group, and nothing else.** Deploy adds one schedule
   to an app's cron entries, named and reconciled with them (its name has the hash of its body, so a change is a new
   schedule made before the old one is deleted), with the input `{"app": "<app>", "sweep": true}` where a cron entry has
   `{"app", "path"}`. It targets the events function's `cron` alias, as the cron entries do, so there is no new alias,
   role, group or permission for it. Its time is a minute of the day taken from the SHA-256 of the app's name
-  (`sweep::at`, as `M H * * *` in UTC, and as `cron(M H * * ? *)` for Scheduler), so apps spread over the 1,440 minutes
-  and no flexible window is needed to avoid a herd; and it is the same time locally, where `Route::cron` fires it at
-  that minute, as it fires an app's cron entries. The router's `job` takes either shape and, for a sweep, sends serve
-  a `POST` with `Forwarded: for=_sweep` as the app's tenant, with credentials minted for one hour as for any request.
-  It answers 204 whatever serve says, as for a cron entry: a sweep that fails is logged and is tomorrow's, not a
-  retry. Serve dispatches `for=_sweep` after the credentials and the tenant are checked and before the app is loaded:
-  a sweep needs the store and none of the app's code, so it reads no release, compiles nothing and runs no guest, and
-  an app that never touches a file or a key costs one cold invocation a day that lists an empty prefix and writes
-  nothing. The check script, and anyone else who wants a run now, invokes the same alias with the same input:
-  `aws lambda invoke --function-name <name>-events --qualifier cron --cli-binary-format raw-in-base64-out --payload
-  '{"app":"<app>","sweep":true}' /dev/stdout` on AWS, and a `POST` of it with `x-amzn-lambda-context` naming the `cron`
-  alias to the events listener locally (`tests/e2e.rs` does that). That adds no endpoint, credential or route, none
-  that a client can reach, and it can only do what the schedule does. A run is bounded by its time (`RUN`, 240 s of
-  serve's 330) and resumable: names are taken in key order from a cursor, `apps/<app>/values/.sweep` (not a name's, as
-  names start with a letter or digit), which a run that stops early writes and a run that completes deletes, and which
-  a run with no cursor and nothing to do does not touch. A name that is larger than a run is skipped with a warning,
-  since its walk cannot complete, and so deletes nothing.
+  (`sweep::schedule`, as `M H * * *` in UTC, and as `cron(M H * * ? *)` for Scheduler), so apps spread over the 1,440
+  minutes and no flexible window is needed to avoid a herd; and it is the same time locally, where `Route::cron` fires
+  it at that minute, as it fires an app's cron entries (the memory store of `tric dev` keeps no versions, so a sweep
+  there deletes nothing). The router's `job` takes either shape and, for a sweep, sends serve a `POST` with
+  `Forwarded: for=_sweep` as the app's tenant, with credentials minted for one hour as for any request. It answers 204
+  whatever serve says, as for a cron entry: a sweep that fails is logged and is tomorrow's, not a retry. An app with no
+  release is answered 404 and not swept. Serve dispatches `for=_sweep` after the credentials and the tenant are checked
+  and before the app is loaded: a sweep needs the store and none of the app's code, so it reads no release, compiles
+  nothing and runs no guest, and an app that never touches a file or a key costs one cold invocation a day that lists
+  an empty prefix and writes nothing.
+- **A sweep can be run now, by the same path.** `aws lambda invoke --function-name <name>-events --qualifier cron
+  --cli-binary-format raw-in-base64-out --payload '{"app":"<app>","sweep":true}' /dev/stdout` on AWS, and a `POST` of
+  it with `x-amzn-lambda-context` naming the `cron` alias to the events listener locally. That adds no endpoint,
+  credential or route that a client can reach, and it can only do what the schedule does. Serve logs `swept` at info
+  with the app and what it did (names swept, objects and bytes deleted, names skipped and failed, and whether it went
+  through every name), and `sweep: reclaimed` for each name it deleted from, so a run says what it reclaimed.
+- **`for=_sweep` cannot be reached from outside.** The router writes `Forwarded` itself for every request it sends
+  serve. On a client's request `forward` removes the client's and inserts the router's, and an event goes through
+  `Route::event`, which takes the word as a `&'static str` its caller names (`for=_cron`, `for=_tric`, `for=_ws` or
+  `for=_sweep`), so nothing in a request or an event body can become it. Only the `cron` alias's `{app, sweep: true}`
+  makes the router say `for=_sweep`, and that alias is invoked by Scheduler's role (and by the owner's credentials,
+  for a run now): any other alias, or none, is a 403, and a `{app, sweep}` with a `path`, or with `sweep` false, is a
+  400. Serve takes the word only with the router's credentials and the tenant its host names, which no client has. A
+  guest's call to its own origin runs in-process with `for=_tric` and never reaches serve's `handle`. The e2e tests
+  send it every way: `drops_forged_events` sends `for=_sweep` in a public `GET` and `POST` (answered by the app, as
+  any request is) and in events for each alias, for none and for ones that are none, and asserts that the log shows
+  no sweep and so no list and no delete; `isolates_apps` sends it to serve with no credentials, with no tenant and with
+  the wrong tenant, and gets a 403 each time.
+- **Only a key a tree could have made is deleted.** A candidate is `apps/<app>/values/<name>/<id>`, where `<name>`
+  passes `is_name` and `<id>` is 32 lowercase hex digits, and where the key is equal to the one `tree::object` builds
+  for that name and id, the one place that builds a `values/` path. A listed key of any other shape (the `.sweep`
+  cursor, a key with a deeper path, a name that no name could be, an id of the wrong length or case, a differently
+  escaped spelling) is not a candidate, and is never deleted, whatever its age. The unit tests
+  `only_the_key_of_a_tree_object_is_a_candidate` and `deletes_only_keys_a_tree_could_have_made` put such keys in and
+  check that they are all still there.
+- **A head is read fresh, and a missing head is told from an error by the listing.** The head is read with
+  `name::read`, from the store, never from a cache of heads, as the sweep must see the latest head at that moment: a
+  stale one would not name what a commit since had added. A name with no head had no commit land (a head is never
+  deleted), so nothing is reachable from it and its objects go; any other failure to read a head aborts that name,
+  with a warning, and deletes nothing from it. A GET cannot tell the two apart: S3 answers a key that is missing with a
+  403 and not a 404 to a caller without `s3:ListBucket`
+  (<https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html>), and a grant by `s3:prefix` is not a grant for
+  a GET, which has no prefix. So a missing head is told by the listing of `names/`, which is why the grant has `names/*`
+  as well as `values/*`: a name that is listed has a head, and if that cannot be read, or is not there, the name is not
+  swept; a name that is not listed had no head when the list was made, and a head created later holds objects that are
+  younger than the grace. This widens an app's session by the keys of its own heads, which are names it already knows,
+  and no other app's.
+- **The head is the only root.** What points into `values/` is the head's tree, and nothing else does. The head also
+  holds `pending`, which is digests of requests (the requests are in the outbox, under `outbox/`, and not under
+  `values/`), and the claim, a lease. The outbox and retry objects hold a request and its digest, and no link. A
+  snapshot or a fork, which a read or a descriptor that outlives the answer holds, is a copy of a root read from a head
+  and reads by version, which a delete marker does not hide, and for at most `TOTAL`, so it needs no mark of its own.
+  A link read from a head or a node is checked to name an object of its own name, so a changed head cannot make the
+  sweep walk, or keep, another's. If anything else were ever to point into `values/`, the sweep would have to mark
+  through it as well, and `tree::object` is where to look for who builds those paths.
+- **The grace outlasts the longest turn, by construction.** An object that a head names was made in the turn whose
+  commit wrote the head, or is in the tree of the head that turn began from (a commit lands only if its base is the
+  head then, so a turn from an older head never lands). The sweep takes `cutoff = now - GRACE` before it lists the
+  heads, and reads each head after that. So an object that the head the sweep read does not name, and that a head
+  names later, was made by a turn that landed after the sweep read it, so after `now`, and that turn began at most
+  `TOTAL` (300 s) before it landed; in absolute terms an invocation lasts 900 s at most (Lambda's limit), and the
+  clocks of Lambda and of S3 may differ by 5 minutes at most, which is set well above what AWS keeps. So the object
+  was made after `now - 900 s - 300 s`, which is after the cutoff, and the age filter keeps it. `src/sweep.rs` states
+  it as assertions that fail the build: `GRACE` is an hour at least, `TOTAL + SKEW < GRACE`, `LAMBDA_MAX + SKEW <
+  GRACE`, and a run (`RUN`, 240 s) and 30 s more fit in `TOTAL`, so a limit raised past the grace cannot be built. A
+  node read from the process cache was verified when it was cached, and the cache's key is its path and version, so
+  the walk uses what a read would. A name with no head when the heads were listed is the case above.
+- **A walk is bounded by its size, and the valve is a last resort.** A walk reads the tree's nodes level by level,
+  `IN_FLIGHT` (16) at once, each checked against its link, and keeps the ids it finds in a set of `u128`. These
+  figures are estimates, not measurements: a GET of a node takes about 25 ms from serve, so a walk reads about 640
+  nodes a second, and 100,000 nodes (`NODES_MAX`) take about 156 s of a run's 240. A name with 4 Mi entries of 250
+  bytes each (keys and links, which is what files are) has 16,000 to 32,000 nodes of 64 KiB, between full and half
+  full, and takes 25 to 50 s. A name passes the valve only with more than 100,000 nodes, which is 3 to 6 GiB of keys,
+  links and inline values in its nodes; the structural extreme, 16 GiB of 4 KiB inline values, is 262,000 to 524,000
+  nodes, which no run reads. The set of ids is about 24 bytes an id, and a name has 4 Mi ids at most, so about 100 MB
+  in serve's 1,024 MB; the nodes in flight are 16 of 64 KiB. The listing is the other bound: S3 lists 1,000 keys a
+  request, in sequence, so the 100,000 objects of a large name take 100 requests, and the 4 Mi of the extreme take
+  4,200, which is longer than a run. So the valve has two parts: a name with more than `NODES_MAX` nodes is not walked,
+  and a name that is the first of a run and takes longer than the run is passed over, each with a warning that names
+  the app and the name, and each deleting nothing, as its walk did not complete. Neither is expected to fire, and a
+  name that makes one is at its limits. If one ever does, the way to raise the bound is to list the sixteen prefixes of
+  the id's first digit at once; nothing is built for that.
+- **The sweep schedule lives and dies with an app's others.** `deploy::wanted` makes the schedules an app is to have,
+  its cron entries and its sweep, and `deploy::changes` compares them with those that exist: it creates what is missing
+  first and then deletes what is extra, so the first deploy makes the sweep and later ones leave it. There is no command
+  that removes an app; removing one is reconciling it to nothing wanted, which deletes every entry, the sweep included,
+  so none of an app's is left. A sweep entry that outlived its app would only be answered 404, as the app has no
+  release. `src/deploy.rs` tests this where the cron schedules are reconciled: the sweep is made, is the same each
+  deploy, stays when a cron job goes, and is deleted with the rest when nothing is wanted. An app has 49 cron jobs at
+  most (`CRON_MAX`), so with its sweep it has 50 schedules, and one page of 100 reads them all.
+- **The sweep's tests pass the clock in.** `sweep::run` takes the time to measure ages from and the instant to stop
+  at, so the unit tests use a time two grace periods on, and tokio's paused time (the dev-dependency feature
+  `test-util`, the only change to `Cargo.toml`) for a run that is out of time, with a store that counts its requests.
+  They check that a tree's objects are kept, that a stray goes only when it is past the grace, to the millisecond, and
+  that a name whose walk fails loses nothing.
 - **The node cache is per process,** a byte-capped LRU (16 MiB, `CACHE_MAX`) of immutable nodes, keyed by the object's
   full path and its version (app, name, id, version), so it can never be stale and a hit is exactly the object that
   a read would fetch, and never one of another app's. A node a commit uploads is put in it, since the next request is
