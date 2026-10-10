@@ -337,24 +337,7 @@ impl Node {
 
     /// The node as the object holds it, once all its children are links.
     fn json(&self) -> Result<Vec<u8>> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "lowercase")]
-        enum Ref<'a> {
-            Leaf(&'a [(String, Item)]),
-            Branch(Vec<(&'a str, &'a Link)>),
-        }
-        let wire = match &self.body {
-            Body::Leaf(es) => Ref::Leaf(es),
-            Body::Branch(kids) => Ref::Branch(
-                kids.iter()
-                    .map(|k| match &k.at {
-                        At::Clean(link) => Ok((k.key.as_str(), link)),
-                        At::Dirty(_) => bail!("a node still has a child in memory"),
-                    })
-                    .collect::<Result<_>>()?,
-            ),
-        };
-        Ok(serde_json::to_vec(&wire)?)
+        Ok(serde_json::to_vec(&self.wire()?)?)
     }
 
     fn measure(&mut self) {
