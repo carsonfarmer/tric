@@ -106,6 +106,17 @@ pub enum Kind {
     Link,
 }
 
+impl Kind {
+    /// Whether it is a file, which a read or a write needs; or else why not.
+    pub fn file(self) -> Res<()> {
+        match self {
+            Self::File => Ok(()),
+            Self::Dir => Err(Errno::IsDirectory),
+            Self::Link => Err(Errno::BadDescriptor),
+        }
+    }
+}
+
 fn is_zero(n: &u64) -> bool {
     *n == 0
 }
@@ -540,11 +551,7 @@ pub struct Plan {
 /// the nodes only once.
 pub async fn plan(tree: &Tree, ino: u64, offset: u64, len: u64) -> Res<Plan> {
     let i = fetch(tree, ino).await?;
-    match i.k {
-        Kind::Dir => return Err(Errno::IsDirectory),
-        Kind::Link => return Err(Errno::BadDescriptor),
-        Kind::File => {}
-    }
+    i.k.file()?;
     let end = offset.saturating_add(len).min(i.s);
     let mut items = Vec::new();
     if offset < end {
@@ -622,17 +629,11 @@ pub async fn write_at(tree: &mut Tree, ino: u64, mut at: At, data: &[u8]) -> Res
 /// Writes `data` to the file `ino` in one batch, and returns where it ends.
 async fn write_chunk(tree: &mut Tree, ino: u64, at: At, data: &[u8]) -> Res<u64> {
     let mut tx = Tx::new(tree);
-    let size = {
-        let i = tx.get(ino).await?;
-        match i.k {
-            Kind::Dir => return Err(Errno::IsDirectory),
-            Kind::Link => return Err(Errno::BadDescriptor),
-            Kind::File => i.s,
-        }
-    };
+    let i = tx.get(ino).await?;
+    i.k.file()?;
     let start = match at {
         At::Offset(o) => o,
-        At::End => size,
+        At::End => i.s,
     };
     let end = start.checked_add(data.len() as u64).filter(|e| *e <= FILE_MAX).ok_or(Errno::FileTooLarge)?;
     for index in start / BLOCK..=(end - 1) / BLOCK {
@@ -665,19 +666,13 @@ pub async fn set_size(tree: &mut Tree, ino: u64, size: u64) -> Res<()> {
         return Err(Errno::FileTooLarge);
     }
     let mut tx = Tx::new(tree);
-    let was = {
-        let i = tx.get(ino).await?;
-        match i.k {
-            Kind::Dir => return Err(Errno::IsDirectory),
-            Kind::Link => return Err(Errno::BadDescriptor),
-            Kind::File => i.s,
-        }
-    };
+    let was = tx.get(ino).await?;
+    was.k.file()?;
     let now = tx.now;
     let inode = tx.edit(ino).await?;
     (inode.s, inode.m, inode.c) = (size, now, now);
     let keep = size.div_ceil(BLOCK); // the blocks that hold any of it
-    if size < was && !size.is_multiple_of(BLOCK) {
+    if size < was.s && !size.is_multiple_of(BLOCK) {
         let last = keep - 1;
         if let Some(stored) = block(tx.tree, ino, last).await?.filter(|b| b.len() as u64 > size % BLOCK) {
             let item = tx.tree.item(stored.slice(..(size % BLOCK) as usize));
@@ -685,7 +680,7 @@ pub async fn set_size(tree: &mut Tree, ino: u64, size: u64) -> Res<()> {
         }
     }
     tx.finish().await?;
-    if size < was {
+    if size < was.s {
         drop_blocks(tree, ino, keep).await?;
     }
     Ok(())

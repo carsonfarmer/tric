@@ -537,24 +537,15 @@ impl Handle {
         ops::set_times(&mut tree, ino, atime, mtime).await
     }
 
-    /// The file, which a read or write needs this to be.
-    fn file(&self) -> Res<()> {
-        match self.kind {
-            Kind::File => Ok(()),
-            Kind::Dir => Err(Errno::IsDirectory),
-            Kind::Link => Err(Errno::BadDescriptor),
-        }
-    }
-
     /// A file that was opened to read.
     pub fn reading(&self) -> Res<()> {
-        self.file()?;
+        self.kind.file()?;
         self.read.then_some(()).ok_or(Errno::BadDescriptor)
     }
 
     /// A file that was opened to write.
     pub fn writing(&self) -> Res<()> {
-        self.file()?;
+        self.kind.file()?;
         self.write.then_some(()).ok_or(Errno::BadDescriptor)
     }
 
