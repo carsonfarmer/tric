@@ -79,16 +79,20 @@ locals {
   events   = "${local.function}-events"
   outbox   = "${local.function}-events:outbox"
   cron     = "${local.function}-events:cron"
+  retry    = "${local.function}-events:retry"
   bucket   = aws_s3_bucket.store.arn
   # API Gateway's, for sockets: its stage `ws`, which CloudFront sends upgrades to, and `@connections`'.
   api = "${aws_apigatewayv2_api.ws.id}.execute-api.${var.region}.amazonaws.com"
   ws  = "${aws_apigatewayv2_api.ws.execution_arn}/ws"
   # The Lambda Web Adapter, which turns invocations into HTTP requests to tric.
   adapter = "arn:aws:lambda:${var.region}:753240598075:layer:LambdaAdapterLayerArm64:30"
+  # The retries' schedule group, and its schedules, whose names the router makes up.
+  retries   = "${var.name}-retry"
+  schedules = "arn:aws:scheduler:${var.region}:${data.aws_caller_identity.current.account_id}:schedule/${local.retries}"
 }
 
-# The bucket: apps/ and native/; ws/, sockets' records, which only the router reads and writes; and Lambda's on-failure
-# records under aws/lambda/async/, the dead letters.
+# The bucket: apps/ and native/; and ws/, sockets' records, and outbox/, the deliveries that wait to be tried again,
+# which only the router reads and writes.
 resource "aws_s3_bucket" "store" {
   bucket_prefix = "${var.name}-"
   force_destroy = true
@@ -119,11 +123,12 @@ resource "aws_s3_bucket_lifecycle_configuration" "store" {
     expiration { expired_object_delete_marker = true }
     abort_incomplete_multipart_upload { days_after_initiation = 1 }
   }
+  # A delivery is tried again for 24 hours, and the router deletes it then, so what is left in 2 days is a safety net.
   rule {
-    id     = "dead"
+    id     = "outbox"
     status = "Enabled"
-    filter { prefix = "aws/lambda/async/" }
-    expiration { days = 14 }
+    filter { prefix = "outbox/" }
+    expiration { days = 2 }
   }
   # A socket lasts 2 hours at most, so a record that its closing never deleted is gone a day on.
   rule {
@@ -161,7 +166,18 @@ resource "aws_iam_role_policy" "route" {
       },
       { Effect = "Allow", Action = "sts:AssumeRole", Resource = aws_iam_role.app.arn },
       { Effect = "Allow", Action = "s3:GetObject", Resource = "${local.bucket}/apps/*/current" },
-      { Effect = "Allow", Action = ["s3:GetObject", "s3:DeleteObject"], Resource = "${local.bucket}/ws/*" },
+      # What the router writes: sockets' records, and the deliveries that wait. It lists a channel's sockets, no more.
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+        Resource = ["${local.bucket}/ws/*", "${local.bucket}/outbox/*"]
+      },
+      {
+        Effect    = "Allow"
+        Action    = "s3:ListBucket"
+        Resource  = local.bucket
+        Condition = { StringLike = { "s3:prefix" = "ws/channels/*" } }
+      },
       { Effect = "Allow", Action = "lambda:InvokeFunction", Resource = local.serve },
       # Sends to, and closes, this API's sockets, and no other's.
       {
@@ -169,10 +185,18 @@ resource "aws_iam_role_policy" "route" {
         Action   = "execute-api:ManageConnections"
         Resource = ["${local.ws}/POST/@connections/*", "${local.ws}/DELETE/@connections/*"]
       },
-      # The outbox alias's on-failure records, which Lambda writes as the function under `aws/lambda/async/`. Lambda
-      # takes the destination only if the role may write the whole bucket.
-      { Effect = "Allow", Action = "s3:PutObject", Resource = "${local.bucket}/*" },
-      { Effect = "Allow", Action = "s3:ListBucket", Resource = local.bucket },
+      # Schedules a delivery's next try in the retry group alone, as the retry role alone.
+      {
+        Effect   = "Allow"
+        Action   = "scheduler:CreateSchedule"
+        Resource = "${local.schedules}/*"
+      },
+      {
+        Effect    = "Allow"
+        Action    = "iam:PassRole"
+        Resource  = aws_iam_role.retry.arn
+        Condition = { StringEquals = { "iam:PassedToService" = "scheduler.amazonaws.com" } }
+      },
     ]
   })
 }
@@ -253,6 +277,38 @@ resource "aws_scheduler_schedule_group" "cron" {
   name = var.name
 }
 
+# Scheduler's, for the deliveries' retries: the events function's `retry` alias, and no other. Its group is its own, so
+# that the router, which makes these schedules, can make none that run as `cron`.
+resource "aws_iam_role" "retry" {
+  name = "${var.name}-retry"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "scheduler.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+      Condition = {
+        StringEquals = {
+          "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+          "aws:SourceArn"     = aws_scheduler_schedule_group.retry.arn
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "retry" {
+  role = aws_iam_role.retry.id
+  policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Effect = "Allow", Action = "lambda:InvokeFunction", Resource = local.retry }]
+  })
+}
+
+resource "aws_scheduler_schedule_group" "retry" {
+  name = local.retries
+}
+
 # The functions, from one package: bootstrap runs `tric <handler>`, behind the adapter, on port 3000.
 resource "random_password" "origin" {
   length  = 40
@@ -267,6 +323,10 @@ locals {
     TRIC_SERVE  = local.serve
     TRIC_ROLE   = aws_iam_role.app.arn
     TRIC_ORIGIN = random_password.origin.result
+    # Where a delivery that fails waits for its next try: the group the router schedules in, and what it schedules.
+    TRIC_RETRIES    = local.retries
+    TRIC_RETRY      = local.retry
+    TRIC_RETRY_ROLE = aws_iam_role.retry.arn
   }
   functions = {
     # Clients' requests, which only CloudFront's secret lets in.
@@ -278,7 +338,7 @@ locals {
       env     = merge(local.router, { AWS_LWA_INVOKE_MODE = "response_stream" })
     }
     # Events only, buffered, as API Gateway reads a socket's answer whole. A 5xx fails the invocation, so that Lambda
-    # retries a delivery. `TRIC_WS` is the stage's URL, where `@connections` is.
+    # tries it again if the router itself failed. `TRIC_WS` is the stage's URL, where `@connections` is.
     events = {
       role    = aws_iam_role.route.arn
       handler = "route"
@@ -332,23 +392,24 @@ resource "aws_lambda_function" "function" {
 }
 
 # The events function's aliases, one for each source, as the router takes no event that names no alias: serve invokes
-# `outbox` with delivery events, Scheduler `cron` with the apps' cron, and API Gateway `ws` with sockets' events.
+# `outbox` with delivery events, Scheduler `cron` with the apps' cron and `retry` with a delivery's retries, as roles of
+# their own, and API Gateway `ws` with sockets' events.
 resource "aws_lambda_alias" "events" {
-  for_each         = toset(["outbox", "cron", "ws"])
+  for_each         = toset(["outbox", "cron", "retry", "ws"])
   name             = each.key
   function_name    = aws_lambda_function.function["events"].function_name
   function_version = "$LATEST"
 }
 
-# Delivery events are retried twice, kept up to 6 hours, then written to the bucket.
-resource "aws_lambda_function_event_invoke_config" "outbox" {
+# A delivery that the app fails waits for Scheduler, and these are for when the router itself fails: Lambda tries the
+# event twice more, for up to 6 hours, and then drops it. There is no destination, which would need the router to write
+# the whole bucket.
+resource "aws_lambda_function_event_invoke_config" "events" {
+  for_each                     = toset(["outbox", "retry"])
   function_name                = aws_lambda_function.function["events"].function_name
-  qualifier                    = aws_lambda_alias.events["outbox"].name
+  qualifier                    = aws_lambda_alias.events[each.key].name
   maximum_retry_attempts       = 2
   maximum_event_age_in_seconds = 21600
-  destination_config {
-    on_failure { destination = local.bucket }
-  }
 }
 
 # API Gateway alone may invoke `ws`.

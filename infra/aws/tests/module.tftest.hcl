@@ -29,10 +29,20 @@ mock_provider "aws" {
   }
 }
 
-# The router's role apart from the rest, so that the app role's trust is seen to name it.
+# The router's role, and the retries' role and group, apart from the rest, so that what names them is seen to name them.
 override_resource {
   target = aws_iam_role.route
   values = { arn = "arn:aws:iam::123456789012:role/tric-route" }
+}
+
+override_resource {
+  target = aws_iam_role.retry
+  values = { arn = "arn:aws:iam::123456789012:role/tric-retry" }
+}
+
+override_resource {
+  target = aws_scheduler_schedule_group.retry
+  values = { arn = "arn:aws:scheduler:us-west-2:123456789012:schedule-group/tric-retry" }
 }
 
 mock_provider "aws" {
@@ -101,9 +111,45 @@ run "module" {
     condition = (
       [for s in jsondecode(aws_iam_role_policy.route.policy).Statement : s.Resource
       if contains(flatten([s.Action]), "s3:GetObject")]
-      == ["${aws_s3_bucket.store.arn}/apps/*/current", "${aws_s3_bucket.store.arn}/ws/*"]
+      == ["${aws_s3_bucket.store.arn}/apps/*/current",
+      ["${aws_s3_bucket.store.arn}/ws/*", "${aws_s3_bucket.store.arn}/outbox/*"]]
     )
-    error_message = "the router reads releases and sockets' records only, never an app's data"
+    error_message = "the router reads releases, sockets' records and waiting deliveries only, never an app's data"
+  }
+  assert {
+    condition = (
+      [for s in jsondecode(aws_iam_role_policy.route.policy).Statement : s.Resource
+      if contains(flatten([s.Action]), "s3:PutObject")]
+      == [["${aws_s3_bucket.store.arn}/ws/*", "${aws_s3_bucket.store.arn}/outbox/*"]]
+      && [for s in jsondecode(aws_iam_role_policy.route.policy).Statement : s.Resource
+      if contains(flatten([s.Action]), "s3:DeleteObject")]
+      == [["${aws_s3_bucket.store.arn}/ws/*", "${aws_s3_bucket.store.arn}/outbox/*"]]
+      && [for s in jsondecode(aws_iam_role_policy.route.policy).Statement : s
+      if contains(flatten([s.Action]), "s3:ListBucket")]
+      == [{
+        Effect    = "Allow"
+        Action    = "s3:ListBucket"
+        Resource  = aws_s3_bucket.store.arn
+        Condition = { StringLike = { "s3:prefix" = "ws/channels/*" } }
+      }]
+    )
+    error_message = "the router writes ws/ and outbox/ only, and lists a channel's sockets only, never the whole bucket"
+  }
+  assert {
+    condition = (
+      [for s in jsondecode(aws_iam_role_policy.route.policy).Statement : s.Resource
+      if s.Action == "scheduler:CreateSchedule"]
+      == ["arn:aws:scheduler:us-west-2:123456789012:schedule/tric-retry/*"]
+      && [for s in jsondecode(aws_iam_role_policy.route.policy).Statement : s
+      if s.Action == "iam:PassRole"]
+      == [{
+        Effect    = "Allow"
+        Action    = "iam:PassRole"
+        Resource  = "arn:aws:iam::123456789012:role/tric-retry"
+        Condition = { StringEquals = { "iam:PassedToService" = "scheduler.amazonaws.com" } }
+      }]
+    )
+    error_message = "the router makes schedules in the retry group only, and passes Scheduler the retry role only"
   }
   assert {
     condition = (
@@ -123,6 +169,33 @@ run "module" {
   }
   assert {
     condition = (
+      jsondecode(aws_iam_role_policy.retry.policy).Statement == [{
+        Effect   = "Allow"
+        Action   = "lambda:InvokeFunction"
+        Resource = "arn:aws:lambda:us-west-2:123456789012:function:tric-events:retry"
+      }]
+      && jsondecode(aws_iam_role.retry.assume_role_policy).Statement == [{
+        Effect    = "Allow"
+        Principal = { Service = "scheduler.amazonaws.com" }
+        Action    = "sts:AssumeRole"
+        Condition = { StringEquals = {
+          "aws:SourceAccount" = "123456789012"
+          "aws:SourceArn"     = "arn:aws:scheduler:us-west-2:123456789012:schedule-group/tric-retry"
+        } }
+      }]
+    )
+    error_message = "Scheduler invokes the events function as retry, for the retry group's schedules only"
+  }
+  assert {
+    condition = (
+      [for p in [aws_iam_role_policy.route, aws_iam_role_policy.app, aws_iam_role_policy.serve,
+        aws_iam_role_policy.scheduler, aws_iam_role_policy.retry] : p.policy
+      if strcontains(p.policy, "function:tric-events:retry")] == [aws_iam_role_policy.retry.policy]
+    )
+    error_message = "only the retry role invokes the retry alias: not serve, the router, the apps or cron's Scheduler"
+  }
+  assert {
+    condition = (
       aws_lambda_permission.ws.function_name == "tric-events" && aws_lambda_permission.ws.qualifier == "ws"
       && aws_lambda_permission.ws.principal == "apigateway.amazonaws.com"
       && aws_lambda_permission.ws.source_arn == "arn:aws:execute-api:us-west-2:123456789012:a1b2c3/ws/*"
@@ -139,15 +212,20 @@ run "module" {
     error_message = "the sockets' stage is throttled"
   }
   assert {
-    condition = (
-      aws_lambda_function_event_invoke_config.outbox.function_name == "tric-events"
-      && aws_lambda_function_event_invoke_config.outbox.qualifier == "outbox"
-      && aws_lambda_function_event_invoke_config.outbox.maximum_retry_attempts == 2
-      && aws_lambda_function_event_invoke_config.outbox.maximum_event_age_in_seconds == 21600
-      && one(aws_lambda_function_event_invoke_config.outbox.destination_config[0].on_failure).destination
-      == aws_s3_bucket.store.arn
-    )
-    error_message = "the outbox alias retries twice, keeps events 6 hours, then writes them to the bucket"
+    condition = alltrue([for q, c in aws_lambda_function_event_invoke_config.events : (
+      c.function_name == "tric-events" && c.qualifier == q && c.maximum_retry_attempts == 2
+      && c.maximum_event_age_in_seconds == 21600 && length(c.destination_config) == 0
+    )]) && keys(aws_lambda_function_event_invoke_config.events) == ["outbox", "retry"]
+    error_message = "the outbox and retry aliases try an event twice more, for 6 hours, then drop it: no destination"
+  }
+  assert {
+    condition = alltrue([for f in ["route", "events"] : (
+      aws_lambda_function.function[f].environment[0].variables.TRIC_RETRIES == "tric-retry"
+      && aws_lambda_function.function[f].environment[0].variables.TRIC_RETRY
+      == "arn:aws:lambda:us-west-2:123456789012:function:tric-events:retry"
+      && aws_lambda_function.function[f].environment[0].variables.TRIC_RETRY_ROLE == aws_iam_role.retry.arn
+    )]) && !strcontains(jsonencode(aws_lambda_function.function["serve"].environment), "TRIC_RETRY")
+    error_message = "the router knows where retries go, and serve does not"
   }
   assert {
     condition = (
@@ -164,11 +242,12 @@ run "module" {
       aws_s3_bucket_versioning.store.versioning_configuration[0].status == "Enabled"
       && aws_s3_bucket_lifecycle_configuration.store.rule[0].noncurrent_version_expiration[0].noncurrent_days == 1
       && aws_s3_bucket_lifecycle_configuration.store.rule[0].expiration[0].expired_object_delete_marker
-      && aws_s3_bucket_lifecycle_configuration.store.rule[1].filter[0].prefix == "aws/lambda/async/"
-      && aws_s3_bucket_lifecycle_configuration.store.rule[1].expiration[0].days == 14
+      && aws_s3_bucket_lifecycle_configuration.store.rule[1].filter[0].prefix == "outbox/"
+      && aws_s3_bucket_lifecycle_configuration.store.rule[1].expiration[0].days == 2
       && aws_s3_bucket_lifecycle_configuration.store.rule[2].filter[0].prefix == "ws/"
       && aws_s3_bucket_lifecycle_configuration.store.rule[2].expiration[0].days == 1
+      && length(aws_s3_bucket_lifecycle_configuration.store.rule) == 3
     )
-    error_message = "versioned; lifecycle expires noncurrent versions, delete markers, the dead letters and sockets"
+    error_message = "versioned; lifecycle expires noncurrent versions, delete markers, waiting deliveries and sockets"
   }
 }
