@@ -373,7 +373,7 @@ struct Tx<'a> {
 }
 
 struct Slot {
-    inode: Option<Inode>,
+    inode: Inode,
     dirty: bool,
 }
 
@@ -385,10 +385,7 @@ impl<'a> Tx<'a> {
     async fn slot(&mut self, ino: u64) -> Res<&mut Slot> {
         Ok(match self.inodes.entry(ino) {
             Entry::Occupied(o) => o.into_mut(),
-            Entry::Vacant(v) => {
-                let inode = load(self.tree, &inode_key(ino)).await?.or_else(|| (ino == ROOT).then(Inode::root));
-                v.insert(Slot { inode, dirty: false })
-            }
+            Entry::Vacant(v) => v.insert(Slot { inode: fetch(self.tree, ino).await?, dirty: false }),
         })
     }
 
@@ -396,23 +393,16 @@ impl<'a> Tx<'a> {
     async fn edit(&mut self, ino: u64) -> Res<&mut Inode> {
         let slot = self.slot(ino).await?;
         slot.dirty = true;
-        slot.inode.as_mut().ok_or_else(|| {
-            tracing::warn!("name: inode {ino} is missing");
-            Errno::Io
-        })
+        Ok(&mut slot.inode)
     }
 
     /// The inode `ino`, to read.
     async fn get(&mut self, ino: u64) -> Res<Inode> {
-        let slot = self.slot(ino).await?;
-        slot.inode.clone().ok_or_else(|| {
-            tracing::warn!("name: inode {ino} is missing");
-            Errno::Io
-        })
+        Ok(self.slot(ino).await?.inode.clone())
     }
 
     fn add(&mut self, ino: u64, inode: Inode) {
-        self.inodes.insert(ino, Slot { inode: Some(inode), dirty: true });
+        self.inodes.insert(ino, Slot { inode, dirty: true });
     }
 
     /// Sets the change and modification times of the directory `ino` to now.
@@ -451,8 +441,7 @@ impl<'a> Tx<'a> {
     async fn finish(self) -> Res<()> {
         let Self { tree, inodes, mut edits, .. } = self;
         for (ino, slot) in inodes.into_iter().filter(|(_, s)| s.dirty) {
-            let item = slot.inode.as_ref().map(|i| encode(tree, i)).transpose()?;
-            edits.insert(inode_key(ino), item);
+            edits.insert(inode_key(ino), Some(encode(tree, &slot.inode)?));
         }
         if edits.is_empty() {
             return Ok(());
