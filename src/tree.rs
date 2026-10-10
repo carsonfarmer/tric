@@ -188,30 +188,6 @@ impl Item {
     }
 }
 
-/// A node as the object, and the head's root, hold it.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase", deny_unknown_fields)]
-enum Wire {
-    Leaf(Vec<(String, Item)>),
-    /// Each child under the least key it may hold, which the first child's is not held to.
-    Branch(Vec<(String, Link)>),
-}
-
-impl Default for Wire {
-    fn default() -> Self {
-        Self::Leaf(vec![])
-    }
-}
-
-impl Wire {
-    fn is_empty(&self) -> bool {
-        match self {
-            Self::Leaf(es) => es.is_empty(),
-            Self::Branch(ks) => ks.is_empty(),
-        }
-    }
-}
-
 fn is_zero(n: &u64) -> bool {
     *n == 0
 }
@@ -220,8 +196,8 @@ fn is_zero(n: &u64) -> bool {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Shape {
-    #[serde(default, skip_serializing_if = "Wire::is_empty")]
-    root: Wire,
+    #[serde(default, skip_serializing_if = "Body::is_empty")]
+    root: Body,
     #[serde(default, skip_serializing_if = "is_zero")]
     bytes: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -245,16 +221,51 @@ struct Node {
     held: usize,
 }
 
-#[derive(Clone)]
+/// What a node holds, as the object and the head's root hold it too. A child is its least key and its link: a node
+/// still in memory has none, and is not written.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase", deny_unknown_fields)]
 enum Body {
     Leaf(Vec<(String, Item)>),
+    /// Each child under the least key it may hold, which the first child's is not held to.
     Branch(Vec<Child>),
 }
 
-#[derive(Clone)]
+impl Default for Body {
+    fn default() -> Self {
+        Self::Leaf(vec![])
+    }
+}
+
+impl Body {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Leaf(es) => es.is_empty(),
+            Self::Branch(kids) => kids.is_empty(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(from = "(String, Link)")]
 struct Child {
     key: String,
     at: At,
+}
+
+impl From<(String, Link)> for Child {
+    fn from((key, link): (String, Link)) -> Self {
+        Self { key, at: At::Clean(link) }
+    }
+}
+
+impl Serialize for Child {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match &self.at {
+            At::Clean(link) => (&self.key, link).serialize(s),
+            At::Dirty(_) => Err(serde::ser::Error::custom("a node still has a child in memory")),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -310,34 +321,14 @@ impl Node {
         node
     }
 
-    fn of(wire: Wire) -> Result<Self> {
-        Ok(Self::measured(match wire {
-            Wire::Leaf(es) => Body::Leaf(es),
-            Wire::Branch(ks) => {
-                ensure!(!ks.is_empty(), "a branch has no children");
-                Body::Branch(ks.into_iter().map(|(key, link)| Child { key, at: At::Clean(link) }).collect())
-            }
-        }))
-    }
-
-    /// The node as the head holds it, once all its children are links.
-    fn wire(&self) -> Result<Wire> {
-        Ok(match &self.body {
-            Body::Leaf(es) => Wire::Leaf(es.clone()),
-            Body::Branch(kids) => Wire::Branch(
-                kids.iter()
-                    .map(|k| match &k.at {
-                        At::Clean(link) => Ok((k.key.clone(), link.clone())),
-                        At::Dirty(_) => bail!("a node still has a child in memory"),
-                    })
-                    .collect::<Result<_>>()?,
-            ),
-        })
+    fn of(body: Body) -> Result<Self> {
+        ensure!(!matches!(&body, Body::Branch(kids) if kids.is_empty()), "a branch has no children");
+        Ok(Self::measured(body))
     }
 
     /// The node as the object holds it, once all its children are links.
     fn json(&self) -> Result<Vec<u8>> {
-        Ok(serde_json::to_vec(&self.wire()?)?)
+        Ok(serde_json::to_vec(&self.body)?)
     }
 
     fn measure(&mut self) {
@@ -350,10 +341,7 @@ impl Node {
     }
 
     fn is_empty(&self) -> bool {
-        match &self.body {
-            Body::Leaf(es) => es.is_empty(),
-            Body::Branch(kids) => kids.is_empty(),
-        }
+        self.body.is_empty()
     }
 
     fn first_key(&self) -> &str {
@@ -583,8 +571,8 @@ impl Reader {
             return Ok(node);
         }
         let bytes = self.fetch(link, self.limits.node as u64).await?;
-        let wire = serde_json::from_slice(&bytes).with_context(|| format!("{}", key.0))?;
-        let node = Arc::new(Node::of(wire)?);
+        let body = serde_json::from_slice(&bytes).with_context(|| format!("{}", key.0))?;
+        let node = Arc::new(Node::of(body)?);
         if keep {
             self.store.cache.nodes.lock().unwrap().put(key, node.clone(), link.h.clone(), node.size);
         }
@@ -1142,7 +1130,7 @@ impl Tree {
         self.sealed = true;
         ensure!(self.root.size <= r.limits.node, "the root is over {} bytes", r.limits.node);
         let Work { bytes, entries, seq, .. } = self.work;
-        Ok(Shape { root: self.root.wire()?, bytes, entries, seq })
+        Ok(Shape { root: self.root.body.clone(), bytes, entries, seq })
     }
 
     /// The head landed: what the tree replaced is no more, and the tree is as it was committed. Returns the objects to
@@ -1805,8 +1793,8 @@ mod tests {
         let seen = audit(&store, &shape).await;
         let path = |id: &str| store::app("a", &["values", "n", id]);
 
-        let Wire::Branch(kids) = &shape.root else { panic!("a tree of one node") };
-        let node = &kids[0].1;
+        let Body::Branch(kids) = &shape.root else { panic!("a tree of one node") };
+        let At::Clean(node) = &kids[0].at else { panic!("a node in memory") };
         let Some(Item::Object(blob)) = seen.items.values().next().cloned() else { panic!("no object") };
         for (link, what) in [(node.clone(), "a node"), (blob, "a value")] {
             let at = path(&link.id);
@@ -1855,7 +1843,8 @@ mod tests {
         ];
         for link in bads {
             assert!(link.check().is_err(), "{link:?}");
-            let shape = Shape { root: Wire::Branch(vec![(String::new(), link.clone())]), bytes: 0, entries: 0, seq: 0 };
+            let shape =
+                Shape { root: Body::Branch(vec![(String::new(), link.clone()).into()]), bytes: 0, entries: 0, seq: 0 };
             let tree = at(&store, &shape);
             let err = tree.get("k/a").await.unwrap_err();
             assert!(format!("{err:#}").contains("malformed"), "{err:#}");
