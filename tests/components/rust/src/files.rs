@@ -1,5 +1,5 @@
-//! The `/files` route: wasi:filesystem through `std::fs`, on `/`, which under `/@name` is the name's tree. The reply is
-//! `{"ok": value}` or `{"err": "<kind>: <message>"}`, with `status=N` as for any route. A file's bytes are
+//! The `/files` route: wasi:filesystem of 0.2, through `std::fs`, on `/`, which under `/@name` is the name's tree. The
+//! reply is `{"ok": value}` or `{"err": "<kind>: <message>"}`, with `status=N` as for any route. A file's bytes are
 //! `pattern(i)`, so a reader can tell any byte from any other, and a block that lands in the wrong place.
 //!
 //! `/files?op=OP&path=P&to=T&data=D&n=N&at=A&chunk=C&key=K&value=V`:
@@ -27,21 +27,21 @@ use wasip3::http_compat::http_into_wasi_response;
 use wasip3::{clocks::monotonic_clock, wit_future, wit_stream};
 
 /// How long `held` and `late` wait, which is for the turn to answer, and to commit.
-const LATER: u64 = 500_000_000;
+pub(crate) const LATER: u64 = 500_000_000;
 
-fn pattern(i: u64) -> u8 {
+pub(crate) fn pattern(i: u64) -> u8 {
     (i % 251) as u8
 }
 
 /// FNV-1a of `bytes`, as an accumulator: start from `OFFSET`.
-fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
+pub(crate) fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
     for b in bytes {
         hash = (hash ^ *b as u64).wrapping_mul(0x100000001b3);
     }
     hash
 }
 
-const OFFSET: u64 = 0xcbf29ce484222325;
+pub(crate) const OFFSET: u64 = 0xcbf29ce484222325;
 
 pub fn respond(name: Option<&str>, q: &HashMap<String, String>) -> Result<Response, ErrorCode> {
     let arg = |k: &str| q.get(k).map_or("", |v| v);
@@ -166,7 +166,7 @@ fn run(q: &HashMap<String, String>) -> Result<Value, String> {
 }
 
 /// A response whose body is what `body` gives, once it is done: after the handler has answered.
-fn streamed(body: impl Future<Output = Value> + 'static) -> Response {
+pub(crate) fn streamed(body: impl Future<Output = Value> + 'static) -> Response {
     let (mut tx, rx) = wit_stream::new();
     let (done, trailers) = wit_future::new(|| Ok(None));
     wasip3::wit_bindgen::spawn_local(async move {
