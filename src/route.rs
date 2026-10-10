@@ -84,14 +84,19 @@ pub async fn run(
     let (known, creds) = (Mutex::default(), Mutex::default());
     let route = Arc::new(Route { domain, bucket, serve, role, origin, store: Store::s3(s3), aws, known, creds });
     let clients = TcpListener::bind(listen).await?;
+    // Locally, events have a listener of their own, which is up before the router says it is.
+    let events = match route.serve.starts_with("arn:") {
+        true => None,
+        false => Some(TcpListener::bind(outbox).await?),
+    };
     eprintln!("routing at http://{}", clients.local_addr()?);
-    if route.serve.starts_with("arn:") {
+    let Some(events) = events else {
         return tric::listen(clients, move |_, req| route.clone().lambda(req)).await;
-    }
+    };
     let ticker = route.clone();
     tokio::spawn(cron::tick(move |t| _ = tokio::spawn(ticker.clone().cron(t))));
     let r = route.clone();
-    let events = tric::listen(TcpListener::bind(outbox).await?, move |_, req| r.clone().lambda(req));
+    let events = tric::listen(events, move |_, req| r.clone().lambda(req));
     let clients = tric::listen(clients, move |peer, req| {
         let host = req.headers().get(HOST).and_then(|h| h.to_str().ok()).unwrap_or_default().to_owned();
         route.clone().handle(peer.ip(), host, "http", req)
