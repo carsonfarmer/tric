@@ -450,29 +450,36 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   `NODES_MAX` nodes is not walked, and a name that is the first of a run and takes longer than the run is passed over,
   each with a warning that names the app and the name, and each deleting nothing, as its walk did not complete.
   Neither is expected to fire, and a name that makes one is at its limits.
-- **A name's objects are listed sixteen ways at once.** S3 lists 1,000 keys a request, in sequence. A name near
-  `DATA_MAX` in values just over the 4 KiB inline limit has 4 Mi objects: 4,200 requests one after another, some 5
-  minutes at 75 ms each, which is longer than a run, so such a name would be passed over every day. An id is 128
-  random bits in hex, so a name's objects are spread evenly over the 16 digits an id may begin with, and
-  `sweep::unnamed` lists each digit's on its own, all at once. The listing of a digit begins after `<before>g`, where
-  `before` is the digit before it (`list_with_offset`, which S3 does with `start-after`), and the stream is dropped
-  at the first key from `<digit>g`. An id has a hex digit second and `g` follows `f` in key order, so every id of the
-  digit lies between those keys and none of another digit does. Each listing is then 263 requests for the 4 Mi, some
-  13 to 26 s at 50 to 100 ms, with 16 requests under way at a time. These figures are assumptions, not measurements.
-  The digit is also checked of each id, so that an id is in one listing and only one whichever way a store treats the
-  offset, and a key that is no id is passed over, as it was. A listing that errors fails its name, and nothing is
-  deleted from it. The unit test puts ids at both ends of every digit's range and in the middle, with keys that are
-  no ids among them, and shows that each id is found once, that no listing reads past its range (it reads the keys
-  there are and one more for each digit), and that a run deletes each once. The price is that a name costs 16 listing
-  requests where it cost 1, whatever its size: $0.00008 a name where it was $0.000005 (S3 Standard, $0.005 for 1,000),
-  so $0.12 a day for an app whose run is full of names (below), and less for a smaller one. Reading the first page
-  alone, and the rest sixteen ways only if it is not the last, would save that, and is not built.
+- **A name's objects are listed in one go, and those of a large name sixteen ways.** S3 lists 1,000 keys a request, in
+  sequence. A name near `DATA_MAX` in values just over the 4 KiB inline limit has 4 Mi objects: 4,200 requests one
+  after another, some 5 minutes at 75 ms each, which is longer than a run, so such a name would be passed over every
+  day. But almost every name has a page of objects or fewer, and an idle app must cost nothing it need not, so
+  `sweep::unnamed` lists `values/<name>/` once, as before, and if the listing ends within `PAGE` (1,000) keys, those
+  are all of it and the name costs one request. If a 1,001st key arrives it drops that listing and lists by digit. An
+  id is 128 random bits in hex, so a name's objects are spread evenly over the 16 digits an id may begin with, and
+  `sweep::partition` lists each digit's on its own, all at once. The listing of a digit begins after `<before>g`,
+  where `before` is the digit before it (`list_with_offset`, which S3 does with `start-after`), and the stream is
+  dropped at the first key from `<digit>g`. An id has a hex digit second and `g` follows `f` in key order, so every id
+  of the digit lies between those keys and none of another digit does. Each listing is then 263 requests for the 4 Mi,
+  some 13 to 26 s at 50 to 100 ms, with 16 requests under way at a time. These figures are assumptions, not
+  measurements. The digit is also checked of each id, so that an id is in one listing and only one whichever way a
+  store treats the offset, and a key that is no id is passed over, as it was. A listing that errors fails its name,
+  and nothing is deleted from it.
+  The cost of the first listing is read from `object_store` 0.14.2: its listing is a stream of pages, and
+  `stream_paginated` (`client/pagination.rs`) asks for the next page only when the stream is polled past the one it
+  has, so a name of 1,000 keys or fewer never makes a second request, and stopping at the 1,001st key makes exactly
+  two. A name over a page then costs those two and a request or more for each digit: about 18 where it cost 2, and
+  for the largest name the same 4,200 requests, but sixteen at a time. The unit tests plant names of 0, 1, 1,000,
+  1,001 and 2,000 ids and count the listings begun (1, and 1 + 16 for the last two) and the keys read (the 1,000, and
+  for the larger the 1,001 of the first listing and no more than the keys there are and one past each range); and
+  put ids at both ends of every digit's range and in the middle, with keys that are no ids among them, to show that
+  each id is found once and that a run deletes each once.
 - **The number of names an app has bounds a run, and that is a known limit.** A sweep lists the app's `values/` for the
   names that have objects (a delimiter listing, 1,000 prefixes a request, which `object_store` cannot begin part of
   the way through) and `names/` for their heads, both at once, and holds both: about 130 bytes a name, so 1M names are
   130 MB of serve's 1,024. At 75 ms a request, which is an assumption, 1M names are 1,000 requests, some 75 s of a
   run's 240, and every run lists them again; 3M names are a run, and leave no time to sweep. The sweep of a name is
-  the nearer limit: its head, a node or more and its listings are four or five requests in sequence, some 150 ms, so
+  the nearer limit: its head, a node or more and its listing are four or five requests in sequence, some 150 ms, so
   a run sweeps about 1,500 names. An app with a thousand is swept every day; one with 100,000 is gone through in some
   65 days, a pass at a time from the cursor; one with 1M in some 900, as a third of each run is its listing. Nothing
   is lost by that, as what a sweep leaves is only space, and nothing is built for it, as no app is there. When one is,

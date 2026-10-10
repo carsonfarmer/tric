@@ -9,7 +9,7 @@ use crate::store::{self, Store};
 use crate::tree;
 use futures_util::TryStreamExt;
 use futures_util::future::{try_join, try_join_all};
-use object_store::{PutMode, path::Path};
+use object_store::{ObjectMeta, PutMode, path::Path};
 use percent_encoding::percent_decode_str;
 use std::collections::{BTreeSet, HashSet};
 use std::ops::Bound::{Excluded, Unbounded};
@@ -32,6 +32,8 @@ pub const RUN: Duration = Duration::from_secs(240);
 const NODES_MAX: usize = 100_000;
 /// The key, in `values/`, of where a run that stopped early got to. A name starts with a letter or a digit.
 const CURSOR: &str = ".sweep";
+/// The keys in a page of a listing: S3 gives 1,000 at most, whatever `max-keys` asks for.
+const PAGE: usize = 1000;
 
 // Every object a head names was made in a turn, which lasts `TOTAL` at most (and Lambda's `LAMBDA_MAX` whatever
 // serve's own limits are) and commits at its end, or is in the tree of the head the turn began from. The sweep reads a
@@ -165,17 +167,35 @@ async fn survey(
     Ok(Some(unnamed(store, app, name, (cutoff, &live)).await?))
 }
 
-/// The objects of `name` that are not in `live` and were made at `cutoff` or before, with their sizes. S3 lists 1,000
-/// keys a request, in sequence, so a name of millions would take longer than a run to list. Its ids are random, so
-/// they are spread evenly over the 16 digits they may begin with: each digit's are listed on their own, all at once.
+/// The objects of `name` that are not in `live` and were made at `cutoff` or before, with their sizes. A name of a page
+/// of objects or fewer is one listing, and that is nearly every name. A name of more is listed by the first digit of
+/// its ids: S3 lists 1,000 keys a request, in sequence, so a name of millions would take longer than a run to list, and
+/// its ids are random, so they are spread evenly over the 16 digits they may begin with. Each digit's are listed on
+/// their own, all at once.
+///
+/// A listing asks for a page when it is read past the one it has, and not before (`object_store` pages by stream), so
+/// that stopping at the key after a page costs two requests, and a name of a page or fewer never asks for a second.
 async fn unnamed(
     store: &Store,
     app: &str,
     name: &str,
     (cutoff, live): (u64, &HashSet<u128>),
 ) -> Result<Vec<(Path, u64)>> {
-    let listings = (0..16).map(|digit| partition(store, app, name, digit, (cutoff, live)));
-    Ok(try_join_all(listings).await?.concat())
+    let mut objects = store.objects(&store::app(app, &["values", name]), None);
+    let mut page = Vec::with_capacity(PAGE);
+    while let Some(meta) = objects.try_next().await? {
+        if page.len() == PAGE {
+            drop(objects);
+            let listings = (0..16).map(|digit| partition(store, app, name, digit, (cutoff, live)));
+            return Ok(try_join_all(listings).await?.concat());
+        }
+        page.push(meta);
+    }
+    Ok(page
+        .into_iter()
+        .filter(|meta| deletable(app, name, meta, (cutoff, live)).is_some())
+        .map(|meta| (meta.location, meta.size))
+        .collect())
 }
 
 /// What `unnamed` finds among the ids of `name` that begin with `digit` (0 to 15). The listing begins after the key
@@ -199,15 +219,18 @@ async fn partition(
         if meta.location >= end {
             break;
         }
-        if u64::try_from(meta.last_modified.timestamp_millis()).unwrap_or_default() > cutoff {
-            continue;
-        }
-        let id = candidate(app, name, &meta.location);
-        if id.is_some_and(|id| id >> 124 == u128::from(digit) && !live.contains(&id)) {
+        if deletable(app, name, &meta, (cutoff, live)).is_some_and(|id| id >> 124 == u128::from(digit)) {
             garbage.push((meta.location, meta.size));
         }
     }
     Ok(garbage)
+}
+
+/// The id of `meta`, if it is an object the sweep may delete: one the tree of `name` could have made, that is not in
+/// `live`, and that was made at `cutoff` or before.
+fn deletable(app: &str, name: &str, meta: &ObjectMeta, (cutoff, live): (u64, &HashSet<u128>)) -> Option<u128> {
+    let made = u64::try_from(meta.last_modified.timestamp_millis()).unwrap_or_default();
+    candidate(app, name, &meta.location).filter(|id| made <= cutoff && !live.contains(id))
 }
 
 /// The id of the object at `path`, if it is one the tree of `name` could have made, and so one the sweep may delete:
@@ -628,38 +651,75 @@ mod tests {
         assert!(warned[0].contains("app=\"a\"") && warned[0].contains("name=\"big\""), "{text}");
     }
 
+    /// `n` distinct ids, evenly spread over the 128 bits, and so over every first digit, each ending in a `1`.
+    fn spread(n: usize) -> Vec<String> {
+        let step = u128::MAX / n.max(1) as u128;
+        (0..n).map(|i| format!("{:032x}", (i as u128 * step) | 1)).collect()
+    }
+
+    async fn plant_keys(store: &Store, keys: impl IntoIterator<Item = &String>) {
+        for key in keys {
+            store.put(&tree::object("a", "n", key), Bytes::from_static(b"x"), PutMode::Overwrite).await.unwrap();
+        }
+    }
+
     #[tokio::test]
-    async fn a_name_is_listed_by_the_first_digit_of_its_ids_in_full_and_once() {
+    async fn a_name_of_a_page_is_one_listing_and_a_name_of_more_is_the_first_and_sixteen() {
+        for n in [0, 1, PAGE, PAGE + 1, 2 * PAGE] {
+            let (store, counts) = counting();
+            let ids = spread(n);
+            plant_keys(&store, &ids).await;
+            // The even ones are named by a tree.
+            let live: HashSet<u128> = ids.iter().step_by(2).filter_map(|id| tree::number(id)).collect();
+            let mut found = unnamed(&store, "a", "n", (u64::MAX, &live)).await.unwrap();
+            found.sort();
+            let want: Vec<_> = ids.iter().skip(1).step_by(2).map(|id| (tree::object("a", "n", id), 1)).collect();
+            assert_eq!(found, want, "{n} objects");
+
+            // A page is the one listing, read to its end. More is the first, read to the key after its page and no
+            // further, and one for each digit, each read to the end of its range and a key past it.
+            let (listings, read) = (counts.listings.load(SeqCst), counts.listed.load(SeqCst));
+            match n > PAGE {
+                false => assert_eq!((listings, read), (1, n), "{n} objects"),
+                true => {
+                    assert_eq!(listings, 1 + 16, "{n} objects");
+                    assert!(read <= (PAGE + 1) + n + 16, "{n} objects: {read} keys were read");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_listing_by_digit_has_every_id_once_and_no_key_that_is_not_one() {
         let (store, counts) = counting();
         // Ids at both ends of every digit's range and one in the middle, so that every boundary has an id beside it on
-        // each side; and keys that no tree made, which sort among them: after each range, and outside them all.
+        // each side; and keys that no tree made, which sort among them: after each range, and outside them all. A
+        // page and one more of keys, so that the name is listed by digit.
         let ids: Vec<String> =
             (0..16).flat_map(|digit| ["0", "8", "f"].map(|x| format!("{digit:x}{}", x.repeat(31)))).collect();
         let mut odd: Vec<String> = (0..16)
             .flat_map(|d| [format!("{d:x}g"), format!("{d:x}g{}", "0".repeat(30)), format!("{d:x}{}g", "f".repeat(30))])
             .collect();
         odd.extend(["A", "g", "-"].map(|c| format!("{c}{}", "0".repeat(31))));
+        let rest = spread(PAGE + 1 - ids.len() - odd.len());
+        plant_keys(&store, ids.iter().chain(&odd).chain(&rest)).await;
         let at = |key: &String| tree::object("a", "n", key);
-        for key in ids.iter().chain(&odd) {
-            store.put(&at(key), Bytes::from_static(b"x"), PutMode::Overwrite).await.unwrap();
-        }
 
         // What a tree names is not found, and the rest is, each once, whichever digit it begins with.
         let live: HashSet<u128> = ids.iter().filter(|id| id.ends_with('8')).filter_map(|id| tree::number(id)).collect();
-        counts.listed.store(0, SeqCst);
         let mut found = unnamed(&store, "a", "n", (u64::MAX, &live)).await.unwrap();
         found.sort();
-        let want: Vec<_> = ids.iter().filter(|id| !id.ends_with('8')).map(|id| (at(id), 1)).collect();
-        assert_eq!(want.len(), 32);
+        let mut want: Vec<_> = ids.iter().filter(|id| !id.ends_with('8')).chain(&rest).map(|id| (at(id), 1)).collect();
+        want.sort();
+        assert_eq!(want.len(), 32 + rest.len());
         assert_eq!(found, want);
-        // Each listing is read to the end of its range, and no further: every key once, and a key past each range.
-        let (keys, read) = (ids.len() + odd.len(), counts.listed.load(SeqCst));
-        assert!(read <= keys + 16, "{read} keys were read of {keys}: a listing went past its range");
+        assert_eq!(counts.listings.load(SeqCst), 1 + 16);
 
         // A run deletes every id of a name with no head, each once, and not a key that no tree made.
         let report = run(&store, "a", later(), long()).await.unwrap();
-        assert_eq!(report, Report { swept: 1, deleted: 48, bytes: 48, done: true, ..Default::default() });
-        assert_eq!(counts.deletes.load(SeqCst), 48, "each once");
+        let count = ids.len() + rest.len();
+        assert_eq!(report, Report { swept: 1, deleted: count, bytes: count as u64, done: true, ..Default::default() });
+        assert_eq!(counts.deletes.load(SeqCst), count, "each once");
         assert_eq!(held(&store, "n").await, odd.iter().map(at).collect());
     }
 

@@ -293,11 +293,11 @@ delete is a current object of an attempt whose host died mid-attempt (killed, or
 could upload in `TOTAL`, and of a commit whose outcome was unknown.
 
 *The sweep* is a mark-and-sweep with a grace period, run by serve with the app's own credentials:
-- It lists the app's names, and for each walks the tree from its head, lists `values/<name>/` (as 16 listings at once,
-  one for each first digit of an id, so that a name of millions of objects takes less than a run), and deletes what is
-  older than the grace period (an hour at least) and unreachable. No later head can refer to such an object, as no
-  attempt lasts an hour, which the build asserts against the limits of a turn. Only a key a tree could have made is
-  ever deleted, and a head is read fresh.
+- It lists the app's names, and for each walks the tree from its head, lists `values/<name>/` (in one request, if it
+  holds a page of objects or fewer, and else as 16 listings at once, one for each first digit of an id, so that a name
+  of millions of objects takes less than a run), and deletes what is older than the grace period (an hour at least) and
+  unreachable. No later head can refer to such an object, as no attempt lasts an hour, which the build asserts against
+  the limits of a turn. Only a key a tree could have made is ever deleted, and a head is read fresh.
 - It needs `s3:ListBucket` on the app's `names/*` and `values/*` only, by an `s3:prefix` condition, in the router's
   policy (`src/route.rs`), `infra/aws/main.tf`, `docker/router-policy.json` and the module's test, with assertions.
   `names/` is there because a missing head can't be told from a refused read by a GET, and can be by the listing.
