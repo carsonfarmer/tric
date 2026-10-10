@@ -35,6 +35,12 @@ variable "route_concurrency" {
   default     = 200
 }
 
+variable "log" {
+  description = "What each function logs, as RUST_LOG; `warn,tric=debug` adds every read and write of a head"
+  type        = string
+  default     = "warn,tric=info"
+}
+
 variable "ws_rate" {
   description = "Sockets' events a second, opening, messages and closing, across every app, as API Gateway throttles"
   type        = number
@@ -316,7 +322,7 @@ resource "aws_lambda_function" "function" {
   # A flood of client requests holds at most this many routers, and as many serves, so the rest of the account's
   # concurrency stays for cron and the outbox. Reserving keeps nothing warm: it costs nothing while idle.
   reserved_concurrent_executions = each.key == "route" ? var.route_concurrency : -1
-  environment { variables = merge(each.value.env, { AWS_LWA_PORT = "3000" }) }
+  environment { variables = merge(each.value.env, { AWS_LWA_PORT = "3000", RUST_LOG = var.log }) }
   # An app per tenant: a Lambda execution environment never runs two apps.
   dynamic "tenancy_config" {
     for_each = each.key == "serve" ? [1] : []

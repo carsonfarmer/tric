@@ -99,6 +99,11 @@ reason.
 - **A snapshot is a turn that has answered.** Both read the name as it was, and neither writes, so one type serves
   both. A write after the answer now fails with `access-denied`, the same as a write to a snapshot, where it used to
   fail with `other`. `wasi:keyvalue` names `access-denied` for exactly this.
+- **A cache of heads waits for numbers.** A cache in each environment would spare a writing turn its read when the
+  cache is current, as `If-Match` catches it when it is not, at the cost of a wasted run. A turn that writes nothing
+  would still have to check its read, and S3 Express keeps no versions. So every read and write of a head logs, at
+  debug, its `ETag`, size and time; the live run turns that on with `-var log=warn,tric=debug`, and counts, in each
+  environment, the reads a cache would have spared and the runs it would have wasted.
 
 ## Local
 

@@ -98,9 +98,14 @@ fn value_path(app: &str, key: &str) -> Path {
     store::app(app, &["values", key])
 }
 
-/// The head at `path`, with its version.
+/// The head at `path`, with its version. Each read and write of a head logs, at debug, its `ETag` and what it took:
+/// the numbers that say whether a cache of heads in each environment would pay.
 pub async fn read(store: &Store, path: &Path) -> Result<Option<(Head, UpdateVersion)>> {
-    store.json(path, HEAD_MAX as u64).await
+    let start = Instant::now();
+    let read = store.json(path, HEAD_MAX as u64).await;
+    let etag = read.as_ref().ok().and_then(Option::as_ref).and_then(|(_, v)| v.e_tag.as_deref());
+    tracing::debug!(%path, etag, ms = start.elapsed().as_millis() as u64, "read");
+    read
 }
 
 /// Writes `head` over the version `base`, or where there is none, if that is still the head: its new version, or
@@ -108,7 +113,11 @@ pub async fn read(store: &Store, path: &Path) -> Result<Option<(Head, UpdateVers
 async fn put(store: &Store, path: &Path, head: &Head, base: Option<UpdateVersion>) -> Result<Option<UpdateVersion>> {
     let json = serde_json::to_vec(head)?;
     ensure!(json.len() <= HEAD_MAX, TooLarge);
-    store.put(path, json.into(), base.map_or(PutMode::Create, PutMode::Update)).await
+    let (start, bytes, over) = (Instant::now(), json.len(), base.as_ref().and_then(|v| v.e_tag.clone()));
+    let put = store.put(path, json.into(), base.map_or(PutMode::Create, PutMode::Update)).await;
+    let etag = put.as_ref().ok().and_then(Option::as_ref).and_then(|v| v.e_tag.as_deref());
+    tracing::debug!(%path, over, etag, bytes, ms = start.elapsed().as_millis() as u64, "put");
+    put
 }
 
 /// The `ETag` of a head's version: a strong one, whatever the store says.

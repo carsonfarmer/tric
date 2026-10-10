@@ -85,7 +85,7 @@ All commands run from the repository's root.
    ```
 
    The region is `us-west-2` unless you add `-var region=<region>`. The first apply waits a few minutes for the
-   certificate and the distribution.
+   certificate and the distribution. The functions log as `-var log=<RUST_LOG>` says, `warn,tric=info` by default.
 
 After a new package, run `apply` again: it updates the three functions. The package is built with WebSockets.
 

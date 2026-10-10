@@ -244,8 +244,7 @@ ws/channels/<app>/<channel>/<id> a socket's subscription to a channel (router on
 - `wasi:filesystem`;
 - S3 Express;
 - head caches;
-- GCP and Azure;
-- the `guard` middleware.
+- GCP and Azure.
 
 ## Acceptance criteria
 
