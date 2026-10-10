@@ -791,3 +791,13 @@ sockets and where API Gateway WebSocket does, on AWS. A probe on AWS, behind Clo
 
 - **Imports are as rustfmt leaves them.** Its `imports_granularity`, which is unstable, made `src` longer at every
   setting (`Module` by 41 lines, `Crate` by 90, `One` by 130), and clippy has no lint for it.
+- **The AWS SDK is not used, for now:** S3 stays on `object_store`, and STS, Lambda and Scheduler on tric's own calls.
+  A study at d2125b4 put every AWS call on the SDK and passed the gate. It cut `src/` from 2,967 code lines to 2,813,
+  and it cost:
+  - 36 more crates in the router, the trusted part (257 to 293);
+  - a stripped binary 16% larger (27.1 MB to 31.5 MB), a zip 15% larger, and a clean build 48 s longer;
+  - 3 of 5 release builds killed for memory on a 7.75 GiB Docker VM, at a peak of 6.8 GiB;
+  - a turn run twice: the SDK tries an invoke up to 3 times, so an answer lost after a commit commits again;
+  - a response silent for 20 s cut by the SDK's stalled-stream protection, by default, which breaks an SSE app that
+    pauses;
+  - `tric dev` needing an S3 endpoint, as the SDK has no store in memory.
