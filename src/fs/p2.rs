@@ -5,19 +5,17 @@
 //! A stream is a state machine in the manner of the stock one, with a read or a write in flight as a task of its own.
 //! A read holds the tree shared for its length only, so closing a stream cancels it. A write is admitted when the
 //! stream takes it, and nothing cancels it: see the rules of [`super`].
-use super::{At, Entries, Errno, Handle, Kind, Mode, READ_MAX, Res, Stat, Time};
+use super::{Ahead, At, Entries, Errno, Fault, Handle, Kind, Mode, READ_MAX, Res, Stat, Task, Time, WRITE_CAP, wrote};
 use crate::engine::Host;
 use bytes::Bytes;
 use std::mem;
 use tokio::task::{JoinError, JoinHandle};
-use wasmtime::component::{HasSelf, Linker, Resource, ResourceTableError};
+use wasmtime::component::{HasSelf, Linker, Resource};
 use wasmtime_wasi_io::poll::Pollable;
 use wasmtime_wasi_io::streams::{
     DynInputStream, DynOutputStream, InputStream, OutputStream, StreamError, StreamResult,
 };
 
-/// The most bytes a stream's `write` takes at once, which is what `check-write` says.
-const WRITE_CAP: usize = 256 << 10;
 /// The bytes a stream reads ahead for a guest that polls it before it reads.
 const READ_AHEAD: usize = 64 << 10;
 
@@ -44,37 +42,6 @@ use wasmtime_wasi::p2::bindings::clocks::wall_clock::Datetime;
 pub fn add_to_linker(linker: &mut Linker<Host>) -> wasmtime::Result<()> {
     types::add_to_linker::<Host, HasSelf<Host>>(linker, |h| h)?;
     preopens::add_to_linker::<Host, HasSelf<Host>>(linker, |h| h)
-}
-
-/// How a call fails: with an error code, which the guest is told, or with a trap, which ends it.
-#[derive(Debug)]
-pub enum Fault {
-    Code(ErrorCode),
-    Trap(wasmtime::Error),
-}
-
-impl From<ErrorCode> for Fault {
-    fn from(code: ErrorCode) -> Self {
-        Self::Code(code)
-    }
-}
-
-impl From<Errno> for Fault {
-    fn from(e: Errno) -> Self {
-        Self::Code(e.into())
-    }
-}
-
-impl From<ResourceTableError> for Fault {
-    fn from(e: ResourceTableError) -> Self {
-        Self::Trap(e.into())
-    }
-}
-
-impl From<wasmtime::Error> for Fault {
-    fn from(e: wasmtime::Error) -> Self {
-        Self::Trap(e)
-    }
 }
 
 impl From<Errno> for ErrorCode {
@@ -138,33 +105,16 @@ fn time(t: NewTimestamp) -> Res<Time> {
     }
 }
 
-impl Host {
-    /// The descriptor, which is cloned out of the table so that nothing of the table is held across an await.
-    fn fd(&self, fd: &Resource<Handle>) -> Result<Handle, Fault> {
-        Ok(self.table.get(fd)?.clone())
-    }
-
-    /// Adds a resource to the table, if there is room: the guest is told there is not, as it would be of memory.
-    fn add<T: Send + 'static>(&mut self, resource: T) -> Result<Resource<T>, Fault> {
-        self.table.push(resource).map_err(|e| match e {
-            ResourceTableError::Full => Errno::InsufficientMemory.into(),
-            e => e.into(),
-        })
-    }
-}
-
 impl preopens::Host for Host {
     async fn get_directories(&mut self) -> wasmtime::Result<Vec<(Resource<Handle>, String)>> {
-        let ctx = self.ctx.clone();
-        let Some(turn) = ctx.mount().await? else { return Ok(Vec::new()) };
-        Ok(vec![(self.table.push(Handle::root(&turn))?, "/".into())])
+        self.preopen().await
     }
 }
 
 impl types::Host for Host {
     fn convert_error_code(&mut self, err: Fault) -> wasmtime::Result<ErrorCode> {
         match err {
-            Fault::Code(code) => Ok(code),
+            Fault::Errno(e) => Ok(e.into()),
             Fault::Trap(e) => Err(e),
         }
     }
@@ -182,7 +132,7 @@ impl types::HostDescriptor for Host {
     ) -> Result<Resource<DynInputStream>, Fault> {
         let file = self.fd(&fd)?;
         file.reading()?;
-        let stream: DynInputStream = Box::new(Input { file, offset, state: Read::Idle });
+        let stream: DynInputStream = Box::new(Input::new(file, offset));
         self.add(stream)
     }
 
@@ -224,7 +174,7 @@ impl types::HostDescriptor for Host {
         if file.writable() {
             flags |= DescriptorFlags::WRITE;
         }
-        if file.kind() == Kind::Dir && file.mutable() {
+        if file.mutates() {
             flags |= DescriptorFlags::MUTATE_DIRECTORY;
         }
         Ok(flags)
@@ -322,24 +272,17 @@ impl types::HostDescriptor for Host {
         let sync = DescriptorFlags::FILE_INTEGRITY_SYNC
             | DescriptorFlags::DATA_INTEGRITY_SYNC
             | DescriptorFlags::REQUESTED_WRITE_SYNC;
-        if flags.intersects(sync) {
-            return Err(Errno::Unsupported.into());
-        }
-        if flags.contains(DescriptorFlags::MUTATE_DIRECTORY) && !dir.mutable() {
-            return Err(Errno::ReadOnly.into());
-        }
-        let (create, truncate) = (open_flags.contains(OpenFlags::CREATE), open_flags.contains(OpenFlags::TRUNCATE));
-        let write = flags.contains(DescriptorFlags::WRITE);
         let mode = Mode {
             follow: path_flags.contains(PathFlags::SYMLINK_FOLLOW),
-            create,
+            create: open_flags.contains(OpenFlags::CREATE),
             directory: open_flags.contains(OpenFlags::DIRECTORY),
             exclusive: open_flags.contains(OpenFlags::EXCLUSIVE),
-            truncate,
-            read: flags.contains(DescriptorFlags::READ) || !write,
-            write: write || create || truncate,
+            truncate: open_flags.contains(OpenFlags::TRUNCATE),
+            read: flags.contains(DescriptorFlags::READ),
+            write: flags.contains(DescriptorFlags::WRITE),
+            mutate: flags.contains(DescriptorFlags::MUTATE_DIRECTORY),
         };
-        let file = dir.open(&path, mode).await?;
+        let file = dir.open_as(&path, mode, flags.intersects(sync)).await?;
         self.add(file)
     }
 
@@ -398,11 +341,7 @@ impl types::HostDescriptor for Host {
 impl Host {
     /// A stream that writes the file from `at`: if the turn can be written.
     fn output(&mut self, fd: &Resource<Handle>, at: At) -> Result<Resource<DynOutputStream>, Fault> {
-        let file = self.fd(fd)?;
-        file.writing()?;
-        if !file.mutable() {
-            return Err(Errno::ReadOnly.into());
-        }
+        let file = self.writer(fd)?;
         let stream: DynOutputStream = Box::new(Output { file, at, state: Write::Ready });
         self.add(stream)
     }
@@ -416,15 +355,6 @@ impl types::HostDirectoryEntryStream for Host {
 
     async fn drop(&mut self, stream: Resource<Entries>) -> wasmtime::Result<()> {
         Ok(self.table.delete(stream).map(drop)?)
-    }
-}
-
-/// A read in flight, which is cancelled if the stream is closed: it holds the tree shared and nothing else.
-struct Task<T>(JoinHandle<T>);
-
-impl<T> Drop for Task<T> {
-    fn drop(&mut self) {
-        self.0.abort();
     }
 }
 
@@ -446,9 +376,14 @@ struct Input {
     file: Handle,
     offset: u64,
     state: Read,
+    ahead: Ahead,
 }
 
 impl Input {
+    fn new(file: Handle, offset: u64) -> Self {
+        Self { file, offset, state: Read::Idle, ahead: Ahead::default() }
+    }
+
     fn start(&mut self, len: usize) {
         let (file, offset) = (self.file.clone(), self.offset);
         self.state = Read::Waiting(Task(tokio::spawn(async move { file.read(offset, len as u64).await })));
@@ -457,20 +392,25 @@ impl Input {
     /// Waits for the read under way, if one is.
     async fn wait(&mut self) {
         if let Read::Waiting(task) = &mut self.state {
-            self.state = Self::landed((&mut task.0).await);
+            let read = (&mut task.0).await;
+            self.land(read);
         }
     }
 
-    fn landed(read: Result<Res<(Bytes, bool)>, JoinError>) -> Read {
-        match read {
+    /// Takes what a read that started at the offset found.
+    fn land(&mut self, read: Result<Res<(Bytes, bool)>, JoinError>) {
+        self.state = match read {
             Ok(Ok((data, _))) if data.is_empty() => Read::Closed,
-            Ok(Ok((data, _))) => Read::Data(data),
+            Ok(Ok((data, _))) => {
+                self.ahead.landed(&self.file, self.offset, data.len() as u64);
+                Read::Data(data)
+            }
             Ok(Err(e)) => Read::Error(e),
             Err(e) => {
                 tracing::warn!("fs: a read failed to finish: {e}");
                 Read::Error(Errno::Io)
             }
-        }
+        };
     }
 }
 
@@ -507,7 +447,7 @@ impl InputStream for Input {
         self.wait().await;
         if let (Read::Idle, true) = (&self.state, size > 0) {
             let read = self.file.read(self.offset, size.min(READ_MAX as usize) as u64).await;
-            self.state = Self::landed(Ok(read));
+            self.land(Ok(read));
         }
         self.read(size)
     }
@@ -602,19 +542,14 @@ impl Pollable for Output {
     async fn ready(&mut self) {
         if let Write::Waiting(task, len) = &mut self.state {
             let len = *len;
-            self.state = match task.await {
-                Ok(Ok(n)) if n == len => {
+            self.state = match wrote(task.await, len) {
+                Ok(()) => {
                     if let At::Offset(p) = &mut self.at {
-                        *p += n as u64;
+                        *p += len as u64;
                     }
                     Write::Ready
                 }
-                Ok(Ok(_)) => Write::Error(Errno::InsufficientSpace), // the name filled part way
-                Ok(Err(e)) => Write::Error(e),
-                Err(e) => {
-                    tracing::warn!("fs: a write failed to finish: {e}");
-                    Write::Error(Errno::Io)
-                }
+                Err(e) => Write::Error(e),
             };
         }
     }
@@ -622,12 +557,18 @@ impl Pollable for Output {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{commit, put, text, turn};
+    use super::super::ops::BLOCK;
+    use super::super::tests::{commit, put, read, text, turn};
     use super::*;
     use crate::store::Store;
+    use crate::tree::counting::counting;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::time::Duration;
+    use tokio::time::{sleep, timeout};
 
     fn reader(file: &Handle, offset: u64) -> Input {
-        Input { file: file.clone(), offset, state: Read::Idle }
+        Input::new(file.clone(), offset)
     }
 
     fn writer(file: &Handle, at: At) -> Output {
@@ -696,6 +637,76 @@ mod tests {
         assert_eq!(input.read(4).unwrap(), &b"2345"[..]);
         assert_eq!(input.blocking_read(100).await.unwrap(), &b"6789"[..]);
         assert!(matches!(input.blocking_read(100).await, Err(StreamError::Closed)), "the end of the file");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_reads_on_has_the_blocks_after_in_the_cache() {
+        let (store, counts) = counting();
+        let first = turn(&store).await;
+        let block = BLOCK as usize;
+        let big: Vec<u8> = (0..block * 12).map(|i| (i % 251) as u8).collect();
+        put(&Handle::root(&first), "f", &big).await;
+        commit(&first).await;
+
+        // The next request is on another instance, which has read nothing.
+        let cold = Store { cache: Arc::default(), ..store };
+        let file = Handle::root(&turn(&cold).await).open("f", read()).await.unwrap();
+        counts.gets.store(0, SeqCst);
+        let mut input = reader(&file, 0);
+        let gets = || counts.gets.load(SeqCst);
+
+        // The first read is what it asked for, and no more is fetched: it may be the only one.
+        assert_eq!(input.blocking_read(block).await.unwrap(), &big[..block]);
+        input.ahead.settled().await;
+        assert_eq!(gets(), 1);
+        // The second carries on from it, and the blocks that follow are fetched, to a megabyte ahead.
+        assert_eq!(input.blocking_read(block).await.unwrap(), &big[block..block * 2]);
+        input.ahead.settled().await;
+        assert_eq!(gets(), 2 + 4);
+        // So the reads that come to those ask nothing of the store, and each brings the next block in.
+        for i in 2..12 {
+            assert_eq!(input.blocking_read(block).await.unwrap(), &big[i * block..(i + 1) * block]);
+            input.ahead.settled().await;
+            assert_eq!(gets(), (i + 5).min(12), "read {i}");
+        }
+        assert!(matches!(input.blocking_read(block).await, Err(StreamError::Closed)));
+        assert_eq!(gets(), 12, "every block was fetched once, and none past the end");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_is_closed_stops_reading_ahead() {
+        let (store, counts) = counting();
+        let first = turn(&store).await;
+        let block = BLOCK as usize;
+        put(&Handle::root(&first), "f", &vec![1; block * 12]).await;
+        commit(&first).await;
+        let cold = Store { cache: Arc::default(), ..store };
+        let file = Handle::root(&turn(&cold).await).open("f", read()).await.unwrap();
+
+        let mut input = reader(&file, 0);
+        input.blocking_read(block).await.unwrap();
+        file.read(block as u64, block as u64).await.unwrap(); // so the next read of the stream asks nothing
+        counts.delay.store(60_000, SeqCst);
+        input.blocking_read(block).await.unwrap();
+        // The blocks after it are being fetched, by a task that has the file open.
+        let waiting = || counts.flight.load(SeqCst) == 4 && Arc::strong_count(&file.pin) == 3;
+        timeout(Duration::from_secs(5), async {
+            while !waiting() {
+                sleep(Duration::from_millis(5)).await
+            }
+        })
+        .await
+        .expect("the read-ahead is under way");
+
+        drop(input);
+        let released = || Arc::strong_count(&file.pin) == 1;
+        timeout(Duration::from_secs(5), async {
+            while !released() {
+                sleep(Duration::from_millis(5)).await
+            }
+        })
+        .await
+        .expect("the read-ahead was cancelled with the stream");
     }
 
     #[tokio::test]

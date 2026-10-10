@@ -19,7 +19,7 @@ use wasmtime_wasi::p2::bindings::{cli, clocks, random, sockets};
 use wasmtime_wasi::random::{WasiRandom, WasiRandomView};
 use wasmtime_wasi::sockets::{WasiSockets, WasiSocketsView};
 #[cfg(test)]
-use wasmtime_wasi::{I32Exit, p2::bindings::Command};
+use wasmtime_wasi::{I32Exit, p2, p3::bindings::Command};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView, p2::pipe::MemoryOutputPipe};
 use wasmtime_wasi_http::p3::bindings::{Service, ServicePre};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView, p3};
@@ -76,6 +76,7 @@ impl Engine {
         wasmtime_wasi::p3::sockets::add_to_linker(&mut linker)?;
         p3::add_to_linker(&mut linker)?;
         fs::p2::add_to_linker(&mut linker)?;
+        fs::p3::add_to_linker(&mut linker)?;
         Imports::add_to_linker::<Host, HasSelf<Host>>(&mut linker, |h| h)?; // `wasi:keyvalue`
         Ok(Self { engine, linker })
     }
@@ -120,9 +121,9 @@ impl Engine {
 
 #[cfg(test)]
 impl Engine {
-    /// Runs the `wasi:cli/command` component `command` to its end, as an app would run, under `ctx`; and returns its
-    /// exit code, and what it wrote to stdout and to stderr. For the tests of the file system, whose conformance tests
-    /// are commands.
+    /// Runs the `wasi:cli/command` component `command` to its end, of WASI 0.3 or of 0.2, as an app would run, under
+    /// `ctx`; and returns its exit code, and what it wrote to stdout and to stderr. For the tests of the file system,
+    /// whose conformance tests are commands.
     pub async fn run_command(
         &self,
         command: &Component,
@@ -133,13 +134,20 @@ impl Engine {
         let (out, err) = (MemoryOutputPipe::new(LOG_MAX), MemoryOutputPipe::new(LOG_MAX));
         let wasi = WasiCtx::builder().stdout(out.clone()).stderr(err.clone()).args(args).envs(env).build();
         let mut store = store(&self.engine, wasi, ctx);
-        let guest = Command::instantiate_async(&mut store, command, &self.linker).await?;
-        let code = match guest.wasi_cli_run().call_run(&mut store).await {
+        let instance = self.linker.instantiate_async(&mut store, command).await?;
+        let ran = match Command::new(&mut store, &instance) {
+            Ok(guest) => {
+                let ran = store.run_concurrent(async |accessor| guest.wasi_cli_run().call_run(accessor).await).await;
+                ran.and_then(|ran| ran)
+            }
+            Err(_) => p2::bindings::Command::new(&mut store, &instance)?.wasi_cli_run().call_run(&mut store).await,
+        };
+        let code = match ran {
             Ok(Ok(())) => 0,
             Ok(Err(())) => 1,
             Err(e) => match e.downcast_ref::<I32Exit>() {
                 Some(&I32Exit(code)) => code,
-                None => return Err(e),
+                None => return Err(e.context(format!("stderr: {}", String::from_utf8_lossy(&err.contents())))),
             },
         };
         Ok((code, out.contents().to_vec(), err.contents().to_vec()))

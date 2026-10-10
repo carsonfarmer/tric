@@ -1,6 +1,7 @@
 //! The file system the guest sees: a name's tree, as directories and files, under a preopened `/`. Which turn's tree it
 //! is, is the request's: the turn on the name it addresses, to read and write until it answers, and a snapshot of the
-//! name if it only reads. A [`Handle`] is a descriptor on it, and [`p2`] serves `wasi:filesystem` of 0.2 with them.
+//! name if it only reads. A [`Handle`] is a descriptor on it, and [`p2`] and [`p3`] serve `wasi:filesystem` of 0.2 and
+//! of 0.3 with them.
 //!
 //! Descriptors outlive the calls that made them, and so do the streams a descriptor makes, so the rules for the turn
 //! are these:
@@ -14,6 +15,10 @@
 //!   the gate, then the tree: a change never waits for the gate while it holds the tree.
 //! * A write that was admitted is never cancelled: a change to the tree that is cut off half way leaves it unfit to
 //!   commit. So a stream's writes are tasks of their own, which a closed stream leaves to finish.
+//! * A read holds the tree shared for as long as it is under way, and nothing outlives it that holds the tree. What
+//!   a stream reads is cancelled by closing the stream, and by the guest cancelling its read of it: the read is
+//!   dropped, and the stream goes on from where it was. A stream that reads on from where it was reads ahead, for the
+//!   cache only, in a task that is cancelled with it: see [`Ahead`].
 //! * A file that is unlinked while it is open stays in the tree, with no links, until the last descriptor on it is
 //!   closed, when it is removed; or, if the turn commits first, until then in a copy of the tree that the descriptors
 //!   read, while the commit leaves it out.
@@ -23,21 +28,101 @@
 mod conformance;
 mod ops;
 pub mod p2;
+pub mod p3;
 
+use crate::engine::Host;
 use crate::name::Turn;
 use crate::tree::Tree;
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
 pub use ops::{At, Errno, Kind, Res, Stat, Time};
 use ops::{Loc, PAGE, ROOT};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::{OwnedRwLockReadGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use wasmtime::Result;
+use wasmtime::component::{Resource, ResourceTableError};
 
 /// The most bytes a read returns.
 pub const READ_MAX: u64 = 1 << 20;
+/// The most bytes a stream's write takes at once.
+pub const WRITE_CAP: usize = 256 << 10;
+/// How far ahead of a stream that reads on from where it was the blocks are fetched, for the cache.
+const AHEAD: u64 = 1 << 20;
+
+/// How a call of a binding fails: with an error of the file system, which the guest is told, or with a trap, which ends
+/// the guest.
+#[derive(Debug)]
+pub enum Fault {
+    Errno(Errno),
+    Trap(wasmtime::Error),
+}
+
+impl From<Errno> for Fault {
+    fn from(e: Errno) -> Self {
+        Self::Errno(e)
+    }
+}
+
+impl From<ResourceTableError> for Fault {
+    fn from(e: ResourceTableError) -> Self {
+        Self::Trap(e.into())
+    }
+}
+
+impl From<wasmtime::Error> for Fault {
+    fn from(e: wasmtime::Error) -> Self {
+        Self::Trap(e)
+    }
+}
+
+impl Host {
+    /// The descriptor, which is cloned out of the table so that nothing of the table is held across an await.
+    fn fd(&self, fd: &Resource<Handle>) -> Result<Handle, Fault> {
+        Ok(self.table.get(fd)?.clone())
+    }
+
+    /// The file a stream writes, if the turn can be written.
+    fn writer(&self, fd: &Resource<Handle>) -> Result<Handle, Fault> {
+        let file = self.fd(fd)?;
+        file.writing()?;
+        if !file.mutable() {
+            return Err(Errno::ReadOnly.into());
+        }
+        Ok(file)
+    }
+
+    /// Adds a resource to the table, if there is room: the guest is told there is not, as it would be of memory.
+    fn add<T: Send + 'static>(&mut self, resource: T) -> Result<Resource<T>, Fault> {
+        self.table.push(resource).map_err(|e| match e {
+            ResourceTableError::Full => Errno::InsufficientMemory.into(),
+            e => e.into(),
+        })
+    }
+
+    /// The preopened directories: `/` if the request addresses a name, and none if it does not.
+    async fn preopen(&mut self) -> Result<Vec<(Resource<Handle>, String)>> {
+        let ctx = self.ctx.clone();
+        let Some(turn) = ctx.mount().await? else { return Ok(Vec::new()) };
+        Ok(vec![(self.table.push(Handle::root(&turn))?, "/".into())])
+    }
+}
+
+/// What a write task found, as the error of the call it was for: all of `len` bytes written is `Ok`, and fewer, which
+/// is the name filling part way, is `insufficient-space`.
+fn wrote(done: Result<Res<usize>, JoinError>, len: usize) -> Res<()> {
+    match done {
+        Ok(Ok(n)) if n == len => Ok(()),
+        Ok(Ok(_)) => Err(Errno::InsufficientSpace),
+        Ok(Err(e)) => Err(e),
+        Err(e) => {
+            tracing::warn!("fs: a write failed to finish: {e}");
+            Err(Errno::Io)
+        }
+    }
+}
 
 /// An admitted change, for as long as it is held.
 type Permit = OwnedRwLockReadGuard<()>;
@@ -276,6 +361,8 @@ pub struct Mode {
     pub truncate: bool,
     pub read: bool,
     pub write: bool,
+    /// For a directory: that it be opened to change its entries, which `get-flags` reports back.
+    pub mutate: bool,
 }
 
 /// What `open` found.
@@ -312,12 +399,16 @@ pub struct Handle {
     kind: Kind,
     read: bool,
     write: bool,
+    /// For a directory: whether it was opened to change its entries. Only what `get-flags` says: what the turn allows
+    /// is what decides, as the adapter of WASI 0.1 asks for no more than reading of a directory it opens, and as
+    /// Wasmtime's own host does not hold a directory to it either.
+    mutate: bool,
 }
 
 impl Handle {
     /// The root, as the preopen, which is read, and changed by whoever may change the turn.
     pub fn root(turn: &Arc<Turn>) -> Self {
-        Self { pin: Pin::new(turn, ROOT), kind: Kind::Dir, read: true, write: false }
+        Self { pin: Pin::new(turn, ROOT), kind: Kind::Dir, read: true, write: false, mutate: true }
     }
 
     pub fn kind(&self) -> Kind {
@@ -337,6 +428,12 @@ impl Handle {
         self.pin.turn.is_open()
     }
 
+    /// Whether `get-flags` says `mutate-directory`: if the directory was opened to change its entries, and still can
+    /// be.
+    pub fn mutates(&self) -> bool {
+        self.mutate && self.mutable()
+    }
+
     fn turn(&self) -> &Arc<Turn> {
         &self.pin.turn
     }
@@ -352,7 +449,8 @@ impl Handle {
     /// A descriptor on `ino`, opened by `mode`, which must be done with the tree locked.
     fn child(&self, ino: u64, kind: Kind, m: &Mode) -> Self {
         let is_file = kind == Kind::File;
-        Self { pin: Pin::new(self.turn(), ino), kind, read: !is_file || m.read, write: is_file && m.write }
+        let pin = Pin::new(self.turn(), ino);
+        Self { pin, kind, read: !is_file || m.read, write: is_file && m.write, mutate: !is_file && m.mutate }
     }
 
     /// Opens `path`, below this directory.
@@ -396,6 +494,22 @@ impl Handle {
         let tree = self.pin.view().await;
         let (ino, _) = ops::lookup(&tree, self.ino(), path, follow).await?;
         ops::stat(&tree, ino).await
+    }
+
+    /// Opens `path` as `open-at` asks, with `mode` holding the flags of the descriptor as the guest gave them. `mutate`
+    /// of it is the right to change the directory entries, which a turn that has answered does not give, and `sync` is
+    /// that a write be durable when it returns, which only a commit makes it.
+    pub async fn open_as(&self, path: &str, mut mode: Mode, sync: bool) -> Res<Self> {
+        if sync {
+            return Err(Errno::Unsupported);
+        }
+        if mode.mutate && !self.mutable() {
+            return Err(Errno::ReadOnly);
+        }
+        // A descriptor that is not asked to write reads, and one that makes a file or empties it writes.
+        mode.read |= !mode.write;
+        mode.write |= mode.create || mode.truncate;
+        self.open(path, mode).await
     }
 
     /// Sets the size of the file.
@@ -442,11 +556,21 @@ impl Handle {
     /// than `READ_MAX`.
     pub async fn read(&self, offset: u64, len: u64) -> Res<(Bytes, bool)> {
         self.reading()?;
+        if offset > i64::MAX as u64 {
+            return Err(Errno::Invalid); // as `pread` does: an offset is signed
+        }
         let len = len.min(READ_MAX);
         let tree = self.pin.view().await;
         let data = ops::read_at(&tree, self.ino(), offset, len).await?;
         let end = (data.len() as u64) < len;
         Ok((data, end))
+    }
+
+    /// Fetches the blocks of a read of `len` bytes from `offset`, for the cache, and lets them go.
+    async fn warm(&self, offset: u64, len: u64) -> Res<()> {
+        self.reading()?;
+        let tree = self.pin.view().await;
+        ops::warm(&tree, self.ino(), offset, len.min(READ_MAX)).await
     }
 
     /// Writes `data`, and returns how much of it: fewer than all if the name filled.
@@ -586,16 +710,95 @@ pub struct Entries {
     done: bool,
 }
 
+/// A page of the entries of a directory.
+pub type Page = Vec<(String, Kind)>;
+
 impl Entries {
-    pub async fn next(&mut self) -> Res<Option<(String, Kind)>> {
-        if self.page.is_empty() && !self.done {
-            let tree = self.dir.pin.view().await;
-            let page = ops::readdir(&tree, self.dir.ino(), self.after.as_deref(), PAGE).await?;
-            self.done = page.len() < PAGE;
-            self.after = page.last().map(|(name, _)| name.clone());
-            self.page = page.into();
+    /// Reads the page that follows the entries taken so far, if there is one. It holds the tree shared while it reads
+    /// and changes nothing, so it can be dropped at any point, and read again.
+    pub fn more(&self) -> Option<BoxFuture<'static, Res<Page>>> {
+        if !self.page.is_empty() || self.done {
+            return None;
         }
-        Ok(self.page.pop_front())
+        let (dir, after) = (self.dir.clone(), self.after.clone());
+        Some(Box::pin(async move {
+            let tree = dir.pin.view().await;
+            ops::readdir(&tree, dir.ino(), after.as_deref(), PAGE).await
+        }))
+    }
+
+    /// Takes the page that [`Entries::more`] read.
+    pub fn fill(&mut self, page: Page) {
+        self.done = page.len() < PAGE;
+        self.after = page.last().map(|(name, _)| name.clone());
+        self.page = page.into();
+    }
+
+    /// The next entry of the page taken, if any is left.
+    pub fn pop(&mut self) -> Option<(String, Kind)> {
+        self.page.pop_front()
+    }
+
+    pub async fn next(&mut self) -> Res<Option<(String, Kind)>> {
+        if let Some(more) = self.more() {
+            self.fill(more.await?);
+        }
+        Ok(self.pop())
+    }
+}
+
+/// A task that is aborted when it is dropped: a read that holds the tree shared and nothing else, which closing the
+/// stream it is for cancels.
+pub struct Task<T>(pub JoinHandle<T>);
+
+impl<T> Drop for Task<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The read-ahead of a stream that reads a file. When a read lands where the one before it ended, the stream is
+/// reading on, and the blocks after it, up to [`AHEAD`] bytes, are fetched for the cache, so that the stream does not
+/// wait for the store at each block. They are fetched as a read does, verified against their links, and the task that
+/// does it is cancelled with the stream. A read of a file that only gets its first bytes reads nothing it did not
+/// ask for.
+#[derive(Default)]
+pub struct Ahead {
+    /// Where the last read that landed ended.
+    end: Option<u64>,
+    /// Where the blocks that were asked for end.
+    asked: u64,
+    task: Option<Task<()>>,
+}
+
+impl Ahead {
+    /// Notes that a read of `len` bytes from `offset` landed.
+    pub fn landed(&mut self, file: &Handle, offset: u64, len: u64) {
+        let end = offset.saturating_add(len);
+        let on = self.end.replace(end) == Some(offset);
+        if !on || len == 0 || self.task.as_ref().is_some_and(|task| !task.0.is_finished()) {
+            return;
+        }
+        let (from, to) = (self.asked.max(end), end.saturating_add(AHEAD));
+        if from >= to {
+            return;
+        }
+        self.asked = to;
+        let file = file.clone();
+        // Nothing here is told of a failure: the read that comes to those blocks will tell it.
+        self.task = Some(Task(tokio::spawn(async move {
+            let _ = file.warm(from, to - from).await;
+        })));
+    }
+}
+
+#[cfg(test)]
+impl Ahead {
+    /// Waits for the blocks that are being fetched to be in the cache.
+    pub async fn settled(&mut self) {
+        if let Some(mut task) = self.task.take() {
+            let _ = (&mut task.0).await;
+        }
     }
 }
 
@@ -757,6 +960,9 @@ mod tests {
         assert_eq!(reader.write(At::End, b"x").await, Err(Errno::BadDescriptor));
         assert_eq!(reader.set_size(0).await, Err(Errno::BadDescriptor));
         assert_eq!(reader.read(0, 10).await.unwrap(), (Bytes::from_static(b"abc"), true));
+        // An offset is signed, as `pread` has it: past the largest is invalid, and not the end of the file.
+        assert_eq!(reader.read(i64::MAX as u64, 1).await.unwrap(), (Bytes::new(), true));
+        assert_eq!(reader.read(i64::MAX as u64 + 1, 1).await.err(), Some(Errno::Invalid));
         let writer = root.open("f", write_only()).await.unwrap();
         assert_eq!(writer.read(0, 1).await.err(), bad);
         assert_eq!(writer.write(At::End, b"d").await, Ok(1));
@@ -776,6 +982,24 @@ mod tests {
         assert_eq!(root.open("d", Mode { create: true, ..self::dir() }).await.err(), Some(Errno::Invalid));
         // All of the above changed nothing.
         assert_eq!(text(&root, "f").await.as_deref(), Ok(&b"abcd"[..]));
+    }
+
+    #[tokio::test]
+    async fn a_directory_says_it_can_be_changed_only_if_it_was_opened_to_and_the_turn_can() {
+        let turn = turn(&Store::memory()).await;
+        let root = Handle::root(&turn);
+        root.mkdir_at("d").await.unwrap();
+        let (plain, changing) = (Mode { directory: true, ..read() }, Mode { mutate: true, ..self::dir() });
+        let (d, e) = (root.open("d", plain).await.unwrap(), root.open("d", changing).await.unwrap());
+        assert!(root.mutates(), "the preopen is opened to change it");
+        assert!(!d.mutates() && e.mutates());
+        // It is only what is said, as Wasmtime's host has it: a directory that is not said to be changed can be.
+        assert!(d.mkdir_at("x").await.is_ok());
+        // A turn that has answered changes nothing, and the descriptors say so.
+        turn.answer();
+        assert!(!root.mutates() && !e.mutates());
+        assert_eq!(root.open_as("d", Mode { mutate: true, ..self::dir() }, false).await.err(), Some(Errno::ReadOnly));
+        assert!(root.open_as("d", plain, false).await.is_ok());
     }
 
     #[tokio::test]

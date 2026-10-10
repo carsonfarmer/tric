@@ -346,27 +346,28 @@ without the file system: for 0.3, `cli`, `clocks`, `random` and `sockets` `add_t
 
 | File | What | Lines |
 |---|---|---|
-| `src/tree.rs` | nodes, links, edits, spill, merge, scans, the cache, garbage lists | 1,040 (built) |
+| `src/tree.rs` | nodes, links, edits, spill, merge, scans, the cache, garbage lists | 1,080 (built) |
 | `src/name.rs`, `src/tric.rs`, `src/store.rs` | the turn over the tree; the joined deletes | +70 (built) |
-| `src/fs.rs` | the core: descriptors, the gate, orphans, and the paths over the operations | 600 (built) |
-| `src/fs/ops.rs` | inodes, blocks, directories, rename, errors, on the tree | 800 (built) |
-| `src/fs/p2.rs` | 0.2: the descriptor's methods, streams, preopens | 620 (built) |
-| `src/fs/p3.rs` | 0.3: the same, async, with `stream` and `future` | 600 |
+| `src/fs.rs` | the core: descriptors, the gate, orphans, read-ahead, and the paths over the operations | 790 (built) |
+| `src/fs/ops.rs` | inodes, blocks, directories, rename, errors, on the tree | 850 (built) |
+| `src/fs/p2.rs` | 0.2: the descriptor's methods, streams, preopens | 560 (built) |
+| `src/fs/p3.rs` | 0.3: the same, async, with `stream` and `future` | 650 (built) |
 | the sweep | listing, walk, delete, the trigger | 300 |
 
-The tree came to 1,040 lines, against an estimate of 800, because spilling, merging, the cache and the log are in it.
-The core and the 0.2 binding came to 2,020 against 1,250: the gate that keeps a stream's write from being lost to the
-answer, the orphans, a mapping of every failure to an errno, and the streams that outlive their calls are most of the
-difference. The whole is about 4,100 lines of runtime code on the 4,289 in `src` at the start. Tests come to well over
-a thousand more. The tree and `name.rs` came first and alone: the key tests' assertions hold on them, which tests the
-tree before any file exists. The main risk is 0.3's `stream` and `future` plumbing, modelled on wasmtime-wasi's own. If
-it costs more than the estimate, that is reported, not cut.
+The tree came to 1,080 lines, against an estimate of 800, because spilling, merging, the cache and the log are in it.
+The core and the 0.2 binding came to 2,200 against 1,250: the gate that keeps a stream's write from being lost to the
+answer, the orphans, a mapping of every failure to an errno, read-ahead, and the streams that outlive their calls are
+most of the difference. The 0.3 binding came to 650 against 600, its `stream` and `future` plumbing (a producer for a
+read, one for a directory listing and a consumer for a write) being about a third of it. The whole is about 4,000
+lines of runtime code so far, on the 4,289 in `src` at the start, and the sweep to come. Tests come to well over
+two thousand more. The tree and `name.rs` came first and alone: the key tests' assertions hold on them, which tests
+the tree before any file exists.
 
 **Stages.** Each is committed on its own and passes the whole gate:
 - (a) the tree, with `wasi:keyvalue` on it (done);
 - (b) the file system core and the 0.2 binding, with the testsuite's wasip1 modules and the end-to-end file cases
   (done);
-- (c) the 0.3 binding, with its 14 components;
+- (c) the 0.3 binding, with its 14 components (done);
 - (d) the sweep.
 
 **Conformance:**
@@ -374,7 +375,7 @@ it costs more than the estimate, that is reported, not cut.
   checked by sha256 (`docker/build.Dockerfile`), with the preview 1 adapter of Wasmtime's 49.0.2 release, also by
   hash: neither is a Cargo dependency. Its prebuilt wasm32-wasip1 modules that name a directory to preopen (42 in Rust
   and 7 in C) are made into components with `wasm-tools component new --adapt`, and run against the 0.2 binding. Its
-  14 0.3 `filesystem-*` components run against the 0.3 binding.
+  14 0.3 `filesystem-*` components run against the 0.3 binding. All 63 pass.
 - **The harness** is a `#[cfg(test)]` module in the binary (`src/fs/conformance.rs`), using the production linker, host
   and limits, and a turn over the memory store, which holds the test's own `fs-tests.dir`; the turn is committed
   after the test. Wasmtime's runner expects every one of these to pass on Linux, and so does the harness: a `FAILS`

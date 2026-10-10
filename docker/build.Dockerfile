@@ -28,16 +28,17 @@ RUN set -eu; mkdir /qjs && cd /qjs \
       cargo build --release --locked && target/release/componentize-qjs --help >/dev/null
 
 # The WASI conformance tests of the file system (docs/decisions.md): the wasi-testsuite at one commit, its Rust and C
-# tests for WASI 0.1, which the tests componentise with the adapter of the Wasmtime release tric pins. Fetched by hash.
-# A stage of its own, so that the toolchain image gains the files alone.
+# tests for WASI 0.1, which the tests componentise with the adapter of the Wasmtime release tric pins, and its Rust
+# components for WASI 0.3. Fetched by hash. A stage of its own, so that the toolchain image gains the files alone.
 FROM base AS conformance
 RUN set -eu; mkdir /conformance && cd /conformance \
  && curl -fsSL -o adapter.wasm https://github.com/bytecodealliance/wasmtime/releases/download/v49.0.2/wasi_snapshot_preview1.command.wasm \
  && echo "09eb9c1a09abb057c61c3dc6979d34277272867610af065246057e1bdf327527  adapter.wasm" | sha256sum -c - \
  && curl -fsSL -o suite.tar.gz https://github.com/WebAssembly/wasi-testsuite/archive/e0aa527fab67f2f311882bcee4f62cc755433b73.tar.gz \
  && echo "b511c0bd77325ae27c93b51059c3b9ed8ac2b35f2872ee94993d39f5595f54cd  suite.tar.gz" | sha256sum -c - \
- && tar xzf suite.tar.gz --strip-components=2 --wildcards '*/tests/rust/testsuite/wasm32-wasip1' '*/tests/c/testsuite/wasm32-wasip1' \
- && rm suite.tar.gz && ls adapter.wasm rust/testsuite/wasm32-wasip1/manifest.json c/testsuite/wasm32-wasip1/manifest.json
+ && tar xzf suite.tar.gz --strip-components=2 --wildcards '*/tests/rust/testsuite/wasm32-wasip1' '*/tests/c/testsuite/wasm32-wasip1' '*/tests/rust/testsuite/wasm32-wasip3' \
+ && rm suite.tar.gz && ls adapter.wasm rust/testsuite/wasm32-wasip1/manifest.json c/testsuite/wasm32-wasip1/manifest.json \
+      rust/testsuite/wasm32-wasip3/manifest.json
 
 FROM base
 COPY --from=qjs /qjs/cli/target/release/componentize-qjs /usr/local/bin/componentize-qjs

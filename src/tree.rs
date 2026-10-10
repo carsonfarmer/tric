@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock, Mutex};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedMutexGuard, Semaphore};
 use wasmtime::{Result, bail, ensure, error::Context};
 
 /// The most a node is as JSON.
@@ -40,8 +40,8 @@ pub const BLOB_MAX: u64 = 1 << 20;
 const NODES_MAX: usize = 16 << 20;
 /// The most of the values and blocks read, kept in the same way.
 const BLOCKS_MAX: usize = 32 << 20;
-/// How many uploads a turn has in flight.
-const PUTS: usize = 16;
+/// How many uploads a turn has in flight, and how many downloads one read does at once.
+pub const IN_FLIGHT: usize = 16;
 /// The longest S3 version id a link may hold: S3 and RustFS give 32 and 36 characters.
 const VERSION_MAX: usize = 64;
 /// What a link is as JSON, at most, when its version id is not yet known.
@@ -402,6 +402,8 @@ impl Node {
 pub struct Cache {
     nodes: Mutex<Lru<Arc<Node>>>,
     blocks: Mutex<Lru<Bytes>>,
+    /// The blocks that are being fetched: see [`Flight`].
+    flights: Mutex<HashMap<CacheKey, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 type CacheKey = (Path, Option<String>);
@@ -457,7 +459,7 @@ impl<V: Clone> Lru<V> {
 
 impl Default for Cache {
     fn default() -> Self {
-        Self { nodes: Lru::new(NODES_MAX), blocks: Lru::new(BLOCKS_MAX) }
+        Self { nodes: Lru::new(NODES_MAX), blocks: Lru::new(BLOCKS_MAX), flights: Mutex::default() }
     }
 }
 
@@ -466,6 +468,36 @@ impl Cache {
     pub fn shared() -> Arc<Self> {
         static SHARED: LazyLock<Arc<Cache>> = LazyLock::new(Default::default);
         SHARED.clone()
+    }
+
+    /// Waits for its turn to fetch the block at `key`, and has it.
+    async fn flight(&self, key: &CacheKey) -> Flight<'_> {
+        let gate = self.flights.lock().unwrap().entry(key.clone()).or_default().clone();
+        let mut flight = Flight { cache: self, key: key.clone(), gate, held: None };
+        flight.held = Some(flight.gate.clone().lock_owned().await);
+        flight
+    }
+}
+
+/// The right to fetch one block. Reads that come to a block that another read is fetching, which a stream that reads
+/// ahead and the read that catches up with it both do, wait for it and then find it in the cache, instead of fetching
+/// it again. A block is checked against its link by whoever fetches it, and by whoever finds it in the cache, so
+/// waiting does not take anything on trust. When the one that holds it is cancelled, the next in turn fetches.
+struct Flight<'a> {
+    cache: &'a Cache,
+    key: CacheKey,
+    gate: Arc<tokio::sync::Mutex<()>>,
+    held: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        drop(self.held.take());
+        let mut flights = self.cache.flights.lock().unwrap();
+        // The map and this are all that hold the gate, if no one else is waiting at it.
+        if Arc::strong_count(&self.gate) == 2 {
+            flights.remove(&self.key);
+        }
     }
 }
 
@@ -534,12 +566,22 @@ impl Reader {
         blocks.put(self.key(link), bytes.clone(), link.h.clone(), bytes.len());
     }
 
+    /// The value `link` names, if the cache has it.
+    fn kept(&self, key: &CacheKey, link: &Link) -> Option<Bytes> {
+        let bytes = self.store.cache.blocks.lock().unwrap().get(key, &link.h)?;
+        self.stats.hits.fetch_add(1, Relaxed);
+        Some(bytes)
+    }
+
     /// The value `link` names, which is an object of its own.
     async fn block(&self, link: &Link) -> Result<Bytes> {
         link.check()?;
         let key = self.key(link);
-        if let Some(bytes) = self.store.cache.blocks.lock().unwrap().get(&key, &link.h) {
-            self.stats.hits.fetch_add(1, Relaxed);
+        if let Some(bytes) = self.kept(&key, link) {
+            return Ok(bytes);
+        }
+        let _flight = self.store.cache.flight(&key).await;
+        if let Some(bytes) = self.kept(&key, link) {
             return Ok(bytes);
         }
         let bytes = self.fetch(link, self.limits.blob).await?;
@@ -963,7 +1005,7 @@ impl Tree {
     }
 
     async fn flush(&mut self, nodes: bool) -> Result<()> {
-        let flush = Flush { reader: &self.reader, made: &self.made, permits: Semaphore::new(PUTS), nodes };
+        let flush = Flush { reader: &self.reader, made: &self.made, permits: Semaphore::new(IN_FLIGHT), nodes };
         flush.node(&mut self.root).await?;
         if matches!(&self.root.body, Body::Branch(kids) if kids.is_empty()) {
             self.root = Node::leaf();
@@ -996,7 +1038,7 @@ impl Tree {
                 _ => break,
             }
         }
-        let flush = Flush { reader: r, made: &self.made, permits: Semaphore::new(PUTS), nodes: true };
+        let flush = Flush { reader: r, made: &self.made, permits: Semaphore::new(IN_FLIGHT), nodes: true };
         flush.node(&mut self.root).await?;
         self.sealed = true;
         ensure!(self.root.size <= r.limits.node, "the root is over {} bytes", r.limits.node);
@@ -1051,14 +1093,18 @@ pub(crate) mod counting {
     };
     use std::fmt;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
+    use std::time::Duration;
 
     #[derive(Debug, Default)]
     pub struct Counts {
         pub gets: AtomicUsize,
         pub puts: AtomicUsize,
         pub deletes: AtomicUsize,
-        pub allow: AtomicUsize, // the puts that succeed, in all
+        pub allow: AtomicUsize,  // the puts that succeed, in all
+        pub delay: AtomicU64,    // how long a get takes, in milliseconds
+        pub flight: AtomicUsize, // the gets under way
+        pub peak: AtomicUsize,   // the most gets that were ever under way together
     }
 
     /// A store that counts what is asked of it, and fails the puts past `allow`.
@@ -1093,7 +1139,15 @@ pub(crate) mod counting {
 
         async fn get_opts(&self, at: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
             self.counts.gets.fetch_add(1, SeqCst);
-            self.inner.get_opts(at, opts).await
+            let flight = self.counts.flight.fetch_add(1, SeqCst) + 1;
+            self.counts.peak.fetch_max(flight, SeqCst);
+            let delay = self.counts.delay.load(SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            let got = self.inner.get_opts(at, opts).await;
+            self.counts.flight.fetch_sub(1, SeqCst);
+            got
         }
 
         fn delete_stream(
@@ -1135,6 +1189,7 @@ mod tests {
     use object_store::ObjectStore;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::Ordering::SeqCst;
+    use std::time::Duration;
 
     /// Limits that make a few keys a deep tree: a branch holds a few nodes, and a leaf as many values that are objects.
     fn tiny() -> Limits {
@@ -1812,6 +1867,53 @@ mod tests {
             assert!(format!("{err:#}").contains("is missing"), "{app}/{name}: {err:#}");
         }
         assert_eq!(counts.gets.load(SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn a_block_that_is_being_fetched_is_waited_for_by_the_reads_that_come_to_it() {
+        let (mut store, counts) = counting();
+        let mut tree = at(&store, &Shape::default());
+        set(&mut tree, "k/a", &[1; 60]).await;
+        let shape = commit(&store, &mut tree).await;
+        drop(tree);
+        store.cache = Arc::default();
+        let tree = Arc::new(at(&store, &shape));
+        let item = tree.get("k/a").await.unwrap().unwrap();
+        counts.gets.store(0, SeqCst);
+        counts.delay.store(50, SeqCst);
+
+        // Eight reads at once are one fetch, and each has the block.
+        let reads = (0..8).map(|_| {
+            let (tree, item) = (tree.clone(), item.clone());
+            tokio::spawn(async move { tree.value(&item).await.unwrap() })
+        });
+        for read in futures_util::future::join_all(reads).await {
+            assert_eq!(read.unwrap().as_ref(), &[1; 60]);
+        }
+        assert_eq!(counts.gets.load(SeqCst), 1);
+        assert!(store.cache.flights.lock().unwrap().is_empty(), "the gate of a block is gone with the fetch");
+
+        // The one that is fetching is cancelled: the next in turn fetches, and none of them is left waiting.
+        store.cache = Arc::default();
+        let tree = Arc::new(at(&store, &shape));
+        counts.gets.store(0, SeqCst);
+        counts.delay.store(200, SeqCst);
+        let first = tokio::spawn({
+            let (tree, item) = (tree.clone(), item.clone());
+            async move { tree.value(&item).await }
+        });
+        while counts.flight.load(SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let second = tokio::spawn({
+            let (tree, item) = (tree.clone(), item.clone());
+            async move { tree.value(&item).await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await; // it is waiting at the gate
+        first.abort();
+        assert_eq!(second.await.unwrap().as_ref(), &[1; 60]);
+        assert_eq!(counts.gets.load(SeqCst), 2, "the fetch that was cancelled, and the one that took its place");
+        assert!(store.cache.flights.lock().unwrap().is_empty());
     }
 
     #[test]

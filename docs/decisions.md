@@ -245,7 +245,10 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   upgrade then isn't linked until someone adds it, which fails loudly at instantiation and not quietly in an app.
 - **0.2 and 0.3 share one core.** Rust's standard library and wasi-libc import 0.2, and tric's HTTP is 0.3. The two
   differ in being async and in `stream` and `future`, and not in what a call does, so each binding is a thin layer
-  that converts types and errors, and the rules live once.
+  that converts types and errors, and the rules live once: opening (`Handle::open_as`), the writer and the preopens
+  of a host, the count a write reports (`wrote`), directory paging (`Entries`) and read-ahead (`Ahead`) are all in
+  `src/fs.rs`. The 0.3 world is built from the same vendored WIT as the 0.2 one is (`wit/filesystem-p3`, 0.3.0), with
+  `wasi:clocks` shared with wasmtime-wasi's bindings through `with:`.
 - **A standard suite tests it, as well as our own tests.** The WebAssembly `wasi-testsuite`
   (<https://github.com/WebAssembly/wasi-testsuite>), pinned at `e0aa527fab67f2f311882bcee4f62cc755433b73`, has prebuilt
   wasm32-wasip1 modules (42 in Rust and 7 in C that name a directory to preopen) and 14 0.3 `filesystem-*` components.
@@ -258,8 +261,9 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   of the fetched files, the test is skipped, so a build outside the image is not broken by it. The host needs an
   `App` to be a `Tric`, so it takes the built fixture.
 - **The conformance run is Wasmtime's own configuration:** the directory as `/`, no environment beyond the test's and
-  no skip-list. All 49 pass, and `FAILS`, the list of those that do not, is empty and has a rule: a listed test that
-  passes fails the run, so a reason cannot outlive its cause. `TESTS` pins the count, so a change of commit is noticed.
+  no skip-list. All 63 pass (the 49 modules through 0.2, the 14 components through 0.3), and `FAILS`, the list of
+  those that do not, is empty and has a rule: a listed test that passes fails the run, so a reason cannot outlive its
+  cause. `TESTS` pins the count, so a change of commit is noticed.
   The harness was shown to be able to fail: with `rmdir` made to succeed on a non-empty directory,
   `remove_nonempty_directory` failed. Wasmtime's own `test-programs` could be a second suite, but they need building
   for wasm32-wasip2 first, so they are not used.
@@ -381,9 +385,15 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   `read-only`: none falls between. A stream's write is admitted when the guest makes it, not when
   it is later flushed to the tree, and the task that applies it is detached and never aborted, as an abort could leave
   half a write. Lock order, to avoid a deadlock: the claim, the gate, the tree, the turn's state.
-- **A directory is as mutable as its mount.** `MUTATE_DIRECTORY` is reported by `get-flags` and nothing more: a change
-  fails when the turn is a snapshot or has answered (`read-only`), and not otherwise. The descriptor flags a guest
-  passes to `open-at` narrow what that descriptor can do (a read without `read` is `bad-descriptor`) and never widen it.
+- **A directory is as mutable as its mount, and `MUTATE_DIRECTORY` is only what `get-flags` says.** The preopen is
+  opened to change its entries, and a directory opened by `open-at` reports the flag if it was asked for, and only
+  while the turn can still change anything. The turn decides what is allowed, not the descriptor: a change fails when
+  the turn is a snapshot or has answered (`read-only`), and not otherwise, and asking for the flag from a turn that
+  has answered is `read-only` too. Enforcing it per descriptor would break wasi-libc's preview 1 adapter, which never
+  asks for it on `path_open` and still changes directories below the preopen, and Wasmtime's own host reports it from
+  the open mode without enforcing it. The `wasi-testsuite` checks the report (`open(".")` with no flags reads
+  `READ`, not `READ | MUTATE_DIRECTORY`), which is how this was found. The descriptor flags a guest passes to
+  `open-at` narrow what that descriptor can do (a read without `read` is `bad-descriptor`) and never widen it.
 - **Every failure is an errno, and the detail is in the log.** A tree error maps to the nearest errno (over a budget is
   `insufficient-space`, a name that cannot be read `io`, a lost inode after a discard `io`), and the app's storage
   details, the bucket and the key, are logged and never returned. Of the errnos the WIT names, `busy` is used for
@@ -428,8 +438,9 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   that land in the same block in one turn put one object, and the measurement bears this out (release build, memory
   store, 64 MiB written in one turn: 4 KiB pieces 333 ms, 64 KiB 173 ms, 1 MiB 166 ms; a 5-byte patch in a 64 MiB file
   4 ms). The latency of S3 PUTs, 256 of them for 64 MiB, is not in these; it will be measured on a live run.
-- **The 0.2 binding has its own error type, `Fault`,** because the orphan rules stop the core's error converting into
-  the bindgen's `ErrorCode` and the `wasmtime::Error` of a trap in one place. `wasmtime-wasi-io` is a new direct
+- **The bindings share an error type, `Fault`,** in the core, because the orphan rules stop the core's error
+  converting into a bindgen's `ErrorCode` and the `wasmtime::Error` of a trap in one place, and each binding converts
+  it to its own `ErrorCode`. `wasmtime-wasi-io` is a new direct
   dependency (`=49.0.2`, which was already in the lock file as wasmtime-wasi's): the bindgen shares its stream
   resources through `with:`, and its `async_trait` is the one the host traits are declared with, so the runtime code
   uses that and not a dependency of its own. `async-trait` itself stays a dev-dependency.
@@ -438,6 +449,40 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
 - **Only a turn's own name is mounted,** as `/`. A snapshot is mounted read-only, and a request without a name has no
   preopens, with no request made. Mounting others would need a path convention, and an app can read another name's
   keys already.
+- **A 0.3 stream is a producer or a consumer over the same handles.** `read-via-stream` and `read-directory` are
+  `StreamProducer`s, `write-via-stream` and `append-via-stream` are `StreamConsumer`s, and each holds its own pin on
+  the inode and the turn, so it outlives the call and the descriptor, as in 0.2. Each also owns the `future` that the
+  WIT returns with it, which is sent exactly once, as a future whose sender is dropped would trap the guest. What
+  closing does differs by the stream. A read stream drops its fetch, as it is only a read and nothing then holds the
+  tree, and aborts its read-ahead. A write that was admitted is allowed to finish, in a task of its own, which tells
+  the future how it ended, as an abort could leave half a write (the rule of the gate, above). A write stream takes at
+  most 256 KiB (`WRITE_CAP`) from the guest at a time and takes no more until that has landed, which is its
+  backpressure. The 0.3 binding came to 650 lines against an estimate of 600.
+- **A stream that reads on reads ahead, to a megabyte, through the same verified path.** When a read begins where the
+  last one ended, the stream is reading on, and a task fetches the blocks up to 1 MiB past it (`AHEAD`) for the cache,
+  as a read does: checked against their links, with the version pinned. The task is aborted with the stream, and a
+  file of which only the start is read has nothing fetched that was not asked for. The 0.2 `Input` and the 0.3 read
+  stream share it (`Ahead`, in `src/fs.rs`). Independently, `read_at` fetches the blocks of one read together, up to
+  `IN_FLIGHT` (16; the tree's bound on uploads, renamed from `PUTS` as it serves both), and puts them in order.
+  Measured with a counting store at 20 ms a GET: a read of 3 blocks is 3 GETs all under way together, 32 blocks are 32
+  GETs with 16 under way, and a stream of 12 blocks is 12 GETs with at least 4 together.
+- **A block that is being fetched is waited for, not fetched again.** The first test of 0.3 read-ahead on a store
+  with a delay counted 19 GETs for a file of 12 blocks: a reader that is faster than the store catches up with its
+  own read-ahead and fetches what is under way. A block is now fetched by one reader at a time (`Flight`, in
+  `src/tree.rs`): one that comes to a block that is being fetched waits, and then looks in the cache, where the block
+  is checked against its hash again, so nothing is taken on trust from the one that fetched it. A fetch that is
+  cancelled lets the next in turn fetch, and the gate is gone when no one waits at it. This holds for any two reads of
+  a block, whatever bound them. Nodes are not gated: a descent that finds a node missing is rare next to reads of
+  blocks, and a duplicate there costs one GET of at most 64 KiB.
+- **An offset is signed, and a time is not.** A `read` from an offset past `i64::MAX` is `invalid`, as `pread` has it,
+  and not an end of file. A 0.3 instant before 1970 is `overflow` for `set-times`, as the tree cannot hold it.
+- **The 0.3 tests are run as Wasmtime's own runner does:** each is a `wasi:cli/run` command, the directory of the test
+  is `/`, and `run_command` serves 0.2 and 0.3 alike. The suite's other 0.3 components (cli, http, sockets, clocks,
+  random) name no directory and are skipped. A trap in a test carries the test's stderr in its error, which is where
+  its assertion message is, and how a failure is read.
+- **Wasmtime's `component-model-bytes` feature is named in `Cargo.toml`,** as the 0.3 streams hand `Bytes` to the
+  guest. It was already on, through the `p3` feature of `wasmtime-wasi`, so the lock file does not change and no
+  crate is added.
 
 ## Local
 

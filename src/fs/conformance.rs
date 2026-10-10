@@ -1,7 +1,8 @@
 //! The WASI conformance tests of the file system, on the file system as an app has it: the wasi-testsuite's tests for
-//! WASI 0.1, in Rust and in C, that name a directory to preopen. Each is a command, which the adapter of the Wasmtime
-//! release tric pins makes a component of WASI 0.2. It runs on a name of its own, in a turn that holds the files the
-//! test starts with, and the turn is committed after it.
+//! WASI 0.1, in Rust and in C, and for WASI 0.3, in Rust, that name a directory to preopen. Each is a command. Those of
+//! 0.1 the adapter of the Wasmtime release tric pins makes components of WASI 0.2, and so they test `wasi:filesystem`
+//! of 0.2; those of 0.3 are components already. Each runs on a name of its own, in a turn that holds the files the test
+//! starts with, and the turn is committed after it.
 //!
 //! The suite and the adapter are fetched, by hash, into the toolchain image (docker/build.Dockerfile), where
 //! `TRIC_CONFORMANCE` is the directory they are in. Without it the test is skipped. The host needs an app to be a
@@ -23,13 +24,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::timeout;
+use wasmtime::component::Component;
 
-/// The tests that fail, by `language/name`, and why. A test that is here and passes fails the run, so the list does
-/// not outlive its reasons.
+/// The tests that fail, by `label/name` (`rust/`, `c/` or `p3/` and the test's name), and why. A test that is here and
+/// passes fails the run, so the list does not outlive its reasons.
 const FAILS: &[(&str, &str)] = &[];
 
-/// How many tests there are in the pinned suite that name a directory to preopen.
-const TESTS: usize = 49;
+/// The suites: the label tests are listed under, where they are, and whether the adapter makes them components.
+const SUITES: &[(&str, &str, bool)] = &[
+    ("rust", "rust/testsuite/wasm32-wasip1", true),
+    ("c", "c/testsuite/wasm32-wasip1", true),
+    ("p3", "rust/testsuite/wasm32-wasip3", false),
+];
+
+/// How many tests there are in the pinned suite that name a directory to preopen: 49 of WASI 0.1, and 14 of WASI 0.3.
+const TESTS: usize = 63;
 
 /// How long a test runs.
 const LIMIT: Duration = Duration::from_secs(60);
@@ -75,15 +84,30 @@ async fn seed(root: &Handle, from: &Path) {
     }
 }
 
-/// Runs the test `wasm`, which has `config`, and says why it failed if it did.
-async fn run(engine: &Engine, app: &Arc<App>, adapter: &Path, wasm: &Path, config: &Config) -> Result<(), String> {
+/// The test `wasm` as a component: itself, or as `adapter` makes it one.
+async fn component(engine: &Engine, adapter: Option<&Path>, wasm: &Path) -> Result<Component, String> {
+    let Some(adapter) = adapter else {
+        let bytes = std::fs::read(wasm).map_err(|e| format!("{}: {e}", wasm.display()))?;
+        return engine.compile(&bytes).map_err(|e| format!("compile: {e:#}"));
+    };
     let adapt = format!("wasi_snapshot_preview1={}", adapter.display());
     let made = Command::new("wasm-tools").args(["component", "new"]).arg(wasm).args(["--adapt", &adapt]).output().await;
     let made = made.map_err(|e| format!("wasm-tools: {e}"))?;
     if !made.status.success() {
         return Err(format!("wasm-tools: {}", tail(&made.stderr)));
     }
-    let component = engine.compile(&made.stdout).map_err(|e| format!("compile: {e:#}"))?;
+    engine.compile(&made.stdout).map_err(|e| format!("compile: {e:#}"))
+}
+
+/// Runs the test `wasm`, which has `config`, and says why it failed if it did.
+async fn run(
+    engine: &Engine,
+    app: &Arc<App>,
+    adapter: Option<&Path>,
+    wasm: &Path,
+    config: &Config,
+) -> Result<(), String> {
+    let component = component(engine, adapter, wasm).await?;
 
     let tric = Arc::new(Tric {
         app: "a".into(),
@@ -139,8 +163,9 @@ async fn the_wasi_testsuite_passes() {
     let app = Arc::new(engine.load(&engine.compile(&wasm).unwrap(), vec![]).unwrap());
 
     let (mut passed, mut unexpected, mut ran) = (0, vec![], vec![]);
-    for language in ["rust", "c"] {
-        let suite = dir.join(language).join("testsuite/wasm32-wasip1");
+    let adapter = dir.join("adapter.wasm");
+    for &(label, suite, adapted) in SUITES {
+        let suite = dir.join(suite);
         let mut tests: Vec<PathBuf> = std::fs::read_dir(&suite).unwrap().map(|e| e.unwrap().path()).collect();
         tests.retain(|p| p.extension().is_some_and(|x| x == "wasm"));
         tests.sort();
@@ -150,9 +175,9 @@ async fn the_wasi_testsuite_passes() {
             if config.root.is_none() {
                 continue;
             }
-            let id = format!("{language}/{}", wasm.file_stem().unwrap().to_string_lossy());
+            let id = format!("{label}/{}", wasm.file_stem().unwrap().to_string_lossy());
             let started = Instant::now();
-            let result = run(&engine, &app, &dir.join("adapter.wasm"), &wasm, &config).await;
+            let result = run(&engine, &app, adapted.then_some(&*adapter), &wasm, &config).await;
             eprintln!("{id}: {} in {:?}", if result.is_ok() { "ok" } else { "FAILED" }, started.elapsed());
             let known = FAILS.iter().find(|(name, _)| *name == id);
             match (result, known) {

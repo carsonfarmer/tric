@@ -110,13 +110,12 @@ There is no web platform under QuickJS (no `TextEncoder`, `URL`, `fetch` or `con
 - **Names.** A path whose first segment starts with `@` (`/@room:42/…`) addresses that name's state, which
   `wasi:keyvalue`'s `open("room:42")` opens. A GET, HEAD or OPTIONS reads a snapshot; any other method is a **turn**,
   which may write that name only.
-- **Files.** The same name's `wasi:filesystem` (0.2) is `/`, a file system of its own, writable in a turn and
+- **Files.** The same name's `wasi:filesystem` (0.2 and 0.3) is `/`, a file system of its own, writable in a turn and
   read-only in a snapshot, and an app with no name has none. Keys and files are one tree, so the same commit makes
   both or neither: a turn's writes are held until the answer, kept if its status is below 500 and dropped if it is a
   5xx or a trap, and a write after the answer fails. A name holds 16 GiB and 4 Mi entries. It is real: directories,
   symlinks, hard links, `rename`, and files that can be unlinked while open. A path can't leave `/`, and a file's
-  bytes are checked against the hash its parent holds. An app that never opens a file pays nothing for it. Only 0.2's
-  `wasi:filesystem` is there so far.
+  bytes are checked against the hash its parent holds. An app that never opens a file pays nothing for it.
 - **Turns commit at the answer**, unless it is a 5xx, or the instance traps. A turn that loses a race runs again,
   unseen. A busy name answers 429 with `Retry-After`. The name's version is its `ETag`, and `If-Match` is honoured.
 - **Calls are fetches.** A request to the app's own origin runs in-process with `Forwarded: for=_tric`; a cycle

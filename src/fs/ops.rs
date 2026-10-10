@@ -8,8 +8,9 @@
 //!
 //! A path never leaves the directory it is resolved from: `..` stops at it, and so do symlinks, which may not be
 //! absolute.
-use crate::tree::{DATA_MAX, Full, Item, Tree};
+use crate::tree::{DATA_MAX, Full, IN_FLIGHT, Item, Tree};
 use bytes::{Bytes, BytesMut};
+use futures_util::stream::{self, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque, hash_map::Entry};
@@ -522,27 +523,71 @@ async fn block(tree: &Tree, ino: u64, index: u64) -> Res<Option<Bytes>> {
     Ok(Some(tree.value(&item).await.map_err(fail)?))
 }
 
-/// Up to `len` bytes of the file `ino` from `offset`: fewer at its end, and none past it.
-pub async fn read_at(tree: &Tree, ino: u64, offset: u64, len: u64) -> Res<Bytes> {
+/// The stored blocks of the file `ino` that `offset..end` is in, in order, and `None` for those that are not stored.
+/// The links are looked up one by one, which costs the nodes only once, and the blocks are fetched [`IN_FLIGHT`] at a
+/// time, and checked against their links, as `tree.value` does.
+async fn blocks<'a>(
+    tree: &'a Tree,
+    ino: u64,
+    offset: u64,
+    end: u64,
+) -> Res<impl stream::Stream<Item = Res<Option<Bytes>>> + 'a> {
+    let mut links = Vec::new();
+    for index in offset / BLOCK..=(end - 1) / BLOCK {
+        links.push(tree.get(&block_key(ino, index)).await.map_err(fail)?);
+    }
+    let value = move |item: Option<Item>| async move {
+        match item {
+            Some(item) => Ok(Some(tree.value(&item).await.map_err(fail)?)),
+            None => Ok(None),
+        }
+    };
+    Ok(stream::iter(links).map(value).buffered(IN_FLIGHT))
+}
+
+/// The size of the file `ino`, and where a read of `len` bytes from `offset` ends: at its end, if that is first.
+async fn extent(tree: &Tree, ino: u64, offset: u64, len: u64) -> Res<u64> {
     let i = fetch(tree, ino).await?;
     match i.k {
         Kind::Dir => return Err(Errno::IsDirectory),
         Kind::Link => return Err(Errno::BadDescriptor),
         Kind::File => {}
     }
-    let end = offset.saturating_add(len).min(i.s);
+    Ok(offset.saturating_add(len).min(i.s))
+}
+
+/// Up to `len` bytes of the file `ino` from `offset`: fewer at its end, and none past it. The blocks are fetched
+/// together, up to [`IN_FLIGHT`] of them, and put in order.
+pub async fn read_at(tree: &Tree, ino: u64, offset: u64, len: u64) -> Res<Bytes> {
+    let end = extent(tree, ino, offset, len).await?;
     if offset >= end {
         return Ok(Bytes::new());
     }
     let mut out = BytesMut::with_capacity((end - offset) as usize);
-    for index in offset / BLOCK..=(end - 1) / BLOCK {
+    let mut index = offset / BLOCK;
+    let mut blocks = std::pin::pin!(blocks(tree, ino, offset, end).await?);
+    while let Some(stored) = blocks.next().await {
+        let stored = stored?.unwrap_or_default();
         let start = index * BLOCK;
         let (from, to) = ((offset.max(start) - start) as usize, (end.min(start + BLOCK) - start) as usize);
-        let stored = block(tree, ino, index).await?.unwrap_or_default();
         out.extend_from_slice(stored.get(from.min(stored.len())..to.min(stored.len())).unwrap_or_default());
         out.resize(out.len() + to.saturating_sub(stored.len().max(from)), 0); // what is not stored reads as zeros
+        index += 1;
     }
     Ok(out.freeze())
+}
+
+/// Fetches the blocks of the file `ino` that a read of `len` bytes from `offset` would, for the cache, and lets them
+/// go. They are fetched, and checked, as a read does it.
+pub async fn warm(tree: &Tree, ino: u64, offset: u64, len: u64) -> Res<()> {
+    let end = extent(tree, ino, offset, len).await?;
+    if offset < end {
+        let mut blocks = std::pin::pin!(blocks(tree, ino, offset, end).await?);
+        while let Some(stored) = blocks.next().await {
+            stored?;
+        }
+    }
+    Ok(())
 }
 
 /// Writes `data` to the file `ino`, at `at`, and returns how much: all of it, or the part that fit if the name filled.
@@ -1023,5 +1068,82 @@ mod tests {
         let t = Tree::open(&forgetful, "a", "n", &shape, Limits::default()).unwrap();
         assert_eq!(read_at(&t, ino, 0, 100).await.err(), Some(Errno::Io));
         assert_eq!(stat(&t, ino).await.unwrap().size, 300_000, "what is in the nodes is still there");
+    }
+
+    /// A file of `blocks` whole blocks and a tail that is small enough to sit in its node, in a tree that is committed,
+    /// and a store to read it back from: its cache is cold, except for the nodes.
+    async fn stored(blocks: u64) -> (Tree, u64, Store, Arc<crate::tree::counting::Counts>, Vec<u8>) {
+        let (store, counts) = counting();
+        let mut t = Tree::open(&store, "a", "n", &Shape::default(), Limits::default()).unwrap();
+        let ino = create(&mut t, ROOT, "f", Kind::File, None).await.unwrap();
+        let data: Vec<u8> = (0..(blocks * BLOCK + 100)).map(|i| (i % 251) as u8).collect();
+        write_at(&mut t, ino, At::Offset(0), &data).await.unwrap();
+        let shape = t.finish().await.unwrap();
+        let cold = Store { cache: Arc::default(), ..store };
+        let t = Tree::open(&cold, "a", "n", &shape, Limits::default()).unwrap();
+        t.get(&block_key(ino, 0)).await.unwrap().unwrap(); // the nodes
+        counts.gets.store(0, SeqCst);
+        (t, ino, cold, counts, data)
+    }
+
+    #[tokio::test]
+    async fn the_blocks_of_a_read_are_fetched_together_and_put_in_order() {
+        let (t, ino, _, counts, data) = stored(3).await;
+        counts.delay.store(20, SeqCst);
+        // Three blocks that are objects, and a tail that is not: a fetch for each of them, all under way at once.
+        let got = read_at(&t, ino, 1000, data.len() as u64).await.unwrap();
+        assert_eq!(got, &data[1000..]);
+        assert_eq!(counts.gets.load(SeqCst), 3);
+        assert_eq!(counts.peak.load(SeqCst), 3);
+
+        // Past the bound they are not all at once, and each is fetched once.
+        let (t, ino, _, counts, data) = stored(IN_FLIGHT as u64 * 2).await;
+        counts.delay.store(20, SeqCst);
+        assert_eq!(read_at(&t, ino, 0, data.len() as u64).await.unwrap(), &data[..]);
+        assert_eq!(counts.gets.load(SeqCst), IN_FLIGHT * 2);
+        assert_eq!(counts.peak.load(SeqCst), IN_FLIGHT);
+    }
+
+    #[tokio::test]
+    async fn blocks_that_are_not_stored_read_as_zeros_among_those_that_are() {
+        let mut t = tree(Limits::default());
+        let ino = create(&mut t, ROOT, "f", Kind::File, None).await.unwrap();
+        let (block, end) = (BLOCK as usize, BLOCK * 3 + 5);
+        write_at(&mut t, ino, At::Offset(0), &vec![7; block + 10]).await.unwrap(); // a block, and a bit of the next
+        write_at(&mut t, ino, At::Offset(end), b"end").await.unwrap(); // and a hole of two blocks, and some
+        let mut want = vec![7; block + 10];
+        want.resize(end as usize, 0);
+        want.extend_from_slice(b"end");
+        assert_eq!(read_at(&t, ino, 0, BLOCK * 4).await.unwrap(), &want[..]);
+        assert_eq!(read_at(&t, ino, 100, BLOCK * 4).await.unwrap(), &want[100..]);
+        assert_eq!(read_at(&t, ino, BLOCK + 5, 20).await.unwrap(), &want[block + 5..block + 25]);
+    }
+
+    #[tokio::test]
+    async fn blocks_that_are_warmed_are_in_the_cache_and_not_fetched_again() {
+        let (t, ino, _, counts, data) = stored(3).await;
+        warm(&t, ino, 0, BLOCK * 2).await.unwrap();
+        assert_eq!(counts.gets.load(SeqCst), 2);
+        assert_eq!(read_at(&t, ino, 0, BLOCK * 2).await.unwrap(), &data[..BLOCK as usize * 2]);
+        assert_eq!(counts.gets.load(SeqCst), 2, "a read of what was warmed asks nothing of the store");
+        // Past the end there is nothing to warm, and in a directory it is refused, as a read is.
+        warm(&t, ino, BLOCK * 9, BLOCK).await.unwrap();
+        assert_eq!(counts.gets.load(SeqCst), 2);
+        assert_eq!(warm(&t, ROOT, 0, 1).await, Err(Errno::IsDirectory));
+    }
+
+    #[tokio::test]
+    async fn blocks_that_are_warmed_are_checked_as_a_read_checks_them() {
+        let (t, ino, store, _, data) = stored(2).await;
+        let metas: Vec<_> = store.inner.list(None).try_collect().await.unwrap();
+        let blocks: Vec<_> = metas.into_iter().filter(|m| m.size == BLOCK).map(|m| m.location).collect();
+        assert_eq!(blocks.len(), 2, "the two whole blocks are objects of their own");
+        let kept = store.inner.get(&blocks[0]).await.unwrap().bytes().await.unwrap();
+        store.inner.put(&blocks[0], vec![0u8; BLOCK as usize].into()).await.unwrap(); // not what the link says
+        assert_eq!(warm(&t, ino, 0, BLOCK * 2).await, Err(Errno::Io));
+        assert_eq!(read_at(&t, ino, 0, BLOCK * 2).await.err(), Some(Errno::Io));
+        // What failed the check was not kept: the block is what it should be, and it reads.
+        store.inner.put(&blocks[0], kept.into()).await.unwrap();
+        assert_eq!(read_at(&t, ino, 0, BLOCK * 2).await.unwrap(), &data[..BLOCK as usize * 2]);
     }
 }

@@ -48,8 +48,9 @@ webpki-root-certs = "1"
 # The defaults minus what tric never uses: cache, profiling, coredump, debug, stack-switching, gc-copying and
 # compile-time-builtins (so no wit-parser either).
 wasmtime = { version = "=49.0.2", default-features = false, features = [
-    "addr2line", "anyhow", "async", "backtrace", "component-model", "component-model-async", "cranelift", "demangle",
-    "gc", "gc-drc", "gc-null", "parallel-compilation", "pooling-allocator", "runtime", "std", "threads", "wat",
+    "addr2line", "anyhow", "async", "backtrace", "component-model", "component-model-async", "component-model-bytes",
+    "cranelift", "demangle", "gc", "gc-drc", "gc-null", "parallel-compilation", "pooling-allocator", "runtime", "std",
+    "threads", "wat",
 ] }
 # p2 too, as Rust's standard library on wasm32-wasip2 imports it.
 wasmtime-wasi = { version = "=49.0.2", default-features = false, features = ["p2", "p3"] }
