@@ -4,7 +4,7 @@
 //!
 //! The stream of a read or a listing is a producer, and the stream of a write is a consumer, which the guest's runtime
 //! polls. A producer reads when it is polled and the guest has room, and drops the read it is waiting for if the guest
-//! cancels, so it holds nothing that is not its own: the tree is held shared for the length of a read only, and a
+//! cancels, so it holds nothing that is not its own: the tree is held shared to plan a read, and not to fetch it, and a
 //! read that is dropped is made again. A consumer takes what the guest writes as a write of its own, which is admitted
 //! then and nothing cancels: it waits for it to land before it takes more, and a stream that is closed leaves the
 //! write to finish, and tells the future how it ended. See the rules of [`super`].

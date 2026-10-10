@@ -5,8 +5,8 @@
 //!
 //! Descriptors outlive the calls that made them, and so do the streams a descriptor makes, so the rules for the turn
 //! are these:
-//! * The tree is behind the turn's lock. A read takes it shared, for the length of the read, and a change takes it
-//!   exclusive, for the length of the change, and only while the turn is open.
+//! * The tree is behind the turn's lock. A read takes it shared, for the length of the walk to what it reads, and a
+//!   change takes it exclusive, for the length of the change, and only while the turn is open.
 //! * Before a change takes the tree it is admitted, by the gate: a shared lock that is held until the change is done.
 //!   The commit takes the gate exclusive, and at once lets go, after it has marked the turn answered and before it
 //!   takes the tree. So it waits for every change that was admitted before the answer, which then lands before the
@@ -15,10 +15,16 @@
 //!   the gate, then the tree: a change never waits for the gate while it holds the tree.
 //! * A write that was admitted is never cancelled: a change to the tree that is cut off half way leaves it unfit to
 //!   commit. So a stream's writes are tasks of their own, which a closed stream leaves to finish.
-//! * A read holds the tree shared for as long as it is under way, and nothing outlives it that holds the tree. What
-//!   a stream reads is cancelled by closing the stream, and by the guest cancelling its read of it: the read is
-//!   dropped, and the stream goes on from where it was. A stream that reads on from where it was reads ahead, for the
-//!   cache only, in a task that is cancelled with it: see [`Ahead`].
+//! * A read holds the tree shared only to plan: to find the inode and the items of the blocks it reads, which is the
+//!   walk from the root, and which may fetch nodes. It lets go of the tree before it fetches the blocks, so a round
+//!   trip to the store for a block is never made with the tree held. An item is a value in memory, or names an object
+//!   that is never changed, by its version, and a fetch checks it against its hash, so it gives the same with the tree
+//!   held or not, and a bucket that keeps versions keeps it for a reader of a day or so after it is deleted. A change,
+//!   and the commit, therefore do not wait behind the fetches of a read, or of the read-ahead that a stream goes on
+//!   with after the answer. Nothing that outlives a call holds the tree but a plan, and the page of a directory that
+//!   is read. What a stream reads is cancelled by closing the stream, and by the guest cancelling its read of it: the
+//!   read is dropped, and the stream goes on from where it was. A stream that reads on from where it was reads
+//!   ahead, for the cache only, in a task that is cancelled with it: see [`Ahead`].
 //! * A file that is unlinked while it is open stays in the tree, with no links, until the last descriptor on it is
 //!   closed, when it is removed; or, if the turn commits first, until then in a copy of the tree that the descriptors
 //!   read, while the commit leaves it out.
@@ -560,8 +566,8 @@ impl Handle {
             return Err(Errno::Invalid); // as `pread` does: an offset is signed
         }
         let len = len.min(READ_MAX);
-        let tree = self.pin.view().await;
-        let data = ops::read_at(&tree, self.ino(), offset, len).await?;
+        let plan = self.plan(offset, len).await?;
+        let data = plan.read().await?;
         let end = (data.len() as u64) < len;
         Ok((data, end))
     }
@@ -569,8 +575,13 @@ impl Handle {
     /// Fetches the blocks of a read of `len` bytes from `offset`, for the cache, and lets them go.
     async fn warm(&self, offset: u64, len: u64) -> Res<()> {
         self.reading()?;
+        self.plan(offset, len.min(READ_MAX)).await?.warm().await
+    }
+
+    /// Plans a read, which holds the tree for the length of the walk to the blocks, and not for fetching them.
+    async fn plan(&self, offset: u64, len: u64) -> Res<ops::Plan> {
         let tree = self.pin.view().await;
-        ops::warm(&tree, self.ino(), offset, len.min(READ_MAX)).await
+        ops::plan(&tree, self.ino(), offset, len).await
     }
 
     /// Writes `data`, and returns how much of it: fewer than all if the name filled.
@@ -714,8 +725,9 @@ pub struct Entries {
 pub type Page = Vec<(String, Kind)>;
 
 impl Entries {
-    /// Reads the page that follows the entries taken so far, if there is one. It holds the tree shared while it reads
-    /// and changes nothing, so it can be dropped at any point, and read again.
+    /// Reads the page that follows the entries taken so far, if there is one. It holds the tree shared while it reads,
+    /// which is the walk to the entries, whose values are inline, and changes nothing, so it can be dropped at any
+    /// point, and read again.
     pub fn more(&self) -> Option<BoxFuture<'static, Res<Page>>> {
         if !self.page.is_empty() || self.done {
             return None;
@@ -747,8 +759,8 @@ impl Entries {
     }
 }
 
-/// A task that is aborted when it is dropped: a read that holds the tree shared and nothing else, which closing the
-/// stream it is for cancels.
+/// A task that is aborted when it is dropped: a read, which holds nothing of the turn's but the tree, shared, while it
+/// plans, and which closing the stream it is for cancels.
 pub struct Task<T>(pub JoinHandle<T>);
 
 impl<T> Drop for Task<T> {
@@ -808,6 +820,8 @@ mod tests {
     use crate::name::Committed;
     use crate::outbox::Sink;
     use crate::store::Store;
+    use crate::tree::counting::counting;
+    use std::sync::atomic::Ordering::SeqCst;
     use std::time::{Duration, Instant};
 
     pub(super) async fn turn(store: &Store) -> Arc<Turn> {
@@ -1176,5 +1190,52 @@ mod tests {
         assert_eq!(file.write_task(At::End, Bytes::from_static(b"x")).err(), Some(Errno::ReadOnly));
         let next = Handle::root(&turn(&store).await);
         assert_eq!(text(&next, "f").await.as_deref(), Ok(&b"admitted"[..]));
+    }
+
+    /// A read, or the read-ahead, of four blocks that the store is slow to give: the guest's write and the commit are
+    /// not held up by them, and they go on to read what was committed.
+    #[tokio::test]
+    async fn a_read_that_waits_for_the_store_holds_up_neither_a_write_nor_the_commit() {
+        for warm in [false, true] {
+            let (mut store, counts) = counting();
+            let first = turn(&store).await;
+            let root = Handle::root(&first);
+            let data: Vec<u8> = (0..4 * ops::BLOCK).map(|i| (i % 251) as u8).collect();
+            put(&root, "big", &data).await;
+            commit(&first).await;
+            store.cache = Arc::default(); // nothing is in the cache, so a read fetches each block
+
+            let turn = turn(&store).await;
+            let root = Handle::root(&turn);
+            let big = root.open("big", read()).await.unwrap();
+            counts.gets.store(0, SeqCst);
+            counts.delay.store(1000, SeqCst);
+            let reading = tokio::spawn({
+                let big = big.clone();
+                async move {
+                    match warm {
+                        true => big.warm(0, 4 * ops::BLOCK).await.map(|()| Bytes::new()),
+                        false => Ok(big.read(0, READ_MAX).await?.0),
+                    }
+                }
+            });
+            while counts.flight.load(SeqCst) < 4 {
+                tokio::time::sleep(Duration::from_millis(1)).await; // the four blocks are being fetched
+            }
+            counts.delay.store(0, SeqCst); // the commit has nothing to wait for from the store but its own puts
+
+            // The tree is not held for those fetches: a write goes through, and so does the commit, while they are.
+            put(&root, "other", b"written meanwhile").await;
+            commit(&turn).await;
+            assert!(!reading.is_finished(), "warm {warm}: the fetches were still under way");
+            assert_eq!(counts.flight.load(SeqCst), 4);
+
+            let got = reading.await.unwrap().unwrap();
+            assert_eq!(got.as_ref(), if warm { &[][..] } else { &data[..] });
+            assert_eq!(counts.gets.load(SeqCst), 4, "warm {warm}: each block was fetched once");
+            let next = Handle::root(&self::turn(&store).await);
+            assert_eq!(text(&next, "other").await.as_deref(), Ok(&b"written meanwhile"[..]));
+            assert_eq!(text(&next, "big").await.unwrap().as_ref(), &data[..]);
+        }
     }
 }

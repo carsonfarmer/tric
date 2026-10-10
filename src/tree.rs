@@ -403,7 +403,15 @@ pub struct Cache {
     nodes: Mutex<Lru<Arc<Node>>>,
     blocks: Mutex<Lru<Bytes>>,
     /// The blocks that are being fetched: see [`Flight`].
-    flights: Mutex<HashMap<CacheKey, Arc<tokio::sync::Mutex<()>>>>,
+    flights: Mutex<HashMap<CacheKey, Gate>>,
+}
+
+/// The gate of a block that is being fetched, and how many reads have come to it: the one that holds it, and those
+/// that wait. The count is kept with the map locked, so it is exact, and the gate goes when it is back to none.
+#[derive(Default)]
+struct Gate {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    comers: usize,
 }
 
 type CacheKey = (Path, Option<String>);
@@ -472,9 +480,15 @@ impl Cache {
 
     /// Waits for its turn to fetch the block at `key`, and has it.
     async fn flight(&self, key: &CacheKey) -> Flight<'_> {
-        let gate = self.flights.lock().unwrap().entry(key.clone()).or_default().clone();
-        let mut flight = Flight { cache: self, key: key.clone(), gate, held: None };
-        flight.held = Some(flight.gate.clone().lock_owned().await);
+        let lock = {
+            let mut flights = self.flights.lock().unwrap();
+            let gate = flights.entry(key.clone()).or_default();
+            gate.comers += 1;
+            gate.lock.clone()
+        };
+        // From here on the count is the flight's to give back, wherever it is dropped: while it waits too.
+        let mut flight = Flight { cache: self, key: key.clone(), held: None };
+        flight.held = Some(lock.lock_owned().await);
         flight
     }
 }
@@ -482,11 +496,13 @@ impl Cache {
 /// The right to fetch one block. Reads that come to a block that another read is fetching, which a stream that reads
 /// ahead and the read that catches up with it both do, wait for it and then find it in the cache, instead of fetching
 /// it again. A block is checked against its link by whoever fetches it, and by whoever finds it in the cache, so
-/// waiting does not take anything on trust. When the one that holds it is cancelled, the next in turn fetches.
+/// waiting does not take anything on trust. When the one that holds it is cancelled, the next in turn fetches. A read
+/// that is cancelled while it waits is counted out as well, so that the gate does not outlive the reads that come to
+/// it: what is counted is the flights, and not who holds a reference to the gate, which depends on the order in which
+/// a cancelled future drops what it holds.
 struct Flight<'a> {
     cache: &'a Cache,
     key: CacheKey,
-    gate: Arc<tokio::sync::Mutex<()>>,
     held: Option<OwnedMutexGuard<()>>,
 }
 
@@ -494,9 +510,11 @@ impl Drop for Flight<'_> {
     fn drop(&mut self) {
         drop(self.held.take());
         let mut flights = self.cache.flights.lock().unwrap();
-        // The map and this are all that hold the gate, if no one else is waiting at it.
-        if Arc::strong_count(&self.gate) == 2 {
-            flights.remove(&self.key);
+        if let Some(gate) = flights.get_mut(&self.key) {
+            gate.comers -= 1;
+            if gate.comers == 0 {
+                flights.remove(&self.key);
+            }
         }
     }
 }
@@ -571,6 +589,15 @@ impl Reader {
         let bytes = self.store.cache.blocks.lock().unwrap().get(key, &link.h)?;
         self.stats.hits.fetch_add(1, Relaxed);
         Some(bytes)
+    }
+
+    /// The value `item` holds.
+    async fn value(&self, item: &Item) -> Result<Bytes> {
+        match item {
+            Item::Inline(s) => Ok(B64.decode(s)?.into()),
+            Item::Object(link) => self.block(link).await,
+            Item::Held(bytes) => Ok(bytes.clone()),
+        }
     }
 
     /// The value `link` names, which is an object of its own.
@@ -861,6 +888,20 @@ impl Flush<'_> {
     }
 }
 
+/// Reads the values of items of a name, apart from its tree. An item is a value in memory, or names an object that is
+/// never changed, by its version, and is checked against its hash when it is read, so what it gives does not depend on
+/// the tree, and a read of it need not hold the tree for the length of a round trip to the store. The tree is for
+/// finding the items, and that is the part that holds it.
+#[derive(Clone)]
+pub struct Values(Arc<Reader>);
+
+impl Values {
+    /// The value `item` holds, checked as [`Tree::value`] checks it, and fetched once for the reads that come to it.
+    pub async fn get(&self, item: &Item) -> Result<Bytes> {
+        self.0.value(item).await
+    }
+}
+
 /// A name's tree, as one turn edits it.
 pub struct Tree {
     reader: Arc<Reader>,
@@ -914,11 +955,12 @@ impl Tree {
 
     /// The value `item` holds.
     pub async fn value(&self, item: &Item) -> Result<Bytes> {
-        match item {
-            Item::Inline(s) => Ok(B64.decode(s)?.into()),
-            Item::Object(link) => self.reader.block(link).await,
-            Item::Held(bytes) => Ok(bytes.clone()),
-        }
+        self.reader.value(item).await
+    }
+
+    /// A way to read the values of items that does not hold the tree: see [`Values`].
+    pub fn values(&self) -> Values {
+        Values(self.reader.clone())
     }
 
     /// `bytes` as an item: inline if it is small.
@@ -1914,6 +1956,76 @@ mod tests {
         assert_eq!(second.await.unwrap().as_ref(), &[1; 60]);
         assert_eq!(counts.gets.load(SeqCst), 2, "the fetch that was cancelled, and the one that took its place");
         assert!(store.cache.flights.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_read_that_is_cancelled_at_the_gate_leaves_no_gate_behind() {
+        let (mut store, counts) = counting();
+        let mut tree = at(&store, &Shape::default());
+        set(&mut tree, "k/a", &[1; 60]).await;
+        let shape = commit(&store, &mut tree).await;
+        drop(tree);
+        store.cache = Arc::default();
+        let tree = Arc::new(at(&store, &shape));
+        let item = tree.get("k/a").await.unwrap().unwrap();
+        let comers = || store.cache.flights.lock().unwrap().values().map(|gate| gate.comers).sum::<usize>();
+        let read = |tree: &Arc<Tree>| {
+            let (tree, item) = (tree.clone(), item.clone());
+            tokio::spawn(async move { tree.value(&item).await })
+        };
+
+        // The one that fetches has the block to itself, and the waiter that is cancelled while it does is counted out
+        // at once, and not when the one that fetches is done: its gate is there until then, and no later.
+        counts.delay.store(300, SeqCst);
+        let leader = read(&tree);
+        while comers() < 1 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let waiter = read(&tree);
+        while comers() < 2 {
+            tokio::time::sleep(Duration::from_millis(1)).await; // it is waiting at the gate
+        }
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(comers(), 1, "the waiter went with its read");
+        assert_eq!(leader.await.unwrap().unwrap().as_ref(), &[1; 60]);
+        assert!(store.cache.flights.lock().unwrap().is_empty(), "nothing is left of the gate");
+        assert_eq!(counts.gets.load(SeqCst), 1, "the waiter that was cancelled fetched nothing");
+    }
+
+    #[tokio::test]
+    async fn reads_that_are_cancelled_at_any_moment_of_a_fetch_leave_no_gate_behind() {
+        let (store, counts) = counting();
+        let mut tree = at(&store, &Shape::default());
+        set(&mut tree, "k/a", &[1; 60]).await;
+        let shape = commit(&store, &mut tree).await;
+        drop(tree);
+        // That includes when the one that fetches lets go of the gate and wakes the next in turn: whichever way the
+        // drops of the cancelled read and of what it waits on fall, none of them leaves a gate behind.
+        for round in 0..4 {
+            let store = Store { cache: Arc::default(), ..store.clone() };
+            let tree = Arc::new(at(&store, &shape));
+            let item = tree.get("k/a").await.unwrap().unwrap();
+            counts.delay.store(20, SeqCst);
+            let reads: Vec<_> = (0..24)
+                .map(|_| {
+                    let (tree, item) = (tree.clone(), item.clone());
+                    tokio::spawn(async move { tree.value(&item).await })
+                })
+                .collect();
+            for (i, read) in reads.iter().enumerate().skip(1) {
+                if i % 2 == round % 2 {
+                    tokio::time::sleep(Duration::from_millis(i as u64 % 5)).await;
+                    read.abort();
+                }
+            }
+            for read in reads {
+                if let Ok(got) = read.await {
+                    assert_eq!(got.unwrap().as_ref(), &[1; 60]);
+                }
+            }
+            assert!(store.cache.flights.lock().unwrap().is_empty(), "round {round}");
+        }
     }
 
     #[test]

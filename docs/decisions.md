@@ -462,7 +462,7 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   last one ended, the stream is reading on, and a task fetches the blocks up to 1 MiB past it (`AHEAD`) for the cache,
   as a read does: checked against their links, with the version pinned. The task is aborted with the stream, and a
   file of which only the start is read has nothing fetched that was not asked for. The 0.2 `Input` and the 0.3 read
-  stream share it (`Ahead`, in `src/fs.rs`). Independently, `read_at` fetches the blocks of one read together, up to
+  stream share it (`Ahead`, in `src/fs.rs`). Independently, a read (`Plan::read`) fetches its blocks together, up to
   `IN_FLIGHT` (16; the tree's bound on uploads, renamed from `PUTS` as it serves both), and puts them in order.
   Measured with a counting store at 20 ms a GET: a read of 3 blocks is 3 GETs all under way together, 32 blocks are 32
   GETs with 16 under way, and a stream of 12 blocks is 12 GETs with at least 4 together.
@@ -471,9 +471,25 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   own read-ahead and fetches what is under way. A block is now fetched by one reader at a time (`Flight`, in
   `src/tree.rs`): one that comes to a block that is being fetched waits, and then looks in the cache, where the block
   is checked against its hash again, so nothing is taken on trust from the one that fetched it. A fetch that is
-  cancelled lets the next in turn fetch, and the gate is gone when no one waits at it. This holds for any two reads of
-  a block, whatever bound them. Nodes are not gated: a descent that finds a node missing is rare next to reads of
-  blocks, and a duplicate there costs one GET of at most 64 KiB.
+  cancelled lets the next in turn fetch, and the gate is gone when no one comes to it. The gate counts the flights
+  that come to it, under the map's lock, and a flight counts itself out when it is dropped, including one that is
+  cancelled while it waits. An earlier version told by the reference count of the gate when to remove it, which was
+  right only if a cancelled read dropped what it waited on before the flight, an order that nothing promises. Tests
+  cancel a waiter at the gate while the one that fetches is under way, and cancel reads at every moment of a fetch,
+  and the gate must be gone after them. This holds for any two reads of a block, whatever bound them. Nodes are not
+  gated: a descent that finds a node missing is rare next to reads of blocks, and a duplicate there costs one GET of
+  at most 64 KiB.
+- **A read holds the tree to plan, and not to fetch.** The first version of `read_at` and the read-ahead held the tree
+  shared while they fetched their blocks. The lock is fair, so a write waited behind every read in flight, the commit
+  behind those, and new reads behind the commit: a stream that outlived the answer and read ahead held up the commit,
+  and the turn behind it, by a GET round trip a time. A read is now planned with the tree held (`ops::plan`: the
+  inode, and the item of each block, which is the walk of the tree's nodes) and fetched after the tree is let go
+  (`Plan::read`, `Plan::warm`), through `Values`, a reader of items that holds the name's reader and not the tree. That
+  is safe because an item is a value in memory, or names an object that is never changed, by its version, and a fetch
+  checks the hash. The deletes of a commit leave a marker and not a gap in a bucket that keeps versions, and a store
+  that does not keep them does not delete. Whether a view is the live tree or a kept copy is still decided with the
+  tree held. A test holds a read of four blocks in flight on a store that takes a second a GET, and a write and the
+  commit go through while it is, for the read and for the read-ahead alike; it fails if either holds the tree.
 - **An offset is signed, and a time is not.** A `read` from an offset past `i64::MAX` is `invalid`, as `pread` has it,
   and not an end of file. A 0.3 instant before 1970 is `overflow` for `set-times`, as the tree cannot hold it.
 - **The 0.3 tests are run as Wasmtime's own runner does:** each is a `wasi:cli/run` command, the directory of the test

@@ -8,7 +8,7 @@
 //!
 //! A path never leaves the directory it is resolved from: `..` stops at it, and so do symlinks, which may not be
 //! absolute.
-use crate::tree::{DATA_MAX, Full, IN_FLIGHT, Item, Tree};
+use crate::tree::{DATA_MAX, Full, IN_FLIGHT, Item, Tree, Values};
 use bytes::{Bytes, BytesMut};
 use futures_util::stream::{self, StreamExt};
 use serde::de::DeserializeOwned;
@@ -523,71 +523,83 @@ async fn block(tree: &Tree, ino: u64, index: u64) -> Res<Option<Bytes>> {
     Ok(Some(tree.value(&item).await.map_err(fail)?))
 }
 
-/// The stored blocks of the file `ino` that `offset..end` is in, in order, and `None` for those that are not stored.
-/// The links are looked up one by one, which costs the nodes only once, and the blocks are fetched [`IN_FLIGHT`] at a
-/// time, and checked against their links, as `tree.value` does.
-async fn blocks<'a>(
-    tree: &'a Tree,
-    ino: u64,
+/// A read of the file `ino`, planned: where it ends, and what each block it spans is. Planning needs the tree, for the
+/// inode and for the items of the blocks, and a plan does not: an item is a value in memory or names an object that
+/// is never changed, which is checked against its hash when it is fetched. So a read is planned with the tree held, for
+/// the nodes it has to walk, and fetched after the tree is let go, so that a write, and the commit, do not wait behind
+/// the round trips of a read to the store.
+pub struct Plan {
     offset: u64,
     end: u64,
-) -> Res<impl stream::Stream<Item = Res<Option<Bytes>>> + 'a> {
-    let mut links = Vec::new();
-    for index in offset / BLOCK..=(end - 1) / BLOCK {
-        links.push(tree.get(&block_key(ino, index)).await.map_err(fail)?);
-    }
-    let value = move |item: Option<Item>| async move {
-        match item {
-            Some(item) => Ok(Some(tree.value(&item).await.map_err(fail)?)),
-            None => Ok(None),
-        }
-    };
-    Ok(stream::iter(links).map(value).buffered(IN_FLIGHT))
+    /// The item of each block from the one `offset` is in, and `None` for those that are not stored.
+    items: Vec<Option<Item>>,
+    values: Values,
 }
 
-/// The size of the file `ino`, and where a read of `len` bytes from `offset` ends: at its end, if that is first.
-async fn extent(tree: &Tree, ino: u64, offset: u64, len: u64) -> Res<u64> {
+/// Plans a read of up to `len` bytes of the file `ino` from `offset`. The items are looked up one by one, which costs
+/// the nodes only once.
+pub async fn plan(tree: &Tree, ino: u64, offset: u64, len: u64) -> Res<Plan> {
     let i = fetch(tree, ino).await?;
     match i.k {
         Kind::Dir => return Err(Errno::IsDirectory),
         Kind::Link => return Err(Errno::BadDescriptor),
         Kind::File => {}
     }
-    Ok(offset.saturating_add(len).min(i.s))
-}
-
-/// Up to `len` bytes of the file `ino` from `offset`: fewer at its end, and none past it. The blocks are fetched
-/// together, up to [`IN_FLIGHT`] of them, and put in order.
-pub async fn read_at(tree: &Tree, ino: u64, offset: u64, len: u64) -> Res<Bytes> {
-    let end = extent(tree, ino, offset, len).await?;
-    if offset >= end {
-        return Ok(Bytes::new());
-    }
-    let mut out = BytesMut::with_capacity((end - offset) as usize);
-    let mut index = offset / BLOCK;
-    let mut blocks = std::pin::pin!(blocks(tree, ino, offset, end).await?);
-    while let Some(stored) = blocks.next().await {
-        let stored = stored?.unwrap_or_default();
-        let start = index * BLOCK;
-        let (from, to) = ((offset.max(start) - start) as usize, (end.min(start + BLOCK) - start) as usize);
-        out.extend_from_slice(stored.get(from.min(stored.len())..to.min(stored.len())).unwrap_or_default());
-        out.resize(out.len() + to.saturating_sub(stored.len().max(from)), 0); // what is not stored reads as zeros
-        index += 1;
-    }
-    Ok(out.freeze())
-}
-
-/// Fetches the blocks of the file `ino` that a read of `len` bytes from `offset` would, for the cache, and lets them
-/// go. They are fetched, and checked, as a read does it.
-pub async fn warm(tree: &Tree, ino: u64, offset: u64, len: u64) -> Res<()> {
-    let end = extent(tree, ino, offset, len).await?;
+    let end = offset.saturating_add(len).min(i.s);
+    let mut items = Vec::new();
     if offset < end {
-        let mut blocks = std::pin::pin!(blocks(tree, ino, offset, end).await?);
+        for index in offset / BLOCK..=(end - 1) / BLOCK {
+            items.push(tree.get(&block_key(ino, index)).await.map_err(fail)?);
+        }
+    }
+    Ok(Plan { offset, end, items, values: tree.values() })
+}
+
+impl Plan {
+    /// The stored block of each item, in order, and `None` for those that are not stored. They are fetched
+    /// [`IN_FLIGHT`] at a time, and checked against their links, as `tree.value` does.
+    fn blocks(&self) -> impl stream::Stream<Item = Res<Option<Bytes>>> + '_ {
+        let value = |item: &Option<Item>| {
+            let (item, values) = (item.clone(), self.values.clone());
+            async move {
+                match item {
+                    Some(item) => Ok(Some(values.get(&item).await.map_err(fail)?)),
+                    None => Ok(None),
+                }
+            }
+        };
+        stream::iter(&self.items).map(value).buffered(IN_FLIGHT)
+    }
+
+    /// The bytes planned: fewer than were asked for at the end of the file, and none past it. The blocks are fetched
+    /// together, up to [`IN_FLIGHT`] of them, and put in order.
+    pub async fn read(self) -> Res<Bytes> {
+        let (offset, end) = (self.offset, self.end);
+        if offset >= end {
+            return Ok(Bytes::new());
+        }
+        let mut out = BytesMut::with_capacity((end - offset) as usize);
+        let mut index = offset / BLOCK;
+        let mut blocks = std::pin::pin!(self.blocks());
+        while let Some(stored) = blocks.next().await {
+            let stored = stored?.unwrap_or_default();
+            let start = index * BLOCK;
+            let (from, to) = ((offset.max(start) - start) as usize, (end.min(start + BLOCK) - start) as usize);
+            out.extend_from_slice(stored.get(from.min(stored.len())..to.min(stored.len())).unwrap_or_default());
+            out.resize(out.len() + to.saturating_sub(stored.len().max(from)), 0); // what is not stored reads as zeros
+            index += 1;
+        }
+        Ok(out.freeze())
+    }
+
+    /// Fetches the blocks planned, for the cache, and lets them go. They are fetched, and checked, as a read does it.
+    pub async fn warm(self) -> Res<()> {
+        let mut blocks = std::pin::pin!(self.blocks());
         while let Some(stored) = blocks.next().await {
             stored?;
         }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Writes `data` to the file `ino`, at `at`, and returns how much: all of it, or the part that fit if the name filled.
@@ -860,6 +872,14 @@ mod tests {
 
     fn tree(limits: Limits) -> Tree {
         Tree::open(&Store::memory(), "a", "n", &Shape::default(), limits).unwrap()
+    }
+
+    async fn read_at(tree: &Tree, ino: u64, offset: u64, len: u64) -> Res<Bytes> {
+        plan(tree, ino, offset, len).await?.read().await
+    }
+
+    async fn warm(tree: &Tree, ino: u64, offset: u64, len: u64) -> Res<()> {
+        plan(tree, ino, offset, len).await?.warm().await
     }
 
     #[tokio::test]

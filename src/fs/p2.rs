@@ -3,8 +3,8 @@
 //! for a request that addresses a name; any other has none.
 //!
 //! A stream is a state machine in the manner of the stock one, with a read or a write in flight as a task of its own.
-//! A read holds the tree shared for its length only, so closing a stream cancels it. A write is admitted when the
-//! stream takes it, and nothing cancels it: see the rules of [`super`].
+//! A read holds the tree shared to plan, and fetches without it, so closing a stream cancels it, and nothing waits for
+//! it. A write is admitted when the stream takes it, and nothing cancels it: see the rules of [`super`].
 use super::{Ahead, At, Entries, Errno, Fault, Handle, Kind, Mode, READ_MAX, Res, Stat, Task, Time, WRITE_CAP, wrote};
 use crate::engine::Host;
 use bytes::Bytes;
