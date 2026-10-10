@@ -354,15 +354,10 @@ pub async fn lookup(tree: &Tree, start: u64, path: &str, follow: bool) -> Res<(u
     }
 }
 
-/// An entry that a path leads to, or may lead to; `dir` is the error for a path that ends in a directory itself.
-pub async fn entry(
-    tree: &Tree,
-    start: u64,
-    path: &str,
-    follow: bool,
-    dir: Errno,
-) -> Res<(u64, String, Option<Dirent>, bool)> {
-    match locate(tree, start, path, follow).await? {
+/// An entry that a path leads to, or may lead to, as `locate` finds it without `follow`; `dir` is the error for a path
+/// that ends in a directory itself.
+pub async fn entry(tree: &Tree, start: u64, path: &str, dir: Errno) -> Res<(u64, String, Option<Dirent>, bool)> {
+    match locate(tree, start, path, false).await? {
         Loc::Dir(_) => Err(dir),
         Loc::Entry { parent, name, at, slash } => Ok((parent, name, at, slash)),
     }

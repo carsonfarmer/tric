@@ -591,7 +591,7 @@ impl Handle {
     pub async fn mkdir_at(&self, path: &str) -> Res<()> {
         self.dir()?;
         let mut tree = edit(self.turn()).await?;
-        let (parent, name, at, _) = ops::entry(&tree, self.ino(), path, false, Errno::Exist).await?;
+        let (parent, name, at, _) = ops::entry(&tree, self.ino(), path, Errno::Exist).await?;
         if at.is_some() {
             return Err(Errno::Exist);
         }
@@ -603,7 +603,7 @@ impl Handle {
     pub async fn symlink_at(&self, path: &str, target: &str) -> Res<()> {
         self.dir()?;
         let mut tree = edit(self.turn()).await?;
-        let (parent, name, at, slash) = ops::entry(&tree, self.ino(), path, false, Errno::Exist).await?;
+        let (parent, name, at, slash) = ops::entry(&tree, self.ino(), path, Errno::Exist).await?;
         if at.is_some() {
             return Err(Errno::Exist);
         }
@@ -628,7 +628,7 @@ impl Handle {
     pub async fn unlink_at(&self, path: &str) -> Res<()> {
         self.dir()?;
         let mut tree = edit(self.turn()).await?;
-        let (parent, name, at, slash) = ops::entry(&tree, self.ino(), path, false, Errno::IsDirectory).await?;
+        let (parent, name, at, slash) = ops::entry(&tree, self.ino(), path, Errno::IsDirectory).await?;
         if slash && at.is_some_and(|d| d.kind() != Kind::Dir) {
             return Err(Errno::NotDirectory);
         }
@@ -639,7 +639,7 @@ impl Handle {
     pub async fn rmdir_at(&self, path: &str) -> Res<()> {
         self.dir()?;
         let mut tree = edit(self.turn()).await?;
-        let (parent, name, _, _) = ops::entry(&tree, self.ino(), path, false, Errno::Invalid).await?;
+        let (parent, name, _, _) = ops::entry(&tree, self.ino(), path, Errno::Invalid).await?;
         let gone = ops::rmdir(&mut tree, parent, &name).await?;
         reclaim(self.turn(), &mut tree, gone).await
     }
@@ -652,8 +652,8 @@ impl Handle {
             return Err(Errno::Invalid);
         }
         let mut tree = edit(self.turn()).await?;
-        let (from_dir, from, _, from_slash) = ops::entry(&tree, self.ino(), from, false, Errno::Busy).await?;
-        let (to_dir, to, _, to_slash) = ops::entry(&tree, to_dir.ino(), to, false, Errno::Busy).await?;
+        let (from_dir, from, _, from_slash) = ops::entry(&tree, self.ino(), from, Errno::Busy).await?;
+        let (to_dir, to, _, to_slash) = ops::entry(&tree, to_dir.ino(), to, Errno::Busy).await?;
         let gone = ops::rename(&mut tree, (from_dir, &from), (to_dir, &to), (from_slash, to_slash)).await?;
         reclaim(self.turn(), &mut tree, gone).await
     }
@@ -668,7 +668,7 @@ impl Handle {
         }
         let mut tree = edit(self.turn()).await?;
         let (ino, _) = ops::lookup(&tree, self.ino(), path, false).await?;
-        let (parent, name, _, slash) = ops::entry(&tree, to_dir.ino(), to, false, Errno::Exist).await?;
+        let (parent, name, _, slash) = ops::entry(&tree, to_dir.ino(), to, Errno::Exist).await?;
         if slash {
             return Err(Errno::NoEntry);
         }
