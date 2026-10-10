@@ -160,8 +160,24 @@ impl<U> Descriptors for Accessor<U, HasSelf<Host>> {
     }
 }
 
-/// The result of a stream's future, told to it once.
-type Done = oneshot::Sender<Result<(), ErrorCode>>;
+/// The result of a stream's future, told to it once: by the stream when it ends, or else, when the stream is dropped,
+/// that it ended well, because the guest closed it.
+#[derive(Default)]
+struct Done(Option<oneshot::Sender<Result<(), ErrorCode>>>);
+
+impl Done {
+    fn send(&mut self, result: Res<()>) {
+        if let Some(done) = self.0.take() {
+            _ = done.send(result.map_err(Into::into));
+        }
+    }
+}
+
+impl Drop for Done {
+    fn drop(&mut self) {
+        self.send(Ok(()));
+    }
+}
 
 impl<U> types::HostDescriptorWithStore<U> for HasSelf<Host> {
     fn read_via_stream(
@@ -173,7 +189,7 @@ impl<U> types::HostDescriptorWithStore<U> for HasSelf<Host> {
         let (tx, rx) = oneshot::channel();
         // A directory, or a descriptor that is not for reading, has a stream with nothing in it, and says why.
         let stream = match file.reading() {
-            Ok(()) => StreamReader::new(&mut store, ReadStream::new(file, offset, tx))?,
+            Ok(()) => StreamReader::new(&mut store, ReadStream::new(file, offset, Done(Some(tx))))?,
             Err(e) => {
                 _ = tx.send(Err(e.into()));
                 StreamReader::new(&mut store, iter::empty::<u8>())?
@@ -206,7 +222,7 @@ impl<U> types::HostDescriptorWithStore<U> for HasSelf<Host> {
         let dir = store.get().table.get(&fd)?.clone();
         let (tx, rx) = oneshot::channel();
         let stream = match dir.entries() {
-            Ok(entries) => StreamReader::new(&mut store, ListStream { entries, fetch: None, done: Some(tx) })?,
+            Ok(entries) => StreamReader::new(&mut store, ListStream { entries, fetch: None, done: Done(Some(tx)) })?,
             Err(e) => {
                 _ = tx.send(Err(e.into()));
                 StreamReader::new(&mut store, iter::empty::<DirectoryEntry>())?
@@ -408,7 +424,7 @@ fn write<U>(
 ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
     let (tx, rx) = oneshot::channel();
     match store.get().writer(&fd) {
-        Ok(file) => data.pipe(&mut *store, WriteSink { file, at, task: None, done: Some(tx) })?,
+        Ok(file) => data.pipe(&mut *store, WriteSink { file, at, task: None, done: Done(Some(tx)) })?,
         Err(Fault::Errno(e)) => {
             data.close(&mut *store)?;
             _ = tx.send(Err(e.into()));
@@ -426,25 +442,12 @@ struct ReadStream {
     ahead: Ahead,
     /// The read under way, which is dropped if the guest cancels, so as to hold nothing.
     fetch: Option<BoxFuture<'static, Res<(Bytes, bool)>>>,
-    done: Option<Done>,
+    done: Done,
 }
 
 impl ReadStream {
     fn new(file: Handle, offset: u64, done: Done) -> Self {
-        Self { file, offset, ahead: Ahead::default(), fetch: None, done: Some(done) }
-    }
-
-    /// Ends the stream's future, if it has not ended.
-    fn close(&mut self, result: Res<()>) {
-        if let Some(done) = self.done.take() {
-            _ = done.send(result.map_err(Into::into));
-        }
-    }
-}
-
-impl Drop for ReadStream {
-    fn drop(&mut self) {
-        self.close(Ok(())); // the guest closed the stream
+        Self { file, offset, ahead: Ahead::default(), fetch: None, done }
     }
 }
 
@@ -479,7 +482,7 @@ impl<D> StreamProducer<D> for ReadStream {
         };
         Poll::Ready(Ok(match read {
             Ok((data, _)) if data.is_empty() => {
-                me.close(Ok(()));
+                me.done.send(Ok(()));
                 StreamResult::Dropped
             }
             Ok((data, _)) => {
@@ -489,7 +492,7 @@ impl<D> StreamProducer<D> for ReadStream {
                 StreamResult::Completed
             }
             Err(e) => {
-                me.close(Err(e));
+                me.done.send(Err(e));
                 StreamResult::Dropped
             }
         }))
@@ -501,21 +504,7 @@ struct ListStream {
     entries: Entries,
     /// The page being read, which is dropped if the guest cancels.
     fetch: Option<BoxFuture<'static, Res<super::Page>>>,
-    done: Option<Done>,
-}
-
-impl ListStream {
-    fn close(&mut self, result: Res<()>) {
-        if let Some(done) = self.done.take() {
-            _ = done.send(result.map_err(Into::into));
-        }
-    }
-}
-
-impl Drop for ListStream {
-    fn drop(&mut self) {
-        self.close(Ok(()));
-    }
+    done: Done,
 }
 
 impl<D> StreamProducer<D> for ListStream {
@@ -547,13 +536,13 @@ impl<D> StreamProducer<D> for ListStream {
             // The page is used up: the next, or the end.
             let fetch = me.fetch.take().or_else(|| me.entries.more());
             let Some(mut fetch) = fetch else {
-                me.close(Ok(()));
+                me.done.send(Ok(()));
                 return Poll::Ready(Ok(StreamResult::Dropped));
             };
             match fetch.as_mut().poll(cx) {
                 Poll::Ready(Ok(page)) => me.entries.fill(page),
                 Poll::Ready(Err(e)) => {
-                    me.close(Err(e));
+                    me.done.send(Err(e));
                     return Poll::Ready(Ok(StreamResult::Dropped));
                 }
                 Poll::Pending if finish => return Poll::Ready(Ok(StreamResult::Cancelled)),
@@ -572,29 +561,18 @@ struct WriteSink {
     at: At,
     /// The write under way, and how long it is.
     task: Option<(JoinHandle<Res<usize>>, usize)>,
-    done: Option<Done>,
-}
-
-impl WriteSink {
-    fn close(&mut self, result: Res<()>) {
-        if let Some(done) = self.done.take() {
-            _ = done.send(result.map_err(Into::into));
-        }
-    }
+    done: Done,
 }
 
 impl Drop for WriteSink {
     /// The future tells how the last write ended, if the guest closed the stream before it did.
     fn drop(&mut self) {
-        match (self.done.take(), self.task.take()) {
-            (Some(done), None) => _ = done.send(Ok(())),
-            (Some(done), Some((task, len))) => {
-                // Without a runtime the store is being dropped, and there is no guest to tell.
-                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                    runtime.spawn(async move { _ = done.send(wrote(task.await, len).map_err(Into::into)) });
-                }
+        if let Some((task, len)) = self.task.take() {
+            let mut done = mem::take(&mut self.done);
+            // Without a runtime the store is being dropped, and there is no guest to tell.
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move { done.send(wrote(task.await, len)) });
             }
-            (None, _) => {}
         }
     }
 }
@@ -626,7 +604,7 @@ impl<D> StreamConsumer<D> for WriteSink {
                     me.task = Some((task, len));
                 }
                 Err(e) => {
-                    me.close(Err(e));
+                    me.done.send(Err(e));
                     return Poll::Ready(Ok(StreamResult::Dropped));
                 }
             }
@@ -643,7 +621,7 @@ impl<D> StreamConsumer<D> for WriteSink {
                 StreamResult::Completed
             }
             Err(e) => {
-                me.close(Err(e));
+                me.done.send(Err(e));
                 StreamResult::Dropped
             }
         }))
@@ -731,7 +709,8 @@ mod tests {
         let got = gathered.clone();
         host()
             .run_concurrent(async move |accessor| {
-                let stream = accessor.with(|mut s| StreamReader::new(&mut s, ReadStream::new(file, offset, tx)));
+                let stream =
+                    accessor.with(|mut s| StreamReader::new(&mut s, ReadStream::new(file, offset, Done(Some(tx)))));
                 accessor.with(|mut s| stream.unwrap().pipe(&mut s, Gather(got))).unwrap();
                 rx.await.unwrap()
             })
@@ -747,7 +726,7 @@ mod tests {
         chunks.into_iter().for_each(|chunk| feed.send(chunk).unwrap());
         drop(feed);
         let file = file.clone();
-        let sink = WriteSink { file, at, task: None, done: Some(tx) };
+        let sink = WriteSink { file, at, task: None, done: Done(Some(tx)) };
         host()
             .run_concurrent(async move |accessor| {
                 let stream = accessor.with(|mut s| StreamReader::new(&mut s, Feed(chunks_in))).unwrap();
@@ -844,7 +823,7 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         let (feed, chunks) = mpsc::unbounded_channel();
-        let sink = WriteSink { file: file.clone(), at: At::Offset(0), task: None, done: Some(tx) };
+        let sink = WriteSink { file: file.clone(), at: At::Offset(0), task: None, done: Done(Some(tx)) };
         let answered = host()
             .run_concurrent(async |accessor| {
                 let stream = accessor.with(|mut s| StreamReader::new(&mut s, Feed(chunks))).unwrap();
@@ -879,7 +858,7 @@ mod tests {
         // The write is taken, and the stream closed before it is done: the future says how it ended.
         let (tx, rx) = oneshot::channel();
         let task = file.write_task(At::Offset(0), Bytes::from_static(b"kept")).unwrap();
-        drop(WriteSink { file: file.clone(), at: At::Offset(0), task: Some((task, 4)), done: Some(tx) });
+        drop(WriteSink { file: file.clone(), at: At::Offset(0), task: Some((task, 4)), done: Done(Some(tx)) });
         assert_eq!(ended(rx.await.unwrap()), Ok(()));
         commit(&first).await;
         let next = Handle::root(&turn(&store).await);
@@ -908,7 +887,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let entries = Arc::<Mutex<Vec<DirectoryEntry>>>::default();
         let (listing, got) =
-            (ListStream { entries: root.entries().unwrap(), fetch: None, done: Some(tx) }, entries.clone());
+            (ListStream { entries: root.entries().unwrap(), fetch: None, done: Done(Some(tx)) }, entries.clone());
         let result = host()
             .run_concurrent(async move |accessor| {
                 let stream = accessor.with(|mut s| StreamReader::new(&mut s, listing)).unwrap();
