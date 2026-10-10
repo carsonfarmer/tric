@@ -60,27 +60,7 @@ pub enum Errno {
 
 impl fmt::Display for Errno {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(match self {
-            Self::BadDescriptor => "bad descriptor",
-            Self::Busy => "busy",
-            Self::Exist => "exists",
-            Self::FileTooLarge => "file too large",
-            Self::Invalid => "invalid argument",
-            Self::Io => "i/o error",
-            Self::IsDirectory => "is a directory",
-            Self::Loop => "too many levels of symbolic links",
-            Self::NameTooLong => "name too long",
-            Self::NoEntry => "no such file or directory",
-            Self::InsufficientMemory => "out of memory",
-            Self::InsufficientSpace => "no space left",
-            Self::NotDirectory => "not a directory",
-            Self::NotEmpty => "directory not empty",
-            Self::Overflow => "value too large",
-            Self::Unsupported => "unsupported",
-            Self::NotPermitted => "not permitted",
-            Self::ReadOnly => "read-only",
-            Self::TooManyLinks => "too many links",
-        })
+        fmt::Debug::fmt(self, f)
     }
 }
 
