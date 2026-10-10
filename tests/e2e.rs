@@ -1,7 +1,8 @@
 //! End to end: tric serving the fixtures in tests/fixtures, which tests/components/build.sh builds. Each test of an
 //! app's semantics runs four times: on `tric dev`, with its state in memory, and on `tric route` in front of
 //! `tric serve`, with its state in the compose stack's RustFS, as an app of its own; each with the Rust app and with
-//! the JavaScript one. Each test runs its own processes, at ports of their own.
+//! the JavaScript one; the tests of the files, which only the Rust app has, with it through each of the two bindings
+//! of `wasi:filesystem`, 0.2 and 0.3. Each test runs its own processes, at ports of their own.
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http::HeaderMap;
@@ -291,6 +292,23 @@ macro_rules! both {
     };
 }
 
+/// Each test of the files, with the Rust app, on `tric dev` and on a stack, through each binding of `wasi:filesystem`.
+macro_rules! files {
+    (@in $mod:ident $stack:literal $fs:ident $($test:ident)*) => {
+        mod $mod {
+            $(#[tokio::test] async fn $test() {
+                super::$test(super::Kind { stack: $stack, app: "app" }, super::Fs::$fs).await
+            })*
+        }
+    };
+    ($($test:ident),* $(,)?) => {
+        files!(@in files_p2_dev false P2 $($test)*);
+        files!(@in files_p2_stack true P2 $($test)*);
+        files!(@in files_p3_dev false P3 $($test)*);
+        files!(@in files_p3_stack true P3 $($test)*);
+    };
+}
+
 both!(
     serves_and_forwards,
     confines_the_guest,
@@ -304,10 +322,9 @@ both!(
 );
 
 // The files are the Rust app's: the JavaScript one has no routes for them.
-both!(@in files_dev false "app"
-    files_commit_or_discard files_tree files_big files_many files_race files_outlive_the_turn);
-both!(@in files_stack true "app"
-    files_commit_or_discard files_tree files_big files_many files_race files_outlive_the_turn);
+both!(@in files_dev false "app" files_are_one_filesystem);
+both!(@in files_stack true "app" files_are_one_filesystem);
+files!(files_commit_or_discard, files_tree, files_big, files_many, files_race, files_outlive_the_turn);
 
 async fn serves_and_forwards(kind: Kind) {
     let tric = Tric::new(kind, &fixture(kind.app), &["-e", "GREETING=hi"]).await;
@@ -459,16 +476,58 @@ async fn turns_on_one_name_serialize(kind: Kind) {
     assert_eq!(tric.value("held", "k").await, "1");
 }
 
+/// A binding of `wasi:filesystem` that the Rust app has a route for, and how each error that the tests look for is
+/// said: by the route of 0.2, as the `io::ErrorKind` that `std` makes of it, and by that of 0.3, as the `error-code`.
+#[derive(Clone, Copy)]
+struct Fs {
+    route: &'static str,
+    read_only: &'static str,
+    no_entry: &'static str,
+    not_empty: &'static str,
+    exist: &'static str,
+    not_permitted: &'static str,
+}
+
+impl Fs {
+    const P2: Fs = Fs {
+        route: "files",
+        read_only: "ReadOnlyFilesystem",
+        no_entry: "NotFound",
+        not_empty: "DirectoryNotEmpty",
+        exist: "AlreadyExists",
+        not_permitted: "PermissionDenied",
+    };
+    const P3: Fs = Fs {
+        route: "files-p3",
+        read_only: "ErrorCode::ReadOnly",
+        no_entry: "ErrorCode::NoEntry",
+        not_empty: "ErrorCode::NotEmpty",
+        exist: "ErrorCode::Exist",
+        not_permitted: "ErrorCode::NotPermitted",
+    };
+
+    /// The target of the route of `name`, with `query`.
+    fn url(self, name: &str, query: &str) -> String {
+        format!("/@{name}/{}?{query}", self.route)
+    }
+}
+
 impl Tric {
-    /// What `/files?query` of `name` answers, as `{"ok": ..}` or `{"err": ..}`. A POST is a turn, and a GET reads.
-    async fn files(&self, method: &str, name: &str, query: &str) -> Value {
-        self.send(method, &format!("/@{name}/files?{query}"), &[]).await.json()
+    /// What the route of `fs` answers to `query` of `name`, as `{"ok": ..}` or `{"err": ..}`. A POST is a turn, and a
+    /// GET reads.
+    async fn files(&self, fs: Fs, method: &str, name: &str, query: &str) -> Value {
+        self.send(method, &fs.url(name, query), &[]).await.json()
     }
 
-    /// Whether `/files?query` of `name` fails with an error of the kind `kind`.
-    async fn fails(&self, method: &str, name: &str, query: &str, kind: &str) -> bool {
-        self.files(method, name, query).await["err"].as_str().is_some_and(|e| e.starts_with(kind))
+    /// Whether the route of `fs` fails with `kind` for `query` of `name`: how `fs` says it.
+    async fn fails(&self, fs: Fs, method: &str, name: &str, query: &str, kind: &str) -> bool {
+        is(&self.files(fs, method, name, query).await["err"], kind)
     }
+}
+
+/// Whether `err`, of `{"err": ..}`, is of `kind`: all of it, or the `kind` and `: ` and the message of the error.
+fn is(err: &Value, kind: &str) -> bool {
+    err.as_str().and_then(|e| e.strip_prefix(kind)).is_some_and(|rest| rest.is_empty() || rest.starts_with(": "))
 }
 
 /// The bytes `big` of the fixture writes: byte `i` is `i % 251`.
@@ -481,36 +540,36 @@ fn fnv(bytes: &[u8]) -> String {
     bytes.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3)).to_string()
 }
 
-async fn files_commit_or_discard(kind: Kind) {
+async fn files_commit_or_discard(kind: Kind, fs: Fs) {
     let tric = Tric::app(kind).await;
     let ok = json!({ "ok": null });
     // A turn's files commit with its keys: whole, or not at all.
-    assert_eq!(tric.files("POST", "a", "op=write&path=/hello.txt&data=hi&key=k&value=v").await, ok);
-    assert_eq!(tric.files("GET", "a", "op=read&path=/hello.txt").await, json!({ "ok": "hi" }));
+    assert_eq!(tric.files(fs, "POST", "a", "op=write&path=/hello.txt&data=hi&key=k&value=v").await, ok);
+    assert_eq!(tric.files(fs, "GET", "a", "op=read&path=/hello.txt").await, json!({ "ok": "hi" }));
     assert_eq!(tric.value("a", "k").await, "v");
     let write = |data: &str, status: u16| {
-        format!("/@a/files?op=write&path=/hello.txt&data={data}&key=k&value={data}&status={status}")
+        fs.url("a", &format!("op=write&path=/hello.txt&data={data}&key=k&value={data}&status={status}"))
     };
     assert_eq!(tric.post(&write("gone", 500)).await.status, 500);
-    assert_eq!(tric.files("GET", "a", "op=read&path=/hello.txt").await, json!({ "ok": "hi" }));
+    assert_eq!(tric.files(fs, "GET", "a", "op=read&path=/hello.txt").await, json!({ "ok": "hi" }));
     assert_eq!(tric.value("a", "k").await, "v");
     assert_eq!(tric.post(&write("kept", 409)).await.status, 409);
-    assert_eq!(tric.files("GET", "a", "op=read&path=/hello.txt").await, json!({ "ok": "kept" }));
+    assert_eq!(tric.files(fs, "GET", "a", "op=read&path=/hello.txt").await, json!({ "ok": "kept" }));
     assert_eq!(tric.value("a", "k").await, "kept");
 
     // Outside a turn on it, a name's files are read-only. They are the name's: no other has them, nor has a request
     // that is on none.
-    assert!(tric.fails("GET", "a", "op=write&path=/x&data=1", "ReadOnlyFilesystem").await);
-    assert!(tric.fails("GET", "a", "op=mkdir&path=/x", "ReadOnlyFilesystem").await);
-    assert!(tric.fails("GET", "a", "op=rm&path=/hello.txt", "ReadOnlyFilesystem").await);
-    assert_eq!(tric.files("GET", "a", "op=read&path=/hello.txt").await, json!({ "ok": "kept" }));
-    assert!(tric.fails("GET", "b", "op=read&path=/hello.txt", "NotFound").await);
-    let none = tric.get("/files?op=read&path=/hello.txt").await.json();
-    assert!(none.get("err").is_some(), "{none}");
-    assert!(tric.files("POST", "b", "op=read&path=/hello.txt").await.get("err").is_some());
+    assert!(tric.fails(fs, "GET", "a", "op=write&path=/x&data=1", fs.read_only).await);
+    assert!(tric.fails(fs, "GET", "a", "op=mkdir&path=/x", fs.read_only).await);
+    assert!(tric.fails(fs, "GET", "a", "op=rm&path=/hello.txt", fs.read_only).await);
+    assert_eq!(tric.files(fs, "GET", "a", "op=read&path=/hello.txt").await, json!({ "ok": "kept" }));
+    assert!(tric.fails(fs, "GET", "b", "op=read&path=/hello.txt", fs.no_entry).await);
+    let none = tric.get(&format!("/{}?op=read&path=/hello.txt", fs.route)).await.json();
+    assert!(is(&none["err"], fs.no_entry), "{none}");
+    assert!(tric.fails(fs, "POST", "b", "op=read&path=/hello.txt", fs.no_entry).await);
 }
 
-async fn files_tree(kind: Kind) {
+async fn files_tree(kind: Kind, fs: Fs) {
     let tric = Tric::app(kind).await;
     let ok = json!({ "ok": null });
     for q in [
@@ -520,92 +579,97 @@ async fn files_tree(kind: Kind) {
         "op=symlink&path=/s&to=d/e",
         "op=mv&path=/d/e/f&to=/d/h",
     ] {
-        assert_eq!(tric.files("POST", "t", q).await, ok, "{q}");
+        assert_eq!(tric.files(fs, "POST", "t", q).await, ok, "{q}");
     }
     let stat = |kind: &str, len: u64| json!({ "ok": { "type": kind, "len": len } });
-    assert_eq!(tric.files("GET", "t", "op=stat&path=/g").await, stat("file", 1));
-    assert_eq!(tric.files("GET", "t", "op=stat&path=/d").await["ok"]["type"], "dir");
-    assert_eq!(tric.files("GET", "t", "op=stat&path=/s").await["ok"]["type"], "symlink");
-    assert_eq!(tric.files("GET", "t", "op=readlink&path=/s").await, json!({ "ok": "d/e" }));
-    assert_eq!(tric.files("GET", "t", "op=ls&path=/s").await["ok"]["count"], 0, "a symlink to a directory is one");
-    assert!(tric.fails("GET", "t", "op=read&path=/d/e/f", "NotFound").await, "moved");
+    assert_eq!(tric.files(fs, "GET", "t", "op=stat&path=/g").await, stat("file", 1));
+    assert_eq!(tric.files(fs, "GET", "t", "op=stat&path=/d").await["ok"]["type"], "dir");
+    assert_eq!(tric.files(fs, "GET", "t", "op=stat&path=/s").await["ok"]["type"], "symlink");
+    assert_eq!(tric.files(fs, "GET", "t", "op=readlink&path=/s").await, json!({ "ok": "d/e" }));
+    assert_eq!(tric.files(fs, "GET", "t", "op=ls&path=/s").await["ok"]["count"], 0, "a symlink to a directory is one");
+    assert!(tric.fails(fs, "GET", "t", "op=read&path=/d/e/f", fs.no_entry).await, "moved");
 
     // A hard link is the file itself.
-    assert_eq!(tric.files("POST", "t", "op=write&path=/d/h&data=22").await, ok);
-    assert_eq!(tric.files("GET", "t", "op=read&path=/g").await, json!({ "ok": "22" }));
-    assert!(tric.fails("POST", "t", "op=rmdir&path=/d", "DirectoryNotEmpty").await);
-    assert!(tric.fails("POST", "t", "op=mkdir&path=/d", "AlreadyExists").await);
-    assert_eq!(tric.files("POST", "t", "op=rmtree&path=/d").await, ok);
-    assert_eq!(tric.files("GET", "t", "op=read&path=/g").await, json!({ "ok": "22" }), "its other name");
-    assert_eq!(tric.files("GET", "t", "op=ls&path=/").await["ok"], json!({ "count": 2, "first": "g", "last": "s" }));
+    assert_eq!(tric.files(fs, "POST", "t", "op=write&path=/d/h&data=22").await, ok);
+    assert_eq!(tric.files(fs, "GET", "t", "op=read&path=/g").await, json!({ "ok": "22" }));
+    assert!(tric.fails(fs, "POST", "t", "op=rmdir&path=/d", fs.not_empty).await);
+    assert!(tric.fails(fs, "POST", "t", "op=mkdir&path=/d", fs.exist).await);
+    assert_eq!(tric.files(fs, "POST", "t", "op=rmtree&path=/d").await, ok);
+    assert_eq!(tric.files(fs, "GET", "t", "op=read&path=/g").await, json!({ "ok": "22" }), "its other name");
+    assert_eq!(
+        tric.files(fs, "GET", "t", "op=ls&path=/").await["ok"],
+        json!({ "count": 2, "first": "g", "last": "s" })
+    );
 
     // A rename that fails leaves nothing of its own, and a turn that fails nothing at all.
-    assert!(tric.fails("POST", "t", "op=mv&path=/nope&to=/g", "NotFound").await);
-    assert_eq!(tric.files("GET", "t", "op=read&path=/g").await, json!({ "ok": "22" }));
-    assert_eq!(tric.post("/@t/files?op=mkdirs&path=/x/y/z&status=500").await.status, 500);
-    assert!(tric.fails("GET", "t", "op=stat&path=/x", "NotFound").await);
+    assert!(tric.fails(fs, "POST", "t", "op=mv&path=/nope&to=/g", fs.no_entry).await);
+    assert_eq!(tric.files(fs, "GET", "t", "op=read&path=/g").await, json!({ "ok": "22" }));
+    assert_eq!(tric.post(&fs.url("t", "op=mkdirs&path=/x/y/z&status=500")).await.status, 500);
+    assert!(tric.fails(fs, "GET", "t", "op=stat&path=/x", fs.no_entry).await);
 
     // Paths lead down from the root and nowhere else: not up out of it, nor along a link out of it.
-    assert!(tric.fails("POST", "t", "op=symlink&path=/abs&to=/etc/passwd", "PermissionDenied").await);
-    assert_eq!(tric.files("POST", "t", "op=symlink&path=/up&to=../..").await, ok);
-    for q in
-        ["op=ls&path=/up", "op=read&path=/up/etc/passwd", "op=read&path=/../etc/passwd", "op=read&path=/etc/passwd"]
-    {
-        let out = tric.files("GET", "t", q).await;
-        assert!(out.get("err").is_some(), "{q}: {out}");
+    assert!(tric.fails(fs, "POST", "t", "op=symlink&path=/abs&to=/etc/passwd", fs.not_permitted).await);
+    assert_eq!(tric.files(fs, "POST", "t", "op=symlink&path=/up&to=../..").await, ok);
+    for (q, kind) in [
+        ("op=ls&path=/up", fs.not_permitted),
+        ("op=read&path=/up/etc/passwd", fs.not_permitted),
+        ("op=read&path=/../etc/passwd", fs.not_permitted),
+        ("op=read&path=/etc/passwd", fs.no_entry), // there is none in the name's own tree
+    ] {
+        assert!(tric.fails(fs, "GET", "t", q, kind).await, "{q}");
     }
 }
 
-async fn files_big(kind: Kind) {
+async fn files_big(kind: Kind, fs: Fs) {
     let tric = Tric::app(kind).await;
     let ok = json!({ "ok": null });
-    let sum = async |name: &str| tric.files("GET", name, "op=sum&path=/big").await["ok"].clone();
+    let sum = async |name: &str| tric.files(fs, "GET", name, "op=sum&path=/big").await["ok"].clone();
     // A file of blocks, and a few bytes in the middle of it, in place.
     let mut want = pattern(1_000_000);
-    assert_eq!(tric.files("POST", "a", "op=big&path=/big&n=1000000").await, json!({ "ok": 1_000_000 }));
+    assert_eq!(tric.files(fs, "POST", "a", "op=big&path=/big&n=1000000").await, json!({ "ok": 1_000_000 }));
     assert_eq!(sum("a").await, json!({ "len": 1_000_000, "fnv": fnv(&want) }));
-    assert_eq!(tric.files("POST", "a", "op=patch&path=/big&at=262142&data=XYZW").await, ok);
+    assert_eq!(tric.files(fs, "POST", "a", "op=patch&path=/big&at=262142&data=XYZW").await, ok);
     want[262142..262146].copy_from_slice(b"XYZW");
     assert_eq!(sum("a").await, json!({ "len": 1_000_000, "fnv": fnv(&want) }), "across the end of a block");
-    let slice = tric.files("GET", "a", "op=slice&path=/big&at=262140&n=8").await;
+    let slice = tric.files(fs, "GET", "a", "op=slice&path=/big&at=262140&n=8").await;
     assert_eq!(slice["ok"], json!(want[262140..262148]));
     // A turn that is discarded leaves it as it was, and one that cuts it short, or makes it longer, makes zeros.
-    assert_eq!(tric.post("/@a/files?op=patch&path=/big&at=5&data=!!&status=500").await.status, 500);
+    assert_eq!(tric.post(&fs.url("a", "op=patch&path=/big&at=5&data=!!&status=500")).await.status, 500);
     assert_eq!(sum("a").await, json!({ "len": 1_000_000, "fnv": fnv(&want) }));
-    assert_eq!(tric.files("POST", "a", "op=trunc&path=/big&n=300000").await, ok);
+    assert_eq!(tric.files(fs, "POST", "a", "op=trunc&path=/big&n=300000").await, ok);
     want.truncate(300_000);
     assert_eq!(sum("a").await, json!({ "len": 300_000, "fnv": fnv(&want) }));
-    assert_eq!(tric.files("POST", "a", "op=trunc&path=/big&n=700000").await, ok);
+    assert_eq!(tric.files(fs, "POST", "a", "op=trunc&path=/big&n=700000").await, ok);
     want.resize(700_000, 0);
     assert_eq!(sum("a").await, json!({ "len": 700_000, "fnv": fnv(&want) }));
 
     // More than a turn holds in memory is sent as it goes, and is the same file once it is done; and a turn that is
     // discarded leaves nothing of what was sent.
     let n = 12 << 20;
-    assert_eq!(tric.files("POST", "b", &format!("op=big&path=/big&n={n}&chunk=16384")).await, json!({ "ok": n }));
+    assert_eq!(tric.files(fs, "POST", "b", &format!("op=big&path=/big&n={n}&chunk=16384")).await, json!({ "ok": n }));
     assert_eq!(sum("b").await, json!({ "len": n, "fnv": fnv(&pattern(n)) }));
-    let spilled = tric.post(&format!("/@c/files?op=big&path=/big&n={n}&chunk=65536&status=500")).await;
+    let spilled = tric.post(&fs.url("c", &format!("op=big&path=/big&n={n}&chunk=65536&status=500"))).await;
     assert_eq!(spilled.status, 500);
-    assert!(tric.fails("GET", "c", "op=stat&path=/big", "NotFound").await);
+    assert!(tric.fails(fs, "GET", "c", "op=stat&path=/big", fs.no_entry).await);
 }
 
-async fn files_many(kind: Kind) {
+async fn files_many(kind: Kind, fs: Fs) {
     let tric = Tric::app(kind).await;
-    assert_eq!(tric.files("POST", "m", "op=many&path=/dir&n=3000").await, json!({ "ok": 3000 }));
-    let ls = tric.files("GET", "m", "op=ls&path=/dir").await;
+    assert_eq!(tric.files(fs, "POST", "m", "op=many&path=/dir&n=3000").await, json!({ "ok": 3000 }));
+    let ls = tric.files(fs, "GET", "m", "op=ls&path=/dir").await;
     assert_eq!(ls["ok"], json!({ "count": 3000, "first": "f00000", "last": "f02999" }));
-    assert_eq!(tric.files("GET", "m", "op=read&path=/dir/f02500").await, json!({ "ok": "2500" }));
-    assert_eq!(tric.files("POST", "m", "op=rmtree&path=/dir").await, json!({ "ok": null }));
-    assert!(tric.fails("GET", "m", "op=ls&path=/dir", "NotFound").await);
-    assert_eq!(tric.files("GET", "m", "op=ls&path=/").await["ok"]["count"], 0);
+    assert_eq!(tric.files(fs, "GET", "m", "op=read&path=/dir/f02500").await, json!({ "ok": "2500" }));
+    assert_eq!(tric.files(fs, "POST", "m", "op=rmtree&path=/dir").await, json!({ "ok": null }));
+    assert!(tric.fails(fs, "GET", "m", "op=ls&path=/dir", fs.no_entry).await);
+    assert_eq!(tric.files(fs, "GET", "m", "op=ls&path=/").await["ok"]["count"], 0);
 }
 
-async fn files_race(kind: Kind) {
+async fn files_race(kind: Kind, fs: Fs) {
     let tric = Arc::new(Tric::app(kind).await);
     let tasks: Vec<_> = (0..20)
         .map(|_| {
             let tric = tric.clone();
-            tokio::spawn(async move { tric.post("/@counter/files?op=incr&path=/n").await })
+            tokio::spawn(async move { tric.post(&fs.url("counter", "op=incr&path=/n")).await })
         })
         .collect();
     let mut ok = 0;
@@ -618,33 +682,72 @@ async fn files_race(kind: Kind) {
         }
     }
     assert!(ok > 0);
-    let n = tric.files("GET", "counter", "op=read&path=/n").await["ok"].as_str().unwrap().parse::<u64>().unwrap();
+    let n = tric.files(fs, "GET", "counter", "op=read&path=/n").await["ok"].as_str().unwrap().parse::<u64>().unwrap();
     assert_eq!(n, ok, "every turn that answered 200 counted once, and no other");
 }
 
-async fn files_outlive_the_turn(kind: Kind) {
+async fn files_outlive_the_turn(kind: Kind, fs: Fs) {
     let tric = Tric::app(kind).await;
     let ok = json!({ "ok": null });
     // A file that is unlinked while it is open is there, with no name, until it is closed.
-    let out = tric.files("POST", "o", "op=orphan&path=/o").await;
+    let out = tric.files(fs, "POST", "o", "op=orphan&path=/o").await;
     assert_eq!(out["ok"], json!({ "listed": false, "text": "abcdef", "after": false }));
-    assert_eq!(tric.files("GET", "o", "op=ls&path=/").await["ok"]["count"], 0);
+    assert_eq!(tric.files(fs, "GET", "o", "op=ls&path=/").await["ok"]["count"], 0);
 
     // Open when the turn answers, it is read after its commit has left it out, and writes are refused.
-    assert_eq!(tric.files("POST", "h", "op=write&path=/h&data=hello").await, ok);
-    let held = tric.post("/@h/files?op=held&path=/h").await.json();
+    assert_eq!(tric.files(fs, "POST", "h", "op=write&path=/h&data=hello").await, ok);
+    let held = tric.post(&fs.url("h", "op=held&path=/h")).await.json();
     assert_eq!(held, json!({ "read": { "ok": "hello" }, "listed": { "ok": false } }));
-    assert!(tric.fails("GET", "h", "op=read&path=/h", "NotFound").await, "the commit left it out");
+    assert!(tric.fails(fs, "GET", "h", "op=read&path=/h", fs.no_entry).await, "the commit left it out");
 
-    assert_eq!(tric.files("POST", "l", "op=write&path=/l&data=first").await, ok);
-    let late = tric.post("/@l/files?op=late&path=/l").await.json();
+    assert_eq!(tric.files(fs, "POST", "l", "op=write&path=/l&data=first").await, ok);
+    let late = tric.post(&fs.url("l", "op=late&path=/l")).await.json();
     for what in ["write", "create", "mkdir", "remove"] {
-        let err = late[what]["err"].as_str().unwrap_or_default();
-        assert!(err.starts_with("ReadOnlyFilesystem"), "{what}: {late}");
+        assert!(is(&late[what]["err"], fs.read_only), "{what}: {late}");
     }
-    assert_eq!(tric.files("GET", "l", "op=read&path=/l").await, json!({ "ok": "" }), "opened, to truncate, before");
+    assert_eq!(tric.files(fs, "GET", "l", "op=read&path=/l").await, json!({ "ok": "" }), "opened, to truncate, before");
     for path in ["/late-file", "/late-dir"] {
-        assert!(tric.fails("GET", "l", &format!("op=stat&path={path}"), "NotFound").await);
+        assert!(tric.fails(fs, "GET", "l", &format!("op=stat&path={path}"), fs.no_entry).await);
+    }
+}
+
+/// Both bindings of `wasi:filesystem` are the one tree: what a turn writes through one, the other reads, whole or in
+/// blocks, and a turn that is discarded leaves nothing of it to either.
+async fn files_are_one_filesystem(kind: Kind) {
+    let tric = Tric::app(kind).await;
+    let ok = json!({ "ok": null });
+    let n = 600_000;
+    let sum = json!({ "ok": { "len": n, "fnv": fnv(&pattern(n)) } });
+    for (name, writer, reader) in [("a", Fs::P3, Fs::P2), ("b", Fs::P2, Fs::P3)] {
+        let data = writer.route;
+        assert_eq!(tric.files(writer, "POST", name, &format!("op=write&path=/small&data={data}")).await, ok);
+        assert_eq!(tric.files(writer, "POST", name, &format!("op=big&path=/big&n={n}")).await, json!({ "ok": n }));
+        assert_eq!(tric.files(reader, "GET", name, "op=read&path=/small").await, json!({ "ok": data }));
+        assert_eq!(tric.files(reader, "GET", name, "op=sum&path=/big").await, sum, "{name}");
+        // And back: what the reader changes in a turn of its own, the writer reads.
+        assert_eq!(tric.files(reader, "POST", name, "op=append&path=/small&data=!").await, ok);
+        assert_eq!(tric.files(reader, "POST", name, "op=patch&path=/big&at=262142&data=XYZW").await, ok);
+        assert_eq!(tric.files(writer, "GET", name, "op=read&path=/small").await, json!({ "ok": format!("{data}!") }));
+        let mut want = pattern(n);
+        want[262142..262146].copy_from_slice(b"XYZW");
+        let sum = json!({ "ok": { "len": n, "fnv": fnv(&want) } });
+        assert_eq!(tric.files(writer, "GET", name, "op=sum&path=/big").await, sum, "{name}");
+    }
+
+    // A turn through 0.3 that answers 500 leaves what it made, and what it changed, as it was, to both.
+    assert_eq!(tric.files(Fs::P2, "POST", "c", "op=write&path=/small&data=before").await, ok);
+    for query in ["op=write&path=/small&data=after", "op=write&path=/new&data=x", "op=big&path=/new-big&n=600000"] {
+        assert_eq!(tric.post(&Fs::P3.url("c", &format!("{query}&status=500"))).await.status, 500, "{query}");
+    }
+    for fs in [Fs::P2, Fs::P3] {
+        assert_eq!(tric.files(fs, "GET", "c", "op=read&path=/small").await, json!({ "ok": "before" }));
+        for path in ["/new", "/new-big"] {
+            assert!(tric.fails(fs, "GET", "c", &format!("op=stat&path={path}"), fs.no_entry).await, "{path}");
+        }
+        assert_eq!(
+            tric.files(fs, "GET", "c", "op=ls&path=/").await["ok"],
+            json!({ "count": 1, "first": "small", "last": "small" })
+        );
     }
 }
 
@@ -962,7 +1065,7 @@ async fn sweeps_the_names() {
     let tric = Tric::app(Kind { stack: true, app: "app" }).await;
     let (app, s3) = (&tric.apps[0], owner());
     let n = 1_000_000;
-    assert_eq!(tric.files("POST", "s", &format!("op=big&path=/big&n={n}")).await, json!({ "ok": n }));
+    assert_eq!(tric.files(Fs::P2, "POST", "s", &format!("op=big&path=/big&n={n}")).await, json!({ "ok": n }));
     assert_eq!(tric.post("/@s/kv?op=set&key=k&value=v").await.status, 200);
     // Objects that no tree names: as an app's turn that died would leave, at a name with a head and at one with none.
     let id = "0123456789abcdef0123456789abcdef";
@@ -991,7 +1094,7 @@ async fn sweeps_the_names() {
         assert!(log.contains(field), "{field}: {log}");
     }
     assert_eq!(all().await, before, "all there, the cursor not left");
-    assert_eq!(tric.files("GET", "s", "op=sum&path=/big").await["ok"]["len"], n);
+    assert_eq!(tric.files(Fs::P2, "GET", "s", "op=sum&path=/big").await["ok"]["len"], n);
     assert_eq!(tric.value("s", "k").await, "v");
 }
 
