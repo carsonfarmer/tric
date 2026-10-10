@@ -394,7 +394,11 @@ tree before any file exists.
   upload leaves nothing; a tampered object; links that try to leave the prefix; paths that try to escape.
 - **e2e, on RustFS, through both bindings:** writes held until the answer; a 5xx discards; a lost race re-runs; a write
   after the answer fails; a snapshot is read-only; keys and files commit together; a file of several blocks updated in
-  place; a directory of thousands of files.
+  place; a directory of thousands of files. The Rust fixture has the same ops twice: `/files` through `std::fs` (0.2),
+  and `/files-p3` through the 0.3 filesystem, with its streams. Each test runs through both, on `tric dev` and on a
+  stack, and expects the exact error of each (`NotFound` through 0.2, `no-entry` through 0.3). A last test shows them to
+  be one tree: what a turn writes through one, in a file of one block or of several, the other reads, and a 5xx
+  through 0.3 leaves nothing for either.
 
 **Alternatives, rejected** (reasons and sources in `docs/decisions.md`): Git's objects through `gix`; IPFS UnixFS with
 sharded directories; JuiceFS; content-defined chunking; SlateDB and ZeroFS; a Lambda `/tmp` served by the stock
