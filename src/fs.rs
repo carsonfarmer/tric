@@ -30,6 +30,48 @@
 //!   read, while the commit leaves it out.
 //! * What descriptors read after the answer is the tree as the commit left it, or as it was if the turn was discarded:
 //!   so a file that was made in a turn that was discarded is no more, and reads fail with `io`.
+/// The conversions of an [`Errno`] and a [`Kind`] to the error code and the descriptor type that a binding generates,
+/// which name the same codes and types, in types of their own.
+macro_rules! convert {
+    ($code:ty, $type:ty) => {
+        impl From<Errno> for $code {
+            fn from(e: Errno) -> Self {
+                match e {
+                    Errno::BadDescriptor => Self::BadDescriptor,
+                    Errno::Busy => Self::Busy,
+                    Errno::Exist => Self::Exist,
+                    Errno::FileTooLarge => Self::FileTooLarge,
+                    Errno::Invalid => Self::Invalid,
+                    Errno::Io => Self::Io,
+                    Errno::IsDirectory => Self::IsDirectory,
+                    Errno::Loop => Self::Loop,
+                    Errno::NameTooLong => Self::NameTooLong,
+                    Errno::NoEntry => Self::NoEntry,
+                    Errno::InsufficientMemory => Self::InsufficientMemory,
+                    Errno::InsufficientSpace => Self::InsufficientSpace,
+                    Errno::NotDirectory => Self::NotDirectory,
+                    Errno::NotEmpty => Self::NotEmpty,
+                    Errno::Overflow => Self::Overflow,
+                    Errno::Unsupported => Self::Unsupported,
+                    Errno::NotPermitted => Self::NotPermitted,
+                    Errno::ReadOnly => Self::ReadOnly,
+                    Errno::TooManyLinks => Self::TooManyLinks,
+                }
+            }
+        }
+
+        impl From<Kind> for $type {
+            fn from(k: Kind) -> Self {
+                match k {
+                    Kind::Dir => Self::Directory,
+                    Kind::File => Self::RegularFile,
+                    Kind::Link => Self::SymbolicLink,
+                }
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod conformance;
 mod ops;

@@ -58,41 +58,7 @@ pub fn add_to_linker(linker: &mut Linker<Host>) -> wasmtime::Result<()> {
     preopens::add_to_linker::<Host, HasSelf<Host>>(linker, |h| h)
 }
 
-impl From<Errno> for ErrorCode {
-    fn from(e: Errno) -> Self {
-        match e {
-            Errno::BadDescriptor => Self::BadDescriptor,
-            Errno::Busy => Self::Busy,
-            Errno::Exist => Self::Exist,
-            Errno::FileTooLarge => Self::FileTooLarge,
-            Errno::Invalid => Self::Invalid,
-            Errno::Io => Self::Io,
-            Errno::IsDirectory => Self::IsDirectory,
-            Errno::Loop => Self::Loop,
-            Errno::NameTooLong => Self::NameTooLong,
-            Errno::NoEntry => Self::NoEntry,
-            Errno::InsufficientMemory => Self::InsufficientMemory,
-            Errno::InsufficientSpace => Self::InsufficientSpace,
-            Errno::NotDirectory => Self::NotDirectory,
-            Errno::NotEmpty => Self::NotEmpty,
-            Errno::Overflow => Self::Overflow,
-            Errno::Unsupported => Self::Unsupported,
-            Errno::NotPermitted => Self::NotPermitted,
-            Errno::ReadOnly => Self::ReadOnly,
-            Errno::TooManyLinks => Self::TooManyLinks,
-        }
-    }
-}
-
-impl From<Kind> for DescriptorType {
-    fn from(k: Kind) -> Self {
-        match k {
-            Kind::Dir => Self::Directory,
-            Kind::File => Self::RegularFile,
-            Kind::Link => Self::SymbolicLink,
-        }
-    }
-}
+convert!(ErrorCode, DescriptorType);
 
 fn instant(nanos: u64) -> Instant {
     Instant { seconds: (nanos / 1_000_000_000) as i64, nanoseconds: (nanos % 1_000_000_000) as u32 }
