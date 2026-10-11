@@ -520,11 +520,12 @@ async fn turns_with_an_idempotency_key_apply_once(kind: Kind) {
     assert_eq!(tric.send("POST", "/@once/kv?op=incr&key=n&delta=2", &[("idempotency-key", "a")]).await.status, 422);
     assert_eq!(count("once").await, 1);
 
-    // A key is one field, of 1 to 255 bytes; a safe method ignores it.
+    // A key is one field, of 1 to 255 bytes, with no comma, as Lambda joins fields with one; a safe method ignores it.
     let long = "k".repeat(256);
-    let keys: [&[(&str, &str)]; 3] = [
+    let keys: [&[(&str, &str)]; 4] = [
         &[("idempotency-key", "")],
         &[("idempotency-key", long.as_str())],
+        &[("idempotency-key", "b,c")],
         &[("idempotency-key", "b"), ("idempotency-key", "c")],
     ];
     for key in keys {

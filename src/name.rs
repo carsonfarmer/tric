@@ -207,9 +207,11 @@ pub struct Idempotency {
 
 impl Idempotency {
     /// The SHA-256 of the request's `Idempotency-Key`, if it has one, which is never kept or logged itself: one field,
-    /// of 1 to 255 visible ASCII characters, taken as sent; else 400.
+    /// of 1 to 255 visible ASCII characters other than a comma, taken as sent; else 400. Lambda joins repeated fields
+    /// with commas, so a key with none is one field wherever it came in.
     pub fn key(headers: &HeaderMap) -> Result<Option<String>, StatusCode> {
-        let ok = |k: &HeaderValue| (1..=IDEMPOTENCY_KEY_MAX).contains(&k.len()) && k.to_str().is_ok();
+        let visible = |b: &u8| b.is_ascii_graphic() && *b != b',';
+        let ok = |k: &HeaderValue| (1..=IDEMPOTENCY_KEY_MAX).contains(&k.len()) && k.as_bytes().iter().all(visible);
         match headers.get_all(IDEMPOTENCY_KEY).iter().collect::<Vec<_>>()[..] {
             [] => Ok(None),
             [key] if ok(key) => Ok(Some(store::hash(key.as_bytes()))),
@@ -701,8 +703,8 @@ impl Turn {
     /// Commits the turn, asked at `host` and answered with `status` and `location`: its tree is uploaded, its held
     /// requests go to `sink` as a delivery event whose digest the head keeps in `pending`, and its head goes over the
     /// version it read, if that is still the head. A commit that puts a head deletes expired records of
-    /// `Idempotency-Key`s, and records the turn's own, if it has one. The `ETag` it returns is the new head's, or the
-    /// old one's when there was nothing to write. A commit that fails is discarded.
+    /// `Idempotency-Key`s, and a turn with a key always puts one, to record it, whatever it changed. The `ETag` it
+    /// returns is the new head's, or the old one's when there was nothing to write. A commit that fails is discarded.
     pub async fn commit(
         &self,
         host: &str,
@@ -738,7 +740,7 @@ impl Turn {
             tree.reset();
             return Ok(Committed::Conflict);
         }
-        if !tree.edited() && held.is_empty() && !claimed {
+        if !tree.edited() && held.is_empty() && !claimed && self.once.is_none() {
             return Ok(Committed::Done(base.as_ref().and_then(etag)));
         }
         let commit = store::random();
@@ -1350,7 +1352,7 @@ mod tests {
         assert_eq!(key(&[b"k"]), Ok(Some(store::hash(b"k"))));
         assert_eq!(key(&[b"\"k\""]), Ok(Some(store::hash(b"\"k\""))), "taken as sent, quotes and all");
         assert_eq!(key(&[&[b'a'; 255]]), Ok(Some(store::hash(&[b'a'; 255]))));
-        for bad in [&b""[..], &[b'a'; 256][..], "café".as_bytes()] {
+        for bad in [&b""[..], &[b'a'; 256][..], "café".as_bytes(), &b"a b"[..], &b"a\tb"[..], &b"a,b"[..]] {
             assert_eq!(key(&[bad]), Err(StatusCode::BAD_REQUEST), "{bad:?}");
         }
         assert_eq!(key(&[b"k", b"k"]), Err(StatusCode::BAD_REQUEST), "one field");
@@ -1409,16 +1411,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_turn_that_puts_no_head_records_nothing() {
+    async fn a_turn_with_a_key_records_it_whatever_it_changed() {
+        // So a retry is answered as the first was, even if what the first found has changed since; a 4xx as it is.
         let store = Store::memory();
         let turn = keyed(&store, false, &once("1")).await.unwrap();
-        assert!(matches!(answered(&turn, 200, None).await, Committed::Done(None)));
-        let turn = keyed(&store, false, &once("1")).await.expect("nothing changed, so nothing was recorded");
-        drop(turn);
-
-        // A claimed one puts a head, whatever it changed, so it records its key; a 4xx that commits, as it is.
-        let turn = keyed(&store, true, &once("1")).await.unwrap();
-        assert!(matches!(answered(&turn, 409, None).await, Committed::Done(Some(_))));
+        assert!(matches!(answered(&turn, 409, None).await, Committed::Done(Some(_))), "a head, to hold the record");
         let replay = keyed(&store, false, &once("1")).await.err();
         assert!(matches!(replay, Some(Answer::Replay(Record { status: 409, location: None, .. }))), "{replay:?}");
     }

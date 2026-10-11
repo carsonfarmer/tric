@@ -67,13 +67,13 @@
     answers 500.
   - A busy name answers 429 with `Retry-After`.
 - **Versions are ETags.** The head's version is the ETag, and `If-Match` is honoured, with 412 on a mismatch.
-- **`Idempotency-Key` applies a turn once.** A key is one field of 1 to 255 visible ASCII bytes, else 400.
-  - A turn whose commit puts a head (it changed the name, held a request or claimed the name) records in that head's
-    tree the key's SHA-256, the request's fingerprint (method, path and query, body), its status and its `Location`,
-    for at least a day.
+- **`Idempotency-Key` applies a turn once.** A key is one field of 1 to 255 visible ASCII bytes other than a comma,
+  else 400.
+  - A turn that commits records in its head's tree, whatever it changed, the key's SHA-256, the request's fingerprint
+    (method, path and query, body), its status and its `Location`, for at least a day.
   - The same request with the same key is then answered with that status and `Location`, `Idempotent-Replayed: true`
     and no body, without running or waiting; another request with the key gets 422.
-  - A turn that changes nothing, or answers 5xx, records nothing. A keyed body too large to keep is 413.
+  - A turn that answers 5xx records nothing. A keyed body too large to keep is 413.
   - Safe methods, and requests without a name, ignore the header.
 - **Calls are fetches.**
   - A `fetch` to the app's own origin runs in-process, as a request with `Forwarded: for=_tric`.
@@ -82,8 +82,8 @@
 - **Background requests.** An outbound request sent during a turn with `Prefer: respond-async` (RFC 7240):
   - gets `202` and `Preference-Applied: respond-async` at once;
   - is held, and sent only if the turn commits;
-  - carries `Idempotency-Key: <commit>/<n>`, so one to the app's own origin that is delivered again within a day is
-    applied once;
+  - carries `Idempotency-Key: <commit>/<n>`, unless the app gave it its own, so one to the app's own origin that is
+    delivered again within a day is applied once;
   - is delivered at least once, in order within its turn.
 
   A turn's held requests total at most 1 MB. A name with 1,000 commits still undelivered refuses a new background

@@ -122,7 +122,7 @@ There is no web platform under QuickJS (no `TextEncoder`, `URL`, `fetch` or `con
   unseen. A busy name answers 429 with `Retry-After`. The name's version is its `ETag`, and `If-Match` is honoured.
 - **`Idempotency-Key`.** A turn sent again with the key of one that committed is answered, for a day at least, with
   its status and `Location`, `Idempotent-Replayed: true` and no body, and does not run; another request with the key
-  gets 422. A turn that changed nothing, or answered 5xx, is not recorded, and runs again.
+  gets 422. A turn that answered 5xx is not recorded, and runs again.
 - **Calls are fetches.** A request to the app's own origin runs in-process with `Forwarded: for=_tric`; a cycle
   answers 508.
 - **Background requests.** A request a turn sends with `Prefer: respond-async` is answered 202 at once, held, and sent

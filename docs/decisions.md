@@ -888,8 +888,8 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
 ## Idempotency keys
 
 - **A turn with an `Idempotency-Key` applies once: tric records the outcome with the effect, and keeps no body.** A
-  commit that puts a head writes, in its tree and so in the same compare-and-swap, the key's SHA-256, the request's
-  fingerprint, the status and `Location`, at `i/<day>/<key>`. A turn sent again with the key finds the record when it
+  turn's commit writes, in its tree and so in the same compare-and-swap, the key's SHA-256, the request's fingerprint,
+  the status and `Location`, at `i/<day>/<key>`. A turn sent again with the key finds the record when it
   opens, and is answered with that status and `Location`, `Idempotent-Replayed: true`, no body and no `ETag`, without
   running. The record lands with the turn's writes or not at all, so a retry is answered as it was only if the first
   landed. Two other designs were weighed:
@@ -913,20 +913,24 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   expired in April 2026, makes the header a Structured Field String, a fingerprint a MAY, a key reused with another
   payload 422 and one still in flight 409, and says the expiry SHOULD be published
   (<https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-idempotency-key-header-07>).
-- **A key is one field of 1 to 255 bytes of visible ASCII, taken as sent, else 400.** 255 is Stripe's limit. The value
-  is not parsed as a Structured Field, so `"k"` and `k` are two keys: a client sends the same bytes again, and there is
-  nothing to get wrong. The check is `HeaderValue::to_str`, which lets a tab through too, and the length. Only the
-  key's SHA-256 is kept, and the key is never logged. Only a turn reads it: a snapshot changes nothing, and a request
+- **A key is one field of 1 to 255 bytes of visible ASCII other than a comma, taken as sent, else 400.** 255 is
+  Stripe's limit. The value is not parsed as a Structured Field, so `"k"` and `k` are two keys: a client sends the same
+  bytes again, and there is nothing to get wrong. No space or tab, which a proxy may trim or fold, and no comma: Lambda
+  joins a repeated field's values with commas, so `a,b` from CloudFront could be two fields sent, which tric refuses
+  locally; with no comma, a key is the same key, or refused, wherever it comes in. Only the key's SHA-256 is kept, and
+  the key is never logged. Only a turn reads it: a snapshot changes nothing, and a request
   without a name commits nothing to record it with. A WebSocket's events do not carry the upgrade's key, which would
   answer each event after the first as the first.
 - **The fingerprint is the SHA-256 of the method, a space, the path and query, a line feed and the body.** Headers are
   not in it, so a retry is not told apart by its `Content-Type` or its date. A keyed body past `REPLAY_MAX` (6 MiB) is
   413, as only a kept body can be hashed before the turn runs; hashing a body as it streams into the guest, and
   recording after, would be more code for uploads that a client can send without a key.
-- **Only a commit that puts a head anyway records.** That is one whose tree changed, that held requests, or that
-  claimed its name. A turn that changed nothing puts nothing, and running it again changes nothing either. A 5xx, a
-  trap or an error discards the turn and records nothing, so a retry runs it again, as Stripe's v2 does. A 4xx that
-  commits records its status, as its writes landed.
+- **Every keyed turn that commits records, whatever it changed.** A turn that changed nothing still puts a head, to
+  hold the record, so a retry is answered as the first was even when what the first found has changed since: a
+  create-if-absent that found the thing there answers 200 again, and does not create it after it was deleted. The cost
+  is a put for a keyed turn that changed nothing, which a client that sends a key means as a write. A 5xx, a trap or
+  an error discards the turn and records nothing, so a retry runs it again, as Stripe's v2 does. A 4xx that commits
+  records its status, as its writes landed.
 - **The record is looked for on each pass of `Turn::open`, before the claim and the conditions.** So a retry is
   answered at once, even while another turn holds the name, and even if its `If-Match` no longer holds because its
   own first try moved the head. Of duplicates sent together, the first to commit records; one that ran beside it
@@ -950,10 +954,13 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   went out. Its 500 is not replayed, so a client that retries it anyway runs it again, and sends again what it sent. An
   app that calls out should pass a key derived from its own on to what it calls, so the far side applies it once.
 - **The outbox's `Idempotency-Key: <commit>/<n>` now counts at home.** A background request to the app's own origin
-  that is delivered again within a day is applied once.
+  that is delivered again within a day is applied once. A held request that the app gave a key of its own keeps it,
+  and gets no second, which tric would refuse at home with 400: the app's key may be one it derived to dedupe across
+  commits, and it knows best.
 - **What was made simple, as there are no clients yet:**
   - no `Content-Location` is kept or replayed, as with no body it says little;
-  - the key is the bytes sent, checked by `to_str` and its length, with no Structured Field parsing;
+  - the key is the bytes sent, checked byte by byte and by its length, with no Structured Field parsing;
+  - every keyed commit records, so only a turn that did not commit goes unrecorded;
   - a duplicate that meets a claim gets the 429 any turn does, and not a 409 of its own;
   - the fingerprint hashes a copy of the method, target and kept body (6 MiB at most) with `store::hash`, rather than
     streaming them into a hasher;
