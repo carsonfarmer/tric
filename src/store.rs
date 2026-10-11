@@ -7,7 +7,8 @@ use futures_util::{StreamExt, stream};
 use object_store::aws::{AmazonS3, AmazonS3Builder, AwsCredential};
 use object_store::client::{HttpClient, HttpConnector, ReqwestConnector};
 use object_store::{
-    Certificate, ClientOptions, GetOptions, ListResult, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode,
+    Certificate, ClientOptions, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, RetryConfig,
     StaticCredentialProvider,
 };
 use object_store::{UpdateVersion, memory::InMemory, path::Path};
@@ -15,6 +16,7 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 use wasmtime::{Result, ensure, error::Context};
 use webpki_root_certs::TLS_SERVER_ROOT_CERTS;
 
@@ -43,14 +45,101 @@ pub fn random() -> String {
     format!("{:032x}", rand::random::<u128>())
 }
 
+/// How many times [`Store::put`] tries a conditional put, while it fails for a reason that is not its condition.
+pub(crate) const TRIES: u32 = 4;
+
 /// The bucket `bucket` on S3, as the environment's `AWS_*` variables configure it, with `creds` if given, and else
 /// the environment's.
-pub fn s3(bucket: &str, creds: Option<AwsCredential>) -> Result<AmazonS3> {
-    let mut s3 = AmazonS3Builder::from_env().with_bucket_name(bucket).with_http_connector(Shared);
+pub fn s3(bucket: &str, creds: Option<AwsCredential>) -> Result<S3> {
+    let mut s3 = AmazonS3Builder::from_env().with_bucket_name(bucket);
     if let Some(creds) = creds {
         s3 = s3.with_credentials(Arc::new(StaticCredentialProvider::new(creds)));
     }
-    Ok(s3.build()?)
+    S3::new(s3)
+}
+
+/// A bucket on S3 whose conditional puts are sent once each, and the rest as object_store sends them, retries and all.
+/// object_store tries a put again after a 5xx, a 429, a 408 or a connection that failed, and a conditional put that
+/// landed but whose answer was lost then fails its own condition: the 412 would read as another's write. So
+/// [`Store::put`] tries those again itself, and knows which failure came after a try that may have landed.
+#[derive(Debug)]
+pub struct S3 {
+    s3: AmazonS3,
+    once: AmazonS3, // with no retries, and the same credentials and connections
+}
+
+impl S3 {
+    pub fn new(s3: AmazonS3Builder) -> Result<Self> {
+        let s3 = s3.with_http_connector(Shared);
+        let (many, once) = (s3.clone().build()?, s3);
+        let once = once.with_credentials(many.credentials().clone());
+        let once = once.with_retry(RetryConfig { max_retries: 0, ..Default::default() }).build()?;
+        Ok(Self { s3: many, once })
+    }
+}
+
+/// The client that retries, for what reads its configuration, as the credentials.
+impl std::ops::Deref for S3 {
+    type Target = AmazonS3;
+
+    fn deref(&self) -> &AmazonS3 {
+        &self.s3
+    }
+}
+
+impl std::fmt::Display for S3 {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        self.s3.fmt(f)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for S3 {
+    async fn put_opts(&self, at: &Path, payload: PutPayload, opts: PutOptions) -> object_store::Result<PutResult> {
+        match opts.mode {
+            PutMode::Overwrite => self.s3.put_opts(at, payload, opts).await,
+            PutMode::Create | PutMode::Update(_) => self.once.put_opts(at, payload, opts).await,
+        }
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        at: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.s3.put_multipart_opts(at, opts).await
+    }
+
+    async fn get_opts(&self, at: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
+        self.s3.get_opts(at, opts).await
+    }
+
+    fn delete_stream(
+        &self,
+        paths: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.s3.delete_stream(paths)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.s3.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        at: &Path,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.s3.list_with_offset(prefix, at)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.s3.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> object_store::Result<()> {
+        self.s3.copy_opts(from, to, opts).await
+    }
 }
 
 /// One HTTP client for each set of options, so everything at one endpoint shares its connections, whatever the
@@ -94,7 +183,7 @@ impl Store {
     }
 
     /// `s3`, whose bucket must keep versions.
-    pub fn s3(s3: AmazonS3) -> Self {
+    pub fn s3(s3: S3) -> Self {
         Self { inner: Arc::new(s3), versioned: true, cache: Cache::shared() }
     }
 
@@ -122,16 +211,34 @@ impl Store {
         Ok(Some((serde_json::from_slice(&bytes).with_context(|| format!("{path}"))?, version)))
     }
 
-    /// Writes `bytes` at `path` as `mode` allows, and returns the new version, or `None` if `mode`'s condition failed.
+    /// Writes `bytes` at `path` as `mode` allows, and returns the new version, or `None` if `mode`'s condition failed,
+    /// or another conditional write was under way (a 409), and nothing was written. A conditional put that fails
+    /// otherwise, as on a 5xx, may have landed: it is tried again, as it was, up to `TRIES` times. Once a try may have
+    /// landed, a later one that is refused may have been refused for that try's write, so that is an error too, and
+    /// what the put did is for the caller to read.
     pub async fn put(&self, path: &Path, bytes: Bytes, mode: PutMode) -> Result<Option<UpdateVersion>> {
-        match self.inner.put_opts(path, bytes.into(), mode.into()).await {
-            Ok(r) => Ok(Some(UpdateVersion { e_tag: r.e_tag, version: r.version })),
-            Err(
-                object_store::Error::Precondition { .. }
-                | object_store::Error::AlreadyExists { .. }
-                | object_store::Error::NotFound { .. },
-            ) => Ok(None),
-            Err(e) => Err(e.into()),
+        let (tries, mut tried) = (if matches!(mode, PutMode::Overwrite) { 1 } else { TRIES }, 0);
+        loop {
+            tried += 1;
+            match self.inner.put_opts(path, bytes.clone().into(), mode.clone().into()).await {
+                Ok(r) => return Ok(Some(UpdateVersion { e_tag: r.e_tag, version: r.version })),
+                Err(
+                    e @ (object_store::Error::Precondition { .. }
+                    | object_store::Error::AlreadyExists { .. }
+                    | object_store::Error::NotFound { .. }),
+                ) => {
+                    return match tried {
+                        1 => Ok(None),
+                        _ => Err(e).with_context(|| format!("{path}: try {tried}, after one that may have landed")),
+                    };
+                }
+                Err(e @ object_store::Error::Generic { .. }) if tried < tries => {
+                    tracing::warn!(%path, tried, "put: {e}");
+                    let ms = rand::random_range(50..=100) << (tried - 1); // 50 to 100 ms, then twice as long each time
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
     }
 
@@ -178,7 +285,8 @@ mod tests {
     use super::*;
     use crate::tree::counting::counting;
     use futures_util::TryStreamExt;
-    use std::sync::atomic::Ordering::SeqCst;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
     async fn put(store: &Store, path: &Path) {
         store.put(path, Bytes::from_static(b"x"), PutMode::Overwrite).await.unwrap();
@@ -201,5 +309,51 @@ mod tests {
         put(&memory, &paths[0]).await;
         assert_eq!(memory.delete_many(vec![paths[0].clone()]).await, 0);
         assert!(memory.head(&paths[0]).await.unwrap());
+    }
+
+    /// An S3 whose puts answer the statuses of `plan` in turn, and 200 after, and the puts it has had.
+    async fn s3(plan: &[u16]) -> (Store, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = listener.local_addr().unwrap();
+        let (plan, puts) = (Arc::new(Mutex::new(VecDeque::from(plan.to_vec()))), Arc::new(AtomicUsize::new(0)));
+        let counted = puts.clone();
+        tokio::spawn(crate::tric::listen(listener, move |_, req| {
+            let (plan, puts) = (plan.clone(), counted.clone());
+            async move {
+                let put = req.method() == http::Method::PUT;
+                _ = http_body_util::BodyExt::collect(req.into_body()).await;
+                let code = if put { plan.lock().unwrap().pop_front().unwrap_or(200) } else { 404 };
+                puts.fetch_add(put as usize, SeqCst);
+                let mut res = crate::tric::status(http::StatusCode::from_u16(code).unwrap());
+                res.headers_mut().insert(http::header::ETAG, http::HeaderValue::from_static("\"new\""));
+                res
+            }
+        }));
+        let s3 = AmazonS3Builder::new().with_endpoint(format!("http://{at}")).with_allow_http(true);
+        let s3 = s3.with_region("us-east-1").with_bucket_name("b").with_access_key_id("k").with_secret_access_key("s");
+        (Store::s3(S3::new(s3).unwrap()), puts)
+    }
+
+    #[tokio::test]
+    async fn a_conditional_put_refused_after_a_try_that_may_have_landed_is_an_error_not_a_conflict() {
+        let update = PutMode::Update(UpdateVersion { e_tag: Some("\"old\"".into()), version: None });
+        let tries = TRIES as usize;
+        // What the put came to: whether it landed, if that is known, and how many puts S3 had.
+        let cases: [(&[u16], PutMode, Option<bool>, usize); 6] = [
+            (&[412], update.clone(), Some(false), 1), // another write landed first
+            (&[409], update.clone(), Some(false), 1), // another write was under way
+            (&[500, 412], update.clone(), None, 2),   // the first may have landed, and the second failed on it
+            (&[500, 200], update.clone(), Some(true), 2),
+            (&[503; TRIES as usize], update, None, tries),
+            (&[500, 200], PutMode::Overwrite, Some(true), 2), // tried again by object_store, as before
+        ];
+        let (mut got, mut want) = (vec![], vec![]);
+        for (plan, mode, landed, puts) in cases {
+            let (store, counted) = s3(plan).await;
+            let put = store.put(&app("a", &["names", "n"]), Bytes::from_static(b"{}"), mode).await;
+            got.push((plan, put.map(|v| v.is_some()).ok(), counted.load(SeqCst)));
+            want.push((plan, landed, puts));
+        }
+        assert_eq!(got, want);
     }
 }
