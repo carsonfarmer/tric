@@ -32,7 +32,7 @@ reason.
   mints them.
 - **An escape from serve's sandbox can invoke the `outbox`,** as serve's role may, with events that name another app.
   They are delivered only if that app's head holds their digest, so they are dropped, but each may hold the other
-  app's tenant for up to 30 s first, waiting for a commit to land. That costs money, and breaks nothing. They leave
+  app's tenant for up to 60 s first, waiting for a commit to land. That costs money, and breaks nothing. They leave
   nothing behind either: serve drops them with a 2xx, and only a delivery that fails is kept and scheduled.
 - **Native code is the app's own.** `native/<app>/…` is written with the app's credentials, so tampered native code
   reaches only the tenant that wrote it. serve compiles again when the native code won't deserialize. Components are
@@ -414,36 +414,75 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   a conditional put again, as it was, after an error that is not a refusal, up to `TRIES` (4) times, from 50 to 100 ms
   apart and twice as long each time. A refusal at the first try is a conflict, as before, and the turn runs again at
   once. A refusal after a try that may have landed is an error, for the caller to settle.
-- **A head names its last commits, and a commit with no answer reads the head.** A head holds the random ids of its last
-  `COMMITS` (8) commits, the newest last, so no head after a commit is ever the same as one before it. Icechunk reads
-  back a write id from an object's metadata; a head names several commits instead, as the next commit replaces the
-  metadata, and so would hide a commit that it landed on. A claim whose put errs is held if the head holds it. A commit
-  whose put errs, other than as `TooLarge`, reads the head, and what it finds decides only whether the turn runs again:
-  nothing is deleted whatever it finds.
+- **A head names the commit that wrote it, and the version it was written over.** A head holds `commit`, the random id
+  of the commit that wrote it, which a claim, its release and `settle` keep, and `over`, the version id of the head it
+  was written over, which every put of a head sets (`name::put`); the first head has none. So no head's bytes are ever
+  another's, and no head's `ETag` is either: S3's `ETag` changes only with an object's contents, and for an object put
+  whole, unencrypted or under SSE-S3, it is the MD5 of its bytes
+  (<https://docs.aws.amazon.com/AmazonS3/latest/API/API_Object.html>). A put with `If-Match` lands only if the `ETag`
+  matches (<https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html>), so a put on a head's
+  `ETag` lands on that head or not at all, and a head's versions form a chain, each written over the one before. Only
+  the version written over a commit's base can be the commit's. The bucket keeps every version, each read by its
+  version id (<https://docs.aws.amazon.com/AmazonS3/latest/userguide/versioning-workflows.html>), until the lifecycle
+  expires it, a day after it stops being current at the least; and a read after a write that S3 has applied sees it
+  (<https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel>). Before, a head held the ids
+  of its last 8 commits: a commit whose base's newest id had been dropped could not tell whether it landed, and a claim
+  taken and let go put a head back to its base's bytes, and so to its `ETag`, on which a commit sent before could still
+  land. Icechunk reads back a write id from an object's metadata
+  (<https://github.com/earth-mover/icechunk/blob/main/design-docs/017-conditional-put-lost-response.md>); a head
+  holds its commit's id in its bytes, which each version keeps.
+- **A commit with no answer reads the head's versions to learn whether it landed.** A commit whose put errs, other
+  than as `TooLarge`, or has no answer, asks the head (`name::fate`), and what it finds decides only whether the turn
+  runs again: nothing is deleted whatever it finds.
   - If the head names the commit, it landed. It is done, and does not run again. Its answer carries the head's `ETag` if
-    the commit is still the newest, and none if another landed on it, as that head has changes the turn never saw, and a
-    client's `If-Match` with its `ETag` would be checked against them.
-  - If the head names the newest commit of the commit's base, and another after it, and not the commit, another commit
-    landed on the base, and the head will never be the base again, so the commit never lands. It is a conflict, and the
-    turn runs again. A base that named no commit counts only while the head names fewer than `COMMITS`, so that none has
-    been dropped.
-  - Else the outcome is unknown, as below. This is when nothing has landed on the base since, the base's newest commit
-    has been dropped from the head, or the head cannot be read.
-- **A commit whose outcome is unknown answers 503.** If the compare-and-swap errors and the head does not settle it, the
-  put may have landed, or may yet. A put that was sent may be applied after its answer is lost (general knowledge, as
-  above), and a claim taken and let go can return a head to its base's bytes, and so to its `ETag`, so a head that does
-  not name the commit is not proof that it never lands. The turn is neither done nor run again: it answers 503, and its
-  objects are left for the sweep, as every turn's are.
+    the head is the commit's own, written over its base and holding no claim, and none if another write landed on it,
+    as that head has changes the turn never saw, and a client's `If-Match` with its `ETag` would be checked against
+    them.
+  - If the head is still the base, by its version id, nothing has landed on it, and the commit is put again, as it was.
+    That put lands only if the first has not, as the first one's landing makes the head another version; if it is
+    refused, the head is read again. A commit on a name with no head does the same while there is still none, with
+    `If-None-Match: *`.
+  - Else the head's versions are read back along `over`, one GET by version id each, to the one written over the base.
+    If that one names the commit, the commit landed, and is done, with no `ETag`. If it does not, another write landed
+    on the base first, the head will never be the base again, and the commit never lands. It is a conflict, and the
+    turn runs again.
+  - Else it cannot tell. That is when there was a head and there is none, a version on the way back has expired or
+    has no `over`, or the bucket keeps no versions (`tric dev`'s memory store, which never loses an answer).
+  - While S3 errors, or a put again is refused, it asks again, after a wait that starts at 100 ms and doubles to 2 s.
+  - A claim whose put errs is held if the head holds its id, as before.
+- **A commit that cannot learn whether it landed answers 500, with no `Retry-After`.** A commit's put, and learning
+  whether it landed, take `SETTLE` (30 s) at most from when the put is sent. Past that, or when the head cannot tell,
+  the commit fails with `Unsettled`, which is logged at warn with the path and the commit's id. The turn answers 500,
+  and is neither done nor run again; its objects are left for the sweep, as every turn's are. A 503 with
+  `Retry-After` asks the client to try again (RFC 9110, 15.6.4 and 10.2.3,
+  <https://www.rfc-editor.org/rfc/rfc9110#section-15.6.4>), and a turn that landed and runs again has run twice; a
+  500 asks nothing of the kind. A commit that fails before its put, in uploading its tree or handing over its event,
+  still answers 503 with `Retry-After: 1`, as nothing landed, and `TooLarge` answers 500, as it never can. Only an
+  error marked `Unsent` answers 503 (`tric::failed`), and every other answers 500, so an error that a later change
+  adds after the put is taken for one that may have landed, and not for one that surely did not.
+  - `SETTLE` is 30 s so that `ANSWER` (10 s), `BUSY` (5 s) and it fit in CloudFront's 60 s for an answer from the
+    origin, and the client hears the 500 and not a 504. A turn that runs again, or uploads slowly, can take longer.
+  - object_store's request timeout is 30 s, so a put that waits it out uses all of `SETTLE`, and the turn answers 500.
+  - The outbox waits for a commit to land for `SETTLE` and 30 s more, for a put that S3 applies late.
 - **What a lost answer still costs.**
-  - A commit of unknown outcome answers 503. If the caller runs the turn again and the first put did land, the turn has
-    run twice.
+  - A commit that cannot learn whether it landed answers 500. If the client runs the turn again all the same, and the
+    first put did land, the turn has run twice. That takes S3 failing for `SETTLE`, a version expiring during the
+    walk, a head that is deleted, or a version put back.
+  - An answer lost after a commit landed can still lead a client to try again: serve's answer may not reach the
+    router, which answers 502; CloudFront answers 504 past its 60 s; a connection may drop. Nothing in the head tells
+    such a retry from a new request. Only a key that the client sends with a request, and again with its retry, could,
+    and tric takes none.
+  - A claimed turn runs once at most. A claim lasts `CLAIM_TTL` (15 s) from when it is taken, 5 s past the turn's
+    deadline at the least, and a commit learning whether it landed can outlast it. Another turn may then claim the
+    name and commit, so a claimed turn whose commit is a conflict fails with `Lapsed`, and answers 500: it sent what
+    it claimed the name for, an unsafe request or a body read past its buffer, and running again would send it
+    again. Its writes are lost, and the client hears that it failed. A longer claim would make this rarer, and keep
+    a name from every other turn longer when a host dies holding it, so the claim stays at 15 s.
   - A 409 on a head is a conflict, and the turn runs again, where object_store sent the put again.
-  - A conditional put that times out is tried again, where object_store did not. Four tries that each wait out the
-    30 s timeout take two minutes, against up to three for object_store's ten tries of a 5xx.
+  - A conditional put that times out is tried again, where object_store did not; the tries, and what follows them,
+    stop at `SETTLE`.
   - A claim whose put errs, when the head cannot then be read, is taken for another's, as before: the turn answers
     429, and the claim runs out in 15 s. That costs availability and not data.
-  - A binary from before `commits` refuses a head that names them, as `Head` denies unknown fields. Every reader
-    must run the new binary before any writer does.
 - **The sweep is built, last, and is the collector.** A commit deletes nothing (the bullet on that above), so what
   leaks is all that no head names any more: what a commit replaced, and what a turn made that did not land, whether
   it trapped, timed out, lost its race or failed, or its host died. The sweep lists the app's names, and for each one
@@ -558,13 +597,14 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   names it already knows, and no other app's.
 - **Every version of a head that the bucket keeps is a root, and nothing else is.** What points into `values/` is a
   head's tree, and nothing else does. A head also holds `pending`, which is digests of requests (the requests are in
-  the outbox, under `outbox/`, and not under `values/`), the claim, a lease, and `commits`, the ids of its last
-  commits, which are not links. The outbox and retry objects hold a request and its digest, and no link. A snapshot or
-  a fork, which a read or a descriptor that outlives the answer holds, is a copy of a root read from a head and reads
-  by version, which a delete marker does not hide, and for at most `TOTAL`, so it needs no mark of its own. A link
-  read from a head or a node is checked to name an object of its own name, so a changed head cannot make the sweep
-  mark, or keep, another's. If anything else were ever to point into `values/`, the sweep would have to mark through
-  it as well, and `tree::object` is where to look for who builds those paths.
+  the outbox, under `outbox/`, and not under `values/`), the claim, a lease, `commit`, the id of the commit that wrote
+  it, and `over`, a version id of the head itself, none of which are links. The outbox and retry objects hold a
+  request and its digest, and no link. A snapshot or a fork, which a read or a descriptor that outlives the answer
+  holds, is a copy of a root read from a head and reads by version, which a delete marker does not hide, and for at
+  most `TOTAL`, so it needs no mark of its own. A link read from a head or a node is checked to name an object of its
+  own name, so a changed head cannot make the sweep mark, or keep, another's. If anything else were ever to point into
+  `values/`, the sweep would have to mark through it as well, and `tree::object` is where to look for who builds those
+  paths.
 - **The grace outlasts the longest turn, by construction.** A head is put by a commit, which lands only if its base is
   the head then (a conditional put on its ETag, so a turn from an older head never lands), and names what its base
   named and what its turn made. The sweep takes `cutoff = now - GRACE` before it lists a name's versions, and reads
@@ -588,7 +628,10 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   lifecycle keeps for an hour (`GRACE`) after the put at least, as a run lasts 900 s at most: S3 may expire a version
   from the first midnight UTC that is `noncurrent_days` after its successor was put, and the version is not put back in
   the hour before. And it must be a conditional put on the current head's ETag, as a commit is, so that it writes over
-  no commit. A tool that puts versions back states both in its own code, and tests them against a run under way.
+  no commit. A tool that puts versions back states both in its own code, and tests them against a run under way. Its
+  `over` should be the current head's version id, as a commit's is; one that keeps the old version's `over` only makes
+  a commit that lost its answer at that moment answer 500, as its walk back along `over` breaks (the bullets on a lost
+  answer).
 - **A name's marks are bounded by their size together, and the valve is a last resort.** The versions of a name's head
   are marked one after another into one set of `u128` (`Head::mark`, which is `Tree::mark`), each reading its tree's
   nodes level by level, `IN_FLIGHT` (16) at once, each checked against its link, and passing over what the set holds.

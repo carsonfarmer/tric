@@ -21,8 +21,9 @@ use wasmtime::Result;
 use wasmtime_wasi_http::Error;
 
 const PREFER: HeaderName = HeaderName::from_static("prefer");
-/// How long delivery waits for the commit to land: a commit is under way when it hands over its event.
-const LANDING: Duration = Duration::from_secs(30);
+/// How long delivery waits for the commit to land: a commit is under way when it hands over its event, and its put,
+/// with learning whether it landed, takes `SETTLE` at most, to which this adds 30 s for a put that S3 applies late.
+const LANDING: Duration = name::SETTLE.saturating_add(Duration::from_secs(30));
 /// One request's whole exchange, its response's body included.
 const EXCHANGE: Duration = Duration::from_secs(60);
 const BODY_MAX: usize = 1 << 20;
