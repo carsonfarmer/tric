@@ -175,10 +175,10 @@ reason.
 What was weighed, and from what. The design is in `docs/plan.md`, under "Files and state".
 
 - **State and files are one tree.** A turn commits by one compare-and-swap of one head, and two trees would need two
-  heads, which S3 can't change together. One tree is one edit path, one commit, one pair of garbage lists and one
-  budget, where two would copy the hardest code. The key prefixes (`k/`, `f/`, `d/`) keep the two apart, so a key write
-  doesn't rewrite a file's leaves. The cost is that a name larger than one node (64 KiB) reads its keys through the
-  tree, and under that it is a head alone, as before.
+  heads, which S3 can't change together. One tree is one edit path, one commit and one budget, where two would copy the
+  hardest code. The key prefixes (`k/`, `f/`, `d/`) keep the two apart, so a key write doesn't rewrite a file's leaves.
+  The cost is that a name larger than one node (64 KiB) reads its keys through the tree, and under that it is a head
+  alone, as before.
 - **The tree is a copy-on-write B+tree,** as LMDB, bbolt and btrfs have it (from general knowledge: LMDB's page
   wouldn't load). A change writes a new copy of the path from a leaf to the root and edits no object, so readers on
   older roots are undisturbed, and the root is in the head, so the commit stays the head's compare-and-swap.
@@ -291,7 +291,7 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
 - **Objects are put at a random id, over any object there.** A put that is retried would get 412 on its own object
   under create-if-absent, and 128 random bits won't collide. The link's version id and hash would catch it if they did.
 - **A link pins a version and a hash.** The version means a reader gets the object it was pointed at, however the key
-  has changed since, and survives the delete marker a commit adds. The hash means a head vouches for everything under
+  has changed since, and survives the delete marker the sweep adds. The hash means a head vouches for everything under
   it, so a corrupted or swapped object is `io` and not a guest's data. Neither costs a request.
 - **A value or file up to 4 KiB is inline,** in its leaf. It rides on a request the leaf needed anyway, and 4 KiB is
   a page. Larger ones are objects of their own: a key's up to 1 MiB, a file's in blocks. (It was 1 KiB in the flat
@@ -326,16 +326,16 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   a change time, in Unix nanoseconds, and a time that does not fit one is `overflow`. **`sync`, `sync-data` and
   `advise` do nothing,** as durability is the commit's.
 - **A file unlinked while open is as on Linux.** Its inode stays in the tree at a link count of 0, and is read and
-  written through the descriptors that hold it, as Linux does. The last close in the turn removes it. The commit
-  leaves out an inode still at 0, so it and its blocks are garbage by the usual lists. A descriptor that outlives the
-  answer (a body that streams a file after it) keeps reading through a fork: a copy of the tree's root that shares its
-  reader and its objects, made by the commit before it purges the orphans, and used once the head has landed. The fork
-  reads blocks by version, which a delete marker doesn't hide. So there is no copy of the file, no cap on how many
-  links it can hold and no `io` for a large file, and a temporary file unlinked at once works. A fork has no `made`
-  list and deletes nothing when dropped. This relies on the bucket being versioned, as the sweep and the lifecycle
-  rule do: a non-versioned store, the memory store of `tric dev` and the tests, never deletes an object, so it reads
-  anyway. If the turn is discarded or loses its race, the descriptors read the tree as it was, and what the turn made
-  is gone, so they get `io`.
+  written through the descriptors that hold it, as Linux does. The last close in the turn removes it. The commit leaves
+  out an inode still at 0, so it and its blocks are garbage, for the sweep. A descriptor that outlives the answer (a
+  body that streams a file after it) keeps reading through a fork: a copy of the tree's root that shares its reader and
+  its objects, made by the commit before it purges the orphans from the tree, and used once the head has landed. The
+  fork reads blocks by version, which a delete marker doesn't hide. So there is no copy of the file, no cap on how many
+  links it can hold and no `io` for a large file, and a temporary file unlinked at once works. A fork, like any tree,
+  deletes nothing when dropped. This relies on the bucket being versioned, as the sweep and the lifecycle rule do: a
+  non-versioned store, the memory store of `tric dev` and the tests, never deletes an object, so it reads anyway. If the
+  turn is discarded or loses its race, the descriptors read the tree as it was, which does not hold what the turn made,
+  so they get `io`.
 - **A turn edits the tree directly, as LMDB and bbolt do,** and has no overlay and no cap on its changes. An overlay
   applied at the commit would be a second structure that every read and `readdir` had to merge with the tree, and
   would need a cap to stay in memory, which the guest would hit as an error that no file system gives. Here the nodes
@@ -345,24 +345,27 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   for upload, count against one budget of 8 MiB (`BUDGET`), checked after each write. Past it, the held values and
   blocks upload first, up to 16 at once while the writer waits, and each becomes a link; if the copies are still over
   the budget, the changed nodes upload bottom-up and become links too, which dirties their parents in turn. Nothing
-  refers to an uploaded object until the commit, so a discard deletes what the turn made and nothing else changed.
-  What a turn made and then replaced goes on the delete list, so it is deleted whether the turn lands or not. The turn
-  holds about its budget and one write however much it writes.
+  refers to an uploaded object until the commit, so a discard changes nothing that a head names. What the turn uploaded,
+  and what it uploaded and then replaced, is left for the sweep. The turn holds about its budget and one write however
+  much it writes.
 - **A key's value over 4 KiB is held like a block,** uploaded when the budget spills it or the commit does, and
   counted against the same budget. This reads "upload eagerly, as blocks do" as "dirty against the shared budget and
   spilled by the same rule": a value is not uploaded at the write, since a value written twice in a turn would then
   put an object for each. The files stage adds the blocks to the same rule.
-- **Garbage is deleted by the committer, exactly.** Each attempt knows what it made and what it replaced, so a landed
-  commit deletes the second and any other end deletes the first. DeleteObjects takes 1,000 keys a request
-  (<https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html>). In a versioned bucket a delete adds a
-  marker, so the bytes stay readable by version until the lifecycle rule expires them a day later
-  (<https://docs.aws.amazon.com/AmazonS3/latest/userguide/versioning-workflows.html>).
-- **The deletes are joined at the end of the response body,** not run in a detached task. Lambda freezes an
-  environment when a response ends, so a task left running can stall and, if the environment is retired, never
-  finish, leaving a current object that no rule expires. Started at the commit, a delete is usually done before a
-  body is, and costs at most one trip when it isn't.
-- **Readers are safe from the deletes** because a reader is at most `TOTAL` (300 s) old, reads by version, and a
-  noncurrent version stays a day.
+- **Nothing is deleted at a commit, and the sweep is the only collector.** A turn deletes nothing, whether it lands,
+  loses its race, is discarded, traps or times out. What its edits replace, and what it uploaded for a head that did not
+  land, is left for the sweep. Lance does the same: a write leaves the files of older versions in place, and
+  `cleanup_old_versions` deletes those that no version it keeps names
+  (<https://github.com/lance-format/lance/blob/main/docs/src/guide/read_and_write.md>). So does Icechunk, where
+  `expire_snapshots` marks old snapshots and `garbage_collect` deletes what only they name
+  (<https://github.com/earth-mover/icechunk/blob/main/icechunk-python/docs/docs/understanding/expiration.md>).
+- **A commit deletes nothing because it cannot always know what is live.** A commit that deletes must know which of its
+  objects the head names, and a commit whose answer was lost does not know whether its head landed. A delete chosen then
+  can remove a live node, which is data loss; a delete not made costs storage until the sweep. With no deletes, a lost
+  answer cannot lose data, and a commit is simpler: there are no lists of what a turn made and replaced, and no deletes
+  for a response to wait for before a Lambda is frozen. An earlier tree also stays whole until the sweep takes it, which
+  is a window in which a name can be rolled back. The cost is that every object a commit replaces, and every object of a
+  turn that does not land, is stored until the sweep, where before a commit deleted it at once.
 - **A refusal of a commit's put could be the commit's own write.** A commit is a conditional put of the head, and
   `Store::put` took a refusal (412, 409, or 404 on `If-Match`) as another's write. object_store sends a request again
   after a 5xx, a 429, a 408 or a dropped connection, and a conditional put again after a 409, and does not say that it
@@ -382,34 +385,33 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   (<https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-design-patterns.html>).
 - **tric tries a conditional put again itself, so it knows what a refusal follows.** Conditional puts go through a
   client with object_store's retries off (`max_retries: 0`), which shares its credentials and connections with the one
-  for everything else (`store::S3`). An overwrite, which is idempotent, keeps object_store's retries. `Store::put`
-  tries a conditional put again, as it was, after an error that is not a refusal, up to `TRIES` (4) times, from 50 to
-  100 ms apart and twice as long each time. A refusal at the first try is a conflict, as before: the turn deletes what
-  it made and runs again at once. A refusal after a try that may have landed is an error, for the caller to settle.
-- **A head names its last commits, and a commit with no answer reads the head.** A head holds the random ids of its
-  last `COMMITS` (8) commits, the newest last, so no head after a commit is ever the same as one before it. Icechunk
-  reads back a write id from an object's metadata; a head names several commits instead, as the next commit replaces
-  the metadata, and so would hide a commit that it landed on. A claim whose put errs is held if the head holds it. A
-  commit whose put errs, other than as `TooLarge`, reads the head:
-  - If the head names the commit, it landed. It is done: it deletes what it dropped, keeps what it made, and does not
-    run again. Its answer carries the head's `ETag` if the commit is still the newest, and none if another landed on
-    it, as that head has changes the turn never saw, and a client's `If-Match` with its `ETag` would be checked
-    against them.
-  - If the head names the newest commit of the commit's base, and another after it, and not the commit, another
-    commit landed on the base, and the head will never be the base again, so the commit never lands. It is a conflict,
-    as at a first refusal. A base that named no commit counts only while the head names fewer than `COMMITS`, so that
-    none has been dropped.
+  for everything else (`store::S3`). An overwrite, which is idempotent, keeps object_store's retries. `Store::put` tries
+  a conditional put again, as it was, after an error that is not a refusal, up to `TRIES` (4) times, from 50 to 100 ms
+  apart and twice as long each time. A refusal at the first try is a conflict, as before, and the turn runs again at
+  once. A refusal after a try that may have landed is an error, for the caller to settle.
+- **A head names its last commits, and a commit with no answer reads the head.** A head holds the random ids of its last
+  `COMMITS` (8) commits, the newest last, so no head after a commit is ever the same as one before it. Icechunk reads
+  back a write id from an object's metadata; a head names several commits instead, as the next commit replaces the
+  metadata, and so would hide a commit that it landed on. A claim whose put errs is held if the head holds it. A commit
+  whose put errs, other than as `TooLarge`, reads the head, and what it finds decides only whether the turn runs again:
+  nothing is deleted whatever it finds.
+  - If the head names the commit, it landed. It is done, and does not run again. Its answer carries the head's `ETag` if
+    the commit is still the newest, and none if another landed on it, as that head has changes the turn never saw, and a
+    client's `If-Match` with its `ETag` would be checked against them.
+  - If the head names the newest commit of the commit's base, and another after it, and not the commit, another commit
+    landed on the base, and the head will never be the base again, so the commit never lands. It is a conflict, and the
+    turn runs again. A base that named no commit counts only while the head names fewer than `COMMITS`, so that none has
+    been dropped.
   - Else the outcome is unknown, as below. This is when nothing has landed on the base since, the base's newest commit
     has been dropped from the head, or the head cannot be read.
-- **A commit whose outcome is unknown deletes nothing.** If the compare-and-swap errors and the head does not settle it,
-  the put may have landed, or may yet, and the objects its head names are then the live tree. A put that was sent may be
-  applied after its answer is lost (general knowledge, as above), and a claim taken and let go can return a head to its
-  base's bytes, and so to its `ETag`. The turn deletes neither list, answers 503, and the sweep reclaims what was left.
-  A turn that can't tell which of its objects are live must not guess, since deleting a live node is data loss and
-  keeping a dead one is a day's storage.
+- **A commit whose outcome is unknown answers 503.** If the compare-and-swap errors and the head does not settle it, the
+  put may have landed, or may yet. A put that was sent may be applied after its answer is lost (general knowledge, as
+  above), and a claim taken and let go can return a head to its base's bytes, and so to its `ETag`, so a head that does
+  not name the commit is not proof that it never lands. The turn is neither done nor run again: it answers 503, and its
+  objects are left for the sweep, as every turn's are.
 - **What a lost answer still costs.**
-  - A commit of unknown outcome answers 503, and its objects wait for the sweep (`GRACE`, an hour). If the caller
-    runs the turn again and the first put did land, the turn has run twice.
+  - A commit of unknown outcome answers 503. If the caller runs the turn again and the first put did land, the turn has
+    run twice.
   - A 409 on a head is a conflict, and the turn runs again, where object_store sent the put again.
   - A conditional put that times out is tried again, where object_store did not. Four tries that each wait out the
     30 s timeout take two minutes, against up to three for object_store's ten tries of a 5xx.
@@ -591,8 +593,7 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   a test would need hundreds of thousands of entries to split, let alone merge. The tiny limits (a node of 1,400
   bytes, 8 bytes inline) are what let the same code be run through splits, merges and collapses on a four-level tree
   against a `BTreeMap` of the same operations, and the store checked after every round against what the tree names, so
-  that a leaked or lost object fails the test. Two mutations (a skipped separator fix, a skipped delete of a replaced
-  node) were each shown to fail it.
+  that a lost or deleted object fails the test. A mutation (a skipped separator fix) was shown to fail it.
 - **A change is admitted through a gate, so the answer cannot lose one.** Every change to the tree takes a permit from
   an `RwLock` (held shared while the change is made) and only then checks that the turn has not answered. The commit
   marks the turn answered, and then waits for the lock exclusively before it reads the tree. A change that saw the
@@ -701,8 +702,8 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   inode, and the item of each block, which is the walk of the tree's nodes) and fetched after the tree is let go
   (`Plan::read`, `Plan::warm`), through `Values`, a reader of items that holds the name's reader and not the tree. That
   is safe because an item is a value in memory, or names an object that is never changed, by its version, and a fetch
-  checks the hash. The deletes of a commit leave a marker and not a gap in a bucket that keeps versions, and a store
-  that does not keep them does not delete. Whether a view is the live tree or a kept copy is still decided with the
+  checks the hash. The sweep's deletes leave a marker and not a gap in a bucket that keeps versions, and a store that
+  does not keep them does not delete. Whether a view is the live tree or a kept copy is still decided with the
   tree held. A test holds a read of four blocks in flight on a store that takes a second a GET, and a write and the
   commit go through while it is, for the read and for the read-ahead alike; it fails if either holds the tree.
 - **An offset is signed, and a time is not.** A `read` from an offset past `i64::MAX` is `invalid`, as `pread` has it,
