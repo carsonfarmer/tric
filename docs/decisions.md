@@ -363,10 +363,60 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   body is, and costs at most one trip when it isn't.
 - **Readers are safe from the deletes** because a reader is at most `TOTAL` (300 s) old, reads by version, and a
   noncurrent version stays a day.
-- **A commit whose outcome is unknown deletes nothing.** If the compare-and-swap errors, the head may have landed, and
-  the objects it names are then the live tree. The turn deletes neither list, and the sweep reclaims what was left.
+- **A refusal of a commit's put could be the commit's own write.** A commit is a conditional put of the head, and
+  `Store::put` took a refusal (412, 409, or 404 on `If-Match`) as another's write. object_store sends a request again
+  after a 5xx, a 429, a 408 or a dropped connection, and a conditional put again after a 409, and does not say that it
+  did. So a put that landed but whose answer was lost was sent again, was refused for its own write, and read as a
+  conflict: the turn deleted the objects that its landed head names, which is data loss, and ran again though it had
+  committed. A claim, a conditional put too, was taken for another's, and its own turn was refused with 429 until the
+  claim ran out (`CLAIM_TTL`, 15 s). Icechunk, which writes through object_store too, met the same bug
+  (<https://github.com/earth-mover/icechunk/blob/main/design-docs/017-conditional-put-lost-response.md>).
+- **That a put which failed may have landed is general knowledge, and not something S3 documents.** No AWS page found
+  says that a 5xx may answer a PUT that was applied. RFC 9110 (9.2.2) has a client repeat an idempotent request whose
+  answer was lost, as the repeat has the same effect "even if the original request succeeded, though the response
+  might differ" (<https://www.rfc-editor.org/rfc/rfc9110#section-9.2.2>). A conditional put is not idempotent in that
+  sense, as the repeat is judged against the first one's write. S3 documents 412 for a condition that fails, and 409
+  `ConditionalRequestConflict` for a conflicting operation during the upload, which it says to retry
+  (<https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html>), and says to retry a 503 Slow Down with
+  exponential backoff
+  (<https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-design-patterns.html>).
+- **tric tries a conditional put again itself, so it knows what a refusal follows.** Conditional puts go through a
+  client with object_store's retries off (`max_retries: 0`), which shares its credentials and connections with the one
+  for everything else (`store::S3`). An overwrite, which is idempotent, keeps object_store's retries. `Store::put`
+  tries a conditional put again, as it was, after an error that is not a refusal, up to `TRIES` (4) times, from 50 to
+  100 ms apart and twice as long each time. A refusal at the first try is a conflict, as before: the turn deletes what
+  it made and runs again at once. A refusal after a try that may have landed is an error, for the caller to settle.
+- **A head names its last commits, and a commit with no answer reads the head.** A head holds the random ids of its
+  last `COMMITS` (8) commits, the newest last, so no head after a commit is ever the same as one before it. Icechunk
+  reads back a write id from an object's metadata; a head names several commits instead, as the next commit replaces
+  the metadata, and so would hide a commit that it landed on. A claim whose put errs is held if the head holds it. A
+  commit whose put errs, other than as `TooLarge`, reads the head:
+  - If the head names the commit, it landed. It is done: it deletes what it dropped, keeps what it made, and does not
+    run again. Its answer carries the head's `ETag` if the commit is still the newest, and none if another landed on
+    it, as that head has changes the turn never saw, and a client's `If-Match` with its `ETag` would be checked
+    against them.
+  - If the head names the newest commit of the commit's base, and another after it, and not the commit, another
+    commit landed on the base, and the head will never be the base again, so the commit never lands. It is a conflict,
+    as at a first refusal. A base that named no commit counts only while the head names fewer than `COMMITS`, so that
+    none has been dropped.
+  - Else the outcome is unknown, as below. This is when nothing has landed on the base since, the base's newest commit
+    has been dropped from the head, or the head cannot be read.
+- **A commit whose outcome is unknown deletes nothing.** If the compare-and-swap errors and the head does not settle it,
+  the put may have landed, or may yet, and the objects its head names are then the live tree. A put that was sent may be
+  applied after its answer is lost (general knowledge, as above), and a claim taken and let go can return a head to its
+  base's bytes, and so to its `ETag`. The turn deletes neither list, answers 503, and the sweep reclaims what was left.
   A turn that can't tell which of its objects are live must not guess, since deleting a live node is data loss and
   keeping a dead one is a day's storage.
+- **What a lost answer still costs.**
+  - A commit of unknown outcome answers 503, and its objects wait for the sweep (`GRACE`, an hour). If the caller
+    runs the turn again and the first put did land, the turn has run twice.
+  - A 409 on a head is a conflict, and the turn runs again, where object_store sent the put again.
+  - A conditional put that times out is tried again, where object_store did not. Four tries that each wait out the
+    30 s timeout take two minutes, against up to three for object_store's ten tries of a 5xx.
+  - A claim whose put errs, when the head cannot then be read, is taken for another's, as before: the turn answers
+    429, and the claim runs out in 15 s. That costs availability and not data.
+  - A binary from before `commits` refuses a head that names them, as `Head` denies unknown fields. Every reader
+    must run the new binary before any writer does.
 - **The sweep is built, last.** What leaks is the objects of an attempt whose host died, and of a commit of unknown
   outcome: a trap, a timeout, a lost race and a failed commit are all seen and cleaned. The sweep lists the app's
   names, and for each one walks its tree from its head, lists its objects, and deletes those that are older than the
@@ -439,12 +489,13 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   and no other app's.
 - **The head is the only root.** What points into `values/` is the head's tree, and nothing else does. The head also
   holds `pending`, which is digests of requests (the requests are in the outbox, under `outbox/`, and not under
-  `values/`), and the claim, a lease. The outbox and retry objects hold a request and its digest, and no link. A
-  snapshot or a fork, which a read or a descriptor that outlives the answer holds, is a copy of a root read from a head
-  and reads by version, which a delete marker does not hide, and for at most `TOTAL`, so it needs no mark of its own.
-  A link read from a head or a node is checked to name an object of its own name, so a changed head cannot make the
-  sweep walk, or keep, another's. If anything else were ever to point into `values/`, the sweep would have to mark
-  through it as well, and `tree::object` is where to look for who builds those paths.
+  `values/`), the claim, a lease, and `commits`, the ids of its last commits, which are not links. The outbox and retry
+  objects hold a request and its digest, and no link. A snapshot or a fork, which a read or a descriptor that outlives
+  the answer holds, is a copy of a root read from a head and reads by version, which a delete marker does not hide, and
+  for at most `TOTAL`, so it needs no mark of its own. A link read from a head or a node is checked to name an object of
+  its own name, so a changed head cannot make the sweep walk, or keep, another's. If anything else were ever to point
+  into `values/`, the sweep would have to mark through it as well, and `tree::object` is where to look for who builds
+  those paths.
 - **The grace outlasts the longest turn, by construction.** An object that a head names was made in the turn whose
   commit wrote the head, or is in the tree of the head that turn began from (a commit lands only if its base is the
   head then, so a turn from an older head never lands). The sweep takes `cutoff = now - GRACE` before it lists the
