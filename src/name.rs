@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::{sync::RwLock, sync::watch, task::JoinHandle, time::sleep};
+use tokio::{sync::RwLock, sync::watch, time::sleep};
 use wasmtime::{Result, ensure};
 
 const NAME_MAX: usize = 128;
@@ -31,6 +31,9 @@ const PENDING_TTL: Duration = WINDOW.saturating_add(Duration::from_secs(3600));
 /// The most commits a name may have pending, at some 130 bytes each in its head. At that, a turn's background requests
 /// are refused, so the head stays far under `HEAD_MAX`, and no pending commit is dropped before its time.
 const PENDING_MAX: usize = 1000;
+/// How many of the last commits a head names, at some 35 bytes each: enough that a commit whose answer was lost finds
+/// itself among them though others landed on it while it read.
+const COMMITS: usize = 8;
 
 /// Whether `s` is a name: 1 to 128 of `A-Za-z0-9._~:-`, starting with a letter or digit.
 pub fn is_name(s: &str) -> bool {
@@ -43,7 +46,7 @@ pub fn of(path: &str) -> Option<&str> {
     path.strip_prefix("/@").map(|rest| rest.split('/').next().unwrap_or_default())
 }
 
-/// A name's state: its tree, with the root in the head, and the commits pending and the claim.
+/// A name's state: its tree, with the root in the head, the commits pending, the claim and the last commits.
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Head {
@@ -54,6 +57,10 @@ pub struct Head {
     pub pending: BTreeMap<String, Pending>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claim: Option<Claim>,
+    /// The ids of the last `COMMITS` commits that landed, the newest last. Each is random, so no head after a commit
+    /// is ever the same as one before it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    commits: Vec<String>,
 }
 
 impl Head {
@@ -112,7 +119,8 @@ pub async fn read(store: &Store, path: &Path) -> Result<Option<(Head, UpdateVers
 }
 
 /// Writes `head` over the version `base`, or where there is none, if that is still the head: its new version, or
-/// `None` if another write landed first.
+/// `None` if another write landed first and this one did not. An error other than [`TooLarge`] may have landed, or may
+/// yet: see [`Store::put`].
 async fn put(store: &Store, path: &Path, head: &Head, base: Option<UpdateVersion>) -> Result<Option<UpdateVersion>> {
     let json = serde_json::to_vec(head)?;
     ensure!(json.len() <= HEAD_MAX, TooLarge);
@@ -190,13 +198,42 @@ pub struct Turn {
     pub fs: fs::State,
     claiming: tokio::sync::Mutex<()>,
     settled: watch::Sender<Option<bool>>, // whether it committed, once it is known
-    reaping: Mutex<Vec<JoinHandle<()>>>,  // the deletes of objects no head names, which the response waits for
 }
 
 /// How a commit went.
+#[derive(Debug, PartialEq)]
 pub enum Committed {
-    Done(Option<String>), // with the head's `ETag`
+    Done(Option<String>), // with the head's `ETag`, if that is known
     Conflict,             // another turn changed the name first
+}
+
+/// What became of a commit whose put had no sure answer, by the head as it is now.
+#[derive(Debug, PartialEq)]
+enum Fate {
+    Landed(Option<String>), // with the head's `ETag`, if the commit is still the newest
+    Lost,                   // it did not land, and never will
+    Unknown,
+}
+
+impl Head {
+    /// The fate of the commit `commit`, made on a head whose newest commit was `last`, if this is the head now, at
+    /// `version`. It landed if this head names it. It did not if the head names every commit since `last`, and it is
+    /// not one; and it never will if another is, as no head after that one is ever `last`'s again.
+    fn fate(&self, version: &UpdateVersion, last: Option<&str>, commit: &str) -> Fate {
+        let commits = &self.commits;
+        if let Some(i) = commits.iter().position(|c| c == commit) {
+            // A commit's own head is the one its answer would have described: one on top has others' changes.
+            return Fate::Landed(if i + 1 == commits.len() { etag(version) } else { None });
+        }
+        let since = match last {
+            Some(last) => commits.iter().position(|c| c == last).map(|i| i + 1),
+            None => (commits.len() < COMMITS).then_some(0), // and none was ever dropped
+        };
+        match since {
+            Some(i) if i < commits.len() => Fate::Lost,
+            _ => Fate::Unknown,
+        }
+    }
 }
 
 /// Why a commit failed when its head would be over `HEAD_MAX`. The head is the root of the tree, at most `NODE_MAX`,
@@ -250,9 +287,8 @@ impl Turn {
         let tree = RwLock::new(Tree::open(store, app, name, &head.tree, Limits::default())?);
         let state = Mutex::new(State { head, base, answered, ..Default::default() });
         let (app, name, path, settled) = (app.into(), name.into(), path(app, name), watch::Sender::new(None));
-        let (claiming, reaping) = (Default::default(), Default::default());
-        let fs = Default::default();
-        Ok(Arc::new(Self { store: store.clone(), app, name, path, state, tree, fs, claiming, settled, reaping }))
+        let (claiming, fs) = (Default::default(), Default::default());
+        Ok(Arc::new(Self { store: store.clone(), app, name, path, state, tree, fs, claiming, settled }))
     }
 
     /// A snapshot of `name`: as it is now, without waiting for anyone's claim.
@@ -312,14 +348,22 @@ impl Turn {
             };
             let id = store::random();
             head.claim = Some(Claim { id: id.clone(), until: now() + CLAIM_TTL.as_millis() as u64 });
-            let put = put(&turn.store, &turn.path, &head, base).await;
+            let landed = match put(&turn.store, &turn.path, &head, base).await {
+                Ok(landed) => landed,
+                // It may have landed all the same: the claim is the turn's if the head holds it, and only the turn
+                // changes a head that holds its live claim.
+                Err(_) => match read(&turn.store, &turn.path).await {
+                    Ok(Some((now, version))) if now.claim.as_ref().is_some_and(|c| c.id == id) => Some(version),
+                    _ => None,
+                },
+            };
             let mut s = turn.state();
-            match put {
-                Ok(Some(version)) => {
+            match landed {
+                Some(version) => {
                     (s.head.claim, s.base, s.claim) = (head.claim, Some(version), Some(id));
                     true
                 }
-                Ok(None) | Err(_) => {
+                None => {
                     s.doomed = true;
                     false
                 }
@@ -456,23 +500,6 @@ impl Turn {
         Ok(true)
     }
 
-    /// Deletes `paths`, which no head names, in the background; the response waits for it, in `reaped`.
-    fn reap(&self, paths: Vec<Path>) {
-        if paths.is_empty() {
-            return;
-        }
-        let store = self.store.clone();
-        self.reaping.lock().unwrap().push(tokio::spawn(async move {
-            store.delete_many(paths).await;
-        }));
-    }
-
-    /// The deletes the turn has started, to wait for before the response ends: a Lambda that is frozen does not finish
-    /// them.
-    pub fn reaped(&self) -> Vec<JoinHandle<()>> {
-        std::mem::take(&mut *self.reaping.lock().unwrap())
-    }
-
     /// Commits the turn, asked at `host`: its tree is uploaded, its held requests go to `sink` as a delivery event
     /// whose digest the head keeps in `pending`, and its head goes over the version it read, if that is still the
     /// head. The `ETag` it returns is the new head's, or the old one's when there was nothing to write. A commit that
@@ -497,12 +524,13 @@ impl Turn {
         self.fs.drain().await; // so the file system's changes that were admitted land first
         let mut tree = self.tree.write().await; // after the writes that were in flight
         if doomed {
-            self.reap(tree.lost());
+            tree.reset();
             return Ok(Committed::Conflict);
         }
         if !tree.edited() && held.is_empty() && !claimed {
             return Ok(Committed::Done(base.as_ref().and_then(etag)));
         }
+        let (commit, last) = (store::random(), head.commits.last().cloned());
         let ready = async {
             let mut kept = None;
             if tree.edited() {
@@ -512,8 +540,9 @@ impl Turn {
             let now = now();
             head.pending.retain(|_, p| p.live(now));
             head.claim = None;
+            head.commits.push(commit.clone());
+            head.commits.drain(..head.commits.len().saturating_sub(COMMITS));
             if !held.is_empty() {
-                let commit = store::random();
                 let event = Event {
                     app: self.app.clone(),
                     host: host.into(),
@@ -523,7 +552,7 @@ impl Turn {
                     requests: held,
                 };
                 let bytes = Bytes::from(serde_json::to_vec(&event)?);
-                head.pending.insert(commit, Pending { digest: store::hash(&bytes), at: now });
+                head.pending.insert(commit.clone(), Pending { digest: store::hash(&bytes), at: now });
                 ensure!(serde_json::to_vec(&head)?.len() <= HEAD_MAX, TooLarge); // or the event would be sent in vain
                 sink(bytes).await?;
             }
@@ -532,30 +561,46 @@ impl Turn {
         let kept = match ready.await {
             Ok(kept) => kept,
             Err(e) => {
-                self.reap(tree.lost());
+                tree.reset();
                 return Err(e);
             }
         };
-        match put(&self.store, &self.path, &head, base).await {
-            Ok(Some(version)) => {
-                self.reap(tree.landed());
+        let landed = match put(&self.store, &self.path, &head, base).await {
+            Ok(Some(version)) => Some(etag(&version)),
+            Ok(None) => None,
+            // The head was too large, so it did not go.
+            Err(e) if e.is::<TooLarge>() => {
+                tree.reset();
+                return Err(e);
+            }
+            // Else it may have landed, or may yet: the head says which, if it can.
+            Err(e) => {
+                let fate = match read(&self.store, &self.path).await {
+                    Ok(Some((now, version))) => now.fate(&version, last.as_deref(), &commit),
+                    _ => Fate::Unknown,
+                };
+                tracing::warn!(path = %self.path, commit, ?fate, "commit: {e:#}");
+                match fate {
+                    Fate::Landed(etag) => Some(etag),
+                    Fate::Lost => None,
+                    // It may land yet, so it is neither done nor run again.
+                    Fate::Unknown => {
+                        tree.reset();
+                        return Err(e);
+                    }
+                }
+            }
+        };
+        match landed {
+            Some(etag) => {
                 if let Some(kept) = kept {
                     self.fs.keep(kept); // under the write lock, so a read sees it from the first
                 }
-                Ok(Committed::Done(etag(&version)))
+                Ok(Committed::Done(etag))
             }
-            Ok(None) => {
-                self.reap(tree.lost());
+            None => {
+                tree.reset();
                 Ok(Committed::Conflict)
-            }
-            // The head was too large, so it did not go. Else it may have landed, and then it names what the tree made.
-            Err(e) if e.is::<TooLarge>() => {
-                self.reap(tree.lost());
-                Err(e)
-            }
-            Err(e) => {
-                tree.lost();
-                Err(e)
             }
         }
     }
@@ -570,7 +615,7 @@ impl Turn {
             (s.head.clone(), s.base.clone(), s.claim.take())
         };
         self.fs.drain().await;
-        self.reap(self.tree.write().await.lost());
+        self.tree.write().await.reset();
         self.settled.send_replace(Some(false));
         if claimed.is_some() {
             head.claim = None;
@@ -597,6 +642,15 @@ pub async fn settle(store: &Store, app: &str, name: &str, commit: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::TryStreamExt;
+    use futures_util::stream::BoxStream;
+    use object_store::memory::InMemory;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
     #[test]
     fn names() {
@@ -653,5 +707,228 @@ mod tests {
         let put = put(&store, &path("a", "n"), &head, None).await;
         assert!(put.err().unwrap().is::<TooLarge>());
         assert!(read(&store, &path("a", "n")).await.unwrap().is_none());
+    }
+
+    /// A store whose conditional puts go as its plan says, a step each, and as asked once the plan is done. A step is
+    /// whether the put lands and what lands on it after; then the put fails, as one whose answer was lost.
+    #[derive(Debug, Default)]
+    struct Lossy {
+        inner: InMemory,
+        plan: Mutex<VecDeque<(bool, Then)>>,
+        tries: AtomicUsize, // the conditional puts
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Then {
+        Nothing,
+        Commit, // another turn's commit, which lands on whatever the head is
+        Claim,  // another turn's claim, which does too
+    }
+
+    impl std::fmt::Display for Lossy {
+        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("lossy")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for Lossy {
+        async fn put_opts(&self, at: &Path, payload: PutPayload, opts: PutOptions) -> object_store::Result<PutResult> {
+            if matches!(opts.mode, PutMode::Overwrite) {
+                return self.inner.put_opts(at, payload, opts).await;
+            }
+            self.tries.fetch_add(1, SeqCst);
+            let Some((lands, then)) = self.plan.lock().unwrap().pop_front() else {
+                return self.inner.put_opts(at, payload, opts).await;
+            };
+            if lands {
+                self.inner.put_opts(at, payload, opts).await?;
+            }
+            let mut head: Head = match self.inner.get(at).await {
+                Ok(got) => serde_json::from_slice(&got.bytes().await?).unwrap(),
+                Err(_) => Head::default(),
+            };
+            match then {
+                Then::Nothing => {}
+                Then::Commit => {
+                    head.claim = None;
+                    head.commits.push(store::random());
+                }
+                Then::Claim => head.claim = Some(Claim { id: store::random(), until: now() + 60_000 }),
+            }
+            if !matches!(then, Then::Nothing) {
+                self.inner.put(at, serde_json::to_vec(&head).unwrap().into()).await?;
+            }
+            Err(object_store::Error::Generic { store: "lossy", source: "the answer was lost".into() })
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            at: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(at, opts).await
+        }
+
+        async fn get_opts(&self, at: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
+            self.inner.get_opts(at, opts).await
+        }
+
+        fn delete_stream(
+            &self,
+            _: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            unreachable!("a turn deletes nothing, whatever becomes of it: the sweep is the only collector")
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            at: &Path,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, at)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    /// A versioned store through a `Lossy`, whose name `n` has one commit, of a value at `s`: the base of the turns.
+    async fn based() -> (Store, Arc<Lossy>) {
+        let lossy = Arc::new(Lossy::default());
+        let store = Store { inner: lossy.clone(), versioned: true, cache: Arc::default() };
+        let turn = writes(&store, false, "s").await.unwrap();
+        assert!(matches!(commit(&turn).await.unwrap(), Committed::Done(Some(_))));
+        lossy.tries.store(0, SeqCst);
+        (store, lossy)
+    }
+
+    /// A turn on `n`, claimed if `claim`, that writes at `key` a value too large to be inline, so it is an object.
+    async fn writes(store: &Store, claim: bool, key: &str) -> Result<Arc<Turn>, StatusCode> {
+        let turn = Turn::open(store, "a", "n", claim, &Default::default(), Instant::now()).await.unwrap()?;
+        turn.write(vec![(key.into(), Some(Bytes::from(vec![7; 5000])))]).await.unwrap();
+        Ok(turn)
+    }
+
+    /// Commits `turn`.
+    async fn commit(turn: &Turn) -> Result<Committed> {
+        let sink: Sink = Arc::new(|_| Box::pin(async { Ok(()) }));
+        turn.commit("h", &sink).await
+    }
+
+    /// How many objects the name's tree has in the store.
+    async fn objects(store: &Store) -> usize {
+        store.objects(&store::app("a", &["values", "n"]), None).try_collect::<Vec<_>>().await.unwrap().len()
+    }
+
+    /// The value at `key`, as a turn would read it now.
+    async fn value(store: &Store, key: &str) -> Option<Bytes> {
+        Turn::snap(store, "a", "n").await.unwrap().get(key).await.unwrap()
+    }
+
+    /// The head's `ETag` now.
+    async fn etag_now(store: &Store) -> Option<String> {
+        etag(&read(store, &path("a", "n")).await.unwrap().unwrap().1)
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_landed_but_lost_its_answer_is_done_and_keeps_what_it_made() {
+        let (store, lossy) = based().await;
+        lossy.plan.lock().unwrap().push_back((true, Then::Nothing));
+        let turn = writes(&store, false, "k").await.unwrap();
+        let done = commit(&turn).await.unwrap();
+        assert_eq!(lossy.tries.load(SeqCst), 2, "tried again, and refused as it had landed");
+        assert_eq!(done, Committed::Done(etag_now(&store).await), "not a conflict, so the turn does not run again");
+        assert_eq!(value(&store, "k").await, Some(Bytes::from(vec![7; 5000])));
+        assert_eq!(objects(&store).await, 2, "the base's and the turn's");
+
+        // Another commit landed on it before the head was read: done, but with no ETag, as the head is not its own.
+        let (store, lossy) = based().await;
+        lossy.plan.lock().unwrap().push_back((true, Then::Commit));
+        let turn = writes(&store, false, "k").await.unwrap();
+        assert_eq!(commit(&turn).await.unwrap(), Committed::Done(None));
+        assert_eq!(value(&store, "k").await, Some(Bytes::from(vec![7; 5000])));
+        assert_eq!(objects(&store).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_did_not_land_is_tried_again_or_settled_by_the_head() {
+        // Nothing else changed the name, so it is tried again, and lands.
+        let (store, lossy) = based().await;
+        lossy.plan.lock().unwrap().push_back((false, Then::Nothing));
+        let turn = writes(&store, false, "k").await.unwrap();
+        assert_eq!(commit(&turn).await.unwrap(), Committed::Done(etag_now(&store).await));
+        assert_eq!((lossy.tries.load(SeqCst), objects(&store).await), (2, 2));
+
+        // Another commit landed instead, so this one never will: a conflict, and what it made is left for the sweep.
+        let (store, lossy) = based().await;
+        lossy.plan.lock().unwrap().push_back((false, Then::Commit));
+        let turn = writes(&store, false, "k").await.unwrap();
+        assert_eq!(commit(&turn).await.unwrap(), Committed::Conflict);
+        assert_eq!((value(&store, "k").await, objects(&store).await), (None, 2));
+
+        // Another took a claim, and committed nothing: the put may still land on the head once the claim is let go,
+        // so the commit fails, and the turn is discarded.
+        let (store, lossy) = based().await;
+        lossy.plan.lock().unwrap().push_back((false, Then::Claim));
+        let turn = writes(&store, false, "k").await.unwrap();
+        assert!(commit(&turn).await.is_err());
+        assert_eq!((value(&store, "k").await, objects(&store).await), (None, 2));
+
+        // It never had an answer.
+        let (store, lossy) = based().await;
+        lossy.plan.lock().unwrap().extend([(false, Then::Nothing); store::TRIES as usize]);
+        let turn = writes(&store, false, "k").await.unwrap();
+        assert!(commit(&turn).await.is_err());
+        assert_eq!((lossy.tries.load(SeqCst), objects(&store).await), (store::TRIES as usize, 2));
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_conflicts_keeps_what_it_made_for_the_sweep() {
+        let (store, lossy) = based().await;
+        let (first, second) = (writes(&store, false, "k").await.unwrap(), writes(&store, false, "l").await.unwrap());
+        assert!(matches!(commit(&first).await.unwrap(), Committed::Done(Some(_))));
+        lossy.tries.store(0, SeqCst);
+        assert_eq!(commit(&second).await.unwrap(), Committed::Conflict);
+        assert_eq!(lossy.tries.load(SeqCst), 1, "refused at once, so it did not land");
+        assert_eq!((value(&store, "k").await.is_some(), value(&store, "l").await), (true, None));
+        assert_eq!(objects(&store).await, 3, "the base's, the first's, and the second's for the sweep");
+    }
+
+    #[tokio::test]
+    async fn a_claim_that_landed_but_lost_its_answer_is_held() {
+        let (store, lossy) = based().await;
+        lossy.plan.lock().unwrap().push_back((true, Then::Nothing));
+        let turn = writes(&store, true, "k").await.expect("the claim is the turn's, not another's");
+        assert!(turn.state().claim.is_some() && !turn.doomed());
+        assert_eq!(commit(&turn).await.unwrap(), Committed::Done(etag_now(&store).await));
+        assert!(read(&store, &path("a", "n")).await.unwrap().unwrap().0.claim.is_none());
+    }
+
+    #[test]
+    fn fate() {
+        let version = UpdateVersion { e_tag: Some("e".into()), version: None };
+        let head = |commits: &[&str]| Head { commits: commits.iter().map(|&c| c.into()).collect(), ..Head::default() };
+        let abc = head(&["a", "b", "c"]);
+        assert_eq!(abc.fate(&version, Some("b"), "c"), Fate::Landed(Some("\"e\"".into())));
+        assert_eq!(abc.fate(&version, Some("a"), "b"), Fate::Landed(None), "another landed on it");
+        assert_eq!(abc.fate(&version, Some("b"), "x"), Fate::Lost, "c landed on its base instead");
+        assert_eq!(abc.fate(&version, Some("c"), "x"), Fate::Unknown, "nothing landed on its base yet");
+        assert_eq!(abc.fate(&version, Some("z"), "x"), Fate::Unknown, "its base is too old to tell");
+        assert_eq!(head(&[]).fate(&version, None, "x"), Fate::Unknown);
+        assert_eq!(head(&["a"]).fate(&version, None, "x"), Fate::Lost);
+        let full: Vec<String> = (0..COMMITS).map(|i| i.to_string()).collect();
+        let full = Head { commits: full, ..Head::default() };
+        assert_eq!(full.fate(&version, None, "x"), Fate::Unknown, "the first commits are gone");
+        assert_eq!(full.fate(&version, Some("0"), "x"), Fate::Lost);
     }
 }

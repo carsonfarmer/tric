@@ -16,6 +16,7 @@ include = ["/src", "/wit", "/README.md", "/LICENSE"]
 ws = ["dep:hyper-util", "dep:tokio-tungstenite"]
 
 [dependencies]
+async-trait = "0.1" # as object_store has it, for a store of tric's own
 base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", default-features = false } # as object_store has it, for cron's calendar
@@ -58,7 +59,6 @@ wasmtime-wasi = { version = "=49.0.2", default-features = false, features = ["p3
 wasmtime-wasi-http = { version = "=49.0.2", default-features = false, features = ["component-model-async", "p3"] }
 
 [dev-dependencies]
-async-trait = "0.1"
 tokio = { version = "1", features = ["io-util", "process", "test-util"] }
 
 # Test binaries link side by side, and full debug info for Wasmtime sent `ld` past the 7.7 GiB Podman VM.

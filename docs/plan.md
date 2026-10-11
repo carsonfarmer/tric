@@ -127,11 +127,10 @@ ws/channels/<app>/<channel>/<id> a socket's subscription to a channel (router on
   - an optional claim.
 - **Objects.** Each node, block or large value is immutable, named by a random id under its name, and read by the
   version id in the link that points to it, and checked against that link's SHA-256 and length.
-  - A commit deletes the objects it replaces. With versioning, that only adds a delete marker, so old heads still
-    read them by version id.
-  - A turn that loses its race, fails or is discarded deletes the objects it made.
+  - A turn deletes nothing, whether it lands, loses its race, fails or is discarded: what a commit replaces, and what
+    a turn that does not land made, is left for the sweep; see "Garbage". With versioning, a delete only adds a delete
+    marker, so old heads still read objects by version id.
   - One lifecycle rule expires noncurrent versions after N days and removes expired delete markers.
-  - The one thing left is an attempt whose host died before it deleted; see "Garbage".
 - **`pending`.** Each commit drops pending entries older than the retry window (24 h) and an hour. A name holds at most
   1,000 live ones, so its head stays an eighth under its 1 MiB; the 1,001st background request is refused (503), and no
   old entry is ever dropped for it.
@@ -146,8 +145,7 @@ head's one compare-and-swap commits or fails everything a turn did.
 **Why one tree, and not one for keys and one for files:**
 - One compare-and-swap commits a turn's keys and files together, or neither. Two trees would need two heads, which S3
   can't change together, or one head holding both roots, which is this design.
-- It is one tree to edit, one commit, one pair of garbage lists and one budget. A second tree would copy the hardest
-  code.
+- It is one tree to edit, one commit and one budget. A second tree would copy the hardest code.
 - Key prefixes keep the two apart, so a key write rewrites no file leaf, only the branches above its own.
 - The cost: a name whose tree is larger than one node (64 KiB) reads its keys through the tree, one more GET per level
   when cold, and its commits need one more PUT round per level. A tree that is a root alone, the common case, costs
@@ -263,7 +261,6 @@ were made. A round is one such trip, and S3 bills per request, not by size. D is
 | A partial-block write | 1 GET of that block, unless cached or held |
 | A write below the root | the GETs of its path, D - 1 at most, unless cached or already copied |
 | A commit | PUTs of held blocks (parallel), D - 1 rounds of node PUTs, 1 PUT of the head |
-| Deleting G objects | ceil(G / 1000) DeleteObjects, after the compare-and-swap |
 
 So a cold read of a byte in a big file takes D + 1 trips (3 or 4), and a warm one the head's and the block's. A commit
 of a changed block takes D + 1 (the blocks, a round per level, then the head). A name under 64 KiB, of keys or not,
@@ -274,14 +271,12 @@ branches above it and the head, and not the 10 MiB.
 written, with the splits, merges and collapses of the root.
 
 **Snapshots.** A read at an older head keeps working while newer commits land: every object is immutable and read by
-version, and a commit only adds delete markers.
+version, and a commit deletes nothing.
 
 **Garbage** is an object that no head a reader could be on refers to:
-1. **The committer, exactly.** A commit that lands deletes `dead`. An attempt that is discarded, doomed, loses its race
-   or fails deletes `made`. A commit whose outcome is unknown (the compare-and-swap errored, so the head may have
-   landed) deletes neither. Deletes go as DeleteObjects, 1,000 to a request. They start at the commit and are joined at
-   the end of the response body: no added latency if the body outlasts them, one trip at most if not, and the Lambda
-   environment isn't frozen under them, as it can be under the detached task they run in today.
+1. **Not the committer.** A turn deletes nothing, whether it lands, is discarded, is doomed, loses its race or fails. A
+   commit whose answer is lost can't know which of its objects the head names, and a delete chosen then can remove a
+   live node (`docs/decisions.md`).
 2. **The lifecycle rule,** which the bucket has: a deleted object is a noncurrent version, and goes a day later.
 3. **The sweep,** last of the stages, for what the committer can't know (below).
 
@@ -350,8 +345,8 @@ system: `cli`, `clocks`, `random` and `sockets` `add_to_linker`.
 
 | File | What | Lines |
 |---|---|---|
-| `src/tree.rs` | nodes, links, edits, spill, merge, scans, the cache, garbage lists | 1,080 (built) |
-| `src/name.rs`, `src/tric.rs`, `src/store.rs` | the turn over the tree; the joined deletes | +70 (built) |
+| `src/tree.rs` | nodes, links, edits, spill, merge, scans, the cache | 1,080 (built) |
+| `src/name.rs`, `src/tric.rs`, `src/store.rs` | the turn over the tree; reading the head back | +70 (built) |
 | `src/fs.rs` | the core: descriptors, the gate, orphans, read-ahead, and the paths over the operations | 790 (built) |
 | `src/fs/ops.rs` | inodes, blocks, directories, rename, errors, on the tree | 850 (built) |
 | `src/fs/p3.rs` | 0.3: the descriptor's methods, preopens, `stream` and `future` | 650 (built) |
@@ -408,7 +403,7 @@ overlay applied at the commit.
 4. **A turn edits the tree and spills at its budget,** with no cap on its changes.
 5. **Thin nodes merge,** as bbolt's do.
 6. **JSON nodes,** not a binary codec, which would be a new crate.
-7. **The deletes are joined at the end of the body,** which can add one trip to a body that is shorter than a delete.
+7. **Nothing is deleted at a commit,** and the sweep is the only collector, so a lost answer cannot lose data.
 8. **A name over 64 KiB reads its keys through the tree,** a GET more per level when cold, and not from its head.
 9. **WASI 0.3 alone,** since 8 October 2026. 0.2 came first and 0.3 after, by stage, and 0.2 was then removed.
 

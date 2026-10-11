@@ -9,8 +9,8 @@
 //! root. A node left under a quarter full merges with a neighbour, and a root with one child gives way to it, as in
 //! bbolt.
 //!
-//! Every object the turn uploads is `made`, and every object its edits replace is `dead`. A commit that lands deletes
-//! the dead, and one that does not deletes what was made, so nothing leaks but what a crash leaves behind.
+//! Nothing is deleted at a commit: what the edits replace, and what a turn that does not land uploaded, is left for the
+//! sweep to collect.
 use crate::store::{self, Store};
 use base64::{Engine as _, prelude::BASE64_STANDARD as B64};
 use bytes::Bytes;
@@ -718,16 +718,13 @@ struct Work {
     entries: u64,
     /// The last inode number allocated.
     seq: u64,
-    /// The objects the edits have replaced or dropped, to delete once the commit lands.
-    dead: Vec<Path>,
 }
 
 impl Work {
-    /// The node `at` leads to, in memory and ready to change: a link is loaded, and the object it names is dead.
+    /// The node `at` leads to, in memory and ready to change: a link is loaded.
     async fn dirty<'a>(&mut self, r: &Reader, at: &'a mut At) -> Result<&'a mut Node> {
         if let At::Clean(link) = at {
             let loaded = r.node(link).await?;
-            self.dead.push(r.path(&link.id));
             *at = At::Dirty(Box::new((*loaded).clone()));
         }
         match at {
@@ -754,8 +751,7 @@ impl Work {
                         node.size = node.size + new.wire() - es[i].1.wire();
                         node.held = node.held + new.held() - es[i].1.held();
                         self.bytes = self.bytes + new.len() - es[i].1.len();
-                        let old = std::mem::replace(&mut es[i].1, new);
-                        self.gone(r, old);
+                        es[i].1 = new;
                     }
                     (Err(i), Some(new)) => {
                         node.size += entry(key, &new);
@@ -770,7 +766,6 @@ impl Work {
                         node.held -= old.held();
                         self.bytes -= old.len();
                         self.entries -= 1;
-                        self.gone(r, old);
                     }
                     (Err(_), None) => {}
                 },
@@ -792,13 +787,6 @@ impl Work {
             let right = node.split_off()?;
             Ok(Some((right.first_key().to_owned(), right)))
         })
-    }
-
-    /// Notes that `item` is gone from the tree.
-    fn gone(&mut self, r: &Reader, item: Item) {
-        if let Item::Object(link) = item {
-            self.dead.push(r.path(&link.id));
-        }
     }
 
     /// Merges what is under a quarter full below `node`, as bbolt does: a child with a neighbour, and with the sides
@@ -845,7 +833,6 @@ impl Work {
 /// An upload of what the turn holds, and of the nodes it changed.
 struct Flush<'a> {
     reader: &'a Reader,
-    made: &'a Mutex<Vec<Path>>,
     permits: Semaphore,
     nodes: bool, // the nodes too, and not only the values
 }
@@ -855,7 +842,6 @@ impl Flush<'_> {
     async fn upload(&self, bytes: Bytes) -> Result<Link> {
         let id = store::random();
         let path = self.reader.path(&id);
-        self.made.lock().unwrap().push(path.clone()); // before the upload, as a failed one may have landed
         let h = store::hash(&bytes);
         let _permit = self.permits.acquire().await?;
         let v = self.reader.store.put(&path, bytes.clone(), PutMode::Overwrite).await?.and_then(|v| v.version);
@@ -931,11 +917,8 @@ pub struct Tree {
     base: (Node, Work), // as opened: the root, and the totals
     root: Node,
     work: Work,
-    /// Every object uploaded since the tree was opened or reset.
-    made: Mutex<Vec<Path>>,
     poisoned: bool, // an edit failed, or went away, half way, so the tree cannot be committed
     edited: bool,
-    sealed: bool, // the tree was finished, so what was made may be in a head by now
 }
 
 impl Tree {
@@ -943,18 +926,9 @@ impl Tree {
         let reader =
             Reader { store: store.clone(), app: app.into(), name: name.into(), limits, stats: Stats::default() };
         let root = Node::of(shape.root.clone())?;
-        let work = Work { bytes: shape.bytes, entries: shape.entries, seq: shape.seq, ..Default::default() };
+        let work = Work { bytes: shape.bytes, entries: shape.entries, seq: shape.seq };
         let base = (root.clone(), work.clone());
-        Ok(Self {
-            reader: reader.into(),
-            base,
-            root,
-            work,
-            made: Default::default(),
-            poisoned: false,
-            edited: false,
-            sealed: false,
-        })
+        Ok(Self { reader: reader.into(), base, root, work, poisoned: false, edited: false })
     }
 
     /// A copy of the tree as it is, to read: it shares the objects, and nothing it does is committed.
@@ -963,11 +937,9 @@ impl Tree {
             reader: self.reader.clone(),
             base: self.base.clone(),
             root: self.root.clone(),
-            work: Work { dead: vec![], ..self.work.clone() },
-            made: Default::default(),
+            work: self.work.clone(),
             poisoned: false,
             edited: false,
-            sealed: true, // there is nothing to delete, and it is never committed
         }
     }
 
@@ -1092,7 +1064,7 @@ impl Tree {
     }
 
     async fn flush(&mut self, nodes: bool) -> Result<()> {
-        let flush = Flush { reader: &self.reader, made: &self.made, permits: Semaphore::new(IN_FLIGHT), nodes };
+        let flush = Flush { reader: &self.reader, permits: Semaphore::new(IN_FLIGHT), nodes };
         flush.node(&mut self.root).await?;
         if matches!(&self.root.body, Body::Branch(kids) if kids.is_empty()) {
             self.root = Node::leaf();
@@ -1100,8 +1072,8 @@ impl Tree {
         Ok(())
     }
 
-    /// Readies the tree for a head: merges what is thin, uploads what is changed, and returns the shape of it. The head
-    /// must land before `landed`, or `lost` follows.
+    /// Readies the tree for a head: merges what is thin, uploads what is changed, and returns the shape of it. If the
+    /// head does not land, `reset` follows.
     pub async fn finish(&mut self) -> Result<Shape> {
         ensure!(!self.poisoned, "an earlier change to the name failed");
         self.poisoned = true; // until it is done, as for a write
@@ -1125,26 +1097,18 @@ impl Tree {
                 _ => break,
             }
         }
-        let flush = Flush { reader: r, made: &self.made, permits: Semaphore::new(IN_FLIGHT), nodes: true };
+        let flush = Flush { reader: r, permits: Semaphore::new(IN_FLIGHT), nodes: true };
         flush.node(&mut self.root).await?;
-        self.sealed = true;
         ensure!(self.root.size <= r.limits.node, "the root is over {} bytes", r.limits.node);
-        let Work { bytes, entries, seq, .. } = self.work;
+        let Work { bytes, entries, seq } = self.work;
         Ok(Shape { root: self.root.body.clone(), bytes, entries, seq })
     }
 
-    /// The head landed: what the tree replaced is no more, and the tree is as it was committed. Returns the objects to
-    /// delete.
-    pub fn landed(&mut self) -> Vec<Path> {
-        self.made.get_mut().unwrap().clear();
-        std::mem::take(&mut self.work.dead)
-    }
-
-    /// The head did not land, or the turn is discarded: the tree is as it was opened. Returns the objects to delete.
-    pub fn lost(&mut self) -> Vec<Path> {
+    /// The head did not land, or the turn is discarded: the tree is as it was opened. What it uploaded is left for the
+    /// sweep.
+    pub fn reset(&mut self) {
         (self.root, self.work) = self.base.clone();
-        (self.poisoned, self.edited, self.sealed) = (false, false, false);
-        std::mem::take(self.made.get_mut().unwrap())
+        (self.poisoned, self.edited) = (false, false);
     }
 
     /// How often the tree split, merged and gave up a level of its root.
@@ -1152,17 +1116,6 @@ impl Tree {
     fn rebalanced(&self) -> (u64, u64, u64) {
         let s = &self.reader.stats;
         (s.splits.load(Relaxed), s.merges.load(Relaxed), s.collapses.load(Relaxed))
-    }
-}
-
-impl Drop for Tree {
-    fn drop(&mut self) {
-        // What a turn that went away made is no one's, unless it was committing, when it may be the head's.
-        let made = std::mem::take(self.made.get_mut().unwrap());
-        if let (false, false, Ok(runtime)) = (self.sealed, made.is_empty(), tokio::runtime::Handle::try_current()) {
-            let store = self.reader.store.clone();
-            runtime.spawn(async move { store.delete_many(made).await });
-        }
     }
 }
 
@@ -1345,11 +1298,9 @@ mod tests {
         tree.write(vec![(key.into(), Some(item))]).await.unwrap();
     }
 
-    /// Commits `tree`, as a turn does: the new shape, and the objects it replaced deleted.
-    async fn commit(store: &Store, tree: &mut Tree) -> Shape {
-        let shape = tree.finish().await.unwrap();
-        store.delete_many(tree.landed()).await;
-        shape
+    /// Commits `tree`, as a turn does: the new shape. Nothing is deleted.
+    async fn commit(tree: &mut Tree) -> Shape {
+        tree.finish().await.unwrap()
     }
 
     /// What a tree holds, and that it is a well-formed one.
@@ -1434,13 +1385,6 @@ mod tests {
         tree.value(&tree.get(key).await.unwrap().unwrap()).await.unwrap().to_vec()
     }
 
-    /// Lets what a dropped tree spawned run.
-    async fn settled() {
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-    }
-
     /// The ids of the objects in the store.
     async fn stored(store: &Store) -> BTreeSet<String> {
         let all = store.inner.list(Some(&store::app("a", &["values", "n"])));
@@ -1452,6 +1396,7 @@ mod tests {
         let limits = Limits { entries: 5000, data: 1 << 20, ..tiny() };
         let (mut store, mut rng) = (versioned(), Rng(0x5EED));
         let (mut model, mut shape) = (BTreeMap::<String, Vec<u8>>::new(), Shape::default());
+        let mut before = BTreeSet::new(); // the objects stored after the round before
         let (mut splits, mut merges, mut collapses, mut deepest) = (0, 0, 0, 0);
         for round in 0..300 {
             if rng.below(2) == 0 {
@@ -1527,15 +1472,12 @@ mod tests {
             (splits, merges, collapses) = (splits + a, merges + b, collapses + c);
             if outcome < 7 {
                 shape = finished.unwrap_or(shape);
-                store.delete_many(tree.landed()).await;
                 model = staged;
                 // It serves what it committed.
                 for (k, v) in model.iter().take(20) {
                     let item = tree.get(k).await.unwrap().unwrap();
                     assert_eq!(tree.value(&item).await.unwrap().as_ref(), v.as_slice());
                 }
-            } else {
-                store.delete_many(tree.lost()).await;
             }
             drop(tree);
 
@@ -1550,13 +1492,12 @@ mod tests {
             assert_eq!(fresh.scan("k/", None, usize::MAX).await.unwrap(), model.keys().cloned().collect::<Vec<_>>());
             let live: HashSet<u128> = audit.ids.iter().map(|id| number(id).unwrap()).collect();
             assert_eq!(fresh.reachable(usize::MAX).await.unwrap(), Some(live), "round {round}");
+            // Nothing was deleted, so nothing the head names is lost; what it does not name is for the sweep.
             let stored = stored(&store).await;
-            let (leaked, lost): (Vec<_>, Vec<_>) =
-                (stored.difference(&audit.ids).collect(), audit.ids.difference(&stored).collect());
-            assert!(
-                leaked.is_empty() && lost.is_empty(),
-                "round {round}: {leaked:?} are leaked, and {lost:?} are lost"
-            );
+            let lost: Vec<_> = audit.ids.difference(&stored).collect();
+            assert!(lost.is_empty(), "round {round}: {lost:?} are lost");
+            assert!(before.is_subset(&stored), "round {round}: an object was deleted");
+            before = stored;
         }
         assert!(deepest >= 4, "the tree was {deepest} deep");
         assert!(splits > 0 && merges > 0 && collapses > 0, "{splits} splits, {merges} merges, {collapses} collapses");
@@ -1589,7 +1530,7 @@ mod tests {
         for i in 0..400 {
             set(&mut tree, &format!("k/{i:03}"), &[i as u8; 5]).await;
         }
-        commit(store, &mut tree).await
+        commit(&mut tree).await
     }
 
     /// The ids that `audit` found, as the numbers `reachable` gives.
@@ -1653,7 +1594,7 @@ mod tests {
         let mut tree = at(&store, &Shape::default());
         set(&mut tree, "small", b"abc").await;
         set(&mut tree, "big", &[7; 90]).await; // inline is 8, so this is an object of its own
-        let shape = commit(&store, &mut tree).await;
+        let shape = commit(&mut tree).await;
         let audit = audit(&store, &shape).await;
         assert_eq!(audit.ids.len(), 1, "a root of two keys has no node below it, and one value is an object");
         let fresh = Tree::open(&store, "a", "n", &shape, tiny()).unwrap();
@@ -1684,7 +1625,7 @@ mod tests {
         counts.puts.store(0, SeqCst);
         let mut tree = at(&store, &shape);
         tree.write(vec![("k/zzz".into(), None)]).await.unwrap();
-        assert!(!tree.edited() && tree.work.dead.is_empty());
+        assert!(!tree.edited());
         drop(tree);
         assert_eq!(counts.puts.load(SeqCst), 0);
 
@@ -1696,19 +1637,19 @@ mod tests {
         assert_eq!(counts.gets.load(SeqCst), below);
         let shape = tree.finish().await.unwrap();
         assert_eq!(counts.puts.load(SeqCst), below);
-        assert_eq!(tree.landed().len(), below, "the nodes it replaced");
         assert_eq!(tree.reader.stats.depth.load(Relaxed), levels);
         let after = audit(&store, &shape).await;
         assert_eq!(after.depth, levels);
         drop(tree);
+        assert_eq!(counts.deletes.load(SeqCst), 0, "a commit deletes nothing, not even the nodes it replaced");
     }
 
     #[tokio::test]
-    async fn a_failed_upload_leaves_nothing() {
+    async fn a_failed_upload_loses_nothing() {
         let (store, counts) = counting();
         let shape = grown(&store).await;
         let kept = audit(&store, &shape).await.ids;
-        assert_eq!(stored(&store).await, kept);
+        assert!(stored(&store).await.is_superset(&kept));
 
         // A put fails after `allowed` more: at the first, the next, and so on, until the commit gets through.
         let mut failed = 0;
@@ -1723,15 +1664,16 @@ mod tests {
                 failed += 1;
                 assert!(tree.finish().await.is_err(), "a tree that failed is not committed");
             }
-            store.delete_many(tree.lost()).await;
+            tree.reset();
             counts.allow.store(usize::MAX, SeqCst);
-            assert_eq!(stored(&store).await, kept, "{allowed} uploads allowed");
+            assert!(stored(&store).await.is_superset(&kept), "{allowed} uploads allowed");
             assert_eq!(audit(&store, &shape).await.items.len(), 400);
             if finished.is_ok() {
                 break;
             }
         }
         assert!(failed >= 30, "{failed} commits failed");
+        assert_eq!(counts.deletes.load(SeqCst), 0, "what a failed commit uploaded is left for the sweep");
     }
 
     #[tokio::test]
@@ -1745,15 +1687,10 @@ mod tests {
         assert!(counts.puts.load(SeqCst) > 0, "it spilled");
         let first = tree.get("k/000").await.unwrap().unwrap();
         assert_eq!(tree.value(&first).await.unwrap().as_ref(), &[0; 100]);
-        // Dropped, it deletes what it made.
-        let made = tree.made.lock().unwrap().len();
-        assert_eq!(made, counts.puts.load(SeqCst));
+        // Dropped, it deletes nothing: what it spilled is left for the sweep.
         drop(tree);
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-        assert!(stored(&store).await.is_empty(), "{} left", stored(&store).await.len());
-        assert_eq!(counts.deletes.load(SeqCst), made);
+        assert_eq!(stored(&store).await.len(), counts.puts.load(SeqCst));
+        assert_eq!(counts.deletes.load(SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1789,7 +1726,7 @@ mod tests {
         for i in 0..40 {
             set(&mut tree, &format!("k/{i:02}"), &[i as u8; 50]).await;
         }
-        let shape = commit(&store, &mut tree).await;
+        let shape = commit(&mut tree).await;
         let seen = audit(&store, &shape).await;
         let path = |id: &str| store::app("a", &["values", "n", id]);
 
@@ -1879,7 +1816,7 @@ mod tests {
                 model.insert(key, value.into_bytes());
             }
         }
-        let shape = commit(&store, &mut tree).await;
+        let shape = commit(&mut tree).await;
         drop(tree);
         let levels = audit(&store, &shape).await.depth;
         assert!(levels >= 3, "{levels} levels");
@@ -1939,7 +1876,6 @@ mod tests {
     async fn a_fork_is_a_tree_of_its_own() {
         let (store, counts) = counting();
         let shape = grown(&store).await;
-        counts.deletes.store(0, SeqCst);
         let mut tree = at(&store, &shape);
         set(&mut tree, "k/000", b"was").await;
         set(&mut tree, "k/001", &[7; 90]).await; // a value to upload, held in the node
@@ -1959,26 +1895,20 @@ mod tests {
         assert!(tree.get("k/200").await.unwrap().is_none() && fork.get("k/200").await.unwrap().is_some());
         assert!(tree.get("k/300").await.unwrap().is_some() && fork.get("k/300").await.unwrap().is_none());
 
-        // Whatever a tree uploaded before, a fork reads, and dropping it deletes none of it: that is for the tree.
+        // Whatever a tree uploaded before, a fork reads, and dropping either deletes none of it.
         drop((fork, tree));
-        settled().await;
-        counts.deletes.store(0, SeqCst);
+        counts.puts.store(0, SeqCst);
         let mut tree = at(&store, &shape);
         for i in 0..60 {
             set(&mut tree, &format!("k/{i:03}"), &[i as u8; 100]).await;
         }
-        let made = tree.made.lock().unwrap().len();
-        assert!(made > 0, "it spilled");
+        assert!(counts.puts.load(SeqCst) > 0, "it spilled");
         let fork = tree.fork();
         for i in 0..60 {
             assert_eq!(text(&fork, &format!("k/{i:03}")).await, [i as u8; 100]);
         }
-        drop(fork);
-        settled().await;
+        drop((fork, tree));
         assert_eq!(counts.deletes.load(SeqCst), 0);
-        drop(tree);
-        settled().await;
-        assert_eq!(counts.deletes.load(SeqCst), made);
     }
 
     #[tokio::test]
@@ -1987,7 +1917,7 @@ mod tests {
         let mut tree = at(&store, &Shape::default());
         assert_eq!((tree.alloc(), tree.alloc()), (2, 3), "the root is 1");
         set(&mut tree, "f/2", b"x").await;
-        let shape = commit(&store, &mut tree).await;
+        let shape = commit(&mut tree).await;
         assert_eq!(shape.seq, 3);
         let shape: Shape = serde_json::from_str(&serde_json::to_string(&shape).unwrap()).unwrap();
         assert_eq!(shape.seq, 3);
@@ -1995,7 +1925,7 @@ mod tests {
         // A tree goes on from the shape, and a turn that is lost leaves its numbers to the next.
         let mut next = at(&store, &shape);
         assert_eq!((next.alloc(), next.alloc()), (4, 5));
-        assert!(next.lost().is_empty());
+        next.reset();
         assert_eq!(next.alloc(), 4);
 
         // A name emptied has still used its numbers up, so its head is not empty.
@@ -2017,7 +1947,7 @@ mod tests {
         let mut tree = at(&store, &Shape::default());
         set(&mut tree, "k/a", &[1; 60]).await;
         set(&mut tree, "k/b", &[2; 60]).await;
-        let shape = commit(&store, &mut tree).await;
+        let shape = commit(&mut tree).await;
         drop(tree);
 
         // What a turn uploaded is kept for the next request, so a read of it is not a GET.
@@ -2059,7 +1989,7 @@ mod tests {
         let (mut store, counts) = counting();
         let mut tree = at(&store, &Shape::default());
         set(&mut tree, "k/a", &[1; 60]).await;
-        let shape = commit(&store, &mut tree).await;
+        let shape = commit(&mut tree).await;
         drop(tree);
         store.cache = Arc::default();
         let tree = Arc::new(at(&store, &shape));
@@ -2106,7 +2036,7 @@ mod tests {
         let (mut store, counts) = counting();
         let mut tree = at(&store, &Shape::default());
         set(&mut tree, "k/a", &[1; 60]).await;
-        let shape = commit(&store, &mut tree).await;
+        let shape = commit(&mut tree).await;
         drop(tree);
         store.cache = Arc::default();
         let tree = Arc::new(at(&store, &shape));
@@ -2141,7 +2071,7 @@ mod tests {
         let (store, counts) = counting();
         let mut tree = at(&store, &Shape::default());
         set(&mut tree, "k/a", &[1; 60]).await;
-        let shape = commit(&store, &mut tree).await;
+        let shape = commit(&mut tree).await;
         drop(tree);
         // That includes when the one that fetches lets go of the gate and wakes the next in turn: whichever way the
         // drops of the cancelled read and of what it waits on fall, none of them leaves a gate behind.

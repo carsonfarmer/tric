@@ -56,7 +56,7 @@ struct Loaded {
 pub async fn run(listen: SocketAddr, domain: String, bucket: String, outbox: String) -> Result<()> {
     let sink: Sink = match outbox.starts_with("arn:") {
         true => {
-            let aws = Arc::new(Aws::new(&store::s3(&bucket, None)?)?);
+            let aws = Arc::new(Aws::new(&*store::s3(&bucket, None)?)?);
             Arc::new(move |event| {
                 let (aws, outbox) = (aws.clone(), outbox.clone());
                 async move { timeout(HAND, lambda::hand(&aws, &outbox, event)).await? }.boxed()
