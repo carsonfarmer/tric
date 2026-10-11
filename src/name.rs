@@ -212,18 +212,27 @@ pub enum Committed {
 #[derive(Debug, PartialEq)]
 enum Fate {
     Landed(Option<String>), // with the head's `ETag`, if the commit is still the newest
+    Lost,                   // it did not land, and never will
     Unknown,
 }
 
 impl Head {
-    /// The fate of the commit `commit`, if this is the head now, at `version`. It landed if this head names it, and
-    /// else it may not have, or may yet.
-    fn fate(&self, version: &UpdateVersion, commit: &str) -> Fate {
+    /// The fate of the commit `commit`, made on a head whose newest commit was `last`, if this is the head now, at
+    /// `version`. It landed if this head names it. It did not if the head names every commit since `last`, and it is
+    /// not one; and it never will if another is, as no head after that one is ever `last`'s again.
+    fn fate(&self, version: &UpdateVersion, last: Option<&str>, commit: &str) -> Fate {
         let commits = &self.commits;
-        match commits.iter().position(|c| c == commit) {
+        if let Some(i) = commits.iter().position(|c| c == commit) {
             // A commit's own head is the one its answer would have described: one on top has others' changes.
-            Some(i) => Fate::Landed(if i + 1 == commits.len() { etag(version) } else { None }),
-            None => Fate::Unknown,
+            return Fate::Landed(if i + 1 == commits.len() { etag(version) } else { None });
+        }
+        let since = match last {
+            Some(last) => commits.iter().position(|c| c == last).map(|i| i + 1),
+            None => (commits.len() < COMMITS).then_some(0), // and none was ever dropped
+        };
+        match since {
+            Some(i) if i < commits.len() => Fate::Lost,
+            _ => Fate::Unknown,
         }
     }
 }
@@ -540,7 +549,7 @@ impl Turn {
         if !tree.edited() && held.is_empty() && !claimed {
             return Ok(Committed::Done(base.as_ref().and_then(etag)));
         }
-        let commit = store::random();
+        let (commit, last) = (store::random(), head.commits.last().cloned());
         let ready = async {
             let mut kept = None;
             if tree.edited() {
@@ -586,12 +595,13 @@ impl Turn {
             // Else it may have landed, or may yet: the head says which, if it can.
             Err(e) => {
                 let fate = match read(&self.store, &self.path).await {
-                    Ok(Some((now, version))) => now.fate(&version, &commit),
+                    Ok(Some((now, version))) => now.fate(&version, last.as_deref(), &commit),
                     _ => Fate::Unknown,
                 };
                 tracing::warn!(path = %self.path, commit, ?fate, "commit: {e:#}");
                 match fate {
                     Fate::Landed(etag) => Some(etag),
+                    Fate::Lost => None,
                     // If it lands, the head names what the tree made, so that is left for the sweep.
                     Fate::Unknown => {
                         tree.lost();
@@ -883,13 +893,12 @@ mod tests {
         assert_eq!(commit(&turn).await.unwrap(), Committed::Done(etag_now(&store).await));
         assert_eq!((lossy.tries.load(SeqCst), objects(&store).await), (2, 2));
 
-        // Another commit landed instead, but the head does not say that this one never will: the commit fails, and
-        // deletes nothing it made.
+        // Another commit landed instead, so this one never will: a conflict, and what it made is deleted.
         let (store, lossy) = based().await;
         lossy.plan.lock().unwrap().push_back((false, Then::Commit));
         let turn = writes(&store, false, "k").await.unwrap();
-        assert!(commit(&turn).await.is_err());
-        assert_eq!((value(&store, "k").await, objects(&store).await), (None, 2));
+        assert_eq!(commit(&turn).await.unwrap(), Committed::Conflict);
+        assert_eq!((value(&store, "k").await, objects(&store).await), (None, 1));
 
         // Another took a claim, and committed nothing: the put may still land on the head once the claim is let go,
         // so the commit fails, and deletes nothing it made.
@@ -934,9 +943,16 @@ mod tests {
         let version = UpdateVersion { e_tag: Some("e".into()), version: None };
         let head = |commits: &[&str]| Head { commits: commits.iter().map(|&c| c.into()).collect(), ..Head::default() };
         let abc = head(&["a", "b", "c"]);
-        assert_eq!(abc.fate(&version, "c"), Fate::Landed(Some("\"e\"".into())));
-        assert_eq!(abc.fate(&version, "b"), Fate::Landed(None), "another landed on it");
-        assert_eq!(abc.fate(&version, "x"), Fate::Unknown);
-        assert_eq!(head(&[]).fate(&version, "x"), Fate::Unknown);
+        assert_eq!(abc.fate(&version, Some("b"), "c"), Fate::Landed(Some("\"e\"".into())));
+        assert_eq!(abc.fate(&version, Some("a"), "b"), Fate::Landed(None), "another landed on it");
+        assert_eq!(abc.fate(&version, Some("b"), "x"), Fate::Lost, "c landed on its base instead");
+        assert_eq!(abc.fate(&version, Some("c"), "x"), Fate::Unknown, "nothing landed on its base yet");
+        assert_eq!(abc.fate(&version, Some("z"), "x"), Fate::Unknown, "its base is too old to tell");
+        assert_eq!(head(&[]).fate(&version, None, "x"), Fate::Unknown);
+        assert_eq!(head(&["a"]).fate(&version, None, "x"), Fate::Lost);
+        let full: Vec<String> = (0..COMMITS).map(|i| i.to_string()).collect();
+        let full = Head { commits: full, ..Head::default() };
+        assert_eq!(full.fate(&version, None, "x"), Fate::Unknown, "the first commits are gone");
+        assert_eq!(full.fate(&version, Some("0"), "x"), Fate::Lost);
     }
 }
