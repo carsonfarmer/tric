@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::{sync::RwLock, sync::watch, task::JoinHandle, time::sleep};
+use tokio::{sync::RwLock, sync::watch, time::sleep};
 use wasmtime::{Result, ensure};
 
 const NAME_MAX: usize = 128;
@@ -198,7 +198,6 @@ pub struct Turn {
     pub fs: fs::State,
     claiming: tokio::sync::Mutex<()>,
     settled: watch::Sender<Option<bool>>, // whether it committed, once it is known
-    reaping: Mutex<Vec<JoinHandle<()>>>,  // the deletes of objects no head names, which the response waits for
 }
 
 /// How a commit went.
@@ -288,9 +287,8 @@ impl Turn {
         let tree = RwLock::new(Tree::open(store, app, name, &head.tree, Limits::default())?);
         let state = Mutex::new(State { head, base, answered, ..Default::default() });
         let (app, name, path, settled) = (app.into(), name.into(), path(app, name), watch::Sender::new(None));
-        let (claiming, reaping) = (Default::default(), Default::default());
-        let fs = Default::default();
-        Ok(Arc::new(Self { store: store.clone(), app, name, path, state, tree, fs, claiming, settled, reaping }))
+        let (claiming, fs) = (Default::default(), Default::default());
+        Ok(Arc::new(Self { store: store.clone(), app, name, path, state, tree, fs, claiming, settled }))
     }
 
     /// A snapshot of `name`: as it is now, without waiting for anyone's claim.
@@ -502,23 +500,6 @@ impl Turn {
         Ok(true)
     }
 
-    /// Deletes `paths`, which no head names, in the background; the response waits for it, in `reaped`.
-    fn reap(&self, paths: Vec<Path>) {
-        if paths.is_empty() {
-            return;
-        }
-        let store = self.store.clone();
-        self.reaping.lock().unwrap().push(tokio::spawn(async move {
-            store.delete_many(paths).await;
-        }));
-    }
-
-    /// The deletes the turn has started, to wait for before the response ends: a Lambda that is frozen does not finish
-    /// them.
-    pub fn reaped(&self) -> Vec<JoinHandle<()>> {
-        std::mem::take(&mut *self.reaping.lock().unwrap())
-    }
-
     /// Commits the turn, asked at `host`: its tree is uploaded, its held requests go to `sink` as a delivery event
     /// whose digest the head keeps in `pending`, and its head goes over the version it read, if that is still the
     /// head. The `ETag` it returns is the new head's, or the old one's when there was nothing to write. A commit that
@@ -543,7 +524,7 @@ impl Turn {
         self.fs.drain().await; // so the file system's changes that were admitted land first
         let mut tree = self.tree.write().await; // after the writes that were in flight
         if doomed {
-            self.reap(tree.lost());
+            tree.reset();
             return Ok(Committed::Conflict);
         }
         if !tree.edited() && held.is_empty() && !claimed {
@@ -580,7 +561,7 @@ impl Turn {
         let kept = match ready.await {
             Ok(kept) => kept,
             Err(e) => {
-                self.reap(tree.lost());
+                tree.reset();
                 return Err(e);
             }
         };
@@ -589,7 +570,7 @@ impl Turn {
             Ok(None) => None,
             // The head was too large, so it did not go.
             Err(e) if e.is::<TooLarge>() => {
-                self.reap(tree.lost());
+                tree.reset();
                 return Err(e);
             }
             // Else it may have landed, or may yet: the head says which, if it can.
@@ -602,9 +583,9 @@ impl Turn {
                 match fate {
                     Fate::Landed(etag) => Some(etag),
                     Fate::Lost => None,
-                    // If it lands, the head names what the tree made, so that is left for the sweep.
+                    // It may land yet, so it is neither done nor run again.
                     Fate::Unknown => {
-                        tree.lost();
+                        tree.reset();
                         return Err(e);
                     }
                 }
@@ -612,14 +593,13 @@ impl Turn {
         };
         match landed {
             Some(etag) => {
-                self.reap(tree.landed());
                 if let Some(kept) = kept {
                     self.fs.keep(kept); // under the write lock, so a read sees it from the first
                 }
                 Ok(Committed::Done(etag))
             }
             None => {
-                self.reap(tree.lost());
+                tree.reset();
                 Ok(Committed::Conflict)
             }
         }
@@ -635,7 +615,7 @@ impl Turn {
             (s.head.clone(), s.base.clone(), s.claim.take())
         };
         self.fs.drain().await;
-        self.reap(self.tree.write().await.lost());
+        self.tree.write().await.reset();
         self.settled.send_replace(Some(false));
         if claimed.is_some() {
             head.claim = None;
@@ -796,9 +776,9 @@ mod tests {
 
         fn delete_stream(
             &self,
-            paths: BoxStream<'static, object_store::Result<Path>>,
+            _: BoxStream<'static, object_store::Result<Path>>,
         ) -> BoxStream<'static, object_store::Result<Path>> {
-            self.inner.delete_stream(paths)
+            unreachable!("a turn deletes nothing, whatever becomes of it: the sweep is the only collector")
         }
 
         fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
@@ -839,14 +819,10 @@ mod tests {
         Ok(turn)
     }
 
-    /// Commits `turn`, and waits for what it deletes.
+    /// Commits `turn`.
     async fn commit(turn: &Turn) -> Result<Committed> {
         let sink: Sink = Arc::new(|_| Box::pin(async { Ok(()) }));
-        let committed = turn.commit("h", &sink).await;
-        for reaping in turn.reaped() {
-            reaping.await.unwrap();
-        }
-        committed
+        turn.commit("h", &sink).await
     }
 
     /// How many objects the name's tree has in the store.
@@ -893,15 +869,15 @@ mod tests {
         assert_eq!(commit(&turn).await.unwrap(), Committed::Done(etag_now(&store).await));
         assert_eq!((lossy.tries.load(SeqCst), objects(&store).await), (2, 2));
 
-        // Another commit landed instead, so this one never will: a conflict, and what it made is deleted.
+        // Another commit landed instead, so this one never will: a conflict, and what it made is left for the sweep.
         let (store, lossy) = based().await;
         lossy.plan.lock().unwrap().push_back((false, Then::Commit));
         let turn = writes(&store, false, "k").await.unwrap();
         assert_eq!(commit(&turn).await.unwrap(), Committed::Conflict);
-        assert_eq!((value(&store, "k").await, objects(&store).await), (None, 1));
+        assert_eq!((value(&store, "k").await, objects(&store).await), (None, 2));
 
         // Another took a claim, and committed nothing: the put may still land on the head once the claim is let go,
-        // so the commit fails, and deletes nothing it made.
+        // so the commit fails, and the turn is discarded.
         let (store, lossy) = based().await;
         lossy.plan.lock().unwrap().push_back((false, Then::Claim));
         let turn = writes(&store, false, "k").await.unwrap();
@@ -917,7 +893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_commit_that_conflicts_deletes_what_it_made_and_runs_again() {
+    async fn a_commit_that_conflicts_keeps_what_it_made_for_the_sweep() {
         let (store, lossy) = based().await;
         let (first, second) = (writes(&store, false, "k").await.unwrap(), writes(&store, false, "l").await.unwrap());
         assert!(matches!(commit(&first).await.unwrap(), Committed::Done(Some(_))));
@@ -925,7 +901,7 @@ mod tests {
         assert_eq!(commit(&second).await.unwrap(), Committed::Conflict);
         assert_eq!(lossy.tries.load(SeqCst), 1, "refused at once, so it did not land");
         assert_eq!((value(&store, "k").await.is_some(), value(&store, "l").await), (true, None));
-        assert_eq!(objects(&store).await, 2, "the base's and the first's");
+        assert_eq!(objects(&store).await, 3, "the base's, the first's, and the second's for the sweep");
     }
 
     #[tokio::test]

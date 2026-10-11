@@ -6,7 +6,7 @@ use crate::outbound::{self, Allow, Fut, Sent};
 use crate::outbox::{self, Held, Sink};
 use crate::store::Store;
 use bytes::{Bytes, BytesMut};
-use futures_util::{FutureExt, StreamExt, future::join_all, stream};
+use futures_util::{FutureExt, StreamExt, stream};
 use http::header::{CONTENT_TYPE, ETAG, FORWARDED, RETRY_AFTER};
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use http_body_util::{BodyExt, BodyStream, StreamBody};
@@ -18,7 +18,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::{sync::Mutex, task::JoinHandle, time::sleep};
+use tokio::{sync::Mutex, time::sleep};
 use wasmtime_wasi_http::{RequestOptions, WasiBody, WasiHttpHooks, io::TokioIo};
 
 pub type Request = http::Request<WasiBody>;
@@ -188,29 +188,8 @@ impl Tric {
         self.dispatch(req, host, vec![], 0).await
     }
 
-    /// Runs `req` in an instance, as a turn if it is one. The response ends once the objects that turns left behind are
-    /// deleted, so a Lambda that is frozen at the end of the response does not leave the deletes half done.
+    /// Runs `req` in an instance, as a turn if it is one, as often as a turn on its name takes.
     async fn dispatch(self: &Arc<Self>, req: Request, host: &str, chain: Vec<String>, depth: usize) -> Response {
-        let mut reaping = vec![];
-        let res = self.attempts(req, host, chain, depth, &mut reaping).await;
-        match reaping.is_empty() {
-            true => res,
-            false => res.map(|body| {
-                let end = stream::once(join_all(reaping)).filter_map(|_| std::future::ready(None));
-                StreamBody::new(BodyStream::new(body).chain(end)).boxed_unsync()
-            }),
-        }
-    }
-
-    /// Runs `req` as often as a turn on its name takes, with the deletes it starts in `reaping`.
-    async fn attempts(
-        self: &Arc<Self>,
-        req: Request,
-        host: &str,
-        chain: Vec<String>,
-        depth: usize,
-        reaping: &mut Vec<JoinHandle<()>>,
-    ) -> Response {
         let named = name::of(req.uri().path()).map(str::to_owned);
         let ctx = |turn, chain| {
             let (tric, name, snaps, host) = (self.clone(), named.clone(), Mutex::default(), host.into());
@@ -254,9 +233,7 @@ impl Tric {
                 timer.claim().await;
             });
             let req = http::Request::from_parts(parts.clone(), body);
-            let attempt = self.attempt(&turn, req, ctx(Some(turn.clone()), chain.clone()), host).await;
-            reaping.extend(turn.reaped());
-            match attempt {
+            match self.attempt(&turn, req, ctx(Some(turn.clone()), chain.clone()), host).await {
                 Some(res) => return res,
                 None => claim = true,
             }
