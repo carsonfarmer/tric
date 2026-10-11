@@ -64,18 +64,29 @@ RUN set -eu; mkdir /rt && cd /rt \
       --package componentize-qjs-runtime --no-default-features --features component-model-async \
  && cp target/wasm32-wasip3/release/componentize_qjs_runtime.wasm /runtime.wasm
 
-# The WASI conformance tests of the file system (docs/decisions.md): the wasi-testsuite at one commit, its Rust and C
-# tests for WASI 0.1, which the tests componentise with the adapter of the Wasmtime release tric pins, and its Rust
-# components for WASI 0.3. Fetched by hash. A stage of its own, so that the toolchain image gains the files alone.
+# The WASI conformance tests of the file system (docs/decisions.md): the wasi-testsuite's sources at one commit,
+# fetched by hash, and those of its tests that name a directory to preopen, built for WASI 0.3: those in C by the SDK's
+# clang, and those in Rust by the fixture toolchain, with the manifest and lockfile in conformance/. A stage of its own,
+# so that the toolchain image gains the tests alone.
 FROM base AS conformance
-RUN set -eu; mkdir /conformance && cd /conformance \
- && curl -fsSL -o adapter.wasm https://github.com/bytecodealliance/wasmtime/releases/download/v49.0.2/wasi_snapshot_preview1.command.wasm \
- && echo "09eb9c1a09abb057c61c3dc6979d34277272867610af065246057e1bdf327527  adapter.wasm" | sha256sum -c - \
- && curl -fsSL -o suite.tar.gz https://github.com/WebAssembly/wasi-testsuite/archive/e0aa527fab67f2f311882bcee4f62cc755433b73.tar.gz \
- && echo "b511c0bd77325ae27c93b51059c3b9ed8ac2b35f2872ee94993d39f5595f54cd  suite.tar.gz" | sha256sum -c - \
- && tar xzf suite.tar.gz --strip-components=2 --wildcards '*/tests/rust/testsuite/wasm32-wasip1' '*/tests/c/testsuite/wasm32-wasip1' '*/tests/rust/testsuite/wasm32-wasip3' \
- && rm suite.tar.gz && ls adapter.wasm rust/testsuite/wasm32-wasip1/manifest.json c/testsuite/wasm32-wasip1/manifest.json \
-      rust/testsuite/wasm32-wasip3/manifest.json
+COPY --from=sdk /sdk /sdk
+COPY conformance/Cargo.toml conformance/Cargo.lock /build/
+RUN set -eu; mkdir /suite && cd /suite \
+ && curl -fsSL -o suite.tar.gz https://github.com/WebAssembly/wasi-testsuite/archive/5ea11d8fe958beb60fb871d6852ae020e45c0433.tar.gz \
+ && echo "e480fefa26ced9a5a8c61293ab26f358dcbdbab52789dcffeac78308b530a9ce  suite.tar.gz" | sha256sum -c - \
+ && tar xzf suite.tar.gz --strip-components=1 --wildcards '*/tests/c/src' '*/tests/rust/wasm32-wasip3/src/bin' \
+      '*/tests/rust/wasm32-wasip3/wit' && rm suite.tar.gz \
+ && mkdir -p /conformance/c /conformance/rust \
+ && cd /suite/tests/c/src && cp -R fs-tests.dir /conformance/c/ \
+ && for json in *.json; do test=${json%.json}; cp "$json" /conformance/c/ \
+      && /sdk/bin/clang --target=wasm32-wasip3 -o "/conformance/c/$test.wasm" "$test.c" || exit 1; done \
+ && cd /suite/tests/rust/wasm32-wasip3 && cp /build/Cargo.toml /build/Cargo.lock . \
+ && cargo "+$TRIC_FIXTURE_TOOLCHAIN" build --release --locked --target wasm32-wasip3 --examples \
+ && cp -R src/bin/fs-tests.dir /conformance/rust/ \
+ && for json in src/bin/filesystem-*.json; do test=$(basename "$json" .json); cp "$json" /conformance/rust/ \
+      && cp "target/wasm32-wasip3/release/examples/$(echo "$test" | tr - _).wasm" "/conformance/rust/$test.wasm" \
+      || exit 1; done \
+ && cd / && rm -rf /suite
 
 FROM base
 COPY --from=qjs /qjs/cli/target/release/componentize-qjs /usr/local/bin/componentize-qjs
