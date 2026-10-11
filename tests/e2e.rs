@@ -10,8 +10,9 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::client::conn::http1;
 use hyper::service::service_fn;
-use object_store::aws::{AmazonS3, AmazonS3Builder};
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload, path::Path as Key};
+use object_store::aws::{AmazonS3, AmazonS3Builder, AwsAuthorizer, AwsCredential};
+use object_store::client::{HttpConnector, ReqwestConnector};
+use object_store::{ClientOptions, ObjectStore, ObjectStoreExt, PutPayload, path::Path as Key};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
@@ -62,6 +63,29 @@ fn owner() -> AmazonS3 {
     let var = |k| std::env::var(k).unwrap_or_else(|_| panic!("{k}: run the tests in compose, which sets it"));
     let s3 = AmazonS3Builder::from_env().with_bucket_name(var("TRIC_BUCKET"));
     s3.with_access_key_id(var("RUSTFS_ACCESS_KEY")).with_secret_access_key(var("RUSTFS_SECRET_KEY")).build().unwrap()
+}
+
+/// A ListObjectVersions of the bucket, of the keys under `prefix` if given, with `creds` as STS gives them, or the
+/// owner's if `None`, as the sweep makes it: its status, and its body. object_store makes none.
+async fn versions(creds: Option<&Value>, prefix: Option<&str>) -> (u16, String) {
+    let var = |k| std::env::var(k).unwrap_or_else(|_| panic!("{k}: run the tests in compose, which sets it"));
+    let cred = match creds {
+        Some(c) => AwsCredential {
+            key_id: c["AccessKeyId"].as_str().unwrap().into(),
+            secret_key: c["SecretAccessKey"].as_str().unwrap().into(),
+            token: c["SessionToken"].as_str().map(Into::into),
+        },
+        None => AwsCredential { key_id: var("RUSTFS_ACCESS_KEY"), secret_key: var("RUSTFS_SECRET_KEY"), token: None },
+    };
+    // The prefix is a key, of an app's name and a name, which are DNS labels.
+    let prefix = prefix.map_or(String::new(), |p| format!("&prefix={}", p.replace('/', "%2F")));
+    let uri = format!("{}/{}?versions={prefix}", var("AWS_ENDPOINT_URL"), var("TRIC_BUCKET"));
+    let mut req = http::Request::get(uri).body(Vec::new().into()).unwrap();
+    AwsAuthorizer::new(&cred, "s3", &var("AWS_REGION")).try_authorize(&mut req, None).unwrap();
+    let http = ReqwestConnector {}.connect(&ClientOptions::new().with_allow_http(true)).unwrap();
+    let res = http.execute(req).await.unwrap();
+    let status = res.status().as_u16();
+    (status, String::from_utf8(res.into_body().bytes().await.unwrap().to_vec()).unwrap())
 }
 
 /// Deploys the app at `path`, with `args`, as an app of its own, named after its directory, and returns that name.
@@ -883,22 +907,33 @@ async fn isolates_apps() {
         get(k.clone()).await.unwrap_or_else(|e| panic!("read {k}: {e}"));
         as_a.delete(&key(k.clone())).await.unwrap_or_else(|e| panic!("delete {k}: {e}"));
     }
-    // A list names the keys under its prefix, so it is a read of them: a's credentials list a's names and a's values,
-    // for the sweep, and nothing else, not even what they can read: the rest of a's, b's, any other app's, the bucket.
+    // A list names the keys under its prefix, so it is a read of them: a's credentials list a's values, for the sweep,
+    // and nothing else, not even what they can read: a's names, the rest of a's, b's, any other app's, the bucket.
     let list = move |prefix: Option<String>| async move {
         let prefix = prefix.map(key);
         let one = as_a.list_with_delimiter(prefix.as_ref()).await.map(|_| ());
         let all = as_a.list(prefix.as_ref()).try_collect::<Vec<_>>().await.map(|_| ());
         one.and(all)
     };
-    for p in [format!("apps/{a}/names"), format!("apps/{a}/values"), format!("apps/{a}/values/n")] {
+    for p in [format!("apps/{a}/values"), format!("apps/{a}/values/n")] {
         list(Some(p.clone())).await.unwrap_or_else(|e| panic!("list {p}: {e}"));
     }
-    let own = ["apps/{a}", "apps/{a}/components", "apps/{a}/current", "native/{a}", "apps", "native", "ws"];
+    let own = ["apps/{a}", "apps/{a}/names", "apps/{a}/components", "apps/{a}/current", "native/{a}"];
     let other = ["apps/{b}", "apps/{b}/names", "apps/{b}/values", "apps/{b}/values/v", "native/{b}"];
-    for p in own.iter().chain(&other).map(|p| p.replace("{a}", &a).replace("{b}", &b)).map(Some).chain([None]) {
+    let all = own.iter().chain(&other).chain(&["apps", "native", "ws"]);
+    for p in all.map(|p| p.replace("{a}", &a).replace("{b}", &b)).map(Some).chain([None]) {
         let refused = list(p.clone()).await.err().map(|e| e.to_string());
         assert!(refused.is_some_and(|e| e.contains("403")), "list {p:?}");
+    }
+    // Nor do they list versions, but those of a's names, which are their history, for the sweep: not of a's values,
+    // whose versions nothing reads, nor of b's names, nor the rest.
+    let to = |p: &str| p.replace("{a}", &a).replace("{b}", &b);
+    for p in ["apps/{a}/names/", "apps/{a}/names/n"].map(to) {
+        assert_eq!(versions(Some(&c), Some(&p)).await.0, 200, "versions of {p}");
+    }
+    let not = ["apps/{a}/", "apps/{a}/values/", "apps/{a}/current", "apps/{b}/names/", "apps/{b}/names/n", "apps/"];
+    for p in not.map(to).iter().map(|p| Some(p.as_str())).chain([Some("native/"), Some("ws/"), None]) {
+        assert_eq!(versions(Some(&c), p).await.0, 403, "versions of {p:?}");
     }
 
     // 3: serve, with no credentials of its own, runs a request only as the tenant its host names, with credentials.
@@ -1016,8 +1051,8 @@ async fn drops_forged_events() {
 }
 
 /// What a sweep keeps. It deletes what no tree names that is older than an hour, and nothing here is: so what the
-/// sweep shows is that it goes through every name, whole, and takes nothing that it should not; what it deletes, and
-/// when, is for the unit tests, which have a clock of their own.
+/// sweep shows is that it goes through every name, whole, with the history of each, as RustFS lists its versions, and
+/// takes nothing that it should not; what it deletes, and when, is for the unit tests, which have a clock of their own.
 #[tokio::test]
 async fn sweeps_the_names() {
     let tric = Tric::app(Kind { stack: true, app: "app" }).await;
@@ -1025,6 +1060,16 @@ async fn sweeps_the_names() {
     let n = 1_000_000;
     assert_eq!(tric.files(Fs::BINDING, "POST", "s", &format!("op=big&path=/big&n={n}")).await, json!({ "ok": n }));
     assert_eq!(tric.post("/@s/kv?op=set&key=k&value=v").await.status, 200);
+    // A name with history, whose head is then deleted: its versions, the newest a delete marker, as S3 lists them, each
+    // of which alone names a value too big to inline, which is an object of its own.
+    for c in ["x", "y"] {
+        assert_eq!(tric.post(&format!("/@h/kv?op=set&key=k&value={}", c.repeat(5000))).await.status, 200);
+    }
+    s3.delete(&Key::from(format!("apps/{app}/names/h"))).await.unwrap();
+    let (status, listed) = versions(None, Some(&format!("apps/{app}/names/h"))).await;
+    assert_eq!(status, 200, "{listed}");
+    let [kept, markers] = ["<Version>", "<DeleteMarker>"].map(|e| listed.matches(e).count());
+    assert_eq!((kept, markers), (2, 1), "{listed}");
     // Objects that no tree names: as an app's turn that died would leave, at a name with a head and at one with none.
     let id = "0123456789abcdef0123456789abcdef";
     let strays = [format!("apps/{app}/values/s/{id}"), format!("apps/{app}/values/ghost/{id}")];
@@ -1041,6 +1086,8 @@ async fn sweeps_the_names() {
     for k in &strays {
         assert!(before.contains(&Key::from(k.as_str())), "{k}");
     }
+    let history = format!("apps/{app}/values/h/");
+    assert_eq!(before.iter().filter(|k| k.as_ref().starts_with(&history)).count(), 2, "a value of each version");
 
     let cron = r#"{"invoked_function_arn":"arn:aws:lambda:local:0:function:events:cron"}"#;
     let body = Bytes::from(json!({ "app": app, "sweep": true }).to_string());
@@ -1048,7 +1095,7 @@ async fn sweeps_the_names() {
     assert_eq!(res.status, 204);
     assert!(tric.logged("swept", Duration::from_secs(30)).await, "swept");
     let log = plain(&tric.log.lock().unwrap());
-    for field in ["swept=2", "deleted=0", "skipped=0", "failed=0", "done=true"] {
+    for field in ["swept=3", "deleted=0", "skipped=0", "failed=0", "done=true"] {
         assert!(log.contains(field), "{field}: {log}");
     }
     assert_eq!(all().await, before, "all there, the cursor not left");

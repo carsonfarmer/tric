@@ -114,16 +114,21 @@ impl Serve {
 
     /// Sweeps `app`'s names for the objects that nothing names (see `sweep`), as far as `sweep::RUN` takes: 204 when it
     /// went well, whether or not it went through every name; else 503, which the router does not retry: a sweep that
-    /// fails is tomorrow's.
+    /// fails is the next one's. The versions of the heads are listed and read with the app's credentials too.
     async fn sweep(&self, app: &str, creds: Credentials) -> Response {
-        let store = match store::s3(&self.bucket, Some(creds.into())) {
-            Ok(s3) => Store::s3(s3),
+        let bucket = store::s3(&self.bucket, Some(creds.into())).and_then(|s3| {
+            let aws = Aws::new(&s3)?;
+            Ok(sweep::Bucket { aws, name: self.bucket.clone(), store: Store::s3(s3) })
+        });
+        let bucket = match bucket {
+            Ok(bucket) => bucket,
             Err(e) => {
                 tracing::warn!(app, "sweep: {e:#}");
                 return status(StatusCode::SERVICE_UNAVAILABLE);
             }
         };
-        match sweep::run(&store, app, SystemTime::now(), tokio::time::Instant::now() + sweep::RUN).await {
+        let until = tokio::time::Instant::now() + sweep::RUN;
+        match sweep::run(&bucket.store, &bucket, app, SystemTime::now(), until).await {
             Ok(r) => {
                 let (swept, deleted, bytes) = (r.swept, r.deleted, r.bytes);
                 let (skipped, failed, done) = (r.skipped, r.failed, r.done);

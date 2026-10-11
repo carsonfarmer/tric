@@ -18,7 +18,7 @@ use wasmtime::{Result, ensure};
 const NAME_MAX: usize = 128;
 const KEY_MAX: usize = 256; // bytes
 const VALUE_MAX: usize = 1 << 20;
-const HEAD_MAX: usize = 1 << 20;
+pub const HEAD_MAX: usize = 1 << 20;
 const HELD_MAX: usize = 1_000_000; // bytes of held requests, as JSON, so an event is within Lambda's 1 MB
 const PAGE: usize = 1000; // keys per `list-keys`
 /// How long a turn waits for others' claims, and reruns, before it gives up with a 429.
@@ -64,11 +64,19 @@ pub struct Head {
 }
 
 impl Head {
-    /// The ids of the objects the head's tree is made of, with the name's own `app` and `name`: see
-    /// [`Tree::reachable`]. The head is the one root of a name's objects: its `pending` holds digests of events and
-    /// its claim a lease, and neither names an object.
-    pub async fn reachable(&self, store: &Store, app: &str, name: &str, max: usize) -> Result<Option<HashSet<u128>>> {
-        Ok(tree::open(store, app, name, &self.tree, tree::config())?.reachable(max).await?)
+    /// Adds to `seen` the ids of the objects the head's tree is made of, with the name's own `app` and `name`, and
+    /// gives how many nodes it read, or `None` if that would be over `max`: see [`Tree::mark`]. The tree is all a head
+    /// names of its name's objects: its `pending` holds digests of events, its claim a lease and `commits` the ids of
+    /// commits, and none of them names an object.
+    pub async fn mark(
+        &self,
+        store: &Store,
+        app: &str,
+        name: &str,
+        seen: &mut HashSet<u128>,
+        max: usize,
+    ) -> Result<Option<usize>> {
+        Ok(tree::open(store, app, name, &self.tree, tree::config())?.mark(seen, max).await?)
     }
 }
 

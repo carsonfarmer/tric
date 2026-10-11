@@ -53,6 +53,26 @@ variable "ws_burst" {
   default     = 200
 }
 
+variable "noncurrent_days" {
+  description = "How many days a replaced or deleted version is kept: the history the sweep keeps, and so the rollback"
+  type        = number
+  default     = 1
+  validation {
+    condition     = var.noncurrent_days >= 1 && var.noncurrent_days == floor(var.noncurrent_days)
+    error_message = "noncurrent_days is a whole number of days, at least 1."
+  }
+}
+
+variable "sweep_every" {
+  description = "How often each app is swept, as `tric deploy` schedules it: hours that divide a day, as `6h`, or days"
+  type        = string
+  default     = "1d"
+  validation {
+    condition     = can(regex("^(1|2|3|4|6|8|12|24)h$|^([1-9]|[12][0-9]|3[01])d$", var.sweep_every))
+    error_message = "sweep_every is hours that divide a day (1h, 2h, 3h, 4h, 6h, 8h, 12h or 24h), or 1d to 31d."
+  }
+}
+
 provider "aws" {
   region = var.region
   default_tags { tags = { app = var.name } }
@@ -114,14 +134,17 @@ resource "aws_s3_bucket_versioning" "store" {
 resource "aws_s3_bucket_lifecycle_configuration" "store" {
   bucket     = aws_s3_bucket.store.id
   depends_on = [aws_s3_bucket_versioning.store]
-  # What a commit or a deploy replaced is kept a day, for the readers and heads that still name it: the committer
-  # deletes what its commit replaced, which in a versioned bucket leaves the version. The objects of a host that died
-  # are left, and the sweep, once a day for each app, deletes those: that leaves the version too, for this rule.
+  # A head's noncurrent versions are the sweep's history: it keeps whatever any of them names, so a name, even one
+  # deleted, could be rolled back to any of them for as long as this rule keeps them. The rule also expires what the
+  # sweep deleted and what a deploy replaced, which a versioned bucket keeps as noncurrent versions. S3 counts whole
+  # days to the next midnight UTC, so a version is kept from `noncurrent_days` to a day more: 1 is 24 to 48 hours. One
+  # rule serves both: a filter is a literal prefix, and each app's heads are under its own, so heads kept longer than
+  # the rest need a key layout that puts every app's heads under one prefix.
   rule {
     id     = "noncurrent"
     status = "Enabled"
     filter {}
-    noncurrent_version_expiration { noncurrent_days = 1 }
+    noncurrent_version_expiration { noncurrent_days = var.noncurrent_days }
     expiration { expired_object_delete_marker = true }
     abort_incomplete_multipart_upload { days_after_initiation = 1 }
   }
@@ -227,12 +250,19 @@ resource "aws_iam_role_policy" "app" {
         Action   = ["s3:PutObject", "s3:DeleteObject"]
         Resource = ["${local.bucket}/apps/*/names/*", "${local.bucket}/apps/*/values/*", "${local.bucket}/native/*"]
       },
-      # Lists its names and its values, for the sweep, and no more: a list shows the keys under its prefix.
+      # For the sweep, and no more: it lists its values, and the versions of its names, which are their history. A list
+      # shows the keys under its prefix; no version is ever the app's to delete.
       {
         Effect    = "Allow"
         Action    = ["s3:ListBucket"]
         Resource  = [local.bucket]
-        Condition = { StringLike = { "s3:prefix" = ["apps/*/names/*", "apps/*/values/*"] } }
+        Condition = { StringLike = { "s3:prefix" = ["apps/*/values/*"] } }
+      },
+      {
+        Effect    = "Allow"
+        Action    = ["s3:ListBucketVersions"]
+        Resource  = [local.bucket]
+        Condition = { StringLike = { "s3:prefix" = ["apps/*/names/*"] } }
       },
     ]
   })
@@ -598,6 +628,10 @@ output "TRIC_EVENTS" {
 
 output "TRIC_SCHEDULER_ROLE" {
   value = aws_iam_role.scheduler.arn
+}
+
+output "TRIC_SWEEP_EVERY" {
+  value = var.sweep_every
 }
 
 output "AWS_REGION" {

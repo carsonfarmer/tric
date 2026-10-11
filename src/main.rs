@@ -51,6 +51,9 @@ enum Cmd {
         /// On AWS, the role the app's schedules invoke the router as
         #[arg(long, env = "TRIC_SCHEDULER_ROLE", requires = "schedules")]
         scheduler_role: Option<String>,
+        /// On AWS, how often the app is swept: hours that divide a day, as `6h`, or days, as `2d`
+        #[arg(long, env = "TRIC_SWEEP_EVERY", default_value = "1d")]
+        sweep_every: sweep::Every,
     },
     /// Run apps, for the router: each request with the app's tenant id and storage credentials
     Serve {
@@ -96,6 +99,9 @@ enum Cmd {
         /// On AWS, the role the retries invoke it as
         #[arg(long, env = "TRIC_RETRY_ROLE", requires = "retries")]
         retry_role: Option<String>,
+        /// Where it ticks cron itself, how often each app is swept: hours that divide a day, as `6h`, or days, as `2d`
+        #[arg(long, env = "TRIC_SWEEP_EVERY", default_value = "1d")]
+        sweep_every: sweep::Every,
     },
 }
 
@@ -128,17 +134,29 @@ async fn main() -> Result<()> {
     }
     match Cmd::parse() {
         Cmd::Dev { app, listen } => dev::run(&app.path, &app.allow, app.e, listen).await,
-        Cmd::Deploy { app, bucket, schedules, events, scheduler_role } => {
+        Cmd::Deploy { app, bucket, schedules, events, scheduler_role, sweep_every } => {
             let scheduler = schedules.zip(events.zip(scheduler_role));
             let scheduler = scheduler.map(|(group, (target, role))| deploy::Scheduler { group, target, role });
-            deploy::run(&app.path, &app.allow, app.e, &bucket, scheduler).await
+            deploy::run(&app.path, &app.allow, app.e, &bucket, scheduler, sweep_every).await
         }
         Cmd::Serve { listen, domain, bucket, outbox } => serve::run(listen, domain, bucket, outbox).await,
-        Cmd::Route { listen, outbox_listen, domain, bucket, serve, role, origin, retries, retry, retry_role } => {
+        Cmd::Route {
+            listen,
+            outbox_listen,
+            domain,
+            bucket,
+            serve,
+            role,
+            origin,
+            retries,
+            retry,
+            retry_role,
+            sweep_every,
+        } => {
             let origin = origin.filter(|o| !o.is_empty()); // an empty secret is none
             let retries = retries.zip(retry.zip(retry_role));
             let retries = retries.map(|(group, (target, role))| deploy::Scheduler { group, target, role });
-            route::run(listen, outbox_listen, domain, bucket, serve, role, origin, retries).await
+            route::run(listen, outbox_listen, domain, bucket, serve, role, origin, retries, sweep_every).await
         }
     }
 }

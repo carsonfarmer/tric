@@ -29,7 +29,9 @@ while idle: the only standing costs are the domain's Route 53 zone and what the 
   - `native/<app>/…` holds the compiled code;
   - `ws/…` holds sockets' records and subscriptions, for the router alone;
   - `outbox/<app>/<commit>` holds a delivery that is waiting for a retry, for the router alone;
-  - the lifecycle rules expire noncurrent versions after a day, `outbox/` after 2 days, and `ws/` after a day.
+  - the lifecycle rules expire noncurrent versions after `noncurrent_days`, 1 by default, `outbox/` after 2 days, and
+    `ws/` after a day. A head's noncurrent versions are its history, and the sweep keeps everything they name: with the
+    default, a name could be rolled back a day or more, even one that was deleted.
 - **CloudFront and DNS.** CloudFront serves `*.<domain>` with a wildcard certificate from ACM, and Route 53 aliases
   point the domain at it.
 
@@ -38,8 +40,9 @@ while idle: the only standing costs are the domain's Route 53 zone and what the 
 - **An app** gets credentials from the router, and those credentials reach only its own data:
   - it can read and write its names, its values and `native/<app>/*`;
   - it can read the rest of `apps/<app>/*`;
-  - it can list its `names/` and its `values/`, for the daily sweep that deletes the objects no name refers to, and
-    no other prefix: not the rest of its own, not another app's, not the bucket's root;
+  - it can list its `values/`, and the versions of its `names/`, for the sweep that deletes the objects no name
+    refers to, and no other prefix: not the rest of its own, not another app's, not the bucket's root. It can delete
+    no version;
   - it gets nothing at all outside its own app.
   - The app role caps every session: no app's credentials can write a release or a component, whatever the router asks.
 - **serve's own role** has no storage access. It can write its logs and invoke the router's `outbox` alias, and
@@ -107,17 +110,18 @@ After a new package, run `apply` again: it updates the three functions. The pack
 ## Deploy an app
 
 `tric deploy` writes the app's component and release to the bucket, then syncs its schedules to Scheduler: its cron,
-and its sweep, once a day at a minute of its own. Install `tric`
-with `cargo install --locked --path .` in a checkout, then take its settings from the install's outputs:
+and its sweep, every `sweep_every` (`1d` by default; hours that divide a day, as `6h`, or days) at a minute of its own.
+Install `tric` with `cargo install --locked --path .` in a checkout, then take its settings from the install's outputs:
 
 ```bash
-for k in TRIC_BUCKET TRIC_SCHEDULES TRIC_EVENTS TRIC_SCHEDULER_ROLE AWS_REGION; do
+for k in TRIC_BUCKET TRIC_SCHEDULES TRIC_EVENTS TRIC_SCHEDULER_ROLE TRIC_SWEEP_EVERY AWS_REGION; do
   export "$k=$(docker compose run --rm -T tofu output -raw "$k")"
 done
 tric deploy path/to/app    # then https://<app>.example.com
 ```
 
-`TRIC_EVENTS` is the `cron` alias of `tric-events`, which the app's schedules invoke.
+`TRIC_EVENTS` is the `cron` alias of `tric-events`, which the app's schedules invoke. A new `sweep_every` reaches
+each app at its next deploy.
 
 The app's name must be a DNS label. On AWS, a cron expression may restrict the day of the month or the day of the
 week, but not both, because Scheduler can't express both. tric refuses it everywhere, so an app runs the same in
@@ -126,8 +130,8 @@ week, but not both, because Scheduler can't express both. tric refuses it everyw
 ## Checks
 
 `docker compose run --rm tofu test` checks the module's isolation properties, as `tests/module.tftest.hcl` lists them,
-against mock providers: it reaches nothing on AWS. Among them, that no app's session can list more than its names and
-its values.
+against mock providers: it reaches nothing on AWS. Among them, that no app's session can list more than its values
+and the versions of its names.
 
 ## Remove
 

@@ -115,10 +115,23 @@ run "module" {
         Effect    = "Allow"
         Action    = ["s3:ListBucket"]
         Resource  = [aws_s3_bucket.store.arn]
-        Condition = { StringLike = { "s3:prefix" = ["apps/*/names/*", "apps/*/values/*"] } }
+        Condition = { StringLike = { "s3:prefix" = ["apps/*/values/*"] } }
+        }, {
+        Effect    = "Allow"
+        Action    = ["s3:ListBucketVersions"]
+        Resource  = [aws_s3_bucket.store.arn]
+        Condition = { StringLike = { "s3:prefix" = ["apps/*/names/*"] } }
       }]
     )
-    error_message = "no app session can list more than its names and its values, whatever policy the router gives it"
+    error_message = "no app session can list more than its values and its names' versions, whatever the router gives it"
+  }
+  assert {
+    condition = (
+      toset(flatten([for s in jsondecode(aws_iam_role_policy.app.policy).Statement : s.Action]))
+      == toset(["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket",
+      "s3:ListBucketVersions"])
+    )
+    error_message = "no app session can delete a version, so the sweep's history is never the app's to lose"
   }
   assert {
     condition = (
@@ -263,4 +276,41 @@ run "module" {
     )
     error_message = "versioned; lifecycle expires noncurrent versions, delete markers, waiting deliveries and sockets"
   }
+}
+
+# The history is a variable, of whole days and at least one, and so is how often each app is swept.
+run "history" {
+  command = plan
+  variables {
+    noncurrent_days = 7
+    sweep_every     = "6h"
+  }
+  assert {
+    condition = (
+      aws_s3_bucket_lifecycle_configuration.store.rule[0].noncurrent_version_expiration[0].noncurrent_days == 7
+    )
+    error_message = "the lifecycle keeps noncurrent versions `noncurrent_days`"
+  }
+  assert {
+    condition     = output.TRIC_SWEEP_EVERY == "6h"
+    error_message = "`tric deploy` sweeps every `sweep_every`"
+  }
+}
+
+run "no_history" {
+  command = plan
+  variables { noncurrent_days = 0 }
+  expect_failures = [var.noncurrent_days]
+}
+
+run "part_of_a_day_of_history" {
+  command = plan
+  variables { noncurrent_days = 1.5 }
+  expect_failures = [var.noncurrent_days]
+}
+
+run "an_interval_that_does_not_divide_a_day" {
+  command = plan
+  variables { sweep_every = "5h" }
+  expect_failures = [var.sweep_every]
 }
