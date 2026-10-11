@@ -1,0 +1,70 @@
+diff --git a/crates/runtime/src/abi.rs b/crates/runtime/src/abi.rs
+index 1e79f7c..6aa6389 100644
+--- a/crates/runtime/src/abi.rs
++++ b/crates/runtime/src/abi.rs
+@@ -334,12 +334,6 @@ mod async_builtins {
+         #[link_name = "[subtask-cancel]"]
+         pub(crate) fn subtask_cancel(task: u32) -> u32;
+ 
+-        #[link_name = "[context-get-0]"]
+-        pub(crate) fn context_get() -> u32;
+-
+-        #[link_name = "[context-set-0]"]
+-        pub(crate) fn context_set(value: u32);
+-
+         #[link_name = "[thread-yield]"]
+         #[allow(dead_code)]
+         pub(crate) fn thread_yield() -> u32;
+@@ -391,14 +385,6 @@ mod async_builtins {
+         async_disabled()
+     }
+ 
+-    pub(crate) unsafe fn context_get() -> u32 {
+-        async_disabled()
+-    }
+-
+-    pub(crate) unsafe fn context_set(_value: u32) {
+-        async_disabled()
+-    }
+-
+     pub(crate) unsafe fn task_cancel() {
+         async_disabled()
+     }
+@@ -414,11 +400,20 @@ mod async_builtins {
+ 
+ pub(crate) use async_builtins::*;
+ 
+-// WASI adapter state reset that is used during Wizer pre-initialization
+-#[link(wasm_import_module = "wasi_snapshot_preview1")]
+-unsafe extern "C" {
+-    #[link_name = "reset_adapter_state"]
+-    pub(crate) fn reset_adapter_state();
++// A task's state between its callbacks. Upstream keeps it in `context.set 0`, but on wasm32-wasip3 that slot is
++// wasi-libc's: it holds the task's stack pointer there, and its TLS block while the task waits. wasi-libc gives each
++// task thread-local storage of its own for the task's life, so the state is kept there, as wit-bindgen keeps its own
++// task state on wasip3. (The WASI 0.1 adapter, whose state upstream resets after Wizer, is not linked.)
++thread_local! {
++    static TASK_CONTEXT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
++}
++
++pub(crate) unsafe fn context_get() -> u32 {
++    TASK_CONTEXT.get()
++}
++
++pub(crate) unsafe fn context_set(value: u32) {
++    TASK_CONTEXT.set(value)
+ }
+ 
+ unsafe extern "C" {
+diff --git a/crates/runtime/src/lib.rs b/crates/runtime/src/lib.rs
+index b8ebe09..8c28321 100644
+--- a/crates/runtime/src/lib.rs
++++ b/crates/runtime/src/lib.rs
+@@ -321,7 +321,6 @@ fn init_js(
+     })?;
+ 
+     unsafe {
+-        abi::reset_adapter_state();
+         abi::__wasilibc_reset_preopens();
+     }
+ 

@@ -2640,7 +2640,6 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
- "wasmtime-wasi-io",
  "webpki-root-certs",
 ]
 

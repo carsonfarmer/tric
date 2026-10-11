@@ -13,17 +13,11 @@ use tokio::time::timeout;
 use tracing::Instrument;
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Config, Result, Store, StoreLimits, StoreLimitsBuilder, bail};
-use wasmtime_wasi::cli::{WasiCli, WasiCliView};
-use wasmtime_wasi::clocks::{WasiClocks, WasiClocksView};
-use wasmtime_wasi::p2::bindings::{cli, clocks, random, sockets};
-use wasmtime_wasi::random::{WasiRandom, WasiRandomView};
-use wasmtime_wasi::sockets::{WasiSockets, WasiSocketsView};
 #[cfg(test)]
-use wasmtime_wasi::{I32Exit, p2, p3::bindings::Command};
+use wasmtime_wasi::{I32Exit, p3::bindings::Command};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView, p2::pipe::MemoryOutputPipe};
 use wasmtime_wasi_http::p3::bindings::{Service, ServicePre};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView, p3};
-use wasmtime_wasi_io::IoView;
 
 /// One epoch tick. A guest yields once per tick, so this bounds how long a runaway holds up the others.
 const TICK: Duration = Duration::from_millis(10);
@@ -69,13 +63,11 @@ impl Engine {
         let mut linker = Linker::new(&engine);
         // The stock interfaces but the file system, which is tric's own. They are linked one by one, as no stock
         // function leaves one out.
-        link_p2(&mut linker)?; // as Rust's standard library on wasm32-wasip2 imports them
         wasmtime_wasi::p3::cli::add_to_linker(&mut linker)?;
         wasmtime_wasi::p3::clocks::add_to_linker(&mut linker)?;
         wasmtime_wasi::p3::random::add_to_linker(&mut linker)?;
         wasmtime_wasi::p3::sockets::add_to_linker(&mut linker)?;
         p3::add_to_linker(&mut linker)?;
-        fs::p2::add_to_linker(&mut linker)?;
         fs::p3::add_to_linker(&mut linker)?;
         Imports::add_to_linker::<Host, HasSelf<Host>>(&mut linker, |h| h)?; // `wasi:keyvalue`
         Ok(Self { engine, linker })
@@ -121,9 +113,9 @@ impl Engine {
 
 #[cfg(test)]
 impl Engine {
-    /// Runs the `wasi:cli/command` component `command` to its end, of WASI 0.3 or of 0.2, as an app would run, under
-    /// `ctx`; and returns its exit code, and what it wrote to stdout and to stderr. For the tests of the file system,
-    /// whose conformance tests are commands.
+    /// Runs the `wasi:cli/command` component `command` to its end, as an app would run, under `ctx`; and returns its
+    /// exit code, and what it wrote to stdout and to stderr. For the tests of the file system, whose conformance tests
+    /// are commands.
     pub async fn run_command(
         &self,
         command: &Component,
@@ -135,14 +127,9 @@ impl Engine {
         let wasi = WasiCtx::builder().stdout(out.clone()).stderr(err.clone()).args(args).envs(env).build();
         let mut store = store(&self.engine, wasi, ctx);
         let instance = self.linker.instantiate_async(&mut store, command).await?;
-        let ran = match Command::new(&mut store, &instance) {
-            Ok(guest) => {
-                let ran = store.run_concurrent(async |accessor| guest.wasi_cli_run().call_run(accessor).await).await;
-                ran.and_then(|ran| ran)
-            }
-            Err(_) => p2::bindings::Command::new(&mut store, &instance)?.wasi_cli_run().call_run(&mut store).await,
-        };
-        let code = match ran {
+        let guest = Command::new(&mut store, &instance)?;
+        let ran = store.run_concurrent(async |accessor| guest.wasi_cli_run().call_run(accessor).await).await;
+        let code = match ran.and_then(|ran| ran) {
             Ok(Ok(())) => 0,
             Ok(Err(())) => 1,
             Err(e) => match e.downcast_ref::<I32Exit>() {
@@ -152,35 +139,6 @@ impl Engine {
         };
         Ok((code, out.contents().to_vec(), err.contents().to_vec()))
     }
-}
-
-/// The interfaces that `wasmtime_wasi::p2::add_to_linker_async` links, less `wasi:filesystem`.
-fn link_p2(l: &mut Linker<Host>) -> Result<()> {
-    wasmtime_wasi_io::add_to_linker_async(l)?;
-    clocks::wall_clock::add_to_linker::<Host, WasiClocks>(l, Host::clocks)?;
-    clocks::monotonic_clock::add_to_linker::<Host, WasiClocks>(l, Host::clocks)?;
-    random::random::add_to_linker::<Host, WasiRandom>(l, Host::random)?;
-    random::insecure::add_to_linker::<Host, WasiRandom>(l, Host::random)?;
-    random::insecure_seed::add_to_linker::<Host, WasiRandom>(l, Host::random)?;
-    cli::exit::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
-    cli::environment::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
-    cli::stdin::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
-    cli::stdout::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
-    cli::stderr::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
-    cli::terminal_input::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
-    cli::terminal_output::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
-    cli::terminal_stdin::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
-    cli::terminal_stdout::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
-    cli::terminal_stderr::add_to_linker::<Host, WasiCli>(l, Host::cli)?;
-    let net = &sockets::network::LinkOptions::default();
-    sockets::tcp_create_socket::add_to_linker::<Host, WasiSockets>(l, Host::sockets)?;
-    sockets::instance_network::add_to_linker::<Host, WasiSockets>(l, Host::sockets)?;
-    sockets::network::add_to_linker::<Host, WasiSockets>(l, net, Host::sockets)?;
-    sockets::tcp::add_to_linker::<Host, WasiSockets>(l, Host::sockets)?;
-    sockets::udp::add_to_linker::<Host, WasiSockets>(l, Host::sockets)?;
-    sockets::udp_create_socket::add_to_linker::<Host, WasiSockets>(l, Host::sockets)?;
-    sockets::ip_name_lookup::add_to_linker::<Host, WasiSockets>(l, Host::sockets)?;
-    Ok(())
 }
 
 /// An app: a component ready to instantiate, its environment and its slots for requests in flight.
@@ -204,12 +162,6 @@ pub struct Host {
 impl WasiView for Host {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView { ctx: &mut self.wasi, table: &mut self.table }
-    }
-}
-
-impl IoView for Host {
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
     }
 }
 
@@ -309,4 +261,66 @@ async fn run(store: &mut Store<Host>, guest: Service, req: Request, tx: oneshot:
             Ok(())
         })
         .await?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::name::Turn;
+    use crate::tric::Tric;
+    use http_body_util::BodyExt;
+    use std::time::Instant;
+
+    /// One instance of the JavaScript app runs two requests at once: the first waits 200 ms, and the second starts
+    /// while it waits and answers after 50 ms. Each is answered with its own echo, so the runtime kept each task's
+    /// state apart between its callbacks (see docs/decisions.md on componentize-qjs).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_instance_of_the_javascript_app_runs_requests_at_once() {
+        let engine = Engine::new().unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/js.wasm");
+        let wasm =
+            std::fs::read(&fixture).unwrap_or_else(|e| panic!("{}: {e}: build the fixtures first", fixture.display()));
+        let app = Arc::new(engine.load(&engine.compile(&wasm).unwrap(), vec![]).unwrap());
+        let tric = Arc::new(Tric {
+            app: "a".into(),
+            store: crate::store::Store::memory(),
+            code: app.clone(),
+            allow: Arc::from([]),
+            sink: Arc::new(|_| Box::pin(async { Ok(()) })),
+        });
+        let turn =
+            Turn::open(&tric.store, "a", "n", false, &Default::default(), Instant::now()).await.unwrap().unwrap();
+        let mut store = store(&engine.engine, WasiCtx::builder().build(), Ctx::of_command(tric, turn, "n"));
+        let guest = app.pre.instantiate_async(&mut store).await.unwrap();
+
+        let uris = ["http://a.localhost/echo?sleep=200", "http://a.localhost/echo?sleep=50"];
+        let [first, second] = uris.map(|uri| {
+            let req: Request = http::Request::get(uri).body(Default::default()).unwrap();
+            let (req, io) = p3::Request::from_http(store.data_mut().http().hooks, req);
+            let req = store.data_mut().table.push(req).unwrap();
+            (guest.wasi_http_handler().func_handle().start_call_concurrent(&mut store, (req,)).unwrap(), io)
+        });
+        let answers = store
+            .run_concurrent(async move |accessor| {
+                let answer = async |(call, io)| -> Result<(serde_json::Value, Instant)> {
+                    let res = guest.wasi_http_handler().func_handle().finish_call_concurrent(accessor, call).await?.0;
+                    let res = res.map_err(|e| wasmtime::format_err!("the guest answered {e:?}"))?;
+                    let res = accessor.with(|mut store| {
+                        let res = store.get().table.delete(res)?;
+                        res.into_http(&mut store, io)
+                    })?;
+                    let body = res.into_body().collect().await.map_err(|e| wasmtime::format_err!("{e:?}"))?;
+                    Ok((serde_json::from_slice(&body.to_bytes())?, Instant::now()))
+                };
+                let (first, second) = tokio::join!(answer(first), answer(second));
+                Ok::<_, wasmtime::Error>((first?, second?))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let ((first, first_at), (second, second_at)) = answers;
+        assert_eq!(first["uri"], uris[0]);
+        assert_eq!(second["uri"], uris[1]);
+        assert!(second_at < first_at, "the second request was not answered while the first waited");
+    }
 }

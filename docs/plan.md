@@ -45,8 +45,8 @@
 - **State.** The import is `wasi:keyvalue`, where `open(name)` opens a name:
   - the turn's own name is writable;
   - any other name opens as a read-only snapshot.
-- **Files.** The import is `wasi:filesystem`, 0.2 and 0.3, a real writable file system as Rust's `std::fs` and
-  wasi-libc expect one:
+- **Files.** The import is `wasi:filesystem` 0.3, a real writable file system as Rust's `std::fs` and wasi-libc
+  expect one:
   - the turn's own name is the one preopen, `/`; a snapshot is mounted read-only; a request without a name has none;
   - it is the same tree as the keys, so a turn's file writes and key writes commit or fail together;
   - sizes are bounded by stated limits, not by memory: a turn reads only the blocks it touches and writes only the
@@ -140,8 +140,8 @@ ws/channels/<app>/<channel>/<id> a socket's subscription to a channel (router on
 ### Files and state: one tree per name
 
 A name's state, keys and files together, is one copy-on-write B+tree: ordered keys in immutable objects, with the root
-inline in the head. `wasi:keyvalue` and `wasi:filesystem` (0.2 and 0.3) are two views of it. The turn model is
-unchanged, and the head's one compare-and-swap commits or fails everything a turn did.
+inline in the head. `wasi:keyvalue` and `wasi:filesystem` are two views of it. The turn model is unchanged, and the
+head's one compare-and-swap commits or fails everything a turn did.
 
 **Why one tree, and not one for keys and one for files:**
 - One compare-and-swap commits a turn's keys and files together, or neither. Two trees would need two heads, which S3
@@ -343,11 +343,10 @@ budgets. A turn has no cap on its changes: it spills.
 - A snapshot is read-only, and every size above is capped, so a guest can't take the host's memory or requests beyond a
   turn's limits.
 
-**Structure and size.** One core, two thin bindings, each with its own `bindgen!`: wasmtime-wasi's `Descriptor` wraps an
-OS file through cap-std, and its generated host traits fix that type. The WIT is vendored verbatim from wasmtime-wasi
-49.0.2 (`wit/filesystem-p2` is 0.2.12, `wit/filesystem-p3` is 0.3.0). The stock interfaces are linked one at a time,
-without the file system: for 0.3, `cli`, `clocks`, `random` and `sockets` `add_to_linker`; for 0.2, each interface's
-`add_to_linker`, with our `bindgen!` sharing the stock `wasi:io` stream resources through `with:`.
+**Structure and size.** A core, and a binding with its own `bindgen!`: wasmtime-wasi's `Descriptor` wraps an OS file
+through cap-std, and its generated host traits fix that type. The WIT is vendored verbatim from wasmtime-wasi 49.0.2
+(`wit/filesystem-p3`, 0.3.0). tric links WASI 0.3 alone, and the stock interfaces one at a time, without the file
+system: `cli`, `clocks`, `random` and `sockets` `add_to_linker`.
 
 | File | What | Lines |
 |---|---|---|
@@ -355,8 +354,7 @@ without the file system: for 0.3, `cli`, `clocks`, `random` and `sockets` `add_t
 | `src/name.rs`, `src/tric.rs`, `src/store.rs` | the turn over the tree; the joined deletes | +70 (built) |
 | `src/fs.rs` | the core: descriptors, the gate, orphans, read-ahead, and the paths over the operations | 790 (built) |
 | `src/fs/ops.rs` | inodes, blocks, directories, rename, errors, on the tree | 850 (built) |
-| `src/fs/p2.rs` | 0.2: the descriptor's methods, streams, preopens | 560 (built) |
-| `src/fs/p3.rs` | 0.3: the same, async, with `stream` and `future` | 650 (built) |
+| `src/fs/p3.rs` | 0.3: the descriptor's methods, preopens, `stream` and `future` | 650 (built) |
 | `src/sweep.rs`, and the trigger | listing, walk, delete, the cursor; the schedule, the router, serve | 480 (built) |
 
 The tree came to 1,080 lines, against an estimate of 800, because spilling, merging, the cache and the log are in it.
@@ -366,23 +364,23 @@ most of the difference. The 0.3 binding came to 650 against 600, its `stream` an
 read, one for a directory listing and a consumer for a write) being about a third of it. The sweep came to about 480
 against 300, the walk and its cap, the shape of the keys it may delete, the listing by digit, the cursor, the router's
 and serve's part, and the reconciling of an app's schedules, which gave deploy its first tests, being the difference.
-The whole is about 4,400 lines of runtime code, on the 4,289 in `src` at the start. Tests come to well over two
-thousand more. The tree and `name.rs` came first and alone: the key tests' assertions hold on them, which tests the
-tree before any file exists.
+The whole is about 4,400 lines of runtime code, on the 4,289 in `src` at the start. Tests come to well over two thousand
+more. The tree and `name.rs` came first and alone: the key tests' assertions hold on them, which tests the tree before
+any file exists. The 0.2 binding was removed later, when tric came to serve WASI 0.3 alone.
 
 **Stages.** Each is committed on its own and passes the whole gate:
 - (a) the tree, with `wasi:keyvalue` on it (done);
 - (b) the file system core and the 0.2 binding, with the testsuite's wasip1 modules and the end-to-end file cases
   (done);
 - (c) the 0.3 binding, with its 14 components (done);
-- (d) the sweep, with its trigger (done).
+- (d) the sweep, with its trigger (done);
+- (e) WASI 0.3 alone: the 0.2 binding removed, and the testsuite's tests built for 0.3 (done).
 
 **Conformance:**
-- **The WebAssembly testsuite** (`wasi-testsuite`, pinned by commit). The toolchain image fetches it as a tarball
-  checked by sha256 (`docker/build.Dockerfile`), with the preview 1 adapter of Wasmtime's 49.0.2 release, also by
-  hash: neither is a Cargo dependency. Its prebuilt wasm32-wasip1 modules that name a directory to preopen (42 in Rust
-  and 7 in C) are made into components with `wasm-tools component new --adapt`, and run against the 0.2 binding. Its
-  14 0.3 `filesystem-*` components run against the 0.3 binding. All 63 pass.
+- **The WebAssembly testsuite** (`wasi-testsuite`, pinned by commit). The toolchain image fetches its sources as a
+  tarball checked by sha256 (`docker/build.Dockerfile`), not as a Cargo dependency, and builds those of its tests that
+  name a directory to preopen for wasm32-wasip3: 7 in C, by wasi-sdk 34's clang, and 14 in Rust, by the fixtures'
+  toolchain. All 21 pass.
 - **The harness** is a `#[cfg(test)]` module in the binary (`src/fs/conformance.rs`), using the production linker, host
   and limits, and a turn over the memory store, which holds the test's own `fs-tests.dir`; the turn is committed
   after the test. Wasmtime's runner expects every one of these to pass on Linux, and so does the harness: a `FAILS`
@@ -392,13 +390,11 @@ tree before any file exists.
   collapses, and grows to four levels, with what is in the store checked against what the tree names after every round;
   request counts with a counting `ObjectStore`, to show that a write puts only what it changed, and that a failed
   upload leaves nothing; a tampered object; links that try to leave the prefix; paths that try to escape.
-- **e2e, on RustFS, through both bindings:** writes held until the answer; a 5xx discards; a lost race re-runs; a write
-  after the answer fails; a snapshot is read-only; keys and files commit together; a file of several blocks updated in
-  place; a directory of thousands of files. The Rust fixture has the same ops twice: `/files` through `std::fs` (0.2),
-  and `/files-p3` through the 0.3 filesystem, with its streams. Each test runs through both, on `tric dev` and on a
-  stack, and expects the exact error of each: the `io::ErrorKind` through 0.2 (`NotFound`), the `error-code` through 0.3
-  (`ErrorCode::NoEntry`). A last test shows them to be one tree: what a turn writes through one, in a file of one block
-  or of several, the other reads, and a 5xx through 0.3 leaves nothing for either.
+- **e2e, on RustFS:** writes held until the answer; a 5xx discards; a lost race re-runs; a write after the answer
+  fails; a snapshot is read-only; keys and files commit together; a file of several blocks updated in place; a
+  directory of thousands of files. The Rust fixture's `/files` does each through the 0.3 file system, with its
+  streams. Each test runs on `tric dev` and on a stack, and expects the exact `error-code` of each
+  (`ErrorCode::NoEntry`).
 
 **Alternatives, rejected** (reasons and sources in `docs/decisions.md`): Git's objects through `gix`; IPFS UnixFS with
 sharded directories; JuiceFS; content-defined chunking; SlateDB and ZeroFS; a Lambda `/tmp` served by the stock
@@ -414,7 +410,7 @@ overlay applied at the commit.
 6. **JSON nodes,** not a binary codec, which would be a new crate.
 7. **The deletes are joined at the end of the body,** which can add one trip to a body that is shorter than a delete.
 8. **A name over 64 KiB reads its keys through the tree,** a GET more per level when cold, and not from its head.
-9. **0.2 first and 0.3 after,** by stage.
+9. **WASI 0.3 alone,** since 8 October 2026. 0.2 came first and 0.3 after, by stage, and 0.2 was then removed.
 
 ### `tric route`: the router (trusted, runs no app code)
 
@@ -573,7 +569,7 @@ overlay applied at the commit.
 7. **Native code** is written under `native/<app>/…` with the app's credentials.
 8. **The app semantics** pass through `route` → `serve`: names, turns, the outbox, self-fetch, middleware and
    outbound.
-9. **Files**, through both `wasi:filesystem` 0.2 and 0.3:
+9. **Files**, through `wasi:filesystem` 0.3:
    - the WebAssembly testsuite's file system tests pass, bar a skip-list that gives a reason for each;
    - a write is held until the answer; a 5xx, a trap or a lost race leaves nothing visible; a write after the answer
      fails;
@@ -598,7 +594,7 @@ overlay applied at the commit.
   shows it for the minted session policy, and for the role alone that no release or component is writable;
 - a direct call to the router can't forge `_cron`, `_tric`, `_sweep` or credentials;
 - the outbox, its retries and cron work;
-- files, through both `wasi:filesystem` 0.2 and 0.3, on S3:
+- files, through `wasi:filesystem` 0.3, on S3:
   - keys and files commit together or not at all;
   - outside a turn on it, a name's files are read-only, and no other name has them;
   - a file of several blocks, written across a block's end and cut short, reads back by its hash;

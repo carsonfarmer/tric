@@ -8,10 +8,12 @@ tric runs components; it does not build them. Anything that exports `wasi:http/h
 
 ## An app
 
-You need Rust 1.96 or later, with the `wasm32-wasip2` target.
+You need Rust 1.100 or later, with the `wasm32-wasip3` target: tric serves WASI 0.3 alone, and that target's standard
+library imports nothing of 0.2. 1.100 becomes stable on 12 November 2026 and is in beta until then
+(`rustup toolchain install beta`, and `cargo +beta`).
 
 ```bash
-rustup target add wasm32-wasip2
+rustup target add wasm32-wasip3
 cargo new --lib hello && cd hello
 cargo add wasip3@0.9 --features http-compat
 cargo add http
@@ -37,8 +39,8 @@ impl wasip3::exports::http::handler::Guest for App {
 Build it, and serve it with its state in memory:
 
 ```bash
-cargo build --release --target wasm32-wasip2
-tric dev target/wasm32-wasip2/release/hello.wasm   # at http://127.0.0.1:3000
+cargo build --release --target wasm32-wasip3
+tric dev target/wasm32-wasip3/release/hello.wasm   # at http://127.0.0.1:3000
 ```
 
 `tric dev` takes `-e NAME=VALUE` for the app's environment, and `--allow scheme://host[:port]` for each host it may
@@ -110,7 +112,7 @@ There is no web platform under QuickJS (no `TextEncoder`, `URL`, `fetch` or `con
 - **Names.** A path whose first segment starts with `@` (`/@room:42/…`) addresses that name's state, which
   `wasi:keyvalue`'s `open("room:42")` opens. A GET, HEAD or OPTIONS reads a snapshot; any other method is a **turn**,
   which may write that name only.
-- **Files.** The same name's `wasi:filesystem` (0.2 and 0.3) is `/`, a file system of its own, writable in a turn and
+- **Files.** The same name's `wasi:filesystem` is `/`, a file system of its own, writable in a turn and
   read-only in a snapshot, and an app with no name has none. Keys and files are one tree, so the same commit makes
   both or neither: a turn's writes are held until the answer, kept if its status is below 500 and dropped if it is a
   5xx or a trap, and a write after the answer fails. A name holds 16 GiB and 4 Mi entries. It is real: directories,
