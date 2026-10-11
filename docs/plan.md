@@ -387,9 +387,10 @@ any file exists. The 0.2 binding was removed later, when tric came to serve WASI
   upload leaves nothing; a tampered object; links that try to leave the prefix; paths that try to escape.
 - **e2e, on RustFS:** writes held until the answer; a 5xx discards; a lost race re-runs; a write after the answer
   fails; a snapshot is read-only; keys and files commit together; a file of several blocks updated in place; a
-  directory of thousands of files. The Rust fixture's `/files` does each through the 0.3 file system, with its
-  streams. Each test runs on `tric dev` and on a stack, and expects the exact `error-code` of each
-  (`ErrorCode::NoEntry`).
+  directory of thousands of files. The Rust fixture does each through the 0.3 binding, with its streams (`/files`),
+  and expects the exact `error-code` (`ErrorCode::NoEntry`); and again through Rust's `std::fs`, which is wasi-libc
+  over that binding (`/std-files`), and expects the `io::ErrorKind` (`NotFound`). Each test runs on `tric dev` and on
+  a stack.
 
 **Alternatives, rejected** (reasons and sources in `docs/decisions.md`): Git's objects through `gix`; IPFS UnixFS with
 sharded directories; JuiceFS; content-defined chunking; SlateDB and ZeroFS; a Lambda `/tmp` served by the stock

@@ -32,24 +32,24 @@ use wasip3::http_compat::http_into_wasi_response;
 use wasip3::{wit_bindgen::StreamResult, wit_future, wit_stream};
 
 /// How long `held` and `late` wait, which is for the turn to answer, and to commit.
-const LATER: u64 = 500_000_000;
+pub(crate) const LATER: u64 = 500_000_000;
 
 /// How much a read asks for, and a `big` writes at once if it is not told.
-const CHUNK: usize = 64 << 10;
+pub(crate) const CHUNK: usize = 64 << 10;
 
-fn pattern(i: u64) -> u8 {
+pub(crate) fn pattern(i: u64) -> u8 {
     (i % 251) as u8
 }
 
 /// FNV-1a of `bytes`, as an accumulator: start from `OFFSET`.
-fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
+pub(crate) fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
     for b in bytes {
         hash = (hash ^ *b as u64).wrapping_mul(0x100000001b3);
     }
     hash
 }
 
-const OFFSET: u64 = 0xcbf29ce484222325;
+pub(crate) const OFFSET: u64 = 0xcbf29ce484222325;
 
 pub async fn respond(name: Option<&str>, q: &HashMap<String, String>) -> Result<Response, HttpError> {
     let arg = |k: &str| q.get(k).map_or("", |v| v);
@@ -306,7 +306,7 @@ async fn slurp(root: &Descriptor, path: &str) -> Result<String, ErrorCode> {
 }
 
 /// A response whose body is what `body` gives, once it is done: after the handler has answered.
-fn streamed(body: impl Future<Output = Value> + 'static) -> Response {
+pub(crate) fn streamed(body: impl Future<Output = Value> + 'static) -> Response {
     let (mut tx, rx) = wit_stream::new();
     let (done, trailers) = wit_future::new(|| Ok(None));
     wasip3::wit_bindgen::spawn_local(async move {
