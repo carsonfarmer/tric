@@ -1,0 +1,32 @@
+[package]
+name = "tric-tree"
+version.workspace = true
+edition = "2024"
+rust-version = "1.96" # as tric's
+license = "Apache-2.0"
+description = "A copy-on-write B+tree in object storage, for many optimistic writers: its root is held by the caller"
+repository = "https://github.com/carsonfarmer/tric"
+keywords = ["btree", "object-store", "s3", "copy-on-write", "async"]
+categories = ["data-structures", "database-implementations", "asynchronous"]
+include = ["/src", "/LICENSE"]
+
+[features]
+# `testing`: a store that counts what is asked of it, for the tests of what is built on the tree.
+testing = ["dep:async-trait", "tokio/time"]
+
+[dependencies]
+async-trait = { version = "0.1", optional = true }
+base64 = "0.22"
+bytes = "1"
+futures-util = "0.3"
+object_store = { version = "0.14.2", default-features = false }
+rand = { version = "0.10", default-features = false, features = ["thread_rng"] } # as object_store has it
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt", "time"] }

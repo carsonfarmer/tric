@@ -297,7 +297,7 @@ async fn forget(store: &Store, app: &str) {
 mod tests {
     use super::*;
     use crate::tree::counting::{Counts, counting};
-    use crate::tree::{Limits, Shape, Tree};
+    use crate::tree::{Config, Root};
     use bytes::Bytes;
     use std::io;
     use std::sync::atomic::Ordering::SeqCst;
@@ -305,18 +305,18 @@ mod tests {
 
     const ID: &str = "0123456789abcdef0123456789abcdef";
 
-    /// Limits that make a few keys a tree of several nodes, and a value of more than 8 bytes an object of its own.
-    fn tiny() -> Limits {
-        Limits { node: 1400, inline: 8, budget: 2048, entries: 1000, data: 100_000, blob: 100 }
+    /// A config that makes a few keys a tree of several nodes, and a value of more than 8 bytes an object of its own.
+    fn tiny() -> Config {
+        Config { node: 1400, inline: 8, budget: 2048, entries: 1000, data: 100_000, blob: 100, ..tree::config() }
     }
 
     /// A tree of `keys` values that are each an object, in `name`, with its head: the objects that are in `name` now.
     async fn plant(store: &Store, name: &str, keys: usize) -> BTreeSet<Path> {
-        let mut tree = Tree::open(store, "a", name, &Shape::default(), tiny()).unwrap();
-        let edits = (0..keys).map(|i| (format!("k/{i:03}"), Some(tree.item(Bytes::from(vec![i as u8; 40]))))).collect();
+        let mut tree = tree::open(store, "a", name, &Root::default(), tiny()).unwrap();
+        let edits = (0..keys).map(|i| (format!("k/{i:03}"), Some(Bytes::from(vec![i as u8; 40])))).collect();
         tree.write(edits).await.unwrap();
-        let shape = tree.finish().await.unwrap();
-        head(store, name, serde_json::to_vec(&serde_json::json!({ "tree": shape })).unwrap()).await;
+        let root = tree.finish().await.unwrap();
+        head(store, name, serde_json::to_vec(&serde_json::json!({ "tree": root })).unwrap()).await;
         held(store, name).await
     }
 

@@ -1,6 +1,5 @@
 //! The bucket: one object store, in memory for `tric dev` and S3 everywhere else. S3 answers 403 for a missing key to a
 //! caller that cannot list, so a 403 reads as not found.
-use crate::tree::Cache;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, stream};
@@ -17,6 +16,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
+use tric_tree::Cache;
 use wasmtime::{Result, ensure, error::Context};
 use webpki_root_certs::TLS_SERVER_ROOT_CERTS;
 
@@ -184,7 +184,8 @@ impl Store {
 
     /// `s3`, whose bucket must keep versions.
     pub fn s3(s3: S3) -> Self {
-        Self { inner: Arc::new(s3), versioned: true, cache: Cache::shared() }
+        static SHARED: LazyLock<Arc<Cache>> = LazyLock::new(Default::default);
+        Self { inner: Arc::new(s3), versioned: true, cache: SHARED.clone() }
     }
 
     /// Whether there is an object at `path`.
