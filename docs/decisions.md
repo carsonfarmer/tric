@@ -1034,6 +1034,10 @@ The tree is the crate `tric-tree`, in `crates/tree`, and the root is a workspace
 
 ## Code
 
+- **There is no backward compatibility.** A binary reads only the formats it writes: heads, trees, releases,
+  manifests, the outbox's and the sockets' records. A change to any of them is installed fresh, with `tofu destroy`
+  and `apply`, and tric carries no shim, alias, default or migration for an older one. The serde defaults that
+  remain are a format's own optional fields, or formats that are not tric's (AWS's XML, `credential_process`).
 - **Imports are as rustfmt leaves them.** Its `imports_granularity`, which is unstable, made `src` longer at every
   setting (`Module` by 41 lines, `Crate` by 90, `One` by 130), and clippy has no lint for it.
 - **The AWS SDK is not used, for now:** S3 stays on `object_store`, and STS, Lambda and Scheduler on tric's own calls.

@@ -133,6 +133,14 @@ week, but not both, because Scheduler can't express both. tric refuses it everyw
 against mock providers: it reaches nothing on AWS. Among them, that no app's session can list more than its values
 and the versions of its names.
 
+`bash infra/aws/check.sh` checks a live install end to end, in about 30 minutes: isolation between apps and from the
+host, the IAM policies by the policy simulator, turns, files, delivery, WebSockets, schedules and the sweep, through
+CloudFront. Run it in the checkout that applied the install, at `main`'s HEAD, with the account's credentials,
+`TF_VAR_domain`, the applied package in `dist/tric.zip`, the fixtures built, and the functions logging at
+`-var log=warn,tric=debug`. It deploys four apps and removes what it made, except one object that it leaves for
+`bash infra/aws/check.sh late` to sweep, 65 minutes to 3 hours later; that run also checks CloudTrail's record of a
+session policy. What it records is kept in `target/live`.
+
 ## Remove
 
 ```bash
