@@ -19,9 +19,9 @@ for name in app guard; do
 done
 
 # The same packages, and tric's wasi:keyvalue, for the JavaScript app. componentize-qjs runs the app's top level at
-# build time and keeps the heap that leaves: see docs/decisions.md.
+# build time and keeps the heap that leaves: see docs/decisions.md. Its runtime is the image's, built for wasm32-wasip3.
 rm -rf js/wit/deps
 cp -R rust/wit/deps js/wit/deps
 cp -R ../../wit/keyvalue js/wit/deps/keyvalue
-componentize-qjs --wit js/wit --js js/src/app.js --world app --output "$out/js.wasm"
+componentize-qjs --runtime "${TRIC_QJS_RUNTIME:?}" --wit js/wit --js js/src/app.js --world app --output "$out/js.wasm"
 ls -l "$out"

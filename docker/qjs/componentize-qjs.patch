@@ -65,7 +65,7 @@ index 3fc8087..e221369 100644
      "component-model",
      "wasmtime",
 diff --git a/lib/src/lib.rs b/lib/src/lib.rs
-index 5ce624c..0b44ffe 100644
+index 5ce624c..0e4ebf4 100644
 --- a/lib/src/lib.rs
 +++ b/lib/src/lib.rs
 @@ -14,7 +14,10 @@ use bytes::Bytes;
@@ -80,7 +80,23 @@ index 5ce624c..0b44ffe 100644
  use wasmtime::{Config, Engine, Store};
  use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
  use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
-@@ -244,7 +247,7 @@ async fn wizer_init(
+@@ -126,7 +129,14 @@ pub async fn componentize(opts: &ComponentizeOpts<'_>) -> Result<Vec<u8>> {
+     let world_id = resolve.select_world(&[pkg_id], opts.world_name)?;
+ 
+     let resolver = module_resolution(opts)?;
+-    let (mut wit_dylib, wit_metadata) = wit_dylib::create_with_metadata(&resolve, world_id, None);
++    // The runtime is built for wasm32-wasip3, whose libc keeps each task's stack pointer in `context.get 0`. wit-dylib
++    // must take its frames from the same stack: "for WASIp3-and-later the `task-context` option should be used".
++    let mut dylib_opts = wit_dylib::DylibOpts {
++        stack_pointer: wit_dylib::StackPointer::TaskContext,
++        ..Default::default()
++    };
++    let (mut wit_dylib, wit_metadata) =
++        wit_dylib::create_with_metadata(&resolve, world_id, Some(&mut dylib_opts));
+     let shim = codegen::generate_shim(&resolve, &wit_metadata);
+ 
+     wit_component::embed_component_metadata(
+@@ -244,7 +254,7 @@ async fn wizer_init(
  
      let mut linker = Linker::new(&engine);
      linker.allow_shadowing(true);
@@ -89,7 +105,7 @@ index 5ce624c..0b44ffe 100644
      wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
      wasmtime_wasi::p3::add_to_linker(&mut linker)?;
  
-@@ -271,7 +274,7 @@ async fn wizer_init(
+@@ -271,7 +281,7 @@ async fn wizer_init(
  
      let component = wizer
          .snapshot_component(
@@ -98,7 +114,7 @@ index 5ce624c..0b44ffe 100644
              &mut WasmtimeWizerComponent {
                  store: &mut store,
                  instance,
-@@ -282,6 +285,52 @@ async fn wizer_init(
+@@ -282,6 +292,52 @@ async fn wizer_init(
      Ok(component)
  }
  

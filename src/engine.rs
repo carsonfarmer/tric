@@ -310,3 +310,65 @@ async fn run(store: &mut Store<Host>, guest: Service, req: Request, tx: oneshot:
         })
         .await?
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::name::Turn;
+    use crate::tric::Tric;
+    use http_body_util::BodyExt;
+    use std::time::Instant;
+
+    /// One instance of the JavaScript app runs two requests at once: the first waits 200 ms, and the second starts while
+    /// it waits and answers after 50 ms. Each is answered with its own echo, so the runtime kept each task's state apart
+    /// between its callbacks (see docs/decisions.md on componentize-qjs).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_instance_of_the_javascript_app_runs_requests_at_once() {
+        let engine = Engine::new().unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/js.wasm");
+        let wasm =
+            std::fs::read(&fixture).unwrap_or_else(|e| panic!("{}: {e}: build the fixtures first", fixture.display()));
+        let app = Arc::new(engine.load(&engine.compile(&wasm).unwrap(), vec![]).unwrap());
+        let tric = Arc::new(Tric {
+            app: "a".into(),
+            store: crate::store::Store::memory(),
+            code: app.clone(),
+            allow: Arc::from([]),
+            sink: Arc::new(|_| Box::pin(async { Ok(()) })),
+        });
+        let turn =
+            Turn::open(&tric.store, "a", "n", false, &Default::default(), Instant::now()).await.unwrap().unwrap();
+        let mut store = store(&engine.engine, WasiCtx::builder().build(), Ctx::of_command(tric, turn, "n"));
+        let guest = app.pre.instantiate_async(&mut store).await.unwrap();
+
+        let uris = ["http://a.localhost/echo?sleep=200", "http://a.localhost/echo?sleep=50"];
+        let [first, second] = uris.map(|uri| {
+            let req: Request = http::Request::get(uri).body(Default::default()).unwrap();
+            let (req, io) = p3::Request::from_http(store.data_mut().http().hooks, req);
+            let req = store.data_mut().table.push(req).unwrap();
+            (guest.wasi_http_handler().func_handle().start_call_concurrent(&mut store, (req,)).unwrap(), io)
+        });
+        let answers = store
+            .run_concurrent(async move |accessor| {
+                let answer = async |(call, io)| -> Result<(serde_json::Value, Instant)> {
+                    let res = guest.wasi_http_handler().func_handle().finish_call_concurrent(accessor, call).await?.0;
+                    let res = res.map_err(|e| wasmtime::format_err!("the guest answered {e:?}"))?;
+                    let res = accessor.with(|mut store| {
+                        let res = store.get().table.delete(res)?;
+                        res.into_http(&mut store, io)
+                    })?;
+                    let body = res.into_body().collect().await.map_err(|e| wasmtime::format_err!("{e:?}"))?;
+                    Ok((serde_json::from_slice(&body.to_bytes())?, Instant::now()))
+                };
+                let (first, second) = tokio::join!(answer(first), answer(second));
+                Ok::<_, wasmtime::Error>((first?, second?))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let ((first, first_at), (second, second_at)) = answers;
+        assert_eq!(first["uri"], uris[0]);
+        assert_eq!(second["uri"], uris[1]);
+        assert!(second_at < first_at, "the second request was not answered while the first waited");
+    }
+}
