@@ -73,9 +73,10 @@ struct Conn {
 
 impl Conn {
     /// A socket of `app` opened at `uri` with `headers`, of which each event carries those that are text, less the
-    /// upgrade's own, but for the subprotocols the client offers, and those each event sets.
+    /// upgrade's own, but for the subprotocols the client offers, those each event sets, and an `Idempotency-Key`,
+    /// which would answer each event after the first as the first.
     fn of(app: &str, uri: String, headers: &HeaderMap) -> Self {
-        let ours = [HOST, CONNECTION, UPGRADE, CONTENT_TYPE, CONTENT_LENGTH, CONNECTION_ID];
+        let ours = [HOST, CONNECTION, UPGRADE, CONTENT_TYPE, CONTENT_LENGTH, CONNECTION_ID, name::IDEMPOTENCY_KEY];
         let upgrade = |k: &HeaderName| k.as_str().starts_with("sec-websocket-") && k != SEC_WEBSOCKET_PROTOCOL;
         let headers = headers.iter().filter(|(k, _)| !ours.contains(k) && !upgrade(k));
         let headers = headers.filter_map(|(k, v)| Some((k.to_string(), v.to_str().ok()?.to_owned()))).collect();

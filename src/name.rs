@@ -6,7 +6,7 @@ use crate::outbox::{Event, Held, Sink, WINDOW};
 use crate::store::{self, Store};
 use crate::tree::{self, Full, Root, Tree};
 use bytes::Bytes;
-use http::{HeaderMap, StatusCode};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use object_store::{PutMode, UpdateVersion, path::Path};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -35,6 +35,13 @@ const PENDING_MAX: usize = 1000;
 /// fails with [`Unsettled`]. The guest's `ANSWER`, the claims it waits for and this fit in CloudFront's 60 s for an
 /// answer from the origin, so the client hears the 500, and not a 504 that it might try again.
 pub const SETTLE: Duration = Duration::from_secs(30);
+/// The header that makes a turn apply once, however often it is sent: see [`Idempotency`].
+pub const IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("idempotency-key");
+const IDEMPOTENCY_KEY_MAX: usize = 255; // bytes
+/// A day, in milliseconds: the records of `Idempotency-Key`s are kept by the Unix day they were made on.
+const DAY: u64 = 24 * 3600 * 1000;
+/// The most expired records of `Idempotency-Key`s one commit deletes.
+const PRUNE_MAX: usize = 1000;
 
 /// Whether `s` is a name: 1 to 128 of `A-Za-z0-9._~:-`, starting with a letter or digit.
 pub fn is_name(s: &str) -> bool {
@@ -189,6 +196,78 @@ fn tags(list: &str) -> impl Iterator<Item = (bool, &str)> {
     list.split(',').map(str::trim).map(|t| t.strip_prefix("W/").map_or((false, t), |t| (true, t)))
 }
 
+/// A turn's `Idempotency-Key`, by its SHA-256, and its request's fingerprint. A turn that commits records what it
+/// answered under the key, and one sent again with the key is answered so, without running; one sent with another
+/// request is refused.
+#[derive(Clone)]
+pub struct Idempotency {
+    key: String,
+    fingerprint: String,
+}
+
+impl Idempotency {
+    /// The SHA-256 of the request's `Idempotency-Key`, if it has one, which is never kept or logged itself: one field,
+    /// of 1 to 255 visible ASCII characters, taken as sent; else 400.
+    pub fn key(headers: &HeaderMap) -> Result<Option<String>, StatusCode> {
+        let ok = |k: &HeaderValue| (1..=IDEMPOTENCY_KEY_MAX).contains(&k.len()) && k.to_str().is_ok();
+        match headers.get_all(IDEMPOTENCY_KEY).iter().collect::<Vec<_>>()[..] {
+            [] => Ok(None),
+            [key] if ok(key) => Ok(Some(store::hash(key.as_bytes()))),
+            _ => Err(StatusCode::BAD_REQUEST),
+        }
+    }
+
+    /// The key `key` of the request `method uri` with `body`, whose fingerprint is the SHA-256 of the method, a space,
+    /// the path and query, a line feed and the body.
+    pub fn of(key: String, method: &Method, uri: &Uri, body: &[u8]) -> Self {
+        let target = uri.path_and_query().map_or("/", |p| p.as_str());
+        let fingerprint = store::hash(&[method.as_str().as_bytes(), b" ", target.as_bytes(), b"\n", body].concat());
+        Self { key, fingerprint }
+    }
+}
+
+/// What a turn with an `Idempotency-Key` answered, which its commit keeps in the tree at `i/<day>/<key>`: its
+/// request's fingerprint, its status and its `Location`, but not its body.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Record {
+    fingerprint: String,
+    pub status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+}
+
+/// The key in the tree of the record of the `Idempotency-Key` `key`, made on the Unix day `day`.
+fn record_key(day: u64, key: &str) -> String {
+    format!("i/{day:06}/{key}")
+}
+
+/// The record of the `Idempotency-Key` `key`, if it was made yesterday, today or tomorrow, as clocks differ.
+async fn recorded(tree: &Tree, key: &str, today: u64) -> Result<Option<Record>> {
+    for day in [today.saturating_sub(1), today, today + 1] {
+        if let Some(item) = tree.get(&record_key(day, key)).await? {
+            return Ok(Some(serde_json::from_slice(&tree.value(&item).await?)?));
+        }
+    }
+    Ok(None)
+}
+
+/// The first `PRUNE_MAX` records of `Idempotency-Key`s, up to the first made yesterday or after, which no lookup reads.
+async fn expired(tree: &Tree, today: u64) -> Result<Vec<String>> {
+    let old = |k: &String| k.split('/').nth(1).and_then(|d| d.parse::<u64>().ok()).is_some_and(|d| d + 1 < today);
+    if !tree.scan("i/", None, 1).await?.first().is_some_and(old) {
+        return Ok(vec![]); // as there mostly are none, at the cost of one key
+    }
+    Ok(tree.scan("i/", None, PRUNE_MAX).await?.into_iter().take_while(old).collect())
+}
+
+/// What a turn that does not run answers.
+#[derive(Debug, PartialEq)]
+pub enum Answer {
+    Refused(StatusCode),
+    Replay(Record), // what the turn that committed with the same `Idempotency-Key` answered
+}
+
 /// What a turn changes, under its lock.
 #[derive(Default)]
 struct State {
@@ -217,6 +296,7 @@ pub struct Turn {
     pub fs: fs::State,
     claiming: tokio::sync::Mutex<()>,
     settled: watch::Sender<Option<bool>>, // whether it committed, once it is known
+    once: Option<Idempotency>,
 }
 
 /// How a commit went.
@@ -306,14 +386,15 @@ fn same(a: &UpdateVersion, b: &UpdateVersion) -> bool {
     }
 }
 
-/// Why a commit failed when its head would be over `HEAD_MAX`. The head is the root of the tree, at most `NODE_MAX`,
-/// and the pending commits, at most `PENDING_MAX` of them, so this is a backstop; it answers 500, as for a trap.
+/// Why a commit failed when the name would be over its limits: its head over `HEAD_MAX`, or its tree too full for the
+/// record of an `Idempotency-Key`. The head is the root of the tree, at most `NODE_MAX`, and the pending commits, at
+/// most `PENDING_MAX` of them, so that is a backstop. Running again would fail again, so it answers 500, as for a trap.
 #[derive(Debug)]
 pub struct TooLarge;
 
 impl std::fmt::Display for TooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "the name would be over {HEAD_MAX} bytes")
+        write!(f, "the name would be over its limits")
     }
 }
 
@@ -382,48 +463,60 @@ fn check(items: &[(String, Option<Bytes>)]) -> Result<(), Error> {
 }
 
 impl Turn {
-    /// A turn on `name` with the head `read`, answered already if `answered`.
+    /// A turn on `name` with the head `read`, answered already if `answered`, with the `Idempotency-Key` `once`.
     fn new(
         store: &Store,
         app: &str,
         name: &str,
         read: Option<(Head, UpdateVersion)>,
         answered: bool,
+        once: Option<Idempotency>,
     ) -> Result<Arc<Self>> {
         let (head, base) = read.map_or_else(Default::default, |(head, version)| (head, Some(version)));
         let tree = RwLock::new(tree::open(store, app, name, &head.tree, tree::config())?);
         let state = Mutex::new(State { head, base, answered, ..Default::default() });
         let (app, name, path, settled) = (app.into(), name.into(), path(app, name), watch::Sender::new(None));
         let (claiming, fs) = (Default::default(), Default::default());
-        Ok(Arc::new(Self { store: store.clone(), app, name, path, state, tree, fs, claiming, settled }))
+        Ok(Arc::new(Self { store: store.clone(), app, name, path, state, tree, fs, claiming, settled, once }))
     }
 
     /// A snapshot of `name`: as it is now, without waiting for anyone's claim.
     pub async fn snap(store: &Store, app: &str, name: &str) -> Result<Arc<Self>> {
-        Self::new(store, app, name, read(store, &path(app, name)).await?, true)
+        Self::new(store, app, name, read(store, &path(app, name)).await?, true, None)
     }
 
     /// Opens a turn on `name`, once no one else's claim is live, if `conditions` hold, and claimed if `claim`; or
-    /// refuses it, with 412 if they do not, or with 429 if others still hold the name, or keep changing it, at `until`.
+    /// answers without one. A turn whose `Idempotency-Key` `once` committed is answered as it was, at once, or with 422
+    /// if its request was another; else the turn is refused with 412 if the conditions do not hold, or with 429 if
+    /// others still hold the name, or keep changing it, at `until`.
     pub async fn open(
         store: &Store,
         app: &str,
         name: &str,
         claim: bool,
         conditions: &Conditions,
+        once: Option<&Idempotency>,
         until: Instant,
-    ) -> Result<Result<Arc<Self>, StatusCode>> {
+    ) -> Result<Result<Arc<Self>, Answer>> {
         loop {
-            let turn = Self::new(store, app, name, read(store, &path(app, name)).await?, false)?;
+            let turn = Self::new(store, app, name, read(store, &path(app, name)).await?, false, once.cloned())?;
+            if let Some(once) = once
+                && let Some(record) = recorded(&*turn.tree.read().await, &once.key, now() / DAY).await?
+            {
+                return Ok(Err(match record.fingerprint == once.fingerprint {
+                    true => Answer::Replay(record),
+                    false => Answer::Refused(StatusCode::UNPROCESSABLE_ENTITY),
+                }));
+            }
             let free = !turn.state().head.claim.as_ref().is_some_and(Claim::live);
             if free && !conditions.hold(turn.etag().as_deref()) {
-                return Ok(Err(StatusCode::PRECONDITION_FAILED));
+                return Ok(Err(Answer::Refused(StatusCode::PRECONDITION_FAILED)));
             }
             if free && (!claim || turn.claim().await) {
                 return Ok(Ok(turn));
             }
             if Instant::now() >= until {
-                return Ok(Err(StatusCode::TOO_MANY_REQUESTS));
+                return Ok(Err(Answer::Refused(StatusCode::TOO_MANY_REQUESTS)));
             }
             sleep(Duration::from_millis(rand::random_range(25..=50))).await;
         }
@@ -605,12 +698,19 @@ impl Turn {
         Ok(true)
     }
 
-    /// Commits the turn, asked at `host`: its tree is uploaded, its held requests go to `sink` as a delivery event
-    /// whose digest the head keeps in `pending`, and its head goes over the version it read, if that is still the
-    /// head. The `ETag` it returns is the new head's, or the old one's when there was nothing to write. A commit that
-    /// fails is discarded.
-    pub async fn commit(&self, host: &str, sink: &Sink) -> Result<Committed> {
-        let committed = self.try_commit(host, sink).await;
+    /// Commits the turn, asked at `host` and answered with `status` and `location`: its tree is uploaded, its held
+    /// requests go to `sink` as a delivery event whose digest the head keeps in `pending`, and its head goes over the
+    /// version it read, if that is still the head. A commit that puts a head deletes expired records of
+    /// `Idempotency-Key`s, and records the turn's own, if it has one. The `ETag` it returns is the new head's, or the
+    /// old one's when there was nothing to write. A commit that fails is discarded.
+    pub async fn commit(
+        &self,
+        host: &str,
+        sink: &Sink,
+        status: StatusCode,
+        location: Option<&HeaderValue>,
+    ) -> Result<Committed> {
+        let committed = self.try_commit(host, sink, status, location).await;
         if committed.is_err() {
             self.discard().await;
         }
@@ -618,7 +718,13 @@ impl Turn {
         committed
     }
 
-    async fn try_commit(&self, host: &str, sink: &Sink) -> Result<Committed> {
+    async fn try_commit(
+        &self,
+        host: &str,
+        sink: &Sink,
+        status: StatusCode,
+        location: Option<&HeaderValue>,
+    ) -> Result<Committed> {
         let _one = self.claiming.lock().await; // so a claim in flight lands first
         let (mut head, base, held, claimed, doomed) = {
             let s = &mut *self.state();
@@ -640,9 +746,22 @@ impl Turn {
             let mut kept = None;
             if tree.edited() {
                 kept = self.fs.settle(&mut tree).await?;
-                head.tree = tree.finish().await?;
             }
             let now = now();
+            let mut edits: Vec<_> = expired(&tree, now / DAY).await?.into_iter().map(|k| (k, None)).collect();
+            if let Some(once) = &self.once {
+                let location = location.and_then(|l| l.to_str().ok()).map(Into::into);
+                let record = Record { fingerprint: once.fingerprint.clone(), status: status.as_u16(), location };
+                edits.push((record_key(now / DAY, &once.key), Some(serde_json::to_vec(&record)?.into())));
+            }
+            tree.write(edits).await.map_err(|e| match e {
+                // A name too full for the record stays so until something is deleted: it is not tried again.
+                tree::Error::Full(_) | tree::Error::TooLarge(_) => wasmtime::Error::from(e).context(TooLarge),
+                e => e.into(),
+            })?;
+            if tree.edited() {
+                head.tree = tree.finish().await?;
+            }
             head.pending.retain(|_, p| p.live(now));
             head.claim = None;
             head.commit = commit.clone();
@@ -797,7 +916,7 @@ mod tests {
             }
             assert!(serde_json::to_vec(&head).unwrap().len() < HEAD_MAX / 4, "the head stays far under its limit");
             put(&store, &path("a", "n"), &mut head, None).await.unwrap().unwrap();
-            let turn = Turn::open(&store, "a", "n", false, &Default::default(), Instant::now()).await;
+            let turn = Turn::open(&store, "a", "n", false, &Default::default(), None, Instant::now()).await;
             assert_eq!(turn.unwrap().ok().unwrap().backlogged(), backlogged, "{live} live");
         }
     }
@@ -1001,8 +1120,8 @@ mod tests {
     }
 
     /// A turn on `n`, claimed if `claim`, that writes at `key` a value too large to be inline, so it is an object.
-    async fn writes(store: &Store, claim: bool, key: &str) -> Result<Arc<Turn>, StatusCode> {
-        let turn = Turn::open(store, "a", "n", claim, &Default::default(), Instant::now()).await.unwrap()?;
+    async fn writes(store: &Store, claim: bool, key: &str) -> Result<Arc<Turn>, Answer> {
+        let turn = Turn::open(store, "a", "n", claim, &Default::default(), None, Instant::now()).await.unwrap()?;
         turn.write(vec![(key.into(), Some(Bytes::from(vec![7; 5000])))]).await.unwrap();
         Ok(turn)
     }
@@ -1010,7 +1129,7 @@ mod tests {
     /// Commits `turn`.
     async fn commit(turn: &Turn) -> Result<Committed> {
         let sink: Sink = Arc::new(|_| Box::pin(async { Ok(()) }));
-        turn.commit("h", &sink).await
+        turn.commit("h", &sink, StatusCode::OK, None).await
     }
 
     /// How many objects the name's tree has in the store.
@@ -1177,7 +1296,7 @@ mod tests {
             let req = http::Request::builder().method("POST").uri("https://h/x").body(Default::default()).unwrap();
             turn.hold(Held::of(req).await.unwrap()).unwrap();
             let sink: Sink = Arc::new(|_| Box::pin(async { wasmtime::bail!("the sink failed") }));
-            let e = turn.commit("h", &sink).await.unwrap_err();
+            let e = turn.commit("h", &sink, StatusCode::OK, None).await.unwrap_err();
             assert_eq!(e.is::<Unsent>(), !claim, "{e:#}");
             assert_eq!(value(&store, "k").await, None, "it did not land");
             let res = crate::tric::failed(&e);
@@ -1216,5 +1335,143 @@ mod tests {
         assert_ne!(version.e_tag, base.e_tag, "nor its ETag");
         let put = put(&store, &at, &mut Head::default(), Some(base)).await.unwrap();
         assert!(put.is_none(), "so a put on the head it was taken on, as of a commit put again, is refused");
+    }
+
+    #[test]
+    fn idempotency_keys() {
+        let key = |values: &[&[u8]]| {
+            let mut headers = HeaderMap::new();
+            for v in values {
+                headers.append(IDEMPOTENCY_KEY, HeaderValue::from_bytes(v).unwrap());
+            }
+            Idempotency::key(&headers)
+        };
+        assert_eq!(key(&[]), Ok(None));
+        assert_eq!(key(&[b"k"]), Ok(Some(store::hash(b"k"))));
+        assert_eq!(key(&[b"\"k\""]), Ok(Some(store::hash(b"\"k\""))), "taken as sent, quotes and all");
+        assert_eq!(key(&[&[b'a'; 255]]), Ok(Some(store::hash(&[b'a'; 255]))));
+        for bad in [&b""[..], &[b'a'; 256][..], "café".as_bytes()] {
+            assert_eq!(key(&[bad]), Err(StatusCode::BAD_REQUEST), "{bad:?}");
+        }
+        assert_eq!(key(&[b"k", b"k"]), Err(StatusCode::BAD_REQUEST), "one field");
+    }
+
+    #[test]
+    fn fingerprints() {
+        let of = |method: Method, uri: &'static str, body: &str| {
+            Idempotency::of("k".into(), &method, &Uri::from_static(uri), body.as_bytes()).fingerprint
+        };
+        let one = of(Method::POST, "/@n/x?y=1", "b");
+        assert_eq!(one, store::hash(b"POST /@n/x?y=1\nb"));
+        assert_eq!(of(Method::POST, "https://h/@n/x?y=1", "b"), one, "the target is in origin form");
+        for other in
+            [of(Method::PUT, "/@n/x?y=1", "b"), of(Method::POST, "/@n/x?y=2", "b"), of(Method::POST, "/@n/x?y=1", "c")]
+        {
+            assert_ne!(other, one);
+        }
+    }
+
+    /// The `Idempotency-Key` `k` of a `POST` to `/@n` of `body`.
+    fn once(body: &str) -> Idempotency {
+        Idempotency::of(store::hash(b"k"), &Method::POST, &Uri::from_static("/@n"), body.as_bytes())
+    }
+
+    /// A turn on `n`, claimed if `claim`, with `once`, if one is opened at once.
+    async fn keyed(store: &Store, claim: bool, once: &Idempotency) -> Result<Arc<Turn>, Answer> {
+        Turn::open(store, "a", "n", claim, &Default::default(), Some(once), Instant::now()).await.unwrap()
+    }
+
+    /// Commits `turn`, as answered with `status` and `location`.
+    async fn answered(turn: &Turn, status: u16, location: Option<&'static str>) -> Committed {
+        let sink: Sink = Arc::new(|_| Box::pin(async { Ok(()) }));
+        let (status, location) = (StatusCode::from_u16(status).unwrap(), location.map(HeaderValue::from_static));
+        turn.commit("h", &sink, status, location.as_ref()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_turn_whose_key_committed_is_answered_as_it_was_without_running() {
+        let store = Store::memory();
+        let turn = keyed(&store, false, &once("1")).await.unwrap();
+        turn.increment("c", 1).await.unwrap();
+        assert!(matches!(answered(&turn, 201, Some("/@n/1")).await, Committed::Done(Some(_))));
+        let record = Record { fingerprint: once("1").fingerprint, status: 201, location: Some("/@n/1".into()) };
+        assert_eq!(keyed(&store, false, &once("1")).await.err(), Some(Answer::Replay(record)));
+        let other = Answer::Refused(StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(keyed(&store, false, &once("2")).await.err(), Some(other), "the key, with another request");
+
+        // Before anyone's claim, and the conditions, so a replay never waits, and is never refused for what changed.
+        let claimed = writes(&store, true, "k").await.unwrap();
+        let conditions = Conditions { if_match: Some("\"other\"".into()), if_none_match: None };
+        let replay = Turn::open(&store, "a", "n", false, &conditions, Some(&once("1")), Instant::now()).await.unwrap();
+        assert!(matches!(replay, Err(Answer::Replay(_))));
+        claimed.discard().await;
+        assert_eq!(value(&store, "c").await, Some(Bytes::copy_from_slice(&1i64.to_le_bytes())), "it ran once");
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_puts_no_head_records_nothing() {
+        let store = Store::memory();
+        let turn = keyed(&store, false, &once("1")).await.unwrap();
+        assert!(matches!(answered(&turn, 200, None).await, Committed::Done(None)));
+        let turn = keyed(&store, false, &once("1")).await.expect("nothing changed, so nothing was recorded");
+        drop(turn);
+
+        // A claimed one puts a head, whatever it changed, so it records its key; a 4xx that commits, as it is.
+        let turn = keyed(&store, true, &once("1")).await.unwrap();
+        assert!(matches!(answered(&turn, 409, None).await, Committed::Done(Some(_))));
+        let replay = keyed(&store, false, &once("1")).await.err();
+        assert!(matches!(replay, Some(Answer::Replay(Record { status: 409, location: None, .. }))), "{replay:?}");
+    }
+
+    #[tokio::test]
+    async fn a_discarded_turn_records_nothing() {
+        // As for a 5xx, or a trap.
+        let store = Store::memory();
+        let turn = keyed(&store, false, &once("1")).await.unwrap();
+        turn.increment("c", 1).await.unwrap();
+        turn.discard().await;
+        keyed(&store, false, &once("1")).await.expect("so it runs again");
+    }
+
+    #[tokio::test]
+    async fn a_record_is_found_from_the_day_before_its_own_to_the_day_after() {
+        let store = Store::memory();
+        let mut tree = tree::open(&store, "a", "n", &Root::default(), tree::config()).unwrap();
+        let record = Record { fingerprint: "f".into(), status: 200, location: None };
+        tree.write(vec![(record_key(100, "k"), Some(serde_json::to_vec(&record).unwrap().into()))]).await.unwrap();
+        for (today, found) in [(98, false), (99, true), (100, true), (101, true), (102, false)] {
+            assert_eq!(recorded(&tree, "k", today).await.unwrap().is_some(), found, "on day {today}");
+        }
+        assert_eq!(recorded(&tree, "l", 100).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn expired_records_are_deleted_a_thousand_at_a_time_up_to_the_first_that_is_not() {
+        let store = Store::memory();
+        let mut tree = tree::open(&store, "a", "n", &Root::default(), tree::config()).unwrap();
+        let days = [(40, 600), (50, 600), (98, 5), (99, 5), (100, 5)];
+        let record = |(day, i)| (record_key(day, &format!("{i:064x}")), Some(Bytes::from_static(b"{}")));
+        tree.write(days.iter().flat_map(|&(day, n)| (0..n).map(move |i| record((day, i)))).collect()).await.unwrap();
+        for n in [PRUNE_MAX, 205, 0] {
+            let expired = expired(&tree, 100).await.unwrap();
+            assert_eq!(expired.len(), n);
+            assert!(expired.iter().all(|k| k.as_str() < record_key(99, "").as_str()), "none from yesterday on");
+            tree.write(expired.into_iter().map(|k| (k, None)).collect()).await.unwrap();
+        }
+        assert_eq!(tree.scan("i/", None, 100).await.unwrap().len(), 10, "yesterday's and today's are kept");
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_puts_a_head_deletes_the_records_made_before_yesterday() {
+        let store = Store::memory();
+        let today = now() / DAY;
+        let mut tree = tree::open(&store, "a", "n", &Root::default(), tree::config()).unwrap();
+        let records = [today - 2, today - 1].map(|day| (record_key(day, "k"), Some(Bytes::from_static(b"{}"))));
+        tree.write(records.into()).await.unwrap();
+        let mut head = Head { tree: tree.finish().await.unwrap(), ..Default::default() };
+        put(&store, &path("a", "n"), &mut head, None).await.unwrap().unwrap();
+        commit(&writes(&store, false, "k").await.unwrap()).await.unwrap();
+        let snap = Turn::snap(&store, "a", "n").await.unwrap();
+        assert_eq!(snap.tree().read().await.scan("i/", None, 10).await.unwrap(), [record_key(today - 1, "k")]);
     }
 }

@@ -1,13 +1,13 @@
 //! Running an app: each request in a fresh instance. A request with an unsafe method to `/@<name>` is a turn on the
 //! name: its writes, and the requests it holds, commit if it answers anything but 5xx. A conflict runs it again.
 use crate::engine::App;
-use crate::name::{self, BUSY, Committed, Conditions, TooLarge, Turn, Unsent};
+use crate::name::{self, Answer, BUSY, Committed, Conditions, Idempotency, Record, TooLarge, Turn, Unsent};
 use crate::outbound::{self, Allow, Fut, Sent};
 use crate::outbox::{self, Held, Sink};
 use crate::store::Store;
 use bytes::{Bytes, BytesMut};
 use futures_util::{FutureExt, StreamExt, stream};
-use http::header::{CONTENT_TYPE, ETAG, FORWARDED, RETRY_AFTER};
+use http::header::{CONTENT_TYPE, ETAG, FORWARDED, LOCATION, RETRY_AFTER};
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use http_body_util::{BodyExt, BodyStream, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -28,6 +28,8 @@ pub type Response = http::Response<WasiBody>;
 pub const TENANT: HeaderName = HeaderName::from_static("x-amz-tenant-id");
 /// The app's storage credentials, which the router sets, as JSON that `credential_process` would print.
 pub const CREDENTIALS: HeaderName = HeaderName::from_static("x-tric-credentials");
+/// What marks the answer of a turn sent again with its `Idempotency-Key`, as Stripe marks one.
+const IDEMPOTENT_REPLAYED: HeaderName = HeaderName::from_static("idempotent-replayed");
 
 /// A turn's request body is kept up to this, so the turn can run again; past it, the turn claims its name first.
 const REPLAY_MAX: usize = 6 << 20;
@@ -87,6 +89,17 @@ fn tag(mut res: Response, etag: Option<String>) -> Response {
     if let Some(e) = etag.and_then(|e| HeaderValue::try_from(e).ok()) {
         res.headers_mut().entry(ETAG).or_insert(e);
     }
+    res
+}
+
+/// The answer of a turn sent again with its `Idempotency-Key`: the status and `Location` the turn committed with,
+/// marked, with no body, which is not kept, and no `ETag`, as the head may have changed since.
+fn replay(record: Record) -> Response {
+    let mut res = status(StatusCode::from_u16(record.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
+    if let Some(location) = record.location.and_then(|l| HeaderValue::try_from(l).ok()) {
+        res.headers_mut().insert(LOCATION, location);
+    }
+    res.headers_mut().insert(IDEMPOTENT_REPLAYED, HeaderValue::from_static("true"));
     res
 }
 
@@ -222,16 +235,23 @@ impl Tric {
             };
         }
         let conditions = Conditions::of(req.headers());
+        let Ok(key) = Idempotency::key(req.headers()) else { return status(StatusCode::BAD_REQUEST) };
         let (parts, body) = req.into_parts();
         let Ok(mut body) = Body::keep(body).await else { return status(StatusCode::BAD_REQUEST) };
+        let once = match (key, &body) {
+            (Some(key), Body::Whole(data, _)) => Some(Idempotency::of(key, &parts.method, &parts.uri, data)),
+            (Some(_), Body::Once(_)) => return status(StatusCode::PAYLOAD_TOO_LARGE), // too large to fingerprint
+            (None, _) => None,
+        };
         let (mut claim, until) = (matches!(body, Body::Once(_)), Instant::now() + BUSY);
         let chain: Vec<String> = chain.into_iter().chain([name.clone()]).collect();
         loop {
             let Some(body) = body.take() else { return later(StatusCode::SERVICE_UNAVAILABLE) }; // read, and lost
-            let turn = match Turn::open(&self.store, &self.app, &name, claim, &conditions, until).await {
+            let turn = match Turn::open(&self.store, &self.app, &name, claim, &conditions, once.as_ref(), until).await {
                 Ok(Ok(turn)) => turn,
-                Ok(Err(StatusCode::TOO_MANY_REQUESTS)) => return later(StatusCode::TOO_MANY_REQUESTS),
-                Ok(Err(refused)) => return status(refused),
+                Ok(Err(Answer::Replay(record))) => return replay(record),
+                Ok(Err(Answer::Refused(StatusCode::TOO_MANY_REQUESTS))) => return later(StatusCode::TOO_MANY_REQUESTS),
+                Ok(Err(Answer::Refused(refused))) => return status(refused),
                 Err(e) => {
                     tracing::warn!(app = self.app, name, "{e:#}");
                     return later(StatusCode::SERVICE_UNAVAILABLE);
@@ -280,7 +300,7 @@ impl Tric {
             turn.discard().await;
             return Some(res);
         }
-        match turn.commit(host, &self.sink).await {
+        match turn.commit(host, &self.sink, res.status(), res.headers().get(LOCATION)).await {
             Ok(Committed::Done(etag)) => Some(tag(res, etag)),
             Ok(Committed::Conflict) => {
                 instance.abort();
