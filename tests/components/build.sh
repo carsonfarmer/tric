@@ -13,8 +13,9 @@ rm -rf rust/wit/deps
 cp -R "$(ls -d "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/wasip3-0.9.0* | head -1)/wit/deps" rust/wit/deps
 
 for name in app guard; do
-  cargo build --release --locked --target wasm32-wasip2 --manifest-path rust/Cargo.toml --features "$name"
-  cp "${CARGO_TARGET_DIR:-rust/target}/wasm32-wasip2/release/fixture.wasm" "$out/$name.wasm"
+  cargo "+${TRIC_FIXTURE_TOOLCHAIN:?}" build --release --locked --target wasm32-wasip3 --manifest-path rust/Cargo.toml \
+    --features "$name"
+  cp "${CARGO_TARGET_DIR:-rust/target}/wasm32-wasip3/release/fixture.wasm" "$out/$name.wasm"
 done
 
 # The same packages, and tric's wasi:keyvalue, for the JavaScript app. componentize-qjs runs the app's top level at
