@@ -124,7 +124,11 @@ ws/channels/<app>/<channel>/<id> a socket's subscription to a channel (router on
     - `bytes` and `entries`: the name's budgets, exact at each commit;
     - `seq`: the last inode number given out, which no inode is given again (absent until a file is made);
   - `pending`: commit id → {SHA-256 of its delivery event, time};
-  - an optional claim.
+  - an optional claim;
+  - `commit`: the random id of the commit that wrote it, which a claim and its release keep (absent before the first);
+  - `over`: the version id of the head it was written over (absent for the first head), so that no head's bytes, and
+    so no head's `ETag`, are ever another's, and a commit whose answer was lost can read back along the versions to
+    the one written over its base, which says whether it landed.
 - **Objects.** Each node, block or large value is immutable, named by a random id under its name, and read by the
   version id in the link that points to it, and checked against that link's SHA-256 and length.
   - A turn deletes nothing, whether it lands, loses its race, fails or is discarded: what a commit replaces, and what

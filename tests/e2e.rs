@@ -12,7 +12,7 @@ use hyper::client::conn::http1;
 use hyper::service::service_fn;
 use object_store::aws::{AmazonS3, AmazonS3Builder, AwsAuthorizer, AwsCredential};
 use object_store::client::{HttpConnector, ReqwestConnector};
-use object_store::{ClientOptions, ObjectStore, ObjectStoreExt, PutPayload, path::Path as Key};
+use object_store::{ClientOptions, ObjectStore, ObjectStoreExt, PutMode, PutPayload, path::Path as Key};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
@@ -1061,20 +1061,30 @@ async fn sweeps_the_names() {
     assert_eq!(tric.files(Fs::BINDING, "POST", "s", &format!("op=big&path=/big&n={n}")).await, json!({ "ok": n }));
     assert_eq!(tric.post("/@s/kv?op=set&key=k&value=v").await.status, 200);
     // A name with history, whose head is then deleted: its versions, the newest a delete marker, as S3 lists them, each
-    // of which alone names a value too big to inline, which is an object of its own.
+    // of which alone names a value too big to inline, which is an object of its own. Each head names the version it
+    // was written over, none for the first, as RustFS gives a version id on a get, as S3 does.
+    let (head, mut over) = (Key::from(format!("apps/{app}/names/h")), None);
     for c in ["x", "y"] {
         assert_eq!(tric.post(&format!("/@h/kv?op=set&key=k&value={}", c.repeat(5000))).await.status, 200);
+        let got = s3.get(&head).await.unwrap();
+        let version = got.meta.version.clone();
+        assert!(version.is_some(), "a version id on a get");
+        let json: Value = serde_json::from_slice(&got.bytes().await.unwrap()).unwrap();
+        assert_eq!(json.get("over").and_then(Value::as_str), over.as_deref(), "{json}");
+        over = version;
     }
-    s3.delete(&Key::from(format!("apps/{app}/names/h"))).await.unwrap();
+    s3.delete(&head).await.unwrap();
     let (status, listed) = versions(None, Some(&format!("apps/{app}/names/h"))).await;
     assert_eq!(status, 200, "{listed}");
     let [kept, markers] = ["<Version>", "<DeleteMarker>"].map(|e| listed.matches(e).count());
     assert_eq!((kept, markers), (2, 1), "{listed}");
     // Objects that no tree names: as an app's turn that died would leave, at a name with a head and at one with none.
+    // Each put is conditional, as a head's is, and RustFS gives its version id, as S3 does.
     let id = "0123456789abcdef0123456789abcdef";
     let strays = [format!("apps/{app}/values/s/{id}"), format!("apps/{app}/values/ghost/{id}")];
     for k in &strays {
-        s3.put(&Key::from(k.as_str()), PutPayload::from_static(b"{}")).await.unwrap();
+        let put = s3.put_opts(&Key::from(k.as_str()), PutPayload::from_static(b"{}"), PutMode::Create.into()).await;
+        assert!(put.unwrap().version.is_some(), "a version id on a conditional put");
     }
     let all = async || {
         let mut keys: Vec<_> =

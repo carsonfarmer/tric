@@ -1,7 +1,7 @@
 //! Running an app: each request in a fresh instance. A request with an unsafe method to `/@<name>` is a turn on the
 //! name: its writes, and the requests it holds, commit if it answers anything but 5xx. A conflict runs it again.
 use crate::engine::App;
-use crate::name::{self, BUSY, Committed, Conditions, TooLarge, Turn};
+use crate::name::{self, BUSY, Committed, Conditions, TooLarge, Turn, Unsettled};
 use crate::outbound::{self, Allow, Fut, Sent};
 use crate::outbox::{self, Held, Sink};
 use crate::store::Store;
@@ -70,6 +70,16 @@ fn later(code: StatusCode) -> Response {
     let mut res = status(code);
     res.headers_mut().insert(RETRY_AFTER, HeaderValue::from_static("1"));
     res
+}
+
+/// The answer of a turn whose commit failed with `e`: 500 if the commit may have landed ([`Unsettled`]) or never can
+/// ([`TooLarge`]), so a client does not run the turn again; else 503, with `Retry-After: 1`, as the commit failed
+/// before its put, so nothing landed.
+pub(crate) fn failed(e: &wasmtime::Error) -> Response {
+    match e.is::<Unsettled>() || e.is::<TooLarge>() {
+        true => status(StatusCode::INTERNAL_SERVER_ERROR),
+        false => later(StatusCode::SERVICE_UNAVAILABLE),
+    }
 }
 
 /// `res`, with `etag` unless it has one.
@@ -279,10 +289,7 @@ impl Tric {
             Err(e) => {
                 instance.abort();
                 tracing::warn!(app = self.app, name, "{e:#}");
-                Some(match e.is::<TooLarge>() {
-                    true => status(StatusCode::INTERNAL_SERVER_ERROR),
-                    false => later(StatusCode::SERVICE_UNAVAILABLE),
-                })
+                Some(failed(&e))
             }
         }
     }
@@ -377,5 +384,21 @@ impl Ctx {
 impl WasiHttpHooks for Outbound {
     fn send_request(&mut self, request: Request, _: Option<RequestOptions>, _: Fut<()>) -> Fut<(Response, Fut<()>)> {
         Box::new(self.0.clone().send(request))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_commit_that_failed_is_tried_again_only_if_nothing_landed() {
+        let answer = |e: wasmtime::Error| {
+            let res = failed(&e);
+            (res.status().as_u16(), res.headers().get(RETRY_AFTER).cloned())
+        };
+        assert_eq!(answer(wasmtime::Error::msg(Unsettled).context("commit")), (500, None), "it may have landed");
+        assert_eq!(answer(wasmtime::Error::msg(TooLarge)), (500, None), "it never can");
+        assert_eq!(answer(wasmtime::format_err!("the upload failed")), (503, Some(HeaderValue::from_static("1"))));
     }
 }
