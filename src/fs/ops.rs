@@ -8,7 +8,7 @@
 //!
 //! A path never leaves the directory it is resolved from: `..` stops at it, and so do symlinks, which may not be
 //! absolute.
-use crate::tree::{DATA_MAX, Full, IN_FLIGHT, Item, Tree, Values};
+use crate::tree::{self, DATA_MAX, IN_FLIGHT, Item, Tree, Values};
 use bytes::{Bytes, BytesMut};
 use futures_util::stream::{self, StreamExt};
 use serde::de::DeserializeOwned;
@@ -70,11 +70,11 @@ pub type Res<T> = Result<T, Errno>;
 
 /// What the guest is told of a tree error: that the name is full, which it can act on, and else only that the i/o
 /// failed, as the rest is the host's to know.
-pub fn fail(e: wasmtime::Error) -> Errno {
-    if e.downcast_ref::<Full>().is_some() {
+pub fn fail(e: tree::Error) -> Errno {
+    if let tree::Error::Full(_) = e {
         return Errno::InsufficientSpace;
     }
-    tracing::warn!("name: {e:#}");
+    tracing::warn!("name: {:#}", wasmtime::Error::from(e));
     Errno::Io
 }
 
@@ -222,9 +222,12 @@ async fn load<T: DeserializeOwned>(tree: &Tree, key: &str) -> Res<Option<T>> {
     })
 }
 
-fn encode<T: Serialize>(tree: &Tree, value: &T) -> Res<Item> {
-    let json = serde_json::to_vec(value).map_err(|e| fail(e.into()))?;
-    Ok(tree.item(json.into()))
+fn encode<T: Serialize>(value: &T) -> Res<Bytes> {
+    let json = serde_json::to_vec(value).map_err(|e| {
+        tracing::warn!("name: {e}");
+        Errno::Io
+    })?;
+    Ok(json.into())
 }
 
 /// The inode `ino`. One that a name or a descriptor leads to and that is not there is the host's to explain: the
@@ -349,7 +352,7 @@ struct Tx<'a> {
     tree: &'a mut Tree,
     now: u64,
     inodes: HashMap<u64, Slot>,
-    edits: BTreeMap<String, Option<Item>>,
+    edits: BTreeMap<String, Option<Bytes>>,
 }
 
 struct Slot {
@@ -403,13 +406,13 @@ impl<'a> Tx<'a> {
         Ok((inode.n == 0).then_some(ino))
     }
 
-    fn put(&mut self, key: String, item: Item) {
-        self.edits.insert(key, Some(item));
+    fn put(&mut self, key: String, value: Bytes) {
+        self.edits.insert(key, Some(value));
     }
 
     fn put_dirent(&mut self, dir: u64, name: &str, at: Dirent) -> Res<()> {
-        let item = encode(self.tree, &at)?;
-        self.put(dirent_key(dir, name), item);
+        let value = encode(&at)?;
+        self.put(dirent_key(dir, name), value);
         Ok(())
     }
 
@@ -421,7 +424,7 @@ impl<'a> Tx<'a> {
     async fn finish(self) -> Res<()> {
         let Self { tree, inodes, mut edits, .. } = self;
         for (ino, slot) in inodes.into_iter().filter(|(_, s)| s.dirty) {
-            edits.insert(inode_key(ino), Some(encode(tree, &slot.inode)?));
+            edits.insert(inode_key(ino), Some(encode(&slot.inode)?));
         }
         if edits.is_empty() {
             return Ok(());
@@ -439,6 +442,13 @@ fn check_name(name: &str) -> Res<()> {
     }
 }
 
+/// A new inode number: the one after the last given out, which the tree keeps with its root, and after the root's.
+fn alloc(tree: &mut Tree) -> u64 {
+    let ino = tree.sequence().max(ROOT) + 1;
+    tree.set_sequence(ino);
+    ino
+}
+
 /// A new file, directory or symlink (with its `target`) named `name` in the directory `parent`, which must not have
 /// one. Returns its inode.
 pub async fn create(tree: &mut Tree, parent: u64, name: &str, kind: Kind, target: Option<&str>) -> Res<u64> {
@@ -453,7 +463,7 @@ pub async fn create(tree: &mut Tree, parent: u64, name: &str, kind: Kind, target
     if dirent(tree, parent, name).await?.is_some() {
         return Err(Errno::Exist);
     }
-    let ino = tree.alloc();
+    let ino = alloc(tree);
     let mut tx = Tx::new(tree);
     let now = tx.now;
     let mut inode = Inode { k: kind, n: 1, s: 0, a: now, m: now, c: now, t: None, p: 0 };
@@ -613,8 +623,7 @@ async fn write_chunk(tree: &mut Tree, ino: u64, at: At, data: &[u8]) -> Res<u64>
             buf[from..to].copy_from_slice(piece);
             buf.freeze()
         };
-        let item = tx.tree.item(bytes);
-        tx.put(block_key(ino, index), item);
+        tx.put(block_key(ino, index), bytes);
     }
     let now = tx.now;
     let inode = tx.edit(ino).await?;
@@ -639,8 +648,7 @@ pub async fn set_size(tree: &mut Tree, ino: u64, size: u64) -> Res<()> {
     if size < was.s && !size.is_multiple_of(BLOCK) {
         let last = keep - 1;
         if let Some(stored) = block(tx.tree, ino, last).await?.filter(|b| b.len() as u64 > size % BLOCK) {
-            let item = tx.tree.item(stored.slice(..(size % BLOCK) as usize));
-            tx.put(block_key(ino, last), item);
+            tx.put(block_key(ino, last), stored.slice(..(size % BLOCK) as usize));
         }
     }
     tx.finish().await?;
@@ -823,14 +831,14 @@ mod tests {
     use super::*;
     use crate::store::Store;
     use crate::tree::counting::counting;
-    use crate::tree::{Limits, Shape};
+    use crate::tree::{Config, Root};
     use futures_util::TryStreamExt;
     use object_store::{ObjectStore, ObjectStoreExt};
     use std::sync::Arc;
     use std::sync::atomic::Ordering::SeqCst;
 
-    fn tree(limits: Limits) -> Tree {
-        Tree::open(&Store::memory(), "a", "n", &Shape::default(), limits).unwrap()
+    fn tree(config: Config) -> Tree {
+        tree::open(&Store::memory(), "a", "n", &Root::default(), config).unwrap()
     }
 
     async fn read_at(tree: &Tree, ino: u64, offset: u64, len: u64) -> Res<Bytes> {
@@ -843,7 +851,7 @@ mod tests {
 
     #[tokio::test]
     async fn files_hold_what_is_written() {
-        let mut t = tree(Limits::default());
+        let mut t = tree(tree::config());
         let ino = create(&mut t, ROOT, "f", Kind::File, None).await.unwrap();
         assert_eq!(write_at(&mut t, ino, At::Offset(0), b"hello").await, Ok(5));
         assert_eq!(write_at(&mut t, ino, At::End, b" world").await, Ok(6));
@@ -871,7 +879,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_write_across_blocks_and_in_the_middle_of_one() {
-        let mut t = tree(Limits::default());
+        let mut t = tree(tree::config());
         let ino = create(&mut t, ROOT, "f", Kind::File, None).await.unwrap();
         let data: Vec<u8> = (0..BLOCK * 2 + 100).map(|i| (i % 251) as u8).collect();
         assert_eq!(write_at(&mut t, ino, At::Offset(0), &data).await, Ok(data.len()));
@@ -886,8 +894,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_name_that_fills_takes_part_of_a_write_and_then_none() {
-        let limits = Limits { data: 3 * WRITE_MAX as u64 + 1000, ..Limits::default() };
-        let mut t = tree(limits);
+        let mut t = tree(Config { data: 3 * WRITE_MAX as u64 + 1000, ..tree::config() });
         let ino = create(&mut t, ROOT, "f", Kind::File, None).await.unwrap();
         let data = vec![7u8; 4 * WRITE_MAX];
         assert_eq!(write_at(&mut t, ino, At::Offset(0), &data).await, Ok(3 * WRITE_MAX), "the part that fits");
@@ -897,7 +904,7 @@ mod tests {
 
     #[tokio::test]
     async fn paths_stay_below_where_they_start() {
-        let mut t = tree(Limits::default());
+        let mut t = tree(tree::config());
         let sub = create(&mut t, ROOT, "sub", Kind::Dir, None).await.unwrap();
         create(&mut t, sub, "in", Kind::File, None).await.unwrap();
         create(&mut t, ROOT, "out", Kind::File, None).await.unwrap();
@@ -933,7 +940,7 @@ mod tests {
 
     #[tokio::test]
     async fn forty_symlinks_are_followed_and_no_more() {
-        let mut t = tree(Limits::default());
+        let mut t = tree(tree::config());
         create(&mut t, ROOT, "end", Kind::File, None).await.unwrap();
         symlink(&mut t, ROOT, "l0", "end").await.unwrap();
         for i in 1..45 {
@@ -946,7 +953,7 @@ mod tests {
 
     #[tokio::test]
     async fn directories_and_names() {
-        let mut t = tree(Limits::default());
+        let mut t = tree(tree::config());
         let a = create(&mut t, ROOT, "a", Kind::Dir, None).await.unwrap();
         let b = create(&mut t, a, "b", Kind::Dir, None).await.unwrap();
         let f = create(&mut t, b, "f", Kind::File, None).await.unwrap();
@@ -973,8 +980,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inode_numbers_count_up_from_the_root_and_go_on_from_a_committed_tree() {
+        let store = Store::memory();
+        let mut t = tree::open(&store, "a", "n", &Root::default(), tree::config()).unwrap();
+        assert_eq!(create(&mut t, ROOT, "f", Kind::File, None).await, Ok(2), "the root is 1");
+        assert_eq!(create(&mut t, ROOT, "d", Kind::Dir, None).await, Ok(3));
+        let root = t.finish().await.unwrap();
+        assert_eq!(t.sequence(), 3, "the last one given out is kept with the root");
+
+        // A tree goes on from the root, and one that is reset gives back what it gave out.
+        let mut next = tree::open(&store, "a", "n", &root, tree::config()).unwrap();
+        assert_eq!(create(&mut next, ROOT, "g", Kind::File, None).await, Ok(4));
+        next.reset();
+        assert_eq!(create(&mut next, ROOT, "g", Kind::File, None).await, Ok(4));
+
+        // A tree whose number is the root's gives out the next one.
+        let mut t = tree(tree::config());
+        t.set_sequence(ROOT);
+        assert_eq!(create(&mut t, ROOT, "f", Kind::File, None).await, Ok(2));
+    }
+
+    #[tokio::test]
     async fn links_count_and_the_last_one_leaves() {
-        let mut t = tree(Limits::default());
+        let mut t = tree(tree::config());
         let f = create(&mut t, ROOT, "f", Kind::File, None).await.unwrap();
         write_at(&mut t, f, At::Offset(0), &vec![1u8; BLOCK as usize + 1]).await.unwrap();
         link(&mut t, f, ROOT, "g").await.unwrap();
@@ -998,7 +1026,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_directory_of_thousands_is_listed_in_pages() {
-        let mut t = tree(Limits { node: 4000, inline: 512, budget: 1 << 16, ..Limits::default() });
+        let mut t = tree(Config { node: 4000, inline: 512, budget: 1 << 16, ..tree::config() });
         for i in 0..2500 {
             create(&mut t, ROOT, &format!("f{i:05}"), Kind::File, None).await.unwrap();
         }
@@ -1019,8 +1047,7 @@ mod tests {
     #[tokio::test]
     async fn a_store_that_fails_is_io_to_the_guest_and_the_tree_cannot_commit() {
         let (store, counts) = counting();
-        let mut t =
-            Tree::open(&store, "a", "n", &Shape::default(), Limits { budget: 4096, ..Limits::default() }).unwrap();
+        let mut t = tree::open(&store, "a", "n", &Root::default(), Config { budget: 4096, ..tree::config() }).unwrap();
         let ino = create(&mut t, ROOT, "f", Kind::File, None).await.unwrap();
         counts.allow.store(counts.puts.load(SeqCst), SeqCst); // no more puts
         // The data does not fit in memory, so it is uploaded, and that fails: the guest is told nothing of why.
@@ -1034,17 +1061,17 @@ mod tests {
     #[tokio::test]
     async fn what_the_store_lost_is_io_to_the_guest() {
         let (store, _) = counting();
-        let mut t = Tree::open(&store, "a", "n", &Shape::default(), Limits::default()).unwrap();
+        let mut t = tree::open(&store, "a", "n", &Root::default(), tree::config()).unwrap();
         let ino = create(&mut t, ROOT, "f", Kind::File, None).await.unwrap();
         write_at(&mut t, ino, At::Offset(0), &vec![1; 300_000]).await.unwrap();
-        let shape = t.finish().await.unwrap();
+        let root = t.finish().await.unwrap();
         let paths: Vec<_> = store.inner.list(None).map_ok(|m| m.location).try_collect().await.unwrap();
         assert!(paths.len() >= 2, "the blocks are objects");
         for path in paths {
             store.inner.delete(&path).await.unwrap();
         }
         let forgetful = Store { cache: Arc::default(), ..store }; // or the blocks are cached
-        let t = Tree::open(&forgetful, "a", "n", &shape, Limits::default()).unwrap();
+        let t = tree::open(&forgetful, "a", "n", &root, tree::config()).unwrap();
         assert_eq!(read_at(&t, ino, 0, 100).await.err(), Some(Errno::Io));
         assert_eq!(stat(&t, ino).await.unwrap().size, 300_000, "what is in the nodes is still there");
     }
@@ -1053,13 +1080,13 @@ mod tests {
     /// and a store to read it back from: its cache is cold, except for the nodes.
     async fn stored(blocks: u64) -> (Tree, u64, Store, Arc<crate::tree::counting::Counts>, Vec<u8>) {
         let (store, counts) = counting();
-        let mut t = Tree::open(&store, "a", "n", &Shape::default(), Limits::default()).unwrap();
+        let mut t = tree::open(&store, "a", "n", &Root::default(), tree::config()).unwrap();
         let ino = create(&mut t, ROOT, "f", Kind::File, None).await.unwrap();
         let data: Vec<u8> = (0..(blocks * BLOCK + 100)).map(|i| (i % 251) as u8).collect();
         write_at(&mut t, ino, At::Offset(0), &data).await.unwrap();
-        let shape = t.finish().await.unwrap();
+        let root = t.finish().await.unwrap();
         let cold = Store { cache: Arc::default(), ..store };
-        let t = Tree::open(&cold, "a", "n", &shape, Limits::default()).unwrap();
+        let t = tree::open(&cold, "a", "n", &root, tree::config()).unwrap();
         t.get(&block_key(ino, 0)).await.unwrap().unwrap(); // the nodes
         counts.gets.store(0, SeqCst);
         (t, ino, cold, counts, data)
@@ -1085,7 +1112,7 @@ mod tests {
 
     #[tokio::test]
     async fn blocks_that_are_not_stored_read_as_zeros_among_those_that_are() {
-        let mut t = tree(Limits::default());
+        let mut t = tree(tree::config());
         let ino = create(&mut t, ROOT, "f", Kind::File, None).await.unwrap();
         let (block, end) = (BLOCK as usize, BLOCK * 3 + 5);
         write_at(&mut t, ino, At::Offset(0), &vec![7; block + 10]).await.unwrap(); // a block, and a bit of the next

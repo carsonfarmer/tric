@@ -4,7 +4,7 @@ use crate::fs;
 use crate::kv::{Error, KeyResponse, other};
 use crate::outbox::{Event, Held, Sink, WINDOW};
 use crate::store::{self, Store};
-use crate::tree::{Full, Limits, Shape, Tree};
+use crate::tree::{self, Full, Root, Tree};
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode};
 use object_store::{PutMode, UpdateVersion, path::Path};
@@ -50,8 +50,8 @@ pub fn of(path: &str) -> Option<&str> {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Head {
-    #[serde(default, skip_serializing_if = "Shape::is_empty")]
-    tree: Shape,
+    #[serde(default, skip_serializing_if = "Root::is_empty")]
+    tree: Root,
     /// The commits whose background requests are not yet delivered.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pending: BTreeMap<String, Pending>,
@@ -68,7 +68,7 @@ impl Head {
     /// [`Tree::reachable`]. The head is the one root of a name's objects: its `pending` holds digests of events and
     /// its claim a lease, and neither names an object.
     pub async fn reachable(&self, store: &Store, app: &str, name: &str, max: usize) -> Result<Option<HashSet<u128>>> {
-        Tree::open(store, app, name, &self.tree, Limits::default())?.reachable(max).await
+        Ok(tree::open(store, app, name, &self.tree, tree::config())?.reachable(max).await?)
     }
 }
 
@@ -254,12 +254,15 @@ fn tree_key(key: &str) -> String {
 
 /// What the guest is told of a tree error: that a limit was hit, which it can act on, and else only that the name
 /// failed, as the rest is the host's to know.
-fn fail(e: wasmtime::Error) -> Error {
-    if let Some(full) = e.downcast_ref::<Full>() {
-        return other(full);
+fn fail(e: tree::Error) -> Error {
+    match e {
+        tree::Error::Full(Full::Entries(n)) => other(format!("a name holds {n} keys or fewer")),
+        tree::Error::Full(Full::Data(n)) => other(format!("a name holds {n} bytes or fewer")),
+        e => {
+            tracing::warn!("name: {:#}", wasmtime::Error::from(e));
+            other("the name could not be read or written")
+        }
     }
-    tracing::warn!("name: {e:#}");
-    other("the name could not be read or written")
 }
 
 fn check(items: &[(String, Option<Bytes>)]) -> Result<(), Error> {
@@ -284,7 +287,7 @@ impl Turn {
         answered: bool,
     ) -> Result<Arc<Self>> {
         let (head, base) = read.map_or_else(Default::default, |(head, version)| (head, Some(version)));
-        let tree = RwLock::new(Tree::open(store, app, name, &head.tree, Limits::default())?);
+        let tree = RwLock::new(tree::open(store, app, name, &head.tree, tree::config())?);
         let state = Mutex::new(State { head, base, answered, ..Default::default() });
         let (app, name, path, settled) = (app.into(), name.into(), path(app, name), watch::Sender::new(None));
         let (claiming, fs) = (Default::default(), Default::default());
@@ -460,7 +463,7 @@ impl Turn {
     pub async fn write(&self, items: Vec<(String, Option<Bytes>)>) -> Result<(), Error> {
         check(&items)?;
         let mut tree = self.writable().await?;
-        let edits = items.into_iter().map(|(k, v)| (tree_key(&k), v.map(|v| tree.item(v)))).collect();
+        let edits = items.into_iter().map(|(k, v)| (tree_key(&k), v)).collect();
         tree.write(edits).await.map_err(fail)
     }
 
@@ -478,8 +481,7 @@ impl Turn {
             Some(_) => return Err(other("not a counter")),
         };
         let next = now.checked_add(delta).ok_or_else(|| other("overflow"))?;
-        let item = tree.item(Bytes::copy_from_slice(&next.to_le_bytes()));
-        tree.write(vec![(key, Some(item))]).await.map_err(fail)?;
+        tree.write(vec![(key, Some(Bytes::copy_from_slice(&next.to_le_bytes())))]).await.map_err(fail)?;
         Ok(next)
     }
 
@@ -495,8 +497,7 @@ impl Turn {
         if now != *seen {
             return Ok(false);
         }
-        let item = tree.item(value);
-        tree.write(vec![(key, Some(item))]).await.map_err(fail)?;
+        tree.write(vec![(key, Some(value))]).await.map_err(fail)?;
         Ok(true)
     }
 
