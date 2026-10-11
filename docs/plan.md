@@ -63,7 +63,8 @@
   - If another turn commits first, the instance is discarded and the request re-runs, which no one can observe.
   - A turn claims its name at its first irreversible step: an unsafe outbound request, reading past the body
     buffer, or running too long.
-  - A claimed turn never runs again: if another write landed first, as its claim ran out, it answers 500.
+  - A claimed turn never runs again: if its commit fails, or another write landed first as its claim ran out, it
+    answers 500.
   - A busy name answers 429 with `Retry-After`.
 - **Versions are ETags.** The head's version is the ETag, and `If-Match` is honoured, with 412 on a mismatch.
 - **Calls are fetches.**

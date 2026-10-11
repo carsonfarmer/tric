@@ -328,8 +328,9 @@ impl std::fmt::Display for Unsettled {
     }
 }
 
-/// Why a commit failed before its head was put, so nothing landed, and a client may try again. Only an error that
-/// says so answers 503: any other may have landed.
+/// Why an unclaimed turn's commit failed before its head was put, so nothing landed, and a client may try again. Only
+/// an error that says so answers 503: any other may have landed, or, for a claimed turn, did what it claimed the name
+/// for, which running again would do again.
 #[derive(Debug)]
 pub struct Unsent;
 
@@ -663,9 +664,10 @@ impl Turn {
         };
         let kept = match ready.await {
             Ok(kept) => kept,
+            // Nothing landed, so an unclaimed turn may run again; a claimed one did what it claimed the name for.
             Err(e) => {
                 tree.reset();
-                return Err(e.context(Unsent));
+                return Err(if claimed { e } else { e.context(Unsent) });
             }
         };
         let landed = match self.land(&mut head, base, &commit).await {
@@ -1164,6 +1166,28 @@ mod tests {
         put(&store, &path("a", "n"), &mut other, Some(version)).await.unwrap().unwrap();
         let e = commit(&turn).await.unwrap_err();
         assert!(e.is::<Lapsed>(), "{e:#}");
+    }
+
+    #[tokio::test]
+    async fn a_claimed_turn_whose_commit_failed_before_its_put_does_not_run_again() {
+        // Its event is not handed over, so nothing lands: an unclaimed turn may run again, and a claimed one may not.
+        for claim in [false, true] {
+            let (store, _) = based().await;
+            let turn = writes(&store, claim, "k").await.unwrap();
+            let req = http::Request::builder().method("POST").uri("https://h/x").body(Default::default()).unwrap();
+            turn.hold(Held::of(req).await.unwrap()).unwrap();
+            let sink: Sink = Arc::new(|_| Box::pin(async { wasmtime::bail!("the sink failed") }));
+            let e = turn.commit("h", &sink).await.unwrap_err();
+            assert_eq!(e.is::<Unsent>(), !claim, "{e:#}");
+            assert_eq!(value(&store, "k").await, None, "it did not land");
+            let res = crate::tric::failed(&e);
+            let answer = (res.status(), res.headers().get(http::header::RETRY_AFTER).is_some());
+            match claim {
+                false => assert_eq!(answer, (StatusCode::SERVICE_UNAVAILABLE, true)),
+                true => assert_eq!(answer, (StatusCode::INTERNAL_SERVER_ERROR, false), "so it does not run again"),
+            }
+            assert!(read(&store, &path("a", "n")).await.unwrap().unwrap().0.claim.is_none(), "and its claim is let go");
+        }
     }
 
     #[tokio::test]

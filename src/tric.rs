@@ -72,9 +72,9 @@ fn later(code: StatusCode) -> Response {
     res
 }
 
-/// The answer of a turn whose commit failed with `e`: 503, with `Retry-After: 1`, if it failed before its put
-/// ([`Unsent`]), so nothing landed, unless it never can ([`TooLarge`]); else 500, so a client does not run the turn
-/// again, as it may have landed.
+/// The answer of a turn whose commit failed with `e`: 503, with `Retry-After: 1`, if it was unclaimed and failed before
+/// its put ([`Unsent`]), so nothing landed, unless it never can ([`TooLarge`]); else 500, so a client does not run the
+/// turn again, as it may have landed, or did what it claimed the name for.
 pub(crate) fn failed(e: &wasmtime::Error) -> Response {
     match e.is::<Unsent>() && !e.is::<TooLarge>() {
         true => later(StatusCode::SERVICE_UNAVAILABLE),

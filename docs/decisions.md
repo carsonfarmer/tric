@@ -456,10 +456,12 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   and is neither done nor run again; its objects are left for the sweep, as every turn's are. A 503 with
   `Retry-After` asks the client to try again (RFC 9110, 15.6.4 and 10.2.3,
   <https://www.rfc-editor.org/rfc/rfc9110#section-15.6.4>), and a turn that landed and runs again has run twice; a
-  500 asks nothing of the kind. A commit that fails before its put, in uploading its tree or handing over its event,
-  still answers 503 with `Retry-After: 1`, as nothing landed, and `TooLarge` answers 500, as it never can. Only an
-  error marked `Unsent` answers 503 (`tric::failed`), and every other answers 500, so an error that a later change
-  adds after the put is taken for one that may have landed, and not for one that surely did not.
+  500 asks nothing of the kind. An unclaimed turn's commit that fails before its put, in uploading its tree or
+  handing over its event, still answers 503 with `Retry-After: 1`, as nothing landed, and `TooLarge` answers 500, as
+  it never can. A claimed turn's answers 500, as for `Lapsed` (below): nothing landed, but the turn did what it
+  claimed the name for. Only an error marked `Unsent` answers 503 (`tric::failed`), and every other answers 500, so an
+  error that a later change adds after the put is taken for one that may have landed, and not for one that surely did
+  not.
   - `SETTLE` is 30 s so that `ANSWER` (10 s), `BUSY` (5 s) and it fit in CloudFront's 60 s for an answer from the
     origin, and the client hears the 500 and not a 504. A turn that runs again, or uploads slowly, can take longer.
   - object_store's request timeout is 30 s, so a put that waits it out uses all of `SETTLE`, and the turn answers 500.
@@ -477,7 +479,8 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
     name and commit, so a claimed turn whose commit is a conflict fails with `Lapsed`, and answers 500: it sent what
     it claimed the name for, an unsafe request or a body read past its buffer, and running again would send it
     again. Its writes are lost, and the client hears that it failed. A longer claim would make this rarer, and keep
-    a name from every other turn longer when a host dies holding it, so the claim stays at 15 s.
+    a name from every other turn longer when a host dies holding it, so the claim stays at 15 s. A claimed turn whose
+    commit fails before its put answers 500 for the same reason, and is not marked `Unsent`.
   - A 409 on a head is a conflict, and the turn runs again, where object_store sent the put again.
   - A conditional put that times out is tried again, where object_store did not; the tries, and what follows them,
     stop at `SETTLE`.
