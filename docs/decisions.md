@@ -176,7 +176,8 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
 
 - **State and files are one tree.** A turn commits by one compare-and-swap of one head, and two trees would need two
   heads, which S3 can't change together. One tree is one edit path, one commit and one budget, where two would copy the
-  hardest code. The key prefixes (`k/`, `f/`, `d/`) keep the two apart, so a key write doesn't rewrite a file's leaves.
+  hardest code. The key prefixes (`k/`, `f/`, `d/`) keep the two apart, so a key write doesn't rewrite a file's leaves,
+  and `i/` keeps the records of `Idempotency-Key`s apart from both.
   The cost is that a name larger than one node (64 KiB) reads its keys through the tree, and under that it is a head
   alone, as before.
 - **The tree is a copy-on-write B+tree,** as LMDB, bbolt and btrfs have it (from general knowledge: LMDB's page
@@ -472,8 +473,9 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
     walk, a head that is deleted, or a version put back.
   - An answer lost after a commit landed can still lead a client to try again: serve's answer may not reach the
     router, which answers 502; CloudFront answers 504 past its 60 s; a connection may drop. Nothing in the head tells
-    such a retry from a new request. Only a key that the client sends with a request, and again with its retry, could,
-    and tric takes none.
+    such a retry from a new request. Only a key that the client sends with a request, and again with its retry, can,
+    and tric takes one: a turn with an `Idempotency-Key` that landed is answered again as it was, and does not run
+    (see "Idempotency keys").
   - A claimed turn runs once at most. A claim lasts `CLAIM_TTL` (15 s) from when it is taken, 5 s past the turn's
     deadline at the least, and a commit learning whether it landed can outlast it. Another turn may then claim the
     name and commit, so a claimed turn whose commit is a conflict fails with `Lapsed`, and answers 500: it sent what
@@ -882,6 +884,82 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
 - **Wasmtime's `component-model-bytes` feature is named in `Cargo.toml`,** as the 0.3 streams hand `Bytes` to the
   guest. It was already on, through the `p3` feature of `wasmtime-wasi`, so the lock file does not change and no
   crate is added.
+
+## Idempotency keys
+
+- **A turn with an `Idempotency-Key` applies once: tric records the outcome with the effect, and keeps no body.** A
+  commit that puts a head writes, in its tree and so in the same compare-and-swap, the key's SHA-256, the request's
+  fingerprint, the status and `Location`, at `i/<day>/<key>`. A turn sent again with the key finds the record when it
+  opens, and is answered with that status and `Location`, `Idempotent-Replayed: true`, no body and no `ETag`, without
+  running. The record lands with the turn's writes or not at all, so a retry is answered as it was only if the first
+  landed. Two other designs were weighed:
+  - Keeping the whole answer, as Stripe's API v1 keeps "the status code and body of the first request", 500s included
+    (<https://docs.stripe.com/api/idempotent_requests>). A body may stream and be of any size, and may hold tokens or
+    personal data, which would sit in the name's tree for a day; tric has no notion of a caller, so it could not check
+    that a replay goes to whoever had the first answer. A replay with no body tells the client what it needs, that the
+    turn landed and how it ended; a GET reads what it made.
+  - Leaving it to apps. An app can keep its own record among its keys, which commit with its writes, but each would
+    build the same thing again, and the host checks a turn's conditions and waits for a claim before the app runs: a
+    retry with `If-Match`, whose first try landed and moved the head, would get 412, and not the first answer.
+- **The sources.** Stripe v1 keeps a key 24 hours at least, takes up to 255 characters, and errors if the parameters
+  differ (above). Stripe v2 runs a request that failed again, rather than replaying the failure, and keeps a key 30
+  days (<https://docs.stripe.com/api-v2-overview#idempotency>). EC2's `ClientToken` is up to 64 ASCII characters, and
+  a retry with other parameters fails with `IdempotentParameterMismatch`
+  (<https://docs.aws.amazon.com/ec2/latest/devguide/ec2-api-idempotency.html>). PayPal's `PayPal-Request-Id` returns
+  the latest status of the first request (<https://developer.paypal.com/api/rest/reference/idempotency/>). Google's
+  `request_id` returns the earlier response, or the resource's current state once that is no longer possible
+  (<https://google.aip.dev/155>). Adyen keeps a key of up to 64 characters 7 to 14 days, and answers a duplicate in
+  flight with 422 or 409 (<https://docs.adyen.com/development-resources/api-idempotency>). The IETF draft, which
+  expired in April 2026, makes the header a Structured Field String, a fingerprint a MAY, a key reused with another
+  payload 422 and one still in flight 409, and says the expiry SHOULD be published
+  (<https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-idempotency-key-header-07>).
+- **A key is one field of 1 to 255 bytes of visible ASCII, taken as sent, else 400.** 255 is Stripe's limit. The value
+  is not parsed as a Structured Field, so `"k"` and `k` are two keys: a client sends the same bytes again, and there is
+  nothing to get wrong. The check is `HeaderValue::to_str`, which lets a tab through too, and the length. Only the
+  key's SHA-256 is kept, and the key is never logged. Only a turn reads it: a snapshot changes nothing, and a request
+  without a name commits nothing to record it with. A WebSocket's events do not carry the upgrade's key, which would
+  answer each event after the first as the first.
+- **The fingerprint is the SHA-256 of the method, a space, the path and query, a line feed and the body.** Headers are
+  not in it, so a retry is not told apart by its `Content-Type` or its date. A keyed body past `REPLAY_MAX` (6 MiB) is
+  413, as only a kept body can be hashed before the turn runs; hashing a body as it streams into the guest, and
+  recording after, would be more code for uploads that a client can send without a key.
+- **Only a commit that puts a head anyway records.** That is one whose tree changed, that held requests, or that
+  claimed its name. A turn that changed nothing puts nothing, and running it again changes nothing either. A 5xx, a
+  trap or an error discards the turn and records nothing, so a retry runs it again, as Stripe's v2 does. A 4xx that
+  commits records its status, as its writes landed.
+- **The record is looked for on each pass of `Turn::open`, before the claim and the conditions.** So a retry is
+  answered at once, even while another turn holds the name, and even if its `If-Match` no longer holds because its
+  own first try moved the head. Of duplicates sent together, the first to commit records; one that ran beside it
+  loses the compare-and-swap, runs again, finds the record and replays. One that finds the name claimed waits up to
+  `BUSY` as any turn does, and then gets 429 with `Retry-After`, and not the draft's 409: a claim does not say whose
+  key it is under, and a 429 already asks for the retry that will then replay.
+- **Another request with a key that has a record is 422,** as the draft says, and as EC2's mismatch is an error.
+- **Records are kept by the day they were made, for one to two days.** A record is at `i/<day>/<key>`, the day being
+  Unix days in six digits, so the records sort by age. A lookup reads yesterday's, today's and tomorrow's, so hosts
+  whose clocks differ by up to a day agree. Each commit that puts a head first deletes up to 1,000 records made before
+  yesterday, scanning from the oldest and stopping at the first that is not; it reads one key first, so a name with
+  nothing to delete pays one lookup. A record is not read after the day after its own, and a name that no turn
+  commits to keeps its records until one does, counting against its budgets. A name too full for a record fails the
+  commit with `TooLarge`, 500, and not with a 503 that would have the client try what fails again. The draft's SHOULD
+  is met by `docs/plan.md`, which states the expiry.
+- **The marker is Stripe's `Idempotent-Replayed: true`.** A client that ignores it can take a replay for a new
+  outcome: CVE-2026-34210 is mppx accepting a replayed Stripe PaymentIntent as a new payment, as it did not check the
+  header (<https://nvd.nist.gov/vuln/detail/CVE-2026-34210>). A replay carries no `ETag`, as the head may have moved.
+- **A key changes no status code, and leaves one case.** A claimed turn that did not land has no record: one that
+  failed with `Lapsed`, one whose commit failed before its put, or one whose app answered 5xx after an unsafe request
+  went out. Its 500 is not replayed, so a client that retries it anyway runs it again, and sends again what it sent. An
+  app that calls out should pass a key derived from its own on to what it calls, so the far side applies it once.
+- **The outbox's `Idempotency-Key: <commit>/<n>` now counts at home.** A background request to the app's own origin
+  that is delivered again within a day is applied once.
+- **What was made simple, as there are no clients yet:**
+  - no `Content-Location` is kept or replayed, as with no body it says little;
+  - the key is the bytes sent, checked by `to_str` and its length, with no Structured Field parsing;
+  - a duplicate that meets a claim gets the 429 any turn does, and not a 409 of its own;
+  - the fingerprint hashes a copy of the method, target and kept body (6 MiB at most) with `store::hash`, rather than
+    streaming them into a hasher;
+  - a `Location` that is not visible ASCII is not recorded;
+  - a record's day is its expiry, so it holds no time of its own;
+  - nothing is configurable: the limits are constants in `src/name.rs`.
 
 ## Local
 

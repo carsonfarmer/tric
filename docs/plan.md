@@ -67,6 +67,14 @@
     answers 500.
   - A busy name answers 429 with `Retry-After`.
 - **Versions are ETags.** The head's version is the ETag, and `If-Match` is honoured, with 412 on a mismatch.
+- **`Idempotency-Key` applies a turn once.** A key is one field of 1 to 255 visible ASCII bytes, else 400.
+  - A turn whose commit puts a head (it changed the name, held a request or claimed the name) records in that head's
+    tree the key's SHA-256, the request's fingerprint (method, path and query, body), its status and its `Location`,
+    for at least a day.
+  - The same request with the same key is then answered with that status and `Location`, `Idempotent-Replayed: true`
+    and no body, without running or waiting; another request with the key gets 422.
+  - A turn that changes nothing, or answers 5xx, records nothing. A keyed body too large to keep is 413.
+  - Safe methods, and requests without a name, ignore the header.
 - **Calls are fetches.**
   - A `fetch` to the app's own origin runs in-process, as a request with `Forwarded: for=_tric`.
   - An unsafe call claims the caller's name first.
@@ -74,7 +82,8 @@
 - **Background requests.** An outbound request sent during a turn with `Prefer: respond-async` (RFC 7240):
   - gets `202` and `Preference-Applied: respond-async` at once;
   - is held, and sent only if the turn commits;
-  - carries `Idempotency-Key: <commit>/<n>`;
+  - carries `Idempotency-Key: <commit>/<n>`, so one to the app's own origin that is delivered again within a day is
+    applied once;
   - is delivered at least once, in order within its turn.
 
   A turn's held requests total at most 1 MB. A name with 1,000 commits still undelivered refuses a new background
@@ -168,6 +177,7 @@ k/<key>              a key of `wasi:keyvalue`: its value
 f/<ino>              an inode: kind, link count, size, times; a symlink's target; a directory's parent
 f/<ino>/<block>      a block of a file's data
 d/<dir>/<name>       a directory entry: the inode it names, and that inode's kind
+i/<day>/<key>        the record of an `Idempotency-Key`: the request's fingerprint, the status, `Location`
 ```
 
 - `<ino>` and `<dir>` are decimal and `<block>` is 16 hex digits, so the blocks of a file sort as numbers. (Nothing
@@ -175,6 +185,10 @@ d/<dir>/<name>       a directory entry: the inode it names, and that inode's kin
   New inodes count up from the head's `seq` and are never reused, so a number names one file for the life of the name,
   which `is-same-object` and a stale descriptor both rely on. A name emptied by deletes keeps its `seq`, so its head
   is `{"seq": N}`, not empty.
+- `<day>` is the Unix day a record was made, six decimal digits, and `<key>` the key's SHA-256 in hex. A lookup reads
+  yesterday's, today's and tomorrow's, so clocks may differ by a day. A commit that puts a head first deletes up to
+  1,000 records made before yesterday, from the oldest, so a record lasts one to two days. Records count against the
+  name's budgets, and a name too full for one fails the commit with 500.
 - An inode sits next to its blocks, and a directory's entries sit together, so an `open` and the first reads of a small
   file touch one leaf, and a `readdir` is a range scan. A guest's file names live inside leaves, never in object keys.
 - A **leaf** is a sorted list of (key, item), and a **branch** a sorted list of (separator, link) to its children: the
@@ -579,8 +593,8 @@ overlay applied at the commit.
 5. **Forged outbox events.** An event naming app B is dropped unless its commit and digest are pending in B's head.
 6. **Cron** reaches the app through `route` as a `POST` with `for=_cron`.
 7. **Native code** is written under `native/<app>/…` with the app's credentials.
-8. **The app semantics** pass through `route` → `serve`: names, turns, the outbox, self-fetch, middleware and
-   outbound.
+8. **The app semantics** pass through `route` → `serve`: names, turns, `Idempotency-Key`, the outbox, self-fetch,
+   middleware and outbound.
 9. **Files**, through `wasi:filesystem` 0.3:
    - the WebAssembly testsuite's file system tests pass, bar a skip-list that gives a reason for each;
    - a write is held until the answer; a 5xx, a trap or a lost race leaves nothing visible; a write after the answer
@@ -605,6 +619,7 @@ overlay applied at the commit.
 - two apps run in different tenants, and neither one's credentials read the other's data: IAM's policy simulator
   shows it for the minted session policy, and for the role alone that no release or component is writable;
 - a direct call to the router can't forge `_cron`, `_tric`, `_sweep` or credentials;
+- a keyed turn sent twice applies once, and the second answer is marked `Idempotent-Replayed: true`;
 - the outbox, its retries and cron work;
 - files, through `wasi:filesystem` 0.3, on S3:
   - keys and files commit together or not at all;
