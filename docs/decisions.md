@@ -1073,7 +1073,9 @@ sockets and where API Gateway WebSocket does, on AWS. A probe on AWS, behind Clo
   handshake's answer; a browser fails the handshake without it.
 - **Every handshake header is sent on every event,** less the upgrade's own but for the subprotocols offered, as
   Pushpin does. `Authorization` is one, so the app can check it on every event. A client can vary only its own
-  socket's headers.
+  socket's headers. `If-Match`, `If-None-Match` and `Idempotency-Key` are the upgrade's alone: as every event is a
+  turn, an `If-Match` would refuse each after the first commit with 412, and a key answer each after the first as the
+  first.
 - **Closing.** A close from the server, by the app's `CLOSE` or an answer that ends the socket, reaches the client
   as 1000, as API Gateway's does. A client's binary frame closes its socket with 1003, and one too large with 1009.
 - **A socket that falls behind misses messages.** API Gateway gives no sign of it, so neither does `tric dev`: a
