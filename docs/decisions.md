@@ -296,16 +296,23 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   its runner links 0.2 beside them. Built for `wasm32-wasip3`, each would export `wasi:cli/run` twice, as above, and
   those named `_across_perms` need preopens with permissions of their own, which tric does not have.
 - **What serving 0.3 alone no longer tests.** The gate ran 103 unit tests, 66 end-to-end and 63 conformance tests (in
-  one of the unit tests) at `a01aa52`, and runs 99, 52 and 21 now (with `ws`, 106 and 73 then, and 102 and 59 now).
-  Gone with 0.2 are:
+  one of the unit tests) at `a01aa52`, and 99, 52 and 21 at `4011167`, which removed 0.2 (with `ws`, 106 and 73, and
+  102 and 59). The end-to-end file tests through Rust's `std::fs` went with 0.2, and are back on 0.3 (below). Gone
+  with 0.2, and not brought back, are:
   - the suite's 49 0.1 modules (42 in Rust and 7 in C), which were made components with Wasmtime's preview 1 adapter
     and served through 0.2. The 7 C tests are now built for 0.3. The 42 Rust ones cannot be, and the suite's Rust
     tests for 0.3 are the 14 above;
-  - the end-to-end file tests through Rust's `std::fs` on 0.2, and `files_are_one_filesystem`, which checked that 0.2
-    and 0.3 saw one tree. The same cases run through the 0.3 binding directly, on the fixture's `/files`, so
-    wasi-libc's 0.3 path is tested by the 7 C tests, and end to end only by the reads of `/fs`. A route through
-    `std::fs` would be small to bring back;
+  - `files_are_one_filesystem`, which checked that 0.2 and 0.3 saw one tree. Both routes to the files now go through
+    the one binding, so there are not two to compare;
   - the unit tests of the 0.2 binding.
+- **The end-to-end file tests run through `std::fs` as well as the binding.** The Rust fixture's `/std-files` has the
+  ops of `/files` through Rust's `std::fs`, which on `wasm32-wasip3` is wasi-libc's over the 0.3 binding, and each of
+  the six file tests runs through both routes, on `tric dev` and on a stack. `/files` uses the binding as its WIT has
+  it, with its streams, and `/std-files` as most Rust apps do: wasi-libc chooses the flags (`MUTATE_DIRECTORY` only
+  with `O_WRONLY`, below), keeps the offset, and makes an errno of each `error-code`, of which `std` makes an
+  `io::ErrorKind` (`ErrorCode::NoEntry` is `NotFound`). The two catch different faults, so both are kept. `std::fs`
+  with Rust 1.100.0-beta.4 does all that the tests of 0.2 did, with the same kinds of error, and nothing in them was
+  left out or worked around.
 - **Objects are put at a random id, over any object there.** A put that is retried would get 412 on its own object
   under create-if-absent, and 128 random bits won't collide. The link's version id and hash would catch it if they did.
 - **A link pins a version and a hash.** The version means a reader gets the object it was pointed at, however the key
