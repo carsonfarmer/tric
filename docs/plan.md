@@ -63,6 +63,7 @@
   - If another turn commits first, the instance is discarded and the request re-runs, which no one can observe.
   - A turn claims its name at its first irreversible step: an unsafe outbound request, reading past the body
     buffer, or running too long.
+  - A claimed turn never runs again: if another write landed first, as its claim ran out, it answers 500.
   - A busy name answers 429 with `Retry-After`.
 - **Versions are ETags.** The head's version is the ETag, and `If-Match` is honoured, with 412 on a mismatch.
 - **Calls are fetches.**
@@ -183,9 +184,9 @@ d/<dir>/<name>       a directory entry: the inode it names, and that inode's kin
   the local memory store), and the SHA-256 and length of the bytes. An object is read at its version and checked for
   both, so the head pins every node and block below it by hash. A link read from a head or a node is checked before it
   is used: the id is 32 lowercase hex digits, so it can't name another prefix, and the version is short and plain.
-- A **head** is `{tree: {root, bytes, entries, seq}, pending, claim}`. The root node is inline, so the top of every
-  lookup costs no request. `bytes` counts the data in values and blocks, and `entries` the keys, both exact: a commit
-  lands only over the head it read, so the deltas it counts while editing are the totals.
+- A **head** is `{tree: {root, bytes, entries, seq}, pending, claim, commit, over}`. The root node is inline, so the
+  top of every lookup costs no request. `bytes` counts the data in values and blocks, and `entries` the keys, both
+  exact: a commit lands only over the head it read, so the deltas it counts while editing are the totals.
 - A turn's size estimates a link at its longest (208 bytes), so a node never encodes to more than the size it was
   split by. A branch holds about 300 links, and a leaf several hundred entries (a directory entry is about 60 bytes, a
   block's link 230), so 4 Mi entries need three levels at the most, the root included.

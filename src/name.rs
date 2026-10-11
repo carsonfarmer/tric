@@ -328,6 +328,28 @@ impl std::fmt::Display for Unsettled {
     }
 }
 
+/// Why a commit failed before its head was put, so nothing landed, and a client may try again. Only an error that
+/// says so answers 503: any other may have landed.
+#[derive(Debug)]
+pub struct Unsent;
+
+impl std::fmt::Display for Unsent {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "the commit failed before its head was put")
+    }
+}
+
+/// Why a claimed turn's commit failed when another write landed on its base first, as its claim had run out. The turn
+/// did what it claimed the name for, which cannot be undone, so it does not run again: it answers 500.
+#[derive(Debug)]
+pub struct Lapsed;
+
+impl std::fmt::Display for Lapsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "the turn's claim ran out, and another write landed on the name first")
+    }
+}
+
 /// The key of `key` in the tree: the keys of the keyvalue store are under `k/`.
 fn tree_key(key: &str) -> String {
     format!("k/{key}")
@@ -643,10 +665,14 @@ impl Turn {
             Ok(kept) => kept,
             Err(e) => {
                 tree.reset();
-                return Err(e);
+                return Err(e.context(Unsent));
             }
         };
-        let landed = self.land(&mut head, base, &commit).await;
+        let landed = match self.land(&mut head, base, &commit).await {
+            // A claimed turn sent what it claimed the name for, so it runs once at most, whatever became of its claim.
+            Ok(Committed::Conflict) if claimed => Err(wasmtime::Error::msg(Lapsed)),
+            landed => landed,
+        };
         match &landed {
             Ok(Committed::Done(_)) => {
                 if let Some(kept) = kept {
@@ -660,7 +686,8 @@ impl Turn {
 
     /// Puts `head`, the commit `commit`'s, over `base`. A put with no sure answer may have landed, or may yet, so the
     /// head's history says which, as [`learn`] reads it, until `SETTLE` after the put began: a commit that landed is
-    /// done, and one that never will is a conflict; else it fails with [`Unsettled`], and is neither done nor run again.
+    /// done, and one that never will is a conflict; else it fails with [`Unsettled`], and is neither done nor run
+    /// again.
     async fn land(&self, head: &mut Head, base: Option<UpdateVersion>, commit: &str) -> Result<Committed> {
         let until = tokio::time::Instant::now() + SETTLE;
         let lost = match timeout_at(until, put(&self.store, &self.path, head, base.clone())).await {
@@ -1114,6 +1141,29 @@ mod tests {
         assert_eq!(lossy.tries.load(SeqCst), 1, "refused at once, so it did not land");
         assert_eq!((value(&store, "k").await.is_some(), value(&store, "l").await), (true, None));
         assert_eq!(objects(&store).await, 3, "the base's, the first's, and the second's for the sweep");
+    }
+
+    #[tokio::test]
+    async fn a_claimed_turn_whose_claim_ran_out_does_not_run_again() {
+        // Its put has no answer, and another commit lands on its claim, as it would once the claim had run out.
+        let (store, lossy) = based().await;
+        let turn = writes(&store, true, "k").await.unwrap();
+        lossy.plan(Put::Fails, &[Then::Commit]);
+        let e = commit(&turn).await.unwrap_err();
+        assert!(e.is::<Lapsed>(), "{e:#}");
+        assert_eq!(value(&store, "k").await, None, "it did not land");
+        let res = crate::tric::failed(&e);
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(res.headers().get(http::header::RETRY_AFTER).is_none(), "so the client does not try again");
+
+        // Another commit landed on its claim before its put, which is refused at once.
+        let (store, _) = based().await;
+        let turn = writes(&store, true, "k").await.unwrap();
+        let (mut other, version) = read(&store, &path("a", "n")).await.unwrap().unwrap();
+        (other.claim, other.commit) = (None, store::random());
+        put(&store, &path("a", "n"), &mut other, Some(version)).await.unwrap().unwrap();
+        let e = commit(&turn).await.unwrap_err();
+        assert!(e.is::<Lapsed>(), "{e:#}");
     }
 
     #[tokio::test]

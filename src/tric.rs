@@ -1,7 +1,7 @@
 //! Running an app: each request in a fresh instance. A request with an unsafe method to `/@<name>` is a turn on the
 //! name: its writes, and the requests it holds, commit if it answers anything but 5xx. A conflict runs it again.
 use crate::engine::App;
-use crate::name::{self, BUSY, Committed, Conditions, TooLarge, Turn, Unsettled};
+use crate::name::{self, BUSY, Committed, Conditions, TooLarge, Turn, Unsent};
 use crate::outbound::{self, Allow, Fut, Sent};
 use crate::outbox::{self, Held, Sink};
 use crate::store::Store;
@@ -72,13 +72,13 @@ fn later(code: StatusCode) -> Response {
     res
 }
 
-/// The answer of a turn whose commit failed with `e`: 500 if the commit may have landed ([`Unsettled`]) or never can
-/// ([`TooLarge`]), so a client does not run the turn again; else 503, with `Retry-After: 1`, as the commit failed
-/// before its put, so nothing landed.
+/// The answer of a turn whose commit failed with `e`: 503, with `Retry-After: 1`, if it failed before its put
+/// ([`Unsent`]), so nothing landed, unless it never can ([`TooLarge`]); else 500, so a client does not run the turn
+/// again, as it may have landed.
 pub(crate) fn failed(e: &wasmtime::Error) -> Response {
-    match e.is::<Unsettled>() || e.is::<TooLarge>() {
-        true => status(StatusCode::INTERNAL_SERVER_ERROR),
-        false => later(StatusCode::SERVICE_UNAVAILABLE),
+    match e.is::<Unsent>() && !e.is::<TooLarge>() {
+        true => later(StatusCode::SERVICE_UNAVAILABLE),
+        false => status(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -397,8 +397,11 @@ mod tests {
             let res = failed(&e);
             (res.status().as_u16(), res.headers().get(RETRY_AFTER).cloned())
         };
-        assert_eq!(answer(wasmtime::Error::msg(Unsettled).context("commit")), (500, None), "it may have landed");
-        assert_eq!(answer(wasmtime::Error::msg(TooLarge)), (500, None), "it never can");
-        assert_eq!(answer(wasmtime::format_err!("the upload failed")), (503, Some(HeaderValue::from_static("1"))));
+        let unsent = wasmtime::format_err!("the upload failed").context(Unsent);
+        assert_eq!(answer(unsent), (503, Some(HeaderValue::from_static("1"))), "nothing landed");
+        assert_eq!(answer(wasmtime::Error::msg(TooLarge).context(Unsent)), (500, None), "it never can");
+        assert_eq!(answer(wasmtime::Error::msg(name::Unsettled)), (500, None), "it may have landed");
+        assert_eq!(answer(wasmtime::Error::msg(name::Lapsed)), (500, None), "it sent what it claimed the name for");
+        assert_eq!(answer(wasmtime::format_err!("anything else")), (500, None), "it may have landed");
     }
 }

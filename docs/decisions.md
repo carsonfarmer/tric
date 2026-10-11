@@ -457,7 +457,9 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   `Retry-After` asks the client to try again (RFC 9110, 15.6.4 and 10.2.3,
   <https://www.rfc-editor.org/rfc/rfc9110#section-15.6.4>), and a turn that landed and runs again has run twice; a
   500 asks nothing of the kind. A commit that fails before its put, in uploading its tree or handing over its event,
-  still answers 503 with `Retry-After: 1`, as nothing landed, and `TooLarge` answers 500, as it never can.
+  still answers 503 with `Retry-After: 1`, as nothing landed, and `TooLarge` answers 500, as it never can. Only an
+  error marked `Unsent` answers 503 (`tric::failed`), and every other answers 500, so an error that a later change
+  adds after the put is taken for one that may have landed, and not for one that surely did not.
   - `SETTLE` is 30 s so that `ANSWER` (10 s), `BUSY` (5 s) and it fit in CloudFront's 60 s for an answer from the
     origin, and the client hears the 500 and not a 504. A turn that runs again, or uploads slowly, can take longer.
   - object_store's request timeout is 30 s, so a put that waits it out uses all of `SETTLE`, and the turn answers 500.
@@ -470,9 +472,12 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
     router, which answers 502; CloudFront answers 504 past its 60 s; a connection may drop. Nothing in the head tells
     such a retry from a new request. Only a key that the client sends with a request, and again with its retry, could,
     and tric takes none.
-  - A claim lasts `CLAIM_TTL` (15 s) from when it is taken, 5 s past the turn's deadline at the least, and a commit
-    learning whether it landed can outlast it. Another turn may then claim the name, so a commit that had not landed
-    is a conflict, and its turn runs again, and sends again the unsafe requests it sent before its answer.
+  - A claimed turn runs once at most. A claim lasts `CLAIM_TTL` (15 s) from when it is taken, 5 s past the turn's
+    deadline at the least, and a commit learning whether it landed can outlast it. Another turn may then claim the
+    name and commit, so a claimed turn whose commit is a conflict fails with `Lapsed`, and answers 500: it sent what
+    it claimed the name for, an unsafe request or a body read past its buffer, and running again would send it
+    again. Its writes are lost, and the client hears that it failed. A longer claim would make this rarer, and keep
+    a name from every other turn longer when a host dies holding it, so the claim stays at 15 s.
   - A 409 on a head is a conflict, and the turn runs again, where object_store sent the put again.
   - A conditional put that times out is tried again, where object_store did not; the tries, and what follows them,
     stop at `SETTLE`.
