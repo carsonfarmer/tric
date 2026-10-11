@@ -360,9 +360,9 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   a write touches are copied in memory and the rest stay links. Reads, `readdir` and `list-keys` use the one tree. A
   blind write descends at the write, so a GET for each level not cached is paid there and not at the commit.
 - **Past its memory budget a turn spills, as LMDB does a dirty page.** The copies, and the blocks and large values held
-  for upload, count against one budget of 8 MiB (`BUDGET`), checked after each write. Past it, the held values and
-  blocks upload first, up to 16 at once while the writer waits, and each becomes a link; if the copies are still over
-  the budget, the changed nodes upload bottom-up and become links too, which dirties their parents in turn. Nothing
+  for upload, count against one budget of 8 MiB (`Config::budget`), checked after each write. Past it, the held values
+  and blocks upload first, up to 16 at once while the writer waits, and each becomes a link; if the copies are still
+  over the budget, the changed nodes upload bottom-up and become links too, which dirties their parents in turn. Nothing
   refers to an uploaded object until the commit, so a discard changes nothing that a head names. What the turn uploaded,
   and what it uploaded and then replaced, is left for the sweep. The turn holds about its budget and one write however
   much it writes.
@@ -490,9 +490,10 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   and with the wrong tenant, and gets a 403 each time.
 - **Only a key a tree could have made is deleted.** A candidate is `apps/<app>/values/<name>/<id>`, where `<name>`
   passes `is_name` and `<id>` is 32 lowercase hex digits, and where the key is equal to the one `tree::object` builds
-  for that name and id, the one place that builds a `values/` path. A listed key of any other shape (the `.sweep`
-  cursor, a key with a deeper path, a name that no name could be, an id of the wrong length or case, a differently
-  escaped spelling) is not a candidate, and is never deleted, whatever its age. The unit tests
+  for that name and id, the one place that builds a `values/` path: the tree reads and writes its objects at
+  `tric_tree::object` under the prefix `tree::prefix` gives, and `tree::object` is that. A listed key of any other shape
+  (the `.sweep` cursor, a key with a deeper path, a name that no name could be, an id of the wrong length or case, a
+  differently escaped spelling) is not a candidate, and is never deleted, whatever its age. The unit tests
   `only_the_key_of_a_tree_object_is_a_candidate` and `deletes_only_keys_a_tree_could_have_made` put such keys in and
   check that they are all still there.
 - **A head is read fresh, and a missing head is told from an error by the listing.** The head is read with
@@ -676,7 +677,7 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
 - **The binding's error type, `Fault`, is in the core:** an errno or a trap, as the core's helpers (`fd`, `writer`,
   `add`) return one or the other. The binding converts an errno to its `ErrorCode`, and a trap stays one.
   `wasmtime-wasi-io`, through which the 0.2 binding shared its streams, was removed with that binding.
-  `async-trait` is a dev-dependency, for the tests of `src/tree.rs`.
+  The tree's counting store, for tests, is behind the `testing` feature of `tric-tree`, which tric's tests turn on.
 - **The end-to-end file cases run on the Rust app,** as the JavaScript app has no file routes: the QuickJS bindings
   are by hand and the files are the subject of the tests, not the language.
 - **Only a turn's own name is mounted,** as `/`. A snapshot is mounted read-only, and a request without a name has no
@@ -702,7 +703,7 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
 - **A block that is being fetched is waited for, not fetched again.** The first test of 0.3 read-ahead on a store
   with a delay counted 19 GETs for a file of 12 blocks: a reader that is faster than the store catches up with its
   own read-ahead and fetches what is under way. A block is now fetched by one reader at a time (`Flight`, in
-  `src/tree.rs`): one that comes to a block that is being fetched waits, and then looks in the cache, where the block
+  `crates/tree`): one that comes to a block that is being fetched waits, and then looks in the cache, where the block
   is checked against its hash again, so nothing is taken on trust from the one that fetched it. A fetch that is
   cancelled lets the next in turn fetch, and the gate is gone when no one comes to it. The gate counts the flights
   that come to it, under the map's lock, and a flight counts itself out when it is dropped, including one that is
@@ -869,6 +870,64 @@ sockets and where API Gateway WebSocket does, on AWS. A probe on AWS, behind Clo
 - **The size.** The budget was all the WebSocket code, `tric dev`'s and the router's, in what `src/ws.rs` was before
   it (494 lines). When it landed, `src/ws.rs` was 494 lines, and its hooks elsewhere added 63, most of them the outbox
   handing back what a delivery published, so the budget was missed by 63. No feature was removed.
+
+## The tree crate
+
+The tree is the crate `tric-tree`, in `crates/tree`, and the root is a workspace with tric as its root package. It was
+`src/tree.rs`, and moved whole, by `git mv`, before it changed.
+
+- **The crate knows no tric concept:** no apps, names, turns, Lambda or Wasmtime. It is Apache-2.0 and edition 2024,
+  as tric is, and both are published from one tag at one version, `[workspace.package]`'s, tree first.
+- **Its storage is `object_store`'s `ObjectStore` and a prefix, and no trait of its own.** The tree needs a get by
+  version and a put that gives the version back, which every `ObjectStore` has, and nothing more: no store needed a
+  trait, so none was made. It deletes nothing, so it asks for no delete. tric's policies stay in `src/store.rs`: a 403
+  reads as missing, only a versioned bucket deletes, and the process's S3 clients are shared. The crate takes
+  `object_store` by caret, from 0.14.2, and tric pins `=0.14.2`.
+- **The root and its swap are the caller's.** `Tree::open` takes a `Root` and `Tree::finish` gives one, and the tree
+  keeps it nowhere; after a failed swap the caller calls `Tree::reset`. tric keeps the root in a name's head, and swaps
+  the head, as before. A `Root` is the old `Shape`, field for field and as JSON, and the node format is unchanged, so
+  every head and node already written reads as it did.
+- **Errors are the crate's `Error`, which a caller matches.** `Full` (with `Full::Entries` or `Full::Data` and the
+  limit), `TooLarge`, `Corrupt`, `Store` (an `object_store` error) and `Poisoned`; it is a `std::error::Error`, so
+  `?` makes it a `wasmtime::Error` in tric. tric's two `fail`s, of keys and of files, match `Full` where they used to
+  downcast, and tell the guest the name's limit in the words they used before.
+- **The limits are one `Config`, with defaults.** The node (64 KiB), inline (4 KiB), budget (8 MiB), blob (1 MiB) and
+  in-flight (16) defaults are the old constants. Entries and data are unbounded by default, as they are policy:
+  tric's `tree::config()` sets 4 Mi and 16 GiB (`ENTRIES_MAX`, `DATA_MAX`), and `DATA_MAX` and the file system's
+  other limits stay in tric.
+- **A path is the caller's prefix and an id.** `tric_tree::object(prefix, id)` is where an object is, directly under
+  the prefix, and `tric_tree::number` reads an id back, for a collector that lists the prefix. tric's `tree::prefix`
+  is `apps/<app>/values/<name>`, as before.
+- **The cache is given, as an `Arc<Cache>`, and is not a static.** A store carries its cache: the S3 stores of a
+  process share one, a static in `src/store.rs`, and a memory store has its own, as before. The crate's `Cache` keeps
+  16 MiB of nodes and 32 MiB of values by default, the old sizes.
+- **The inode counter is a number kept with the root, `Tree::sequence`, whose meaning is the caller's.** A counter
+  in the root is what keeps inode numbers from being reused across turns: it is in the root `finish` gives, and a
+  `reset` gives back what a lost turn took. Keeping the number and dropping its meaning keeps that guarantee, and the
+  JSON of every head written so far (`seq`), while the rule is the file system's own (`fs::ops::alloc`: one after the
+  last, and after the root's 1). A key in the tree would have changed what heads hold, and an inode allocator in the
+  crate would have been a tric concept. A caller with no use for it never sees it, as 0 is not written.
+- **The hash and the random ids are private helpers of the crate,** the same SHA-256 in hex and 128 random bits in
+  hex as `store::hash` and `store::random`, which stay in tric for its heads and commits.
+- **A commit deletes nothing, and the crate offers the collector a mark, and nothing to delete with.** The sweep is
+  the only collector: its survey, its grace and its deletes stay in tric. `Tree::mark` walks every object a root
+  reaches, its nodes and the values that are objects, each node checked as any read is, and at most `max` nodes; it
+  adds to a set it is given, and passes over what the set holds, so the marks of several roots share one set and read
+  each object once. `Tree::reachable` is a mark from an empty set.
+- **One tree type, and a walk of its own for the mark.** A snapshot is a tree that is not written, and `Tree::fork`
+  is the copy that outlives a turn, so a snapshot type would only repeat the reads. The mark does not share the
+  scans' walk: it reads level by level, unordered and up to `Config::in_flight` at once, and keeps nothing in the
+  cache, where a scan reads in key order, to a limit, through the cache.
+- **The tests moved with the tree,** the model test against a `BTreeMap` among them, and its counting store is
+  `tric_tree::testing`, behind the `testing` feature, which tric's dev-dependency turns on; tric's tests take it as a
+  `Store` from `tree::counting`. Of the tree's 21 tests, 19 are the crate's as they were, and one is renamed for the
+  root (`an_empty_tree_is_an_empty_root`, which was `an_empty_tree_is_not_in_the_head`). The test of inode numbers is
+  two: the crate's `a_sequence_is_kept_in_the_root`, and the file system's
+  `inode_numbers_count_up_from_the_root_and_go_on_from_a_committed_tree`. The crate adds
+  `a_mark_shares_what_it_has_seen_across_roots`, and a doctest on the memory store.
+- **The gate covers the crate:** `fmt` of the workspace, `clippy` of the crate with all its features as well as of
+  tric's two feature sets, the crate's tests and doctest, and `cargo publish --workspace --dry-run`, which packages
+  the crate and then tric on it.
 
 ## Code
 

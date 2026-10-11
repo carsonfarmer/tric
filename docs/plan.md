@@ -172,8 +172,8 @@ d/<dir>/<name>       a directory entry: the inode it names, and that inode's kin
   file touch one leaf, and a `readdir` is a range scan. A guest's file names live inside leaves, never in object keys.
 - A **leaf** is a sorted list of (key, item), and a **branch** a sorted list of (separator, link) to its children: the
   separator of a child is at most every key in it and above every key in the child before; the first child's is not
-  looked at. Each node is JSON of at most 64 KiB (`NODE_MAX`). An item is data (base64, inline up to 4 KiB) or a link;
-  an inode and a dirent are JSON, so inline.
+  looked at. Each node is JSON of at most 64 KiB (`Config::node`). An item is data (base64, inline up to 4 KiB) or a
+  link; an inode and a dirent are JSON, so inline.
 - A **link** is `{id, v, h, n}`: a random 128-bit id (the object is `values/<name>/<id>`), the S3 version id (none in
   the local memory store), and the SHA-256 and length of the bytes. An object is read at its version and checked for
   both, so the head pins every node and block below it by hash. A link read from a head or a node is checked before it
@@ -196,7 +196,7 @@ d/<dir>/<name>       a directory entry: the inode it names, and that inode's kin
   shrinks as it is emptied, and a name that is mostly deleted does not stay sparse.
 
 **Spilling.** The copies in memory, and file data and large values held for upload, count against one budget of 8 MiB
-(`BUDGET`), checked after each write. Past it, as LMDB spills dirty pages:
+(`Config::budget`), checked after each write. Past it, as LMDB spills dirty pages:
 1. The held blocks and values upload, up to 16 at once, and the writer waits. Each item becomes a link.
 2. If the copies still pass the budget, the changed nodes upload bottom-up and become links, so each parent is changed,
    and in memory, in its turn.
@@ -345,7 +345,7 @@ system: `cli`, `clocks`, `random` and `sockets` `add_to_linker`.
 
 | File | What | Lines |
 |---|---|---|
-| `src/tree.rs` | nodes, links, edits, spill, merge, scans, the cache | 1,080 (built) |
+| `crates/tree` (was `src/tree.rs`) | nodes, links, edits, spill, merge, scans, the cache, the mark | 1,080 (built) |
 | `src/name.rs`, `src/tric.rs`, `src/store.rs` | the turn over the tree; reading the head back | +70 (built) |
 | `src/fs.rs` | the core: descriptors, the gate, orphans, read-ahead, and the paths over the operations | 790 (built) |
 | `src/fs/ops.rs` | inodes, blocks, directories, rename, errors, on the tree | 850 (built) |
