@@ -218,8 +218,8 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   it would link, with a large tree of dependencies.
 - **ZeroFS is rejected.** Source: <https://github.com/Barre/ZeroFS>. It is a daemon that serves NFS, 9P and NBD over
   SlateDB, under AGPL-3.0 or a commercial licence: a server to run, not a library to implement WIT traits with.
-- **A Lambda `/tmp` under the stock wasmtime-wasi is rejected,** though it gives 0.2, 0.3 and cap-std confinement for
-  nothing. Source: <https://docs.aws.amazon.com/lambda/latest/dg/configuration-ephemeral-storage.html>.
+- **A Lambda `/tmp` under the stock wasmtime-wasi is rejected,** though it gives `wasi:filesystem` and cap-std
+  confinement for nothing. Source: <https://docs.aws.amazon.com/lambda/latest/dg/configuration-ephemeral-storage.html>.
   - `/tmp` belongs to one execution environment (512 MB to 10,240 MB), and a name's files must be seen by all of them.
   - Lambda has no FUSE (general knowledge, not fetched), so a file can't be fetched on first touch. A name's files
     would be copied in at every cold start, in proportion to their size, whether read or not.
@@ -250,44 +250,62 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   a name and no diffs, and a plain B+tree is simpler to reason about.
 - **A file system as a component over `wasi:keyvalue` is rejected.** It would run in the app's own memory, with no
   ranges and nowhere to spill, and the host couldn't commit its writes with the app's keys.
-- **The bindings are our own `bindgen!`s over vendored WIT.** wasmtime-wasi's `Descriptor` is an enum of cap-std files
+- **The binding is our own `bindgen!` over vendored WIT.** wasmtime-wasi's `Descriptor` is an enum of cap-std files
   and directories, and the host traits it generates fix that resource type, so no file system of ours can sit behind
-  them. So the core implements the traits itself, once for 0.2 and once for 0.3, over the WIT copied verbatim from
-  wasmtime-wasi 49.0.2.
+  them. So tric implements the 0.3 traits itself, over the WIT copied verbatim from wasmtime-wasi 49.0.2
+  (`wit/filesystem-p3`, 0.3.0), with `wasi:clocks` shared with wasmtime-wasi's bindings through `with:`. The rules are
+  in the core, `src/fs.rs`, and the binding, `src/fs/p3.rs`, converts types and errors.
 - **The stock interfaces are linked one at a time, without the file system, and nothing is shadowed.** Wasmtime's
-  `add_to_linker` for each version adds every interface, the file system among them, and a second definition of one
-  is an error unless shadowing is allowed, which would also let a mistake of ours hide behind the stock file system
-  without a sign. So for 0.3 the linker takes `cli`, `clocks`, `random` and `sockets` (`add_to_linker` in each,
-  wasmtime-wasi's `src/p3/mod.rs`), and for 0.2 each interface's `bindings::...::add_to_linker`, with our `bindgen!`
-  sharing the stock `wasi:io` stream resources through `with:`. A new stock interface that appears in a Wasmtime
-  upgrade then isn't linked until someone adds it, which fails loudly at instantiation and not quietly in an app.
-- **0.2 and 0.3 share one core.** An app's toolchain, not the app, picks the version, and each has its users (checked
-  2026-10-10). Rust's `std::fs` imports `wasi:filesystem` 0.2 on `wasm32-wasip2`, stable Rust's target until 1.100,
-  and 0.3 on `wasm32-wasip3`, stable from 1.100 (due 12 November 2026), which imports nothing of 0.2 at all and runs
-  on Wasmtime 49.0.2. A componentize-qjs component imports the 0.2 file system whether it uses files or not. The two
-  differ in being async and in `stream` and `future`, and not in what a call does, so each binding is a thin layer
-  that converts types and errors, and the rules live once: opening (`Handle::open_as`), the writer and the preopens
-  of a host, the count a write reports (`wrote`), directory paging (`Entries`) and read-ahead (`Ahead`) are all in
-  `src/fs.rs`. The 0.3 world is built from the same vendored WIT as the 0.2 one is (`wit/filesystem-p3`, 0.3.0), with
-  `wasi:clocks` shared with wasmtime-wasi's bindings through `with:`.
+  `add_to_linker` adds every interface, the file system among them, and a second definition of one is an error unless
+  shadowing is allowed, which would also let a mistake of ours hide behind the stock file system without a sign. So the
+  linker takes `cli`, `clocks`, `random` and `sockets` (`add_to_linker` in each, wasmtime-wasi's `src/p3/mod.rs`). A
+  new stock interface that appears in a Wasmtime upgrade then isn't linked until someone adds it, which fails loudly at
+  instantiation and not quietly in an app.
+- **tric serves WASI 0.3 alone,** as decided on 8 October 2026. Rust's standard library imports 0.3 alone on
+  `wasm32-wasip3`, stable from Rust 1.100 (due 12 November 2026), and the JavaScript runtime is built for that target
+  too (below). An app built for 0.2, for `wasm32-wasip2` or by StarlingMonkey or ComponentizeJS, is not served: it
+  fails at load (`instantiate_pre`), with an error that names the import the linker lacks, such as
+  `wasi:cli/environment@0.2.6` (checked with `tric dev`). One version is one binding and one linker. 0.2 was served
+  first, and 0.3 beside it from one core, until then; the 0.2 binding (`src/fs/p2.rs`, `wit/filesystem-p2`) and its
+  tests were removed with this decision.
 - **A standard suite tests it, as well as our own tests.** The WebAssembly `wasi-testsuite`
-  (<https://github.com/WebAssembly/wasi-testsuite>), pinned at `e0aa527fab67f2f311882bcee4f62cc755433b73`, has prebuilt
-  wasm32-wasip1 modules (42 in Rust and 7 in C that name a directory to preopen) and 14 0.3 `filesystem-*` components.
-  The modules are made components with `wasm-tools component new --adapt` and the command adapter of Wasmtime's
-  49.0.2 release (`wasi_snapshot_preview1.command.wasm`, a release asset, so the one Wasmtime's own runner uses).
-  Both are fetched by the toolchain image (`docker/build.Dockerfile`, a `conformance` stage) as tarballs checked by
-  sha256, which is not a Cargo dependency and puts 103 MB in the image. The harness is a `#[cfg(test)]` module in the
-  binary (`src/fs/conformance.rs`), because only the binary holds the production linker, and it runs `wasm-tools` as a
-  subprocess, so the `wit-component` crate is not a dev-dependency either. Without `TRIC_CONFORMANCE`, the directory
-  of the fetched files, the test is skipped, so a build outside the image is not broken by it. The host needs an
-  `App` to be a `Tric`, so it takes the built fixture.
+  (<https://github.com/WebAssembly/wasi-testsuite>) is pinned at `5ea11d8fe958beb60fb871d6852ae020e45c0433` (1 October
+  2026, its newest commit on 10 October). Its tests that name a directory to preopen and can be built for 0.3 are 7 in
+  C and the 14 `filesystem-*` tests in Rust (`tests/rust/wasm32-wasip3`). It has no binaries at that commit, and the
+  prebuilt 0.3 tests of the last pin, `e0aa527`, import `wasi:io/poll@0.2.9`, so they are built from source. The
+  toolchain image fetches the sources as a tarball checked by sha256, not as a Cargo dependency, and builds them in a
+  `conformance` stage (`docker/build.Dockerfile`): the C by wasi-sdk 34's clang for `wasm32-wasip3`, and the Rust by
+  the fixture toolchain, with a manifest and lockfile of ours (`docker/conformance`).
+  - Each Rust test is built as a library (a `cdylib` example) and not as the program it is written as: on
+    `wasm32-wasip3` a program's `main` exports `wasi:cli/run`, and the test's own `export!` would be a second, on which
+    `wit-component` fails.
+  - wit-bindgen is 0.62.0, not the suite's 0.58.0, which keeps a task's state in the component's context slot 0. On
+    `wasm32-wasip3` wasi-libc keeps that slot for the task's stack, and 0.58.0 traps
+    (`assertion failed: context_get().is_null()`). 0.62.0 keeps the state in a thread-local.
+
+  The harness is a `#[cfg(test)]` module in the binary (`src/fs/conformance.rs`), because only the binary holds the
+  production linker. Without `TRIC_CONFORMANCE`, the directory of the built tests, the test is skipped, so a build
+  outside the image is not broken by it. The host needs an `App` to be a `Tric`, so it takes the built fixture.
 - **The conformance run is Wasmtime's own configuration:** the directory as `/`, no environment beyond the test's and
-  no skip-list. All 63 pass (the 49 modules through 0.2, the 14 components through 0.3), and `FAILS`, the list of
-  those that do not, is empty and has a rule: a listed test that passes fails the run, so a reason cannot outlive its
-  cause. `TESTS` pins the count, so a change of commit is noticed.
-  The harness was shown to be able to fail: with `rmdir` made to succeed on a non-empty directory,
-  `remove_nonempty_directory` failed. Wasmtime's own `test-programs` could be a second suite, but they need building
-  for wasm32-wasip2 first, so they are not used.
+  no skip-list. All 21 pass, and `FAILS`, the list of those that do not, is empty and has a rule: a listed test that
+  passes fails the run, so a reason cannot outlive its cause. `TESTS` pins the count, so a change of commit is noticed.
+  The harness was shown to be able to fail: with `get-flags` made to report `mutate-directory` for any descriptor
+  opened to read, `rust/filesystem-flags-and-type` failed, at its check that `open(".")` with no flags reads `READ`.
+- **Wasmtime's own 0.3 file system programs are not a second suite.** Wasmtime 49.0.2 has 8, in its `test-programs`
+  crate, which depends on its 0.1 and 0.2 bindings and on the workspace and its lock, and is built for `wasm32-wasip1`;
+  its runner links 0.2 beside them. Built for `wasm32-wasip3`, each would export `wasi:cli/run` twice, as above, and
+  those named `_across_perms` need preopens with permissions of their own, which tric does not have.
+- **What serving 0.3 alone no longer tests.** The gate ran 103 unit tests, 66 end-to-end and 63 conformance tests (in
+  one of the unit tests) at `a01aa52`, and runs 99, 52 and 21 now (with `ws`, 106 and 73 then, and 102 and 59 now).
+  Gone with 0.2 are:
+  - the suite's 49 0.1 modules (42 in Rust and 7 in C), which were made components with Wasmtime's preview 1 adapter
+    and served through 0.2. The 7 C tests are now built for 0.3. The 42 Rust ones cannot be, and the suite's Rust
+    tests for 0.3 are the 14 above;
+  - the end-to-end file tests through Rust's `std::fs` on 0.2, and `files_are_one_filesystem`, which checked that 0.2
+    and 0.3 saw one tree. The same cases run through the 0.3 binding directly, on the fixture's `/files`, so
+    wasi-libc's 0.3 path is tested by the 7 C tests, and end to end only by the reads of `/fs`. A route through
+    `std::fs` would be small to bring back;
+  - the unit tests of the 0.2 binding.
 - **Objects are put at a random id, over any object there.** A put that is retried would get 412 on its own object
   under create-if-absent, and 128 random bits won't collide. The link's version id and hash would catch it if they did.
 - **A link pins a version and a hash.** The version means a reader gets the object it was pointed at, however the key
@@ -553,11 +571,12 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   opened to change its entries, and a directory opened by `open-at` reports the flag if it was asked for, and only
   while the turn can still change anything. The turn decides what is allowed, not the descriptor: a change fails when
   the turn is a snapshot or has answered (`read-only`), and not otherwise, and asking for the flag from a turn that
-  has answered is `read-only` too. Enforcing it per descriptor would break wasi-libc's preview 1 adapter, which never
-  asks for it on `path_open` and still changes directories below the preopen, and Wasmtime's own host reports it from
-  the open mode without enforcing it. The `wasi-testsuite` checks the report (`open(".")` with no flags reads
-  `READ`, not `READ | MUTATE_DIRECTORY`), which is how this was found. The descriptor flags a guest passes to
-  `open-at` narrow what that descriptor can do (a read without `read` is `bad-descriptor`) and never widen it.
+  has answered is `read-only` too. Enforcing it per descriptor would break wasi-libc, which asks for it only with
+  `O_WRONLY`, which no directory is opened with, and still changes the entries of the directories it opens, and
+  Wasmtime's own host reports it from the open mode without enforcing it. The `wasi-testsuite` checks the report
+  (`open(".")` with no flags reads `READ`, not `READ | MUTATE_DIRECTORY`), which is how this was found. The descriptor
+  flags a guest passes to `open-at` narrow what that descriptor can do (a read without `read` is `bad-descriptor`) and
+  never widen it.
 - **Every failure is an errno, and the detail is in the log.** A tree error maps to the nearest errno (over a budget is
   `insufficient-space`, a name that cannot be read `io`, a lost inode after a discard `io`), and the app's storage
   details, the bucket and the key, are logged and never returned. Of the errnos the WIT names, `busy` is used for
@@ -602,20 +621,18 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   that land in the same block in one turn put one object, and the measurement bears this out (release build, memory
   store, 64 MiB written in one turn: 4 KiB pieces 333 ms, 64 KiB 173 ms, 1 MiB 166 ms; a 5-byte patch in a 64 MiB file
   4 ms). The latency of S3 PUTs, 256 of them for 64 MiB, is not in these; it will be measured on a live run.
-- **The bindings share an error type, `Fault`,** in the core, because the orphan rules stop the core's error
-  converting into a bindgen's `ErrorCode` and the `wasmtime::Error` of a trap in one place, and each binding converts
-  it to its own `ErrorCode`. `wasmtime-wasi-io` is a new direct
-  dependency (`=49.0.2`, which was already in the lock file as wasmtime-wasi's): the bindgen shares its stream
-  resources through `with:`, and its `async_trait` is the one the host traits are declared with, so the runtime code
-  uses that and not a dependency of its own. `async-trait` itself stays a dev-dependency.
+- **The binding's error type, `Fault`, is in the core:** an errno or a trap, as the core's helpers (`fd`, `writer`,
+  `add`) return one or the other. The binding converts an errno to its `ErrorCode`, and a trap stays one.
+  `wasmtime-wasi-io`, through which the 0.2 binding shared its streams, was removed with that binding.
+  `async-trait` is a dev-dependency, for the tests of `src/tree.rs`.
 - **The end-to-end file cases run on the Rust app,** as the JavaScript app has no file routes: the QuickJS bindings
   are by hand and the files are the subject of the tests, not the language.
 - **Only a turn's own name is mounted,** as `/`. A snapshot is mounted read-only, and a request without a name has no
   preopens, with no request made. Mounting others would need a path convention, and an app can read another name's
   keys already.
-- **A 0.3 stream is a producer or a consumer over the same handles.** `read-via-stream` and `read-directory` are
+- **A stream is a producer or a consumer over a handle of its own.** `read-via-stream` and `read-directory` are
   `StreamProducer`s, `write-via-stream` and `append-via-stream` are `StreamConsumer`s, and each holds its own pin on
-  the inode and the turn, so it outlives the call and the descriptor, as in 0.2. Each also owns the `future` that the
+  the inode and the turn, so it outlives the call and the descriptor. Each also owns the `future` that the
   WIT returns with it, which is sent exactly once, as a future whose sender is dropped would trap the guest. What
   closing does differs by the stream. A read stream drops its fetch, as it is only a read and nothing then holds the
   tree, and aborts its read-ahead. A write that was admitted is allowed to finish, in a task of its own, which tells
@@ -625,9 +642,9 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
 - **A stream that reads on reads ahead, to a megabyte, through the same verified path.** When a read begins where the
   last one ended, the stream is reading on, and a task fetches the blocks up to 1 MiB past it (`AHEAD`) for the cache,
   as a read does: checked against their links, with the version pinned. The task is aborted with the stream, and a
-  file of which only the start is read has nothing fetched that was not asked for. The 0.2 `Input` and the 0.3 read
-  stream share it (`Ahead`, in `src/fs.rs`). Independently, a read (`Plan::read`) fetches its blocks together, up to
-  `IN_FLIGHT` (16; the tree's bound on uploads, renamed from `PUTS` as it serves both), and puts them in order.
+  file of which only the start is read has nothing fetched that was not asked for. It is `Ahead`, in `src/fs.rs`.
+  Independently, a read (`Plan::read`) fetches its blocks together, up to `IN_FLIGHT` (16; the tree's bound on
+  uploads, renamed from `PUTS` as it serves both), and puts them in order.
   Measured with a counting store at 20 ms a GET: a read of 3 blocks is 3 GETs all under way together, 32 blocks are 32
   GETs with 16 under way, and a stream of 12 blocks is 12 GETs with at least 4 together.
 - **A block that is being fetched is waited for, not fetched again.** The first test of 0.3 read-ahead on a store
@@ -656,10 +673,10 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   commit go through while it is, for the read and for the read-ahead alike; it fails if either holds the tree.
 - **An offset is signed, and a time is not.** A `read` from an offset past `i64::MAX` is `invalid`, as `pread` has it,
   and not an end of file. A 0.3 instant before 1970 is `overflow` for `set-times`, as the tree cannot hold it.
-- **The 0.3 tests are run as Wasmtime's own runner does:** each is a `wasi:cli/run` command, the directory of the test
-  is `/`, and `run_command` serves 0.2 and 0.3 alike. The suite's other 0.3 components (cli, http, sockets, clocks,
-  random) name no directory and are skipped. A trap in a test carries the test's stderr in its error, which is where
-  its assertion message is, and how a failure is read.
+- **The conformance tests are run as Wasmtime's own runner does:** each is a `wasi:cli/run` command, called by
+  `run_command`, and the directory of the test is `/`. The suite's other tests (7 in C, and the Rust ones of cli,
+  http, sockets, clocks and random) name no directory and are not built. A trap in a test carries the test's stderr in
+  its error, which is where its assertion message is, and how a failure is read.
 - **Wasmtime's `component-model-bytes` feature is named in `Cargo.toml`,** as the 0.3 streams hand `Bytes` to the
   guest. It was already on, through the `p3` feature of `wasmtime-wasi`, so the lock file does not change and no
   crate is added.
@@ -693,11 +710,22 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   WASI 0.3 components: StarlingMonkey and ComponentizeJS make 0.2 ones. As published it can't build a world that
   imports an async function, so `docker/build.Dockerfile` builds it from crates.io, checked by sha256, with a lockfile
   and `docker/qjs/componentize-qjs.patch`: Wasmtime 49.0.2 for its build-time run, which traps the imports it isn't
-  given.
+  given, and wit-dylib's stack in the task's context (`StackPointer::TaskContext`, the option wit-dylib names for
+  WASI 0.3 and later).
+- **Its runtime is built for `wasm32-wasip3`,** as the runtime the crate embeds imports 0.2. The source is the commit
+  tagged v0.4.5 (`e563c6d6`), fetched by sha256 and built by the fixture toolchain, its C by wasi-sdk 34's clang, with
+  upstream's flags and an export of `__wasm_library_tls_info`, by which wit-component gives a library thread-local
+  storage of its own. `docker/qjs/runtime.patch` changes two things:
+  - a task's state between its callbacks is kept in a thread-local, as wit-bindgen 0.62.0 keeps its own, and not in
+    the component's context slot 0, which wasi-libc keeps for the task's stack on `wasm32-wasip3`;
+  - the WASI 0.1 adapter is not linked, so its state is not reset after the build-time run.
+
+  A unit test runs two requests at once on one instance of the JavaScript fixture (the first waits 200 ms, and the
+  second answers while it waits), and each gets its own answer, so each task's state is kept apart.
 - **There is no shim for `fetch`, `Request` or `URL`.** They are not WASI, and tric invents nothing.
 - **The JavaScript fixture skips `/print` and `/fs`,** which try tric's own stdio and files: QuickJS has neither.
-- **A JavaScript component also imports the WASI 0.2 interfaces its runtime stands on,** as a Rust one does, and
-  exports an `init` that tric never calls.
+- **A JavaScript component imports WASI 0.3 alone,** as a Rust one does, and exports an `init` that tric never
+  calls.
 
 ## WebSockets
 
@@ -804,3 +832,8 @@ sockets and where API Gateway WebSocket does, on AWS. A probe on AWS, behind Clo
   - a response silent for 20 s cut by the SDK's stalled-stream protection, by default, which breaks an SSE app that
     pauses;
   - `tric dev` needing an S3 endpoint, as the SDK has no store in memory.
+- **The host and the fixtures have a toolchain each, until 12 November 2026.** The host is built by Rust 1.99.0, and
+  the fixtures and the conformance tests by 1.100.0-beta.4 (`TRIC_FIXTURE_TOOLCHAIN` in `docker/build.Dockerfile`), as
+  `wasm32-wasip3` is stable from 1.100. Both move to 1.100.0 when it is stable, on 12 November 2026. Serving 0.3 alone
+  switched nothing on in the engine: its component-model async was already callbacks only, with no stackful async and
+  no extra builtins.
