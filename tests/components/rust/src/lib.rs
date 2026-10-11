@@ -9,3 +9,5 @@ mod files;
 mod guard;
 #[cfg(feature = "app")]
 mod kv;
+#[cfg(feature = "app")]
+mod std_files;
