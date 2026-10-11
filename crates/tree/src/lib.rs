@@ -1,102 +1,215 @@
-//! A name's data: one copy-on-write B+tree of keys and values, as LMDB and bbolt keep theirs. The root is in the name's
-//! head; every other node, and every value too large to sit in a node, is an immutable object under
-//! `apps/<app>/values/<name>/`, which its parent names by a [`Link`]: the object's id, its S3 version, its SHA-256 and
-//! its length. A read follows links and checks each object against its link, so a changed object is an error, not data.
+//! A copy-on-write B+tree in an object store, as LMDB and bbolt keep theirs in a file.
 //!
-//! A turn edits the tree directly. A node it touches becomes a copy in memory, and the rest stay links. When the
-//! copies, and the large values held for upload, pass their budget, they are uploaded and become links again, as LMDB
-//! spills dirty pages. The commit uploads what is left, bottom-up, and its caller swaps in the head that names the new
-//! root. A node left under a quarter full merges with a neighbour, and a root with one child gives way to it, as in
-//! bbolt.
+//! A tree maps string keys to byte values. Its root is a small [`Root`], which the caller keeps where it keeps its own
+//! state, such as an object it swaps by compare-and-swap. Every other node, and every value too large to sit in a node,
+//! is an immutable object directly under a prefix the caller gives, at a random 128-bit id: see [`object`]. A parent
+//! names each object by a link of its id, its version if the store keeps versions, its SHA-256 and its length, and
+//! every read is checked against its link.
 //!
-//! Nothing is deleted at a commit: what the edits replace, and what a turn that does not land uploaded, is left for the
-//! sweep to collect.
-use crate::store::{self, Store};
+//! A [`Tree`] is opened at a root, written, and finished, which uploads what changed and gives the new root:
+//!
+//! ```
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> Result<(), tric_tree::Error> {
+//! use object_store::{memory::InMemory, path::Path};
+//! use std::sync::Arc;
+//! use tric_tree::{Cache, Config, Root, Tree};
+//!
+//! let (store, cache) = (Arc::new(InMemory::new()), Arc::new(Cache::default()));
+//! let prefix = Path::from("trees/one");
+//!
+//! let mut tree = Tree::open(store.clone(), prefix.clone(), cache.clone(), &Root::default(), Config::default())?;
+//! tree.write(vec![("a".into(), Some("small".into())), ("b".into(), Some(vec![7u8; 10_000].into()))]).await?;
+//! let root = tree.finish().await?; // for the caller to keep, or to swap in where it keeps it
+//!
+//! let tree = Tree::open(store, prefix, cache, &root, Config::default())?;
+//! let item = tree.get("b").await?.expect("b is there");
+//! assert_eq!(tree.value(&item).await?.len(), 10_000);
+//! assert_eq!(tree.scan("", None, 10).await?, ["a", "b"]);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # What it guarantees
+//!
+//! - **A read is verified.** An object that is missing, over the size the config allows, or not what its link says is
+//!   [`Error::Corrupt`], and never data.
+//! - **A finished root never changes.** Objects are only added, at new random ids: none is overwritten or deleted, so
+//!   a root reads the same for as long as its objects are kept.
+//! - **A write is all or none.** One refused as [`Error::Full`] or [`Error::TooLarge`] changes nothing. One that fails
+//!   otherwise, as when the store fails, or that is dropped half way, leaves the tree [`Error::Poisoned`] until
+//!   [`Tree::reset`].
+//! - **Memory is bounded.** A node an edit changes is a copy in memory, and a large value is held until it is uploaded;
+//!   past [`Config::budget`], the values and then the nodes are uploaded early, as LMDB spills dirty pages.
+//! - **The tree stays balanced.** A node over its size splits, a node left under a quarter full merges with a
+//!   neighbour, and a root of one child gives way to it, as in bbolt.
+//!
+//! # The caller's part
+//!
+//! - **The root, and its swap.** [`Tree::finish`] gives a root, and the tree keeps it nowhere. Where writers race, the
+//!   caller swaps it in by compare-and-swap, and when that fails, it calls [`Tree::reset`] and tries again.
+//! - **Collection.** The tree deletes nothing: what an edit replaces, and what a writer that lost its race or crashed
+//!   uploaded, stays in the store. A collector lists the prefix, marks what every root it keeps reaches with
+//!   [`Tree::mark`], and deletes only the ids that none reaches and that are older than the longest a writer takes
+//!   from its first upload to its swap, as until then a writer's objects are reached by no root.
+//! - **The store.** Any [`ObjectStore`]. In one that keeps versions, a link holds the version it wrote, and a read asks
+//!   for it.
+//! - **The config.** A tree is opened with a [`Config`] whose `node` and `blob` are no smaller than those it was
+//!   written with, as a larger object is refused as corrupt. A `node` of 1 KiB or more holds enough to be a tree.
+//! - **The cache.** A [`Cache`] of what was read, which the trees that are to share it share through an `Arc`.
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
 use base64::{Engine as _, prelude::BASE64_STANDARD as B64};
 use bytes::Bytes;
 use futures_util::future::{BoxFuture, try_join_all};
 use futures_util::{StreamExt, TryStreamExt, stream};
-use object_store::{PutMode, path::Path};
+use object_store::{GetOptions, ObjectStore, PutMode, path::Path};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedMutexGuard, Semaphore};
-use wasmtime::{Result, bail, ensure, error::Context};
 
-/// The most a node is as JSON.
-pub const NODE_MAX: usize = 64 << 10;
-/// The most a value is, to sit in its node. A larger one is an object of its own.
-pub const INLINE_MAX: usize = 4 << 10;
-/// The most a turn holds in memory that is not yet uploaded: nodes it changed, and values it has not uploaded.
-pub const BUDGET: usize = 8 << 20;
-/// The most keys a name holds.
-pub const ENTRIES_MAX: u64 = 4 << 20;
-/// The most bytes of values a name holds.
-pub const DATA_MAX: u64 = 16 << 30;
-/// The most a value that is an object of its own is.
-pub const BLOB_MAX: u64 = 1 << 20;
-/// The most of the nodes read, as a process keeps them for the next request, in bytes of JSON.
-const NODES_MAX: usize = 16 << 20;
-/// The most of the values and blocks read, kept in the same way.
-const BLOCKS_MAX: usize = 32 << 20;
-/// How many uploads a turn has in flight, and how many downloads one read does at once.
-pub const IN_FLIGHT: usize = 16;
-/// The longest S3 version id a link may hold: S3 and RustFS give 32 and 36 characters.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
+/// The longest version id a link may hold: S3 and RustFS give 32 and 36 characters.
 const VERSION_MAX: usize = 64;
 /// What a link is as JSON, at most, when its version id is not yet known.
 const LINK_SIZE: usize = 144 + VERSION_MAX;
 /// What a node is as JSON beyond its entries.
 const OVERHEAD: usize = 16;
+/// The bytes of nodes, as JSON, that a default cache keeps.
+const NODES: usize = 16 << 20;
+/// The bytes of values that a default cache keeps.
+const VALUES: usize = 32 << 20;
 
-/// What bounds a name's tree. The tests use tiny ones, so that a few keys make a deep tree.
-#[derive(Clone, Copy)]
-pub struct Limits {
-    /// The most a node is as JSON.
+/// What bounds a tree, and how it uses the store. A tree is read with a `node` and a `blob` no smaller than those it
+/// was written with.
+#[derive(Clone, Copy, Debug)]
+pub struct Config {
+    /// The most a node is as JSON, in bytes: 64 KiB by default. A key and its value take a quarter of one at most.
     pub node: usize,
-    /// The most a value is, to sit in its node.
+    /// The most a value is, to sit in its node: 4 KiB by default. A larger one is an object of its own.
     pub inline: usize,
-    /// The most a turn holds in memory that is not yet uploaded.
+    /// The most a tree holds in memory that is not yet uploaded, of the nodes it changed and the values it holds: 8 MiB
+    /// by default.
     pub budget: usize,
-    /// The most keys.
+    /// The most keys a tree holds: no bound by default.
     pub entries: u64,
-    /// The most bytes of values.
+    /// The most bytes of values a tree holds: no bound by default.
     pub data: u64,
-    /// The most a value that is an object of its own is.
+    /// The most a value is: 1 MiB by default.
     pub blob: u64,
+    /// How many uploads a tree has under way at once, and how many nodes a mark reads at once: 16 by default.
+    pub in_flight: usize,
 }
 
-impl Default for Limits {
+impl Default for Config {
     fn default() -> Self {
         Self {
-            node: NODE_MAX,
-            inline: INLINE_MAX,
-            budget: BUDGET,
-            entries: ENTRIES_MAX,
-            data: DATA_MAX,
-            blob: BLOB_MAX,
+            node: 64 << 10,
+            inline: 4 << 10,
+            budget: 8 << 20,
+            entries: u64::MAX,
+            data: u64::MAX,
+            blob: 1 << 20,
+            in_flight: 16,
         }
     }
 }
 
-/// Why a write was refused: the name would hold more than its limits allow. The guest is told, as it can act on it.
+/// Why a tree failed.
 #[derive(Debug)]
-pub struct Full(String);
+#[non_exhaustive]
+pub enum Error {
+    /// A write was refused, and changed nothing: the tree would hold more than its config allows.
+    Full(Full),
+    /// A write was refused, and changed nothing: a value or a key is over what the config allows. A node or a root over
+    /// its size, when a tree is finished, is this too.
+    TooLarge(String),
+    /// An object is missing, or is not what its link says, or a link is malformed: the tree is not whole.
+    Corrupt(String),
+    /// The store failed.
+    Store(object_store::Error),
+    /// A change failed half way, or was dropped, and the tree is not to be finished: see [`Tree::reset`].
+    Poisoned,
+}
+
+/// What a tree would hold more of than its config allows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Full {
+    /// The most keys a tree holds, which is [`Config::entries`].
+    Entries(u64),
+    /// The most bytes of values a tree holds, which is [`Config::data`].
+    Data(u64),
+}
 
 impl fmt::Display for Full {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(&self.0)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Entries(n) => write!(f, "a tree holds {n} keys or fewer"),
+            Self::Data(n) => write!(f, "a tree holds {n} bytes of values or fewer"),
+        }
     }
+}
+
+impl std::error::Error for Full {}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full(full) => full.fmt(f),
+            Self::TooLarge(why) | Self::Corrupt(why) => f.write_str(why),
+            Self::Store(e) => e.fmt(f),
+            Self::Poisoned => f.write_str("an earlier change to the tree failed"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    /// The store's error is shown as this one, so what it has below it is the source.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Store(e) => e.source(),
+            _ => None,
+        }
+    }
+}
+
+impl From<object_store::Error> for Error {
+    fn from(e: object_store::Error) -> Self {
+        Self::Store(e)
+    }
+}
+
+/// The result of what a tree does.
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+fn corrupt<T>(why: String) -> Result<T> {
+    Err(Error::Corrupt(why))
+}
+
+/// The SHA-256 of `bytes`, in hex.
+fn hash(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// 128 random bits, in hex: a new object's id.
+fn random() -> String {
+    format!("{:032x}", rand::random::<u128>())
 }
 
 /// An object in the tree: where it is, which of its versions, and what it must hold.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Link {
+struct Link {
     id: String, // 128 random bits, in hex
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    v: Option<String>, // the S3 version
+    v: Option<String>, // the version, if the store keeps them
     h: String,  // the SHA-256, in hex
     n: u64,     // the length
 }
@@ -106,30 +219,33 @@ fn hex(s: &str, n: usize) -> bool {
     s.len() == n && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// An object's id as a number, if it is one: 128 bits, as it is 32 lowercase hex digits. A key listed in the bucket is
-/// compared with the ids a tree names as numbers, in 16 bytes where the string takes 56 or more.
+/// An object's id as a number, if it is one: 128 bits, as it is 32 lowercase hex digits, as every id a tree gives is.
+/// A collector compares the ids it lists with those [`Tree::mark`] gives as numbers, in 16 bytes where the string takes
+/// 56 or more.
 pub fn number(id: &str) -> Option<u128> {
     hex(id, 32).then(|| u128::from_str_radix(id, 16).ok()).flatten()
 }
 
-/// Where the object `id` of a name's tree is: every one is directly under the name's own prefix.
-pub fn object(app: &str, name: &str, id: &str) -> Path {
-    store::app(app, &["values", name, id])
+/// Where the object `id` of the tree under `prefix` is: every one is directly under its prefix.
+pub fn object(prefix: &Path, id: &str) -> Path {
+    prefix.clone().join(id)
 }
 
 impl Link {
-    /// Whether the link is well-formed, so that the path it leads to is under the name's own and nowhere else.
+    /// Whether the link is well-formed, so that the path it leads to is under the tree's prefix and nowhere else.
     fn check(&self) -> Result<()> {
         let plain =
             |v: &str| v.len() <= VERSION_MAX && v.bytes().all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\');
-        ensure!(hex(&self.id, 32) && hex(&self.h, 64) && self.v.as_deref().is_none_or(plain), "a link is malformed");
-        Ok(())
+        match hex(&self.id, 32) && hex(&self.h, 64) && self.v.as_deref().is_none_or(plain) {
+            true => Ok(()),
+            false => corrupt("a link is malformed".into()),
+        }
     }
 
     /// The id as a number: see [`number`].
     fn number(&self) -> Result<u128> {
         self.check()?;
-        number(&self.id).context("a link is malformed")
+        number(&self.id).map_or_else(|| corrupt("a link is malformed".into()), Ok)
     }
 
     /// What the link is as JSON, at most.
@@ -138,11 +254,11 @@ impl Link {
     }
 }
 
-/// What a key holds.
+/// What a key holds, as its node holds it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase", deny_unknown_fields)]
-pub enum Item {
-    /// A value of `INLINE_MAX` bytes or less, in base64.
+enum Value {
+    /// A value of `inline` bytes or less, in base64.
     Inline(String),
     /// A larger value, which is an object.
     Object(Link),
@@ -151,7 +267,7 @@ pub enum Item {
     Held(Bytes),
 }
 
-impl Item {
+impl Value {
     fn of(bytes: Bytes, inline: usize) -> Self {
         match bytes.len() <= inline {
             true => Self::Inline(B64.encode(&bytes)),
@@ -159,8 +275,7 @@ impl Item {
         }
     }
 
-    /// The length of the value.
-    pub fn len(&self) -> u64 {
+    fn len(&self) -> u64 {
         match self {
             Self::Inline(s) => {
                 (s.len() / 4 * 3).saturating_sub(s.bytes().rev().take_while(|b| *b == b'=').count()) as u64
@@ -170,7 +285,7 @@ impl Item {
         }
     }
 
-    /// What the item is as JSON, at most.
+    /// What the value is as JSON, at most.
     fn wire(&self) -> usize {
         match self {
             Self::Inline(s) => s.len() + 14,
@@ -188,45 +303,65 @@ impl Item {
     }
 }
 
+/// What a key holds, as a read finds it: the value, or a link to the object that holds it. [`Tree::value`] and
+/// [`Values::get`] read the value.
+#[derive(Clone, Debug)]
+pub struct Item(Value);
+
+impl Item {
+    /// The length of the value, which is known without reading it.
+    pub fn len(&self) -> u64 {
+        self.0.len()
+    }
+
+    /// Whether the value is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
-/// A tree as a head holds it: the root, and the totals the limits are held to.
-#[derive(Clone, Default, Serialize, Deserialize)]
+/// A tree as its caller keeps it: the root node, the totals the config holds it to, and the caller's number. It is
+/// small, at most a node, and serialises to `{}` when it is empty.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Shape {
+pub struct Root {
     #[serde(default, skip_serializing_if = "Body::is_empty")]
     root: Body,
     #[serde(default, skip_serializing_if = "is_zero")]
     bytes: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
     entries: u64,
-    /// The last inode number the file system allocated, which no key uses; none have been allocated if it is 0.
+    /// A number the caller keeps with the root: see [`Tree::sequence`].
     #[serde(default, skip_serializing_if = "is_zero")]
     seq: u64,
 }
 
-impl Shape {
+impl Root {
+    /// Whether it is the root of a tree that holds nothing, and whose number is 0: such a root is the default one, and
+    /// need not be kept.
     pub fn is_empty(&self) -> bool {
         self.root.is_empty() && self.bytes == 0 && self.entries == 0 && self.seq == 0
     }
 }
 
 /// A node in memory. `size` is its JSON, at most, and `held` the bytes of values in it not yet uploaded.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Node {
     body: Body,
     size: usize,
     held: usize,
 }
 
-/// What a node holds, as the object and the head's root hold it too. A child is its least key and its link: a node
-/// still in memory has none, and is not written.
-#[derive(Clone, Serialize, Deserialize)]
+/// What a node holds, as its object and the root hold it too. A child is its least key and its link: a node still in
+/// memory has none, and is not written.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase", deny_unknown_fields)]
 enum Body {
-    Leaf(Vec<(String, Item)>),
+    Leaf(Vec<(String, Value)>),
     /// Each child under the least key it may hold, which the first child's is not held to.
     Branch(Vec<Child>),
 }
@@ -246,7 +381,7 @@ impl Body {
     }
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(from = "(String, Link)")]
 struct Child {
     key: String,
@@ -268,7 +403,7 @@ impl Serialize for Child {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum At {
     Clean(Link),
     Dirty(Box<Node>),
@@ -284,8 +419,8 @@ fn json_len(s: &str) -> usize {
     2 + s.chars().map(one).sum::<usize>()
 }
 
-fn entry(key: &str, item: &Item) -> usize {
-    json_len(key) + item.wire() + 4
+fn entry(key: &str, value: &Value) -> usize {
+    json_len(key) + value.wire() + 4
 }
 
 fn child(kid: &Child) -> usize {
@@ -322,19 +457,21 @@ impl Node {
     }
 
     fn of(body: Body) -> Result<Self> {
-        ensure!(!matches!(&body, Body::Branch(kids) if kids.is_empty()), "a branch has no children");
+        if matches!(&body, Body::Branch(kids) if kids.is_empty()) {
+            return corrupt("a branch has no children".into());
+        }
         Ok(Self::measured(body))
     }
 
-    /// The node as the object holds it, once all its children are links.
-    fn json(&self) -> Result<Vec<u8>> {
-        Ok(serde_json::to_vec(&self.body)?)
+    /// The node as its object holds it, once all its children are links.
+    fn json(&self) -> Vec<u8> {
+        serde_json::to_vec(&self.body).expect("a node whose children are links is JSON")
     }
 
     fn measure(&mut self) {
         (self.size, self.held) = match &self.body {
             Body::Leaf(es) => {
-                (OVERHEAD + es.iter().map(|(k, i)| entry(k, i)).sum::<usize>(), es.iter().map(|(_, i)| i.held()).sum())
+                (OVERHEAD + es.iter().map(|(k, v)| entry(k, v)).sum::<usize>(), es.iter().map(|(_, v)| v.held()).sum())
             }
             Body::Branch(kids) => (OVERHEAD + kids.iter().map(child).sum::<usize>(), 0),
         };
@@ -366,12 +503,12 @@ impl Node {
     fn split_off(&mut self) -> Result<Self> {
         let body = match &mut self.body {
             Body::Leaf(es) if es.len() > 1 => {
-                Body::Leaf(es.split_off(cut(es.iter().map(|(k, i)| entry(k, i)), self.size, es.len())))
+                Body::Leaf(es.split_off(cut(es.iter().map(|(k, v)| entry(k, v)), self.size, es.len())))
             }
             Body::Branch(kids) if kids.len() > 1 => {
                 Body::Branch(kids.split_off(cut(kids.iter().map(child), self.size, kids.len())))
             }
-            _ => bail!("a node of one entry is over its size"),
+            _ => return corrupt(format!("a node of one entry is over {} bytes", self.size)),
         };
         self.measure();
         Ok(Self::measured(body))
@@ -382,24 +519,24 @@ impl Node {
         match (&mut self.body, right.body) {
             (Body::Leaf(a), Body::Leaf(b)) => a.extend(b),
             (Body::Branch(a), Body::Branch(b)) => a.extend(b),
-            _ => bail!("the tree is not as deep on one side"),
+            _ => return corrupt("the tree is not as deep on one side".into()),
         }
         self.measure();
         Ok(())
     }
 }
 
-/// The objects read, for the next request in the same process: nodes, and the values and blocks too large to sit in
-/// one. They are immutable, and named by the object's full path and version, which hold the app, the name and an id
-/// nobody else gets, so a hit is what a read would fetch. A hit must also be what the link says, by its hash.
+/// The objects read, for the trees that share it: nodes, and the values too large to sit in one. An object never
+/// changes, and is kept by its full path and version; a hit must also be what its link says, by its hash, so trees
+/// under any prefix, of any store, may share one.
 pub struct Cache {
     nodes: Mutex<Lru<Arc<Node>>>,
-    blocks: Mutex<Lru<Bytes>>,
-    /// The blocks that are being fetched: see [`Flight`].
+    values: Mutex<Lru<Bytes>>,
+    /// The values that are being fetched: see [`Flight`].
     flights: Mutex<HashMap<CacheKey, Gate>>,
 }
 
-/// The gate of a block that is being fetched, and how many reads have come to it: the one that holds it, and those
+/// The gate of a value that is being fetched, and how many reads have come to it: the one that holds it, and those
 /// that wait. The count is kept with the map locked, so it is exact, and the gate goes when it is back to none.
 #[derive(Default)]
 struct Gate {
@@ -458,20 +595,14 @@ impl<V: Clone> Lru<V> {
     }
 }
 
-impl Default for Cache {
-    fn default() -> Self {
-        Self { nodes: Lru::new(NODES_MAX), blocks: Lru::new(BLOCKS_MAX), flights: Mutex::default() }
-    }
-}
-
 impl Cache {
-    /// The cache a process shares among its stores of S3.
-    pub fn shared() -> Arc<Self> {
-        static SHARED: LazyLock<Arc<Cache>> = LazyLock::new(Default::default);
-        SHARED.clone()
+    /// A cache that keeps up to `nodes` bytes of nodes, as JSON, and `values` bytes of values. Past either, it forgets
+    /// what it used least, down to seven eighths.
+    pub fn new(nodes: usize, values: usize) -> Self {
+        Self { nodes: Lru::new(nodes), values: Lru::new(values), flights: Mutex::default() }
     }
 
-    /// Waits for its turn to fetch the block at `key`, and has it.
+    /// Waits for its turn to fetch the value at `key`, and has it.
     async fn flight(&self, key: &CacheKey) -> Flight<'_> {
         let lock = {
             let mut flights = self.flights.lock().unwrap();
@@ -486,9 +617,26 @@ impl Cache {
     }
 }
 
-/// The right to fetch one block. Reads that come to a block that another read is fetching, which a stream that reads
+impl Default for Cache {
+    /// A cache of 16 MiB of nodes and 32 MiB of values.
+    fn default() -> Self {
+        Self::new(NODES, VALUES)
+    }
+}
+
+impl fmt::Debug for Cache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (nodes, values) = (self.nodes.lock().unwrap(), self.values.lock().unwrap());
+        f.debug_struct("Cache")
+            .field("nodes", &(nodes.bytes, nodes.max))
+            .field("values", &(values.bytes, values.max))
+            .finish_non_exhaustive()
+    }
+}
+
+/// The right to fetch one value. Reads that come to a value that another read is fetching, which a stream that reads
 /// ahead and the read that catches up with it both do, wait for it and then find it in the cache, instead of fetching
-/// it again. A block is checked against its link by whoever fetches it, and by whoever finds it in the cache, so
+/// it again. A value is checked against its link by whoever fetches it, and by whoever finds it in the cache, so
 /// waiting does not take anything on trust. When the one that holds it is cancelled, the next in turn fetches. A read
 /// that is cancelled while it waits is counted out as well, so that the gate does not outlive the reads that come to
 /// it: what is counted is the flights, and not who holds a reference to the gate, which depends on the order in which
@@ -512,7 +660,7 @@ impl Drop for Flight<'_> {
     }
 }
 
-/// What a turn did with the bucket, for the debug log, which is written when the last of its trees is gone.
+/// What a tree and its forks did with the store, for the debug log, which is written when the last of them is gone.
 #[derive(Default)]
 struct Stats {
     gets: AtomicU64,
@@ -526,18 +674,18 @@ struct Stats {
     collapses: AtomicU64,
 }
 
-/// Where a name's objects are, and how to read them.
+/// Where a tree's objects are, and how to read them.
 struct Reader {
-    store: Store,
-    app: String,
-    name: String,
-    limits: Limits,
+    store: Arc<dyn ObjectStore>,
+    prefix: Path,
+    cache: Arc<Cache>,
+    config: Config,
     stats: Stats,
 }
 
 impl Reader {
     fn path(&self, id: &str) -> Path {
-        object(&self.app, &self.name, id)
+        object(&self.prefix, id)
     }
 
     fn key(&self, link: &Link) -> CacheKey {
@@ -547,13 +695,24 @@ impl Reader {
     /// The object `link` names, which must be `max` bytes or less, and be what the link says.
     async fn fetch(&self, link: &Link, max: u64) -> Result<Bytes> {
         link.check()?;
-        ensure!(link.n <= max, "an object is over {max} bytes");
         let path = self.path(&link.id);
-        let got = self.store.get(&path, link.v.clone(), max).await?;
-        let (bytes, _) = got.with_context(|| format!("{path} is missing"))?;
+        if link.n > max {
+            return corrupt(format!("{path} is over {max} bytes"));
+        }
+        let got = match self.store.get_opts(&path, GetOptions { version: link.v.clone(), ..Default::default() }).await {
+            Ok(got) => got,
+            Err(object_store::Error::NotFound { .. }) => return corrupt(format!("{path} is missing")),
+            Err(e) => return Err(e.into()),
+        };
+        if got.meta.size > max {
+            return corrupt(format!("{path} is over {max} bytes"));
+        }
+        let bytes = got.bytes().await?;
         self.stats.gets.fetch_add(1, Relaxed);
         self.stats.read.fetch_add(bytes.len() as u64, Relaxed);
-        ensure!(bytes.len() as u64 == link.n && store::hash(&bytes) == link.h, "{path} is not what its link says");
+        if bytes.len() as u64 != link.n || hash(&bytes) != link.h {
+            return corrupt(format!("{path} is not what its link says"));
+        }
         Ok(bytes)
     }
 
@@ -562,42 +721,45 @@ impl Reader {
     }
 
     /// The node `link` names, from the cache if it is there, else read and checked against the link, and then kept if
-    /// `keep`. A read of a whole name passes `false`, so as not to push out what requests are using.
+    /// `keep`. A mark passes `false`, so as not to push out what reads are using.
     async fn load(&self, link: &Link, keep: bool) -> Result<Arc<Node>> {
         link.check()?;
         let key = self.key(link);
-        if let Some(node) = self.store.cache.nodes.lock().unwrap().get(&key, &link.h) {
+        if let Some(node) = self.cache.nodes.lock().unwrap().get(&key, &link.h) {
             self.stats.hits.fetch_add(1, Relaxed);
             return Ok(node);
         }
-        let bytes = self.fetch(link, self.limits.node as u64).await?;
-        let body = serde_json::from_slice(&bytes).with_context(|| format!("{}", key.0))?;
+        let bytes = self.fetch(link, self.config.node as u64).await?;
+        let body = match serde_json::from_slice(&bytes) {
+            Ok(body) => body,
+            Err(e) => return corrupt(format!("{}: {e}", key.0)),
+        };
         let node = Arc::new(Node::of(body)?);
         if keep {
-            self.store.cache.nodes.lock().unwrap().put(key, node.clone(), link.h.clone(), node.size);
+            self.cache.nodes.lock().unwrap().put(key, node.clone(), link.h.clone(), node.size);
         }
         Ok(node)
     }
 
-    /// Keeps a value this turn uploaded, for the next request to read.
+    /// Keeps a value the tree uploaded, for the next read.
     fn keep(&self, link: &Link, bytes: &Bytes) {
-        let blocks = &mut *self.store.cache.blocks.lock().unwrap();
-        blocks.put(self.key(link), bytes.clone(), link.h.clone(), bytes.len());
+        let values = &mut *self.cache.values.lock().unwrap();
+        values.put(self.key(link), bytes.clone(), link.h.clone(), bytes.len());
     }
 
     /// The value `link` names, if the cache has it.
     fn kept(&self, key: &CacheKey, link: &Link) -> Option<Bytes> {
-        let bytes = self.store.cache.blocks.lock().unwrap().get(key, &link.h)?;
+        let bytes = self.cache.values.lock().unwrap().get(key, &link.h)?;
         self.stats.hits.fetch_add(1, Relaxed);
         Some(bytes)
     }
 
-    /// The value `item` holds.
-    async fn value(&self, item: &Item) -> Result<Bytes> {
-        match item {
-            Item::Inline(s) => Ok(B64.decode(s)?.into()),
-            Item::Object(link) => self.block(link).await,
-            Item::Held(bytes) => Ok(bytes.clone()),
+    /// The value `value` holds.
+    async fn value(&self, value: &Value) -> Result<Bytes> {
+        match value {
+            Value::Inline(s) => B64.decode(s).map(Bytes::from).or_else(|e| corrupt(format!("a value in a node: {e}"))),
+            Value::Object(link) => self.block(link).await,
+            Value::Held(bytes) => Ok(bytes.clone()),
         }
     }
 
@@ -608,11 +770,11 @@ impl Reader {
         if let Some(bytes) = self.kept(&key, link) {
             return Ok(bytes);
         }
-        let _flight = self.store.cache.flight(&key).await;
+        let _flight = self.cache.flight(&key).await;
         if let Some(bytes) = self.kept(&key, link) {
             return Ok(bytes);
         }
-        let bytes = self.fetch(link, self.limits.blob).await?;
+        let bytes = self.fetch(link, self.config.blob).await?;
         self.keep(link, &bytes);
         Ok(bytes)
     }
@@ -624,15 +786,16 @@ impl Drop for Reader {
         let (gets, hits, puts) = (s.gets.load(Relaxed), s.hits.load(Relaxed), s.puts.load(Relaxed));
         if gets + hits + puts > 0 {
             let (read, written, depth) = (s.read.load(Relaxed), s.written.load(Relaxed), s.depth.load(Relaxed));
-            let (splits, merges) = (s.splits.load(Relaxed), s.merges.load(Relaxed));
-            let (collapses, app, name) = (s.collapses.load(Relaxed), &self.app, &self.name);
-            tracing::debug!(app, name, gets, hits, puts, read, written, depth, splits, merges, collapses, "tree");
+            let (splits, merges, collapses) =
+                (s.splits.load(Relaxed), s.merges.load(Relaxed), s.collapses.load(Relaxed));
+            let prefix = &self.prefix;
+            tracing::debug!(%prefix, gets, hits, puts, read, written, depth, splits, merges, collapses, "tree");
         }
     }
 }
 
 /// The value at `key`, below `node`.
-fn find<'a>(r: &'a Reader, node: &'a Node, key: &'a str, depth: usize) -> BoxFuture<'a, Result<Option<Item>>> {
+fn find<'a>(r: &'a Reader, node: &'a Node, key: &'a str, depth: usize) -> BoxFuture<'a, Result<Option<Value>>> {
     Box::pin(async move {
         r.stats.depth.fetch_max(depth, Relaxed);
         match &node.body {
@@ -652,7 +815,7 @@ fn walk<'a, T: Send>(
     node: &'a Node,
     (prefix, after, limit): (&'a str, Option<&'a str>, usize),
     out: &'a mut Vec<T>,
-    pick: fn(&str, &Item) -> T,
+    pick: fn(&str, &Value) -> T,
     depth: usize,
 ) -> BoxFuture<'a, Result<()>> {
     Box::pin(async move {
@@ -660,11 +823,11 @@ fn walk<'a, T: Send>(
         match &node.body {
             Body::Leaf(es) => {
                 let before = |k: &str| k < prefix || after.is_some_and(|a| k <= a);
-                for (k, item) in &es[es.partition_point(|(k, _)| before(k))..] {
+                for (k, value) in &es[es.partition_point(|(k, _)| before(k))..] {
                     if out.len() >= limit || !k.starts_with(prefix) {
                         break;
                     }
-                    out.push(pick(k, item));
+                    out.push(pick(k, value));
                 }
             }
             Body::Branch(kids) => {
@@ -689,21 +852,26 @@ fn walk<'a, T: Send>(
     })
 }
 
-/// Adds to `ids` the objects `node` names, and to `next` the links of its children that are nodes.
-fn refs(node: &Node, ids: &mut HashSet<u128>, next: &mut Vec<Link>) -> Result<()> {
+/// Adds to `seen` the objects `node` names, and those below it that are in memory, and to `next` the links of the
+/// nodes among them that were not in `seen`.
+fn refs(node: &Node, seen: &mut HashSet<u128>, next: &mut Vec<Link>) -> Result<()> {
     match &node.body {
         Body::Leaf(es) => {
-            for (_, item) in es {
-                if let Item::Object(link) = item {
-                    ids.insert(link.number()?);
+            for (_, value) in es {
+                if let Value::Object(link) = value {
+                    seen.insert(link.number()?);
                 }
             }
         }
         Body::Branch(kids) => {
             for kid in kids {
-                let At::Clean(link) = &kid.at else { bail!("a node has a child in memory") };
-                if ids.insert(link.number()?) {
-                    next.push(link.clone());
+                match &kid.at {
+                    At::Clean(link) => {
+                        if seen.insert(link.number()?) {
+                            next.push(link.clone());
+                        }
+                    }
+                    At::Dirty(below) => refs(below, seen, next)?,
                 }
             }
         }
@@ -711,42 +879,81 @@ fn refs(node: &Node, ids: &mut HashSet<u128>, next: &mut Vec<Link>) -> Result<()
     Ok(())
 }
 
-/// What editing a tree changes besides its nodes.
-#[derive(Clone, Default)]
+/// The node `at` leads to, in memory and ready to change: a link is loaded, and copied.
+async fn dirty<'a>(r: &Reader, at: &'a mut At) -> Result<&'a mut Node> {
+    if let At::Clean(link) = at {
+        let loaded = r.node(link).await?;
+        *at = At::Dirty(Box::new((*loaded).clone()));
+    }
+    match at {
+        At::Dirty(node) => Ok(node),
+        At::Clean(_) => unreachable!("a node was just loaded"),
+    }
+}
+
+/// Merges what is under a quarter full below `node`, as bbolt does: a child with a neighbour, and with the sides shared
+/// out again if they do not fit in one. A child that is empty is dropped.
+fn fix<'a>(r: &'a Reader, node: &'a mut Node) -> BoxFuture<'a, Result<()>> {
+    Box::pin(async move {
+        let Body::Branch(kids) = &mut node.body else { return Ok(()) };
+        for kid in kids.iter_mut() {
+            if let At::Dirty(below) = &mut kid.at {
+                fix(r, below).await?;
+            }
+        }
+        kids.retain(|k| !matches!(&k.at, At::Dirty(n) if n.is_empty()));
+        let (thin, mut i) = (r.config.node / 4, 0);
+        while i < kids.len() {
+            if kids.len() < 2 || !matches!(&kids[i].at, At::Dirty(n) if n.size < thin) {
+                i += 1;
+                continue;
+            }
+            let (a, b) = if i > 0 { (i - 1, i) } else { (0, 1) };
+            dirty(r, &mut kids[a].at).await?;
+            dirty(r, &mut kids[b].at).await?;
+            let least = kids[b].key.clone();
+            let At::Dirty(mut right) = kids.remove(b).at else { unreachable!("a node was just loaded") };
+            if let Body::Branch(firsts) = &mut right.body {
+                firsts[0].key = least; // the first child's key is a bound now, as it was the parent's
+            }
+            let At::Dirty(left) = &mut kids[a].at else { unreachable!("a node was just loaded") };
+            left.append(*right)?;
+            r.stats.merges.fetch_add(1, Relaxed);
+            i = a;
+            if left.size > r.config.node {
+                let right = left.split_off()?;
+                kids.insert(a + 1, Child { key: right.first_key().to_owned(), at: At::Dirty(Box::new(right)) });
+                i = a + 2;
+            }
+        }
+        node.measure();
+        Ok(())
+    })
+}
+
+/// What a tree holds besides its nodes.
+#[derive(Clone, Debug, Default)]
 struct Work {
     bytes: u64,
     entries: u64,
-    /// The last inode number allocated.
     seq: u64,
 }
 
 impl Work {
-    /// The node `at` leads to, in memory and ready to change: a link is loaded.
-    async fn dirty<'a>(&mut self, r: &Reader, at: &'a mut At) -> Result<&'a mut Node> {
-        if let At::Clean(link) = at {
-            let loaded = r.node(link).await?;
-            *at = At::Dirty(Box::new((*loaded).clone()));
-        }
-        match at {
-            At::Dirty(node) => Ok(node),
-            At::Clean(_) => bail!("a node was not loaded"),
-        }
-    }
-
-    /// Sets `key` to `item` below `node`, or removes it if `item` is none. A node that grows past its size is split,
+    /// Sets `key` to `value` below `node`, or removes it if `value` is none. A node that grows past its size is split,
     /// and its second half, with the least key of it, is for the parent to take.
     fn edit<'a>(
         &'a mut self,
         r: &'a Reader,
         node: &'a mut Node,
         key: &'a str,
-        item: Option<Item>,
+        value: Option<Value>,
         depth: usize,
     ) -> BoxFuture<'a, Result<Option<(String, Node)>>> {
         Box::pin(async move {
             r.stats.depth.fetch_max(depth, Relaxed);
             match &mut node.body {
-                Body::Leaf(es) => match (es.binary_search_by(|(k, _)| k.as_str().cmp(key)), item) {
+                Body::Leaf(es) => match (es.binary_search_by(|(k, _)| k.as_str().cmp(key)), value) {
                     (Ok(i), Some(new)) => {
                         node.size = node.size + new.wire() - es[i].1.wire();
                         node.held = node.held + new.held() - es[i].1.held();
@@ -772,15 +979,15 @@ impl Work {
                 Body::Branch(kids) => {
                     let i = slot(kids, key);
                     let link = if let At::Clean(link) = &kids[i].at { Some(link.wire()) } else { None };
-                    let below = self.dirty(r, &mut kids[i].at).await?;
+                    let below = dirty(r, &mut kids[i].at).await?;
                     node.size = node.size + link.map_or(0, |_| LINK_SIZE) - link.unwrap_or(0);
-                    if let Some((least, right)) = self.edit(r, below, key, item, depth + 1).await? {
+                    if let Some((least, right)) = self.edit(r, below, key, value, depth + 1).await? {
                         node.size += json_len(&least) + LINK_SIZE + 4;
                         kids.insert(i + 1, Child { key: least, at: At::Dirty(Box::new(right)) });
                     }
                 }
             }
-            if node.size <= r.limits.node {
+            if node.size <= r.config.node {
                 return Ok(None);
             }
             r.stats.splits.fetch_add(1, Relaxed);
@@ -788,82 +995,45 @@ impl Work {
             Ok(Some((right.first_key().to_owned(), right)))
         })
     }
-
-    /// Merges what is under a quarter full below `node`, as bbolt does: a child with a neighbour, and with the sides
-    /// shared out again if they do not fit in one. A child that is empty is dropped.
-    fn fix<'a>(&'a mut self, r: &'a Reader, node: &'a mut Node) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            let Body::Branch(kids) = &mut node.body else { return Ok(()) };
-            for kid in kids.iter_mut() {
-                if let At::Dirty(below) = &mut kid.at {
-                    self.fix(r, below).await?;
-                }
-            }
-            kids.retain(|k| !matches!(&k.at, At::Dirty(n) if n.is_empty()));
-            let (thin, mut i) = (r.limits.node / 4, 0);
-            while i < kids.len() {
-                if kids.len() < 2 || !matches!(&kids[i].at, At::Dirty(n) if n.size < thin) {
-                    i += 1;
-                    continue;
-                }
-                let (a, b) = if i > 0 { (i - 1, i) } else { (0, 1) };
-                self.dirty(r, &mut kids[a].at).await?;
-                self.dirty(r, &mut kids[b].at).await?;
-                let least = kids[b].key.clone();
-                let At::Dirty(mut right) = kids.remove(b).at else { bail!("a node was not loaded") };
-                if let Body::Branch(firsts) = &mut right.body {
-                    firsts[0].key = least; // the first child's key is a bound now, as it was the parent's
-                }
-                let At::Dirty(left) = &mut kids[a].at else { bail!("a node was not loaded") };
-                left.append(*right)?;
-                r.stats.merges.fetch_add(1, Relaxed);
-                i = a;
-                if left.size > r.limits.node {
-                    let right = left.split_off()?;
-                    kids.insert(a + 1, Child { key: right.first_key().to_owned(), at: At::Dirty(Box::new(right)) });
-                    i = a + 2;
-                }
-            }
-            node.measure();
-            Ok(())
-        })
-    }
 }
 
-/// An upload of what the turn holds, and of the nodes it changed.
+/// An upload of what a tree holds, and of the nodes it changed.
 struct Flush<'a> {
     reader: &'a Reader,
     permits: Semaphore,
     nodes: bool, // the nodes too, and not only the values
 }
 
-impl Flush<'_> {
-    /// Uploads a value, and returns the link.
+impl<'a> Flush<'a> {
+    fn new(reader: &'a Reader, nodes: bool) -> Self {
+        Self { reader, permits: Semaphore::new(reader.config.in_flight.max(1)), nodes }
+    }
+
+    /// Uploads an object at a new id, and returns the link.
     async fn upload(&self, bytes: Bytes) -> Result<Link> {
-        let id = store::random();
+        let (id, h) = (random(), hash(&bytes));
         let path = self.reader.path(&id);
-        let h = store::hash(&bytes);
-        let _permit = self.permits.acquire().await?;
-        let v = self.reader.store.put(&path, bytes.clone(), PutMode::Overwrite).await?.and_then(|v| v.version);
+        let _permit = self.permits.acquire().await.expect("the semaphore is never closed");
+        let put = self.reader.store.put_opts(&path, bytes.clone().into(), PutMode::Overwrite.into()).await?;
         self.reader.stats.puts.fetch_add(1, Relaxed);
         self.reader.stats.written.fetch_add(bytes.len() as u64, Relaxed);
-        let link = Link { id, v, h, n: bytes.len() as u64 };
+        let link = Link { id, v: put.version, h, n: bytes.len() as u64 };
         link.check()?;
         Ok(link)
     }
 
     /// Uploads the values held in `node`, and, if `nodes`, the nodes below it that are in memory, so each is a link.
     /// Those left empty are dropped. The node itself is for the caller to upload.
-    fn node<'a>(&'a self, node: &'a mut Node) -> BoxFuture<'a, Result<()>> {
+    fn node(&'a self, node: &'a mut Node) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             match &mut node.body {
                 Body::Leaf(es) => {
-                    let held = es.iter_mut().filter(|(_, i)| matches!(i, Item::Held(_)));
-                    try_join_all(held.map(|(_, item)| async move {
-                        let Item::Held(bytes) = &*item else { return Ok::<_, wasmtime::Error>(()) };
+                    let held = es.iter_mut().filter(|(_, v)| matches!(v, Value::Held(_)));
+                    try_join_all(held.map(|(_, value)| async move {
+                        let Value::Held(bytes) = &*value else { return Ok::<_, Error>(()) };
                         let link = self.upload(bytes.clone()).await?;
-                        self.reader.keep(&link, bytes); // for the next request
-                        *item = Item::Object(link);
+                        self.reader.keep(&link, bytes); // for the next read
+                        *value = Value::Object(link);
                         Ok(())
                     }))
                     .await?;
@@ -886,71 +1056,92 @@ impl Flush<'_> {
         if !self.nodes || node.is_empty() {
             return Ok(());
         }
-        let json = node.json()?;
-        ensure!(json.len() <= self.reader.limits.node, "a node is over {} bytes", self.reader.limits.node);
+        let (json, max) = (node.json(), self.reader.config.node);
+        if json.len() > max {
+            return Err(Error::TooLarge(format!("a node is over {max} bytes")));
+        }
         let link = self.upload(json.into()).await?;
         let (key, hash) = (self.reader.key(&link), link.h.clone());
-        let At::Dirty(node) = std::mem::replace(&mut kid.at, At::Clean(link)) else { bail!("a node was not loaded") };
+        let At::Dirty(node) = std::mem::replace(&mut kid.at, At::Clean(link)) else { unreachable!("it is in memory") };
         let size = node.size;
-        self.reader.store.cache.nodes.lock().unwrap().put(key, Arc::new(*node), hash, size); // for the next request
+        self.reader.cache.nodes.lock().unwrap().put(key, Arc::new(*node), hash, size); // for the next read
         Ok(())
     }
 }
 
-/// Reads the values of items of a name, apart from its tree. An item is a value in memory, or names an object that is
-/// never changed, by its version, and is checked against its hash when it is read, so what it gives does not depend on
-/// the tree, and a read of it need not hold the tree for the length of a round trip to the store. The tree is for
-/// finding the items, and that is the part that holds it.
+/// Reads values apart from their tree. An item holds its value, or names an object that never changes and is checked
+/// against its hash when it is read, so what it gives does not depend on the tree, and a read of it need not hold the
+/// tree for a round trip to the store. The tree is for finding the items, and that is the part that holds it.
 #[derive(Clone)]
 pub struct Values(Arc<Reader>);
 
 impl Values {
-    /// The value `item` holds, checked as [`Tree::value`] checks it, and fetched once for the reads that come to it.
+    /// The value `item` holds, checked as [`Tree::value`] checks it, and fetched once for the reads that come to it at
+    /// once.
     pub async fn get(&self, item: &Item) -> Result<Bytes> {
-        self.0.value(item).await
+        self.0.value(&item.0).await
     }
 }
 
-/// A name's tree, as one turn edits it.
+impl fmt::Debug for Values {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Values").field("prefix", &self.0.prefix).finish_non_exhaustive()
+    }
+}
+
+/// A tree, as one writer reads and edits it.
+///
+/// It is opened at a [`Root`], and a write changes it in memory, uploading early only what is over the budget.
+/// [`Tree::finish`] uploads the rest and gives the new root, and [`Tree::reset`] goes back to the root it was opened
+/// at. Reads take `&self`, and see the writes made so far.
 pub struct Tree {
     reader: Arc<Reader>,
     base: (Node, Work), // as opened: the root, and the totals
     root: Node,
     work: Work,
-    poisoned: bool, // an edit failed, or went away, half way, so the tree cannot be committed
+    poisoned: bool, // a change failed, or went away, half way, so the tree is not to be finished
     edited: bool,
 }
 
 impl Tree {
-    pub fn open(store: &Store, app: &str, name: &str, shape: &Shape, limits: Limits) -> Result<Self> {
-        let reader =
-            Reader { store: store.clone(), app: app.into(), name: name.into(), limits, stats: Stats::default() };
-        let root = Node::of(shape.root.clone())?;
-        let work = Work { bytes: shape.bytes, entries: shape.entries, seq: shape.seq };
-        let base = (root.clone(), work.clone());
-        Ok(Self { reader: reader.into(), base, root, work, poisoned: false, edited: false })
+    /// The tree at `root`, whose objects are under `prefix` in `store`, and whose reads `cache` keeps. It reads
+    /// nothing until it is used. A root whose node is malformed is [`Error::Corrupt`].
+    pub fn open(
+        store: Arc<dyn ObjectStore>,
+        prefix: Path,
+        cache: Arc<Cache>,
+        root: &Root,
+        config: Config,
+    ) -> Result<Self> {
+        let reader = Reader { store, prefix, cache, config, stats: Stats::default() };
+        let node = Node::of(root.root.clone())?;
+        let work = Work { bytes: root.bytes, entries: root.entries, seq: root.seq };
+        let base = (node.clone(), work.clone());
+        Ok(Self { reader: reader.into(), base, root: node, work, poisoned: false, edited: false })
     }
 
-    /// A copy of the tree as it is, to read: it shares the objects, and nothing it does is committed.
+    /// A copy of the tree as it is, which goes its own way: it shares the store, the cache and the objects, and neither
+    /// sees what the other writes after. Either may be finished, and either resets to the root they were opened at.
     pub fn fork(&self) -> Self {
         Self {
             reader: self.reader.clone(),
             base: self.base.clone(),
             root: self.root.clone(),
             work: self.work.clone(),
-            poisoned: false,
-            edited: false,
+            poisoned: self.poisoned,
+            edited: self.edited,
         }
     }
 
     /// The item at `key`.
     pub async fn get(&self, key: &str) -> Result<Option<Item>> {
-        find(&self.reader, &self.root, key, 1).await
+        Ok(find(&self.reader, &self.root, key, 1).await?.map(Item))
     }
 
-    /// The value `item` holds.
+    /// The value `item` holds, checked against its link if it is an object, and fetched once for the reads that come
+    /// to it at once.
     pub async fn value(&self, item: &Item) -> Result<Bytes> {
-        self.reader.value(item).await
+        self.reader.value(&item.0).await
     }
 
     /// A way to read the values of items that does not hold the tree: see [`Values`].
@@ -958,81 +1149,85 @@ impl Tree {
         Values(self.reader.clone())
     }
 
-    /// `bytes` as an item: inline if it is small.
-    pub fn item(&self, bytes: Bytes) -> Item {
-        Item::of(bytes, self.reader.limits.inline)
-    }
-
-    /// The first `limit` keys that start with `prefix` and follow `after`, if given.
+    /// The first `limit` keys that start with `prefix` and follow `after`, if given, in order.
     pub async fn scan(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Vec<String>> {
         let mut keys = vec![];
         walk(&self.reader, &self.root, (prefix, after, limit), &mut keys, |k, _| k.to_owned(), 1).await?;
         Ok(keys)
     }
 
-    /// The first `limit` entries whose keys start with `prefix` and follow `after`, if given.
+    /// The first `limit` entries whose keys start with `prefix` and follow `after`, if given, in order.
     pub async fn entries(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Vec<(String, Item)>> {
         let mut entries = vec![];
-        let pick = |k: &str, item: &Item| (k.to_owned(), item.clone());
+        let pick = |k: &str, value: &Value| (k.to_owned(), Item(value.clone()));
         walk(&self.reader, &self.root, (prefix, after, limit), &mut entries, pick, 1).await?;
         Ok(entries)
     }
 
-    /// The ids of the objects the tree is made of below its root: its nodes, and the values that are objects of their
-    /// own. They are found by reading every node, `IN_FLIGHT` at once and one level after another, each checked against
-    /// its link as any read is, and kept out of the cache; one that is missing or is not what its link says is an
-    /// error, so a set is of a tree that was whole. `None` if the tree has more than `max` nodes, which is not read.
-    pub async fn reachable(&self, max: usize) -> Result<Option<HashSet<u128>>> {
-        let (mut ids, mut next, mut nodes) = (HashSet::new(), vec![], 0);
-        refs(&self.root, &mut ids, &mut next)?;
-        while !next.is_empty() {
-            nodes += next.len();
-            if nodes > max {
-                return Ok(None);
-            }
-            let (r, links) = (&*self.reader, std::mem::take(&mut next));
-            let reads = stream::iter(links).map(|link| async move { r.load(&link, false).await });
-            let mut reads = reads.buffer_unordered(IN_FLIGHT);
-            while let Some(node) = reads.try_next().await? {
-                refs(&node, &mut ids, &mut next)?;
-            }
-        }
-        Ok(Some(ids))
-    }
-
-    /// A new inode number, for the file system: the root is 1, and the others count up, never reused.
-    pub fn alloc(&mut self) -> u64 {
-        self.work.seq = self.work.seq.max(1) + 1;
-        self.work.seq
-    }
-
-    /// Whether the tree was changed.
+    /// Whether the tree was changed since it was opened or reset.
     pub fn edited(&self) -> bool {
         self.edited
     }
 
-    /// Sets and removes keys, all or none: a batch over the limits is refused with [`Full`], and changes nothing. One
-    /// that fails otherwise, or that is dropped half way, leaves a tree that cannot be committed.
-    pub async fn write(&mut self, edits: Vec<(String, Option<Item>)>) -> Result<()> {
-        ensure!(!self.poisoned, "an earlier change to the name failed");
-        let limits = self.reader.limits;
-        let (adds, size) = edits.iter().filter_map(|(_, i)| i.as_ref()).fold((0, 0), |(n, b), i| (n + 1, b + i.len()));
-        if self.work.entries + adds > limits.entries || self.work.bytes + size > limits.data {
+    /// The number kept with the root, for the caller's own use, such as the last id it gave out. It is 0 in a new tree,
+    /// is set by [`Tree::set_sequence`], is in the root [`Tree::finish`] gives, and goes back with [`Tree::reset`].
+    pub fn sequence(&self) -> u64 {
+        self.work.seq
+    }
+
+    /// Sets the number kept with the root. It does not mark the tree edited: a number is worth keeping once a key uses
+    /// it, and a write that does marks the tree.
+    pub fn set_sequence(&mut self, seq: u64) {
+        self.work.seq = seq;
+    }
+
+    /// Sets each key to its value, or removes it if the value is none, in order, all or none.
+    ///
+    /// A batch that would take the tree over [`Config::entries`] or [`Config::data`] is refused as [`Error::Full`],
+    /// and one with a value over [`Config::blob`], or a key and value over a quarter of [`Config::node`], as
+    /// [`Error::TooLarge`]: either changes nothing. A write that fails otherwise, or that is dropped half way, leaves
+    /// the tree [`Error::Poisoned`].
+    pub async fn write(&mut self, edits: Vec<(String, Option<Bytes>)>) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        let config = self.reader.config;
+        let edits: Vec<_> = edits.into_iter().map(|(k, v)| (k, v.map(|v| Value::of(v, config.inline)))).collect();
+        for (key, value) in &edits {
+            let Some(value) = value else { continue };
+            if value.held() as u64 > config.blob {
+                return Err(Error::TooLarge(format!("a value of {} bytes is over {}", value.len(), config.blob)));
+            }
+            if json_len(key) + 4 + value.wire().max(LINK_SIZE) > config.node / 4 {
+                let (n, node) = (key.len(), config.node);
+                return Err(Error::TooLarge(format!("a key of {n} bytes and its value are over a quarter of {node}")));
+            }
+        }
+        let (adds, size) = edits
+            .iter()
+            .filter_map(|(_, v)| v.as_ref())
+            .fold((0u64, 0u64), |(n, b), v| (n.saturating_add(1), b.saturating_add(v.len())));
+        if self.work.entries.saturating_add(adds) > config.entries || self.work.bytes.saturating_add(size) > config.data
+        {
             // Possibly over: count again, as the batch replaces and removes too.
-            let (mut entries, mut bytes) = (self.work.entries as i64, self.work.bytes as i64);
+            let (mut entries, mut bytes) = (i128::from(self.work.entries), i128::from(self.work.bytes));
             let mut seen: HashMap<&str, Option<u64>> = HashMap::new();
-            for (key, item) in &edits {
+            for (key, value) in &edits {
                 let was = match seen.get(key.as_str()) {
                     Some(was) => *was,
-                    None => self.get(key).await?.map(|i| i.len()),
+                    None => self.get(key).await?.map(|item| item.len()),
                 };
-                let now = item.as_ref().map(Item::len);
-                entries += i64::from(now.is_some()) - i64::from(was.is_some());
-                bytes += now.unwrap_or(0) as i64 - was.unwrap_or(0) as i64;
+                let now = value.as_ref().map(Value::len);
+                entries += i128::from(now.is_some()) - i128::from(was.is_some());
+                bytes += i128::from(now.unwrap_or(0)) - i128::from(was.unwrap_or(0));
                 seen.insert(key, now);
             }
-            ensure!(entries <= limits.entries as i64, Full(format!("a name holds {} keys or fewer", limits.entries)));
-            ensure!(bytes <= limits.data as i64, Full(format!("a name holds {} bytes or fewer", limits.data)));
+            if entries > i128::from(config.entries) {
+                return Err(Error::Full(Full::Entries(config.entries)));
+            }
+            if bytes > i128::from(config.data) {
+                return Err(Error::Full(Full::Data(config.data)));
+            }
         }
         self.poisoned = true; // until it is applied, which a caller that goes away does not see
         let applied = self.apply(edits).await;
@@ -1040,23 +1235,23 @@ impl Tree {
         applied
     }
 
-    async fn apply(&mut self, edits: Vec<(String, Option<Item>)>) -> Result<()> {
-        for (key, item) in edits {
-            if item.is_none() && self.get(&key).await?.is_none() {
+    async fn apply(&mut self, edits: Vec<(String, Option<Value>)>) -> Result<()> {
+        for (key, value) in edits {
+            if value.is_none() && find(&self.reader, &self.root, &key, 1).await?.is_none() {
                 continue; // nothing to remove, so nothing to copy
             }
             self.edited = true;
-            if let Some((least, right)) = self.work.edit(&self.reader, &mut self.root, &key, item, 1).await? {
+            if let Some((least, right)) = self.work.edit(&self.reader, &mut self.root, &key, value, 1).await? {
                 let left = std::mem::replace(&mut self.root, Node::leaf());
                 let first = Child { key: left.first_key().to_owned(), at: At::Dirty(Box::new(left)) };
                 let second = Child { key: least, at: At::Dirty(Box::new(right)) };
                 self.root = Node::measured(Body::Branch(vec![first, second]));
             }
         }
-        let limit = self.reader.limits.budget;
-        if self.root.dirty() > limit {
+        let budget = self.reader.config.budget;
+        if self.root.dirty() > budget {
             self.flush(false).await?; // the values first, which are the most
-            if self.root.dirty() > limit {
+            if self.root.dirty() > budget {
                 self.flush(true).await?;
             }
         }
@@ -1064,51 +1259,87 @@ impl Tree {
     }
 
     async fn flush(&mut self, nodes: bool) -> Result<()> {
-        let flush = Flush { reader: &self.reader, permits: Semaphore::new(IN_FLIGHT), nodes };
-        flush.node(&mut self.root).await?;
+        Flush::new(&self.reader, nodes).node(&mut self.root).await?;
         if matches!(&self.root.body, Body::Branch(kids) if kids.is_empty()) {
             self.root = Node::leaf();
         }
         Ok(())
     }
 
-    /// Readies the tree for a head: merges what is thin, uploads what is changed, and returns the shape of it. If the
-    /// head does not land, `reset` follows.
-    pub async fn finish(&mut self) -> Result<Shape> {
-        ensure!(!self.poisoned, "an earlier change to the name failed");
+    /// Merges what is thin, uploads what changed, and gives the new root, for the caller to keep. The tree is then as
+    /// that root is: if the caller's swap of it fails, [`Tree::reset`] goes back to the root the tree was opened at.
+    pub async fn finish(&mut self) -> Result<Root> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
         self.poisoned = true; // until it is done, as for a write
         let finished = self.seal().await;
         self.poisoned = finished.is_err();
         finished
     }
 
-    async fn seal(&mut self) -> Result<Shape> {
+    async fn seal(&mut self) -> Result<Root> {
         let r = &*self.reader;
-        self.work.fix(r, &mut self.root).await?;
+        fix(r, &mut self.root).await?;
         while let Body::Branch(kids) = &mut self.root.body {
             match kids.len() {
                 0 => self.root = Node::leaf(),
                 1 => {
                     let Some(Child { mut at, .. }) = kids.pop() else { break };
-                    let only = self.work.dirty(r, &mut at).await?;
+                    let only = dirty(r, &mut at).await?;
                     self.root = std::mem::replace(only, Node::leaf());
                     r.stats.collapses.fetch_add(1, Relaxed);
                 }
                 _ => break,
             }
         }
-        let flush = Flush { reader: r, permits: Semaphore::new(IN_FLIGHT), nodes: true };
-        flush.node(&mut self.root).await?;
-        ensure!(self.root.size <= r.limits.node, "the root is over {} bytes", r.limits.node);
+        Flush::new(r, true).node(&mut self.root).await?;
+        if self.root.size > r.config.node {
+            return Err(Error::TooLarge(format!("the root is over {} bytes", r.config.node)));
+        }
         let Work { bytes, entries, seq } = self.work;
-        Ok(Shape { root: self.root.body.clone(), bytes, entries, seq })
+        Ok(Root { root: self.root.body.clone(), bytes, entries, seq })
     }
 
-    /// The head did not land, or the turn is discarded: the tree is as it was opened. What it uploaded is left for the
-    /// sweep.
+    /// Goes back to the root the tree was opened at, as when the caller's swap of a finished root fails, or a write
+    /// failed: what it uploaded since is left for the caller's collector. To go on from a root that was swapped in,
+    /// open a tree at it.
     pub fn reset(&mut self) {
         (self.root, self.work) = self.base.clone();
         (self.poisoned, self.edited) = (false, false);
+    }
+
+    /// Adds to `seen` the ids of the objects the tree reaches below its root, as [`number`] gives them, its nodes and
+    /// its values that are objects alike, and gives how many nodes it read, or `None` if that would be over `max`.
+    ///
+    /// The nodes are read level by level, [`Config::in_flight`] at once, each checked as any read is, and none is kept
+    /// in the cache. An id already in `seen` is passed over with all below it, as what is below an object never
+    /// changes, so one set passed to the marks of several roots has each object read once. A node that is missing or
+    /// not what its link says is an error, so what is marked is of a tree that was whole. After `None` or an error,
+    /// `seen` holds part of the tree, and is not to be used.
+    pub async fn mark(&self, seen: &mut HashSet<u128>, max: usize) -> Result<Option<usize>> {
+        let (mut next, mut nodes) = (vec![], 0);
+        refs(&self.root, seen, &mut next)?;
+        while !next.is_empty() {
+            nodes += next.len();
+            if nodes > max {
+                return Ok(None);
+            }
+            let (r, links) = (&*self.reader, std::mem::take(&mut next));
+            let reads = stream::iter(links).map(|link| async move { r.load(&link, false).await });
+            let mut reads = reads.buffer_unordered(r.config.in_flight.max(1));
+            while let Some(node) = reads.try_next().await? {
+                refs(&node, seen, &mut next)?;
+            }
+        }
+        Ok(Some(nodes))
+    }
+
+    /// The ids of the objects the tree reaches below its root: [`Tree::mark`] from none, or `None` if it would read
+    /// over `max` nodes.
+    pub async fn reachable(&self, max: usize) -> Result<Option<HashSet<u128>>> {
+        let mut seen = HashSet::new();
+        Ok(self.mark(&mut seen, max).await?.map(|_| seen))
     }
 
     /// How often the tree split, merged and gave up a level of its root.
@@ -1119,151 +1350,59 @@ impl Tree {
     }
 }
 
-/// A store for tests that counts what is asked of it, and fails the puts past a count.
-#[cfg(test)]
-pub(crate) mod counting {
-    use crate::store::Store;
-    use futures_util::StreamExt;
-    use futures_util::stream::BoxStream;
-    use object_store::memory::InMemory;
-    use object_store::path::Path;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
-        PutOptions, PutPayload, PutResult,
-    };
-    use std::fmt;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
-    use std::time::Duration;
-
-    #[derive(Debug, Default)]
-    pub struct Counts {
-        pub gets: AtomicUsize,
-        pub puts: AtomicUsize,
-        pub deletes: AtomicUsize,
-        pub allow: AtomicUsize,    // the puts that succeed, in all
-        pub delay: AtomicU64,      // how long a get takes, in milliseconds
-        pub flight: AtomicUsize,   // the gets under way
-        pub peak: AtomicUsize,     // the most gets that were ever under way together
-        pub listed: AtomicUsize,   // the keys that listings have given, as a listing is read
-        pub listings: AtomicUsize, // the listings begun, by `list` and by `list_with_offset`
-    }
-
-    /// A store that counts what is asked of it, and fails the puts past `allow`.
-    #[derive(Debug)]
-    struct Counting {
-        inner: InMemory,
-        counts: Arc<Counts>,
-    }
-
-    impl fmt::Display for Counting {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("counting")
-        }
-    }
-
-    impl Counting {
-        fn counted(
-            &self,
-            listing: BoxStream<'static, object_store::Result<ObjectMeta>>,
-        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-            let counts = self.counts.clone();
-            counts.listings.fetch_add(1, SeqCst);
-            listing
-                .inspect(move |_| {
-                    counts.listed.fetch_add(1, SeqCst);
-                })
-                .boxed()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ObjectStore for Counting {
-        async fn put_opts(&self, at: &Path, payload: PutPayload, opts: PutOptions) -> object_store::Result<PutResult> {
-            if self.counts.puts.fetch_add(1, SeqCst) >= self.counts.allow.load(SeqCst) {
-                return Err(object_store::Error::Generic { store: "counting", source: "a put that fails".into() });
-            }
-            self.inner.put_opts(at, payload, opts).await
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            at: &Path,
-            opts: PutMultipartOptions,
-        ) -> object_store::Result<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart_opts(at, opts).await
-        }
-
-        async fn get_opts(&self, at: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
-            self.counts.gets.fetch_add(1, SeqCst);
-            let flight = self.counts.flight.fetch_add(1, SeqCst) + 1;
-            self.counts.peak.fetch_max(flight, SeqCst);
-            let delay = self.counts.delay.load(SeqCst);
-            if delay > 0 {
-                tokio::time::sleep(Duration::from_millis(delay)).await;
-            }
-            let got = self.inner.get_opts(at, opts).await;
-            self.counts.flight.fetch_sub(1, SeqCst);
-            got
-        }
-
-        fn delete_stream(
-            &self,
-            paths: BoxStream<'static, object_store::Result<Path>>,
-        ) -> BoxStream<'static, object_store::Result<Path>> {
-            let counts = self.counts.clone();
-            let counted = paths.inspect(move |_| {
-                counts.deletes.fetch_add(1, SeqCst);
-            });
-            self.inner.delete_stream(counted.boxed())
-        }
-
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-            self.counted(self.inner.list(prefix))
-        }
-
-        /// Gives only the keys after `offset`, as S3 does, so that what is counted is what a request would return.
-        fn list_with_offset(
-            &self,
-            prefix: Option<&Path>,
-            offset: &Path,
-        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-            self.counted(self.inner.list_with_offset(prefix, offset))
-        }
-
-        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> object_store::Result<()> {
-            self.inner.copy_opts(from, to, opts).await
-        }
-    }
-
-    pub fn counting() -> (Store, Arc<Counts>) {
-        let counts = Arc::new(Counts { allow: AtomicUsize::new(usize::MAX), ..Default::default() });
-        let inner = Counting { inner: InMemory::new(), counts: counts.clone() };
-        (Store { inner: Arc::new(inner), versioned: true, cache: Arc::default() }, counts)
+impl fmt::Debug for Tree {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Tree")
+            .field("prefix", &self.reader.prefix)
+            .field("entries", &self.work.entries)
+            .field("bytes", &self.work.bytes)
+            .field("edited", &self.edited)
+            .field("poisoned", &self.poisoned)
+            .finish_non_exhaustive()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::counting::counting;
     use super::*;
-    use futures_util::TryStreamExt;
-    use object_store::{ObjectStore, ObjectStoreExt};
+    use object_store::ObjectStoreExt;
+    use object_store::memory::InMemory;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::Ordering::SeqCst;
     use std::time::Duration;
 
-    /// Limits that make a few keys a deep tree: a branch holds a few nodes, and a leaf as many values that are objects.
-    fn tiny() -> Limits {
-        Limits { node: 1400, inline: 8, budget: 2048, entries: 1000, data: 100_000, blob: 100 }
+    /// A store, and the cache its trees share, as a process keeps them.
+    #[derive(Clone)]
+    struct Store {
+        inner: Arc<dyn ObjectStore>,
+        cache: Arc<Cache>,
     }
 
-    fn versioned() -> Store {
-        Store { versioned: true, ..Store::memory() }
+    fn memory() -> Store {
+        Store { inner: Arc::new(InMemory::new()), cache: Arc::default() }
+    }
+
+    fn counting() -> (Store, Arc<testing::Counts>) {
+        let (inner, counts) = testing::counting();
+        (Store { inner, cache: Arc::default() }, counts)
+    }
+
+    fn prefix() -> Path {
+        Path::from("t/n")
+    }
+
+    /// A config that makes a few keys a deep tree: a branch holds a few nodes, and a leaf as many values that are
+    /// objects.
+    fn tiny() -> Config {
+        Config { node: 1400, inline: 8, budget: 2048, entries: 1000, data: 100_000, blob: 100, in_flight: 16 }
+    }
+
+    fn open(store: &Store, root: &Root, config: Config) -> Tree {
+        Tree::open(store.inner.clone(), prefix(), store.cache.clone(), root, config).unwrap()
+    }
+
+    fn at(store: &Store, root: &Root) -> Tree {
+        open(store, root, tiny())
     }
 
     /// The same sequence from a seed, as a test needs.
@@ -1289,24 +1428,19 @@ mod tests {
         }
     }
 
-    fn at(store: &Store, shape: &Shape) -> Tree {
-        Tree::open(store, "a", "n", shape, tiny()).unwrap()
-    }
-
     async fn set(tree: &mut Tree, key: &str, value: &[u8]) {
-        let item = tree.item(Bytes::copy_from_slice(value));
-        tree.write(vec![(key.into(), Some(item))]).await.unwrap();
+        tree.write(vec![(key.into(), Some(Bytes::copy_from_slice(value)))]).await.unwrap();
     }
 
-    /// Commits `tree`, as a turn does: the new shape. Nothing is deleted.
-    async fn commit(tree: &mut Tree) -> Shape {
+    /// Finishes `tree`, as a writer whose swap lands does: the new root. Nothing is deleted.
+    async fn commit(tree: &mut Tree) -> Root {
         tree.finish().await.unwrap()
     }
 
     /// What a tree holds, and that it is a well-formed one.
     #[derive(Default)]
     struct Audit {
-        items: BTreeMap<String, Item>,
+        items: BTreeMap<String, Value>,
         ids: BTreeSet<String>,
         depth: usize,
     }
@@ -1320,10 +1454,10 @@ mod tests {
         out: &'a mut Audit,
     ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let json = node.json().unwrap();
+            let json = node.json();
             assert!(json.len() <= node.size, "a node is {} bytes, and was thought {}", json.len(), node.size);
             if level > 0 {
-                assert!(json.len() <= r.limits.node, "a node is {} bytes", json.len());
+                assert!(json.len() <= r.config.node, "a node is {} bytes", json.len());
                 assert!(!node.is_empty(), "an empty node");
             }
             match &node.body {
@@ -1331,16 +1465,16 @@ mod tests {
                     assert!(out.depth == 0 || out.depth == level + 1, "leaves are at different depths");
                     out.depth = level + 1;
                     assert!(es.windows(2).all(|w| w[0].0 < w[1].0), "keys are not in order");
-                    for (k, item) in es {
+                    for (k, value) in es {
                         assert!(
                             lo.is_none_or(|lo| k.as_str() >= lo) && hi.is_none_or(|hi| k.as_str() < hi),
                             "{k} strays"
                         );
-                        assert!(!matches!(item, Item::Held(_)), "a value is still in memory");
-                        if let Item::Object(link) = item {
+                        assert!(!matches!(value, Value::Held(_)), "a value is still in memory");
+                        if let Value::Object(link) = value {
                             assert!(out.ids.insert(link.id.clone()), "an object is named twice");
                         }
-                        out.items.insert(k.clone(), item.clone());
+                        out.items.insert(k.clone(), value.clone());
                     }
                 }
                 Body::Branch(kids) => {
@@ -1364,19 +1498,19 @@ mod tests {
         })
     }
 
-    async fn audit(store: &Store, shape: &Shape) -> Audit {
+    async fn audit(store: &Store, root: &Root) -> Audit {
         let r = Reader {
-            store: store.clone(),
-            app: "a".into(),
-            name: "n".into(),
-            limits: tiny(),
+            store: store.inner.clone(),
+            prefix: prefix(),
+            cache: store.cache.clone(),
+            config: tiny(),
             stats: Default::default(),
         };
-        let root = Node::of(shape.root.clone()).unwrap();
+        let node = Node::of(root.root.clone()).unwrap();
         let mut out = Audit::default();
-        dig(&r, &root, 0, (None, None), &mut out).await;
-        assert_eq!(out.items.len() as u64, shape.entries);
-        assert_eq!(out.items.values().map(Item::len).sum::<u64>(), shape.bytes);
+        dig(&r, &node, 0, (None, None), &mut out).await;
+        assert_eq!(out.items.len() as u64, root.entries);
+        assert_eq!(out.items.values().map(Value::len).sum::<u64>(), root.bytes);
         out
     }
 
@@ -1387,22 +1521,22 @@ mod tests {
 
     /// The ids of the objects in the store.
     async fn stored(store: &Store) -> BTreeSet<String> {
-        let all = store.inner.list(Some(&store::app("a", &["values", "n"])));
+        let all = store.inner.list(Some(&prefix()));
         all.map_ok(|m| m.location.filename().unwrap().to_owned()).try_collect().await.unwrap()
     }
 
     #[tokio::test]
     async fn matches_a_map() {
-        let limits = Limits { entries: 5000, data: 1 << 20, ..tiny() };
-        let (mut store, mut rng) = (versioned(), Rng(0x5EED));
-        let (mut model, mut shape) = (BTreeMap::<String, Vec<u8>>::new(), Shape::default());
+        let config = Config { entries: 5000, data: 1 << 20, ..tiny() };
+        let (mut store, mut rng) = (memory(), Rng(0x5EED));
+        let (mut model, mut root) = (BTreeMap::<String, Vec<u8>>::new(), Root::default());
         let mut before = BTreeSet::new(); // the objects stored after the round before
         let (mut splits, mut merges, mut collapses, mut deepest) = (0, 0, 0, 0);
         for round in 0..300 {
             if rng.below(2) == 0 {
-                store.cache = Arc::default(); // a cold cache, as on another instance
+                store.cache = Arc::default(); // a cold cache, as in another process
             }
-            let mut tree = Tree::open(&store, "a", "n", &shape, limits).unwrap();
+            let mut tree = open(&store, &root, config);
             let mut staged = model.clone();
             if round % 9 == 3 {
                 // Thin it out, so that nodes merge and the root gives way.
@@ -1431,7 +1565,7 @@ mod tests {
                                 Some(v) => staged.insert(key.clone(), v.clone()),
                                 None => staged.remove(&key),
                             };
-                            edits.push((key, value.map(|v| tree.item(v.into()))));
+                            edits.push((key, value.map(Bytes::from)));
                         }
                         tree.write(edits).await.unwrap();
                     }
@@ -1465,34 +1599,34 @@ mod tests {
                     }
                 }
             }
-            // It commits, or is ready to and loses the race, or is thrown away as it is.
+            // It is finished and swapped in, or is finished and loses the race, or is thrown away as it is.
             let outcome = rng.below(10);
             let finished = if tree.edited() && outcome < 9 { Some(tree.finish().await.unwrap()) } else { None };
             let (a, b, c) = tree.rebalanced();
             (splits, merges, collapses) = (splits + a, merges + b, collapses + c);
             if outcome < 7 {
-                shape = finished.unwrap_or(shape);
+                root = finished.unwrap_or(root);
                 model = staged;
-                // It serves what it committed.
-                for (k, v) in model.iter().take(20) {
-                    let item = tree.get(k).await.unwrap().unwrap();
-                    assert_eq!(tree.value(&item).await.unwrap().as_ref(), v.as_slice());
-                }
+            } else {
+                tree.reset();
+                assert!(!tree.edited());
+            }
+            // It serves what is in the root it has now.
+            for (k, v) in model.iter().take(20) {
+                assert_eq!(text(&tree, k).await, v.as_slice(), "round {round}: {k}");
             }
             drop(tree);
 
-            let audit = audit(&store, &shape).await;
+            let audit = audit(&store, &root).await;
             deepest = deepest.max(audit.depth);
             assert_eq!(audit.items.keys().collect::<Vec<_>>(), model.keys().collect::<Vec<_>>(), "round {round}");
-            let fresh = Tree::open(&store, "a", "n", &shape, limits).unwrap();
+            let fresh = open(&store, &root, config);
             for (k, v) in &model {
-                let item = fresh.get(k).await.unwrap().unwrap();
-                assert_eq!(fresh.value(&item).await.unwrap().as_ref(), v.as_slice(), "{k}");
+                assert_eq!(text(&fresh, k).await, v.as_slice(), "{k}");
             }
             assert_eq!(fresh.scan("k/", None, usize::MAX).await.unwrap(), model.keys().cloned().collect::<Vec<_>>());
-            let live: HashSet<u128> = audit.ids.iter().map(|id| number(id).unwrap()).collect();
-            assert_eq!(fresh.reachable(usize::MAX).await.unwrap(), Some(live), "round {round}");
-            // Nothing was deleted, so nothing the head names is lost; what it does not name is for the sweep.
+            assert_eq!(fresh.reachable(usize::MAX).await.unwrap(), Some(numbers(&audit)), "round {round}");
+            // Nothing was deleted, so nothing the root reaches is lost; what it does not reach is for a collector.
             let stored = stored(&store).await;
             let lost: Vec<_> = audit.ids.difference(&stored).collect();
             assert!(lost.is_empty(), "round {round}: {lost:?} are lost");
@@ -1513,27 +1647,27 @@ mod tests {
         assert_eq!(LINK_SIZE, link.wire());
         for n in 0..40 {
             let bytes = Bytes::from(vec![7; n]);
-            for item in [Item::of(bytes.clone(), 16), Item::of(bytes, 0)] {
-                assert_eq!(item.len(), n as u64);
-                let wire = Item::Object(Link { id: "a".repeat(32), v: None, h: "b".repeat(64), n: 1 });
+            for value in [Value::of(bytes.clone(), 16), Value::of(bytes, 0)] {
+                assert_eq!(value.len(), n as u64);
+                let wire = Value::Object(Link { id: "a".repeat(32), v: None, h: "b".repeat(64), n: 1 });
                 assert!(serde_json::to_string(&wire).unwrap().len() <= wire.wire());
-                if let Item::Inline(_) = item {
-                    assert!(serde_json::to_string(&item).unwrap().len() <= item.wire());
+                if let Value::Inline(_) = value {
+                    assert!(serde_json::to_string(&value).unwrap().len() <= value.wire());
                 }
             }
         }
     }
 
-    /// A tree of 400 keys, in the store, and its shape.
-    async fn grown(store: &Store) -> Shape {
-        let mut tree = at(store, &Shape::default());
+    /// A tree of 400 keys, in the store, and its root.
+    async fn grown(store: &Store) -> Root {
+        let mut tree = at(store, &Root::default());
         for i in 0..400 {
             set(&mut tree, &format!("k/{i:03}"), &[i as u8; 5]).await;
         }
         commit(&mut tree).await
     }
 
-    /// The ids that `audit` found, as the numbers `reachable` gives.
+    /// The ids that `audit` found, as the numbers `mark` gives.
     fn numbers(audit: &Audit) -> HashSet<u128> {
         audit.ids.iter().map(|id| number(id).unwrap()).collect()
     }
@@ -1541,20 +1675,20 @@ mod tests {
     #[tokio::test]
     async fn reachable_is_every_object_of_the_tree_read_once_and_kept_out_of_the_cache() {
         let (mut store, counts) = counting();
-        let shape = grown(&store).await;
-        let audit = audit(&store, &shape).await;
+        let root = grown(&store).await;
+        let audit = audit(&store, &root).await;
         let all = numbers(&audit);
         assert!(all.len() > 16, "{} nodes are too few to read at once", all.len());
         store.cache = Arc::default();
-        let tree = at(&store, &shape);
+        let tree = at(&store, &root);
 
-        // Every node below the root is read once, a few at once and no more than IN_FLIGHT, and none is kept.
+        // Every node below the root is read once, a few at once and no more than `in_flight`, and none is kept.
         counts.gets.store(0, SeqCst);
         counts.delay.store(5, SeqCst);
         assert_eq!(tree.reachable(usize::MAX).await.unwrap(), Some(all.clone()));
         assert_eq!(counts.gets.load(SeqCst), all.len());
         let peak = counts.peak.load(SeqCst);
-        assert!((2..=IN_FLIGHT).contains(&peak), "{peak} at once");
+        assert!((2..=tiny().in_flight).contains(&peak), "{peak} at once");
         counts.delay.store(0, SeqCst);
         counts.gets.store(0, SeqCst);
         assert!(tree.get("k/077").await.unwrap().is_some());
@@ -1571,49 +1705,70 @@ mod tests {
     #[tokio::test]
     async fn reachable_fails_when_the_tree_is_not_whole() {
         for damage in ["missing", "changed", "emptied"] {
-            let mut store = versioned();
-            let shape = grown(&store).await;
-            let audit = audit(&store, &shape).await;
+            let mut store = memory();
+            let root = grown(&store).await;
+            let audit = audit(&store, &root).await;
             // A node below the root, and one that is not a leaf if the tree has any: its loss costs the most.
             let id = audit.ids.iter().next().unwrap();
-            let path = object("a", "n", id);
+            let path = object(&prefix(), id);
             match damage {
                 "missing" => store.inner.delete(&path).await.unwrap(),
-                "changed" => drop(store.put(&path, Bytes::from_static(b"{}"), PutMode::Overwrite).await.unwrap()),
-                _ => drop(store.put(&path, Bytes::new(), PutMode::Overwrite).await.unwrap()),
+                "changed" => drop(store.inner.put(&path, Bytes::from_static(b"{}").into()).await.unwrap()),
+                _ => drop(store.inner.put(&path, Bytes::new().into()).await.unwrap()),
             }
             store.cache = Arc::default(); // a node in the cache was whole when it was put there
-            let fresh = Tree::open(&store, "a", "n", &shape, tiny()).unwrap();
-            assert!(fresh.reachable(usize::MAX).await.is_err(), "a {damage} node is no tree");
+            let err = at(&store, &root).reachable(usize::MAX).await.unwrap_err();
+            assert!(matches!(err, Error::Corrupt(_)), "a {damage} node is no tree: {err}");
         }
     }
 
     #[tokio::test]
     async fn reachable_includes_values_that_are_objects() {
-        let store = versioned();
-        let mut tree = at(&store, &Shape::default());
+        let store = memory();
+        let mut tree = at(&store, &Root::default());
         set(&mut tree, "small", b"abc").await;
         set(&mut tree, "big", &[7; 90]).await; // inline is 8, so this is an object of its own
-        let shape = commit(&mut tree).await;
-        let audit = audit(&store, &shape).await;
+        let root = commit(&mut tree).await;
+        let audit = audit(&store, &root).await;
         assert_eq!(audit.ids.len(), 1, "a root of two keys has no node below it, and one value is an object");
-        let fresh = Tree::open(&store, "a", "n", &shape, tiny()).unwrap();
-        assert_eq!(fresh.reachable(usize::MAX).await.unwrap(), Some(numbers(&audit)));
+        assert_eq!(at(&store, &root).reachable(usize::MAX).await.unwrap(), Some(numbers(&audit)));
         assert_eq!(stored(&store).await, audit.ids, "the object is all there is");
+    }
+
+    #[tokio::test]
+    async fn a_mark_shares_what_it_has_seen_across_roots() {
+        let (mut store, counts) = counting();
+        let first = grown(&store).await;
+        let mut tree = at(&store, &first);
+        set(&mut tree, "k/077", &[9; 90]).await; // an object of its own, which a mark does not read
+        let second = commit(&mut tree).await;
+        drop(tree);
+        let (a, b) = (numbers(&audit(&store, &first).await), numbers(&audit(&store, &second).await));
+        let new: HashSet<u128> = b.difference(&a).copied().collect();
+        store.cache = Arc::default();
+        counts.gets.store(0, SeqCst);
+
+        // The second root shares most of the first's nodes, and those are not read again.
+        let mut seen = HashSet::new();
+        assert_eq!(at(&store, &first).mark(&mut seen, usize::MAX).await.unwrap(), Some(a.len()));
+        assert_eq!(seen, a);
+        assert_eq!(at(&store, &second).mark(&mut seen, usize::MAX).await.unwrap(), Some(new.len() - 1));
+        assert_eq!(seen, a.union(&b).copied().collect());
+        assert_eq!(counts.gets.load(SeqCst), a.len() + new.len() - 1, "each node was read once");
     }
 
     #[tokio::test]
     async fn costs_what_it_touches() {
         let (mut store, counts) = counting();
-        let shape = grown(&store).await;
-        let levels = audit(&store, &shape).await.depth;
+        let root = grown(&store).await;
+        let levels = audit(&store, &root).await.depth;
         assert!(levels >= 3, "{levels} levels");
-        let below = levels - 1; // the root is in the head
+        let below = levels - 1; // the root is the caller's
 
         // A cold read is a GET for each node below the root; a warm one is none.
         store.cache = Arc::default();
         counts.gets.store(0, SeqCst);
-        let tree = at(&store, &shape);
+        let tree = at(&store, &root);
         assert!(tree.get("k/077").await.unwrap().is_some());
         assert_eq!(counts.gets.load(SeqCst), below);
         assert!(tree.get("k/077").await.unwrap().is_some());
@@ -1621,73 +1776,77 @@ mod tests {
         assert_eq!(tree.reader.stats.hits.load(Relaxed) as usize, below);
         drop(tree);
 
-        // A turn that wrote nothing writes nothing, and one that removes what is not there copies nothing.
+        // A tree that wrote nothing writes nothing, and one that removes what is not there copies nothing.
         counts.puts.store(0, SeqCst);
-        let mut tree = at(&store, &shape);
+        let mut tree = at(&store, &root);
         tree.write(vec![("k/zzz".into(), None)]).await.unwrap();
         assert!(!tree.edited());
         drop(tree);
         assert_eq!(counts.puts.load(SeqCst), 0);
 
-        // One value changed is a copy of the nodes from it to the root, which the head holds.
+        // One value changed is a copy of the nodes from it to the root, which the caller keeps.
         store.cache = Arc::default();
         counts.gets.store(0, SeqCst);
-        let mut tree = at(&store, &shape);
+        let mut tree = at(&store, &root);
         set(&mut tree, "k/077", &[9; 5]).await;
         assert_eq!(counts.gets.load(SeqCst), below);
-        let shape = tree.finish().await.unwrap();
+        let root = tree.finish().await.unwrap();
         assert_eq!(counts.puts.load(SeqCst), below);
         assert_eq!(tree.reader.stats.depth.load(Relaxed), levels);
-        let after = audit(&store, &shape).await;
-        assert_eq!(after.depth, levels);
+        assert_eq!(audit(&store, &root).await.depth, levels);
         drop(tree);
-        assert_eq!(counts.deletes.load(SeqCst), 0, "a commit deletes nothing, not even the nodes it replaced");
+        assert_eq!(counts.deletes.load(SeqCst), 0, "a tree deletes nothing, not even the nodes it replaced");
     }
 
     #[tokio::test]
     async fn a_failed_upload_loses_nothing() {
         let (store, counts) = counting();
-        let shape = grown(&store).await;
-        let kept = audit(&store, &shape).await.ids;
+        let root = grown(&store).await;
+        let kept = audit(&store, &root).await.ids;
         assert!(stored(&store).await.is_superset(&kept));
 
-        // A put fails after `allowed` more: at the first, the next, and so on, until the commit gets through.
+        // A put fails after `allowed` more: at the first, the next, and so on, until the tree is finished.
         let mut failed = 0;
         for allowed in 0..200 {
-            let mut tree = Tree::open(&store, "a", "n", &shape, Limits { budget: 1 << 20, ..tiny() }).unwrap();
+            let mut tree = open(&store, &root, Config { budget: 1 << 20, ..tiny() });
             for i in 0..30 {
                 set(&mut tree, &format!("k/{:03}", i * 13), &[1; 60]).await;
             }
             counts.allow.store(counts.puts.load(SeqCst) + allowed, SeqCst);
             let finished = tree.finish().await;
-            if finished.is_err() {
+            if let Err(e) = &finished {
                 failed += 1;
-                assert!(tree.finish().await.is_err(), "a tree that failed is not committed");
+                assert!(matches!(e, Error::Store(_)), "{e}");
+                assert!(matches!(tree.finish().await, Err(Error::Poisoned)), "a tree that failed is not finished");
+                assert!(matches!(tree.write(vec![]).await, Err(Error::Poisoned)));
             }
             tree.reset();
+            assert!(!tree.edited());
+            assert_eq!(text(&tree, "k/013").await, [13; 5], "it is back at its root");
             counts.allow.store(usize::MAX, SeqCst);
             assert!(stored(&store).await.is_superset(&kept), "{allowed} uploads allowed");
-            assert_eq!(audit(&store, &shape).await.items.len(), 400);
-            if finished.is_ok() {
+            assert_eq!(audit(&store, &root).await.items.len(), 400);
+            if let Ok(done) = finished {
+                assert_eq!(text(&at(&store, &done), "k/013").await, [1; 60]);
+                assert_eq!(audit(&store, &done).await.items.len(), 400);
                 break;
             }
         }
-        assert!(failed >= 30, "{failed} commits failed");
-        assert_eq!(counts.deletes.load(SeqCst), 0, "what a failed commit uploaded is left for the sweep");
+        assert!(failed >= 30, "{failed} finishes failed");
+        assert_eq!(counts.deletes.load(SeqCst), 0, "what a failed finish uploaded is left for a collector");
     }
 
     #[tokio::test]
     async fn spills_when_it_holds_too_much() {
         let (store, counts) = counting();
-        let mut tree = at(&store, &Shape::default());
+        let mut tree = at(&store, &Root::default());
         for i in 0..150 {
             set(&mut tree, &format!("k/{i:03}"), &[i as u8; 100]).await;
             assert!(tree.root.dirty() <= tiny().budget, "{} bytes held", tree.root.dirty());
         }
         assert!(counts.puts.load(SeqCst) > 0, "it spilled");
-        let first = tree.get("k/000").await.unwrap().unwrap();
-        assert_eq!(tree.value(&first).await.unwrap().as_ref(), &[0; 100]);
-        // Dropped, it deletes nothing: what it spilled is left for the sweep.
+        assert_eq!(text(&tree, "k/000").await, [0; 100]);
+        // Dropped, it deletes nothing: what it spilled is left for a collector.
         drop(tree);
         assert_eq!(stored(&store).await.len(), counts.puts.load(SeqCst));
         assert_eq!(counts.deletes.load(SeqCst), 0);
@@ -1695,25 +1854,31 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_what_is_over_its_limits() {
-        let store = versioned();
-        let mut tree = at(&store, &Shape::default());
-        let edits: Vec<_> =
-            (0..1001).map(|i| (format!("k/{i:04}"), Some(tree.item(Bytes::from_static(b"v"))))).collect();
+        let store = memory();
+        let mut tree = open(&store, &Root::default(), Config { blob: 1 << 10, ..tiny() });
+        let edits: Vec<_> = (0..1001).map(|i| (format!("k/{i:04}"), Some(Bytes::from_static(b"v")))).collect();
         let full = tree.write(edits).await.unwrap_err();
-        assert!(full.is::<Full>(), "{full:#}");
+        assert!(matches!(full, Error::Full(Full::Entries(1000))), "{full}");
         assert!(!tree.edited() && tree.root.is_empty(), "nothing was written");
 
-        let edits: Vec<_> = (0..900).map(|i| (format!("k/{i:04}"), Some(tree.item(vec![0; 120].into())))).collect();
-        assert!(tree.write(edits).await.unwrap_err().is::<Full>());
+        let edits: Vec<_> = (0..900).map(|i| (format!("k/{i:04}"), Some(Bytes::from(vec![0; 120])))).collect();
+        assert!(matches!(tree.write(edits).await, Err(Error::Full(Full::Data(100_000)))));
+        assert!(!tree.edited());
+
+        // A value over the most a value is, and a key too long for a node, are refused, and change nothing either.
+        let big = vec![("k/a".into(), Some(Bytes::from_static(b"v"))), ("k/b".into(), Some(vec![0; 1025].into()))];
+        assert!(matches!(tree.write(big).await, Err(Error::TooLarge(_))));
+        let long = vec![("k/".repeat(200), Some(Bytes::from_static(b"v")))];
+        assert!(matches!(tree.write(long).await, Err(Error::TooLarge(_))));
         assert!(!tree.edited());
 
         // What a batch replaces or removes does not count against it.
         for i in 0..900 {
             set(&mut tree, &format!("k/{i:04}"), &[0; 100]).await;
         }
-        let edits: Vec<_> = (0..900).map(|i| (format!("k/{i:04}"), Some(tree.item(vec![1; 100].into())))).collect();
+        let edits: Vec<_> = (0..900).map(|i| (format!("k/{i:04}"), Some(Bytes::from(vec![1; 100])))).collect();
         tree.write(edits).await.unwrap();
-        let edits: Vec<_> = (0..900).map(|i| (format!("k/{i:04}"), Some(tree.item(vec![1; 50].into())))).collect();
+        let edits: Vec<_> = (0..900).map(|i| (format!("k/{i:04}"), Some(Bytes::from(vec![1; 50])))).collect();
         tree.write(edits).await.unwrap();
         set(&mut tree, "k/zzz", &[1; 100]).await;
         assert!(tree.finish().await.is_ok(), "it is not poisoned");
@@ -1721,39 +1886,37 @@ mod tests {
 
     #[tokio::test]
     async fn is_not_fooled_by_a_changed_object() {
-        let mut store = versioned();
-        let mut tree = at(&store, &Shape::default());
+        let mut store = memory();
+        let mut tree = at(&store, &Root::default());
         for i in 0..40 {
             set(&mut tree, &format!("k/{i:02}"), &[i as u8; 50]).await;
         }
-        let shape = commit(&mut tree).await;
-        let seen = audit(&store, &shape).await;
-        let path = |id: &str| store::app("a", &["values", "n", id]);
+        let root = commit(&mut tree).await;
+        let seen = audit(&store, &root).await;
 
-        let Body::Branch(kids) = &shape.root else { panic!("a tree of one node") };
+        let Body::Branch(kids) = &root.root else { panic!("a tree of one node") };
         let At::Clean(node) = &kids[0].at else { panic!("a node in memory") };
-        let Some(Item::Object(blob)) = seen.items.values().next().cloned() else { panic!("no object") };
+        let Some(Value::Object(blob)) = seen.items.values().next().cloned() else { panic!("no object") };
         for (link, what) in [(node.clone(), "a node"), (blob, "a value")] {
-            let at = path(&link.id);
-            let (good, _) = store.get(&at, None, 1 << 20).await.unwrap().unwrap();
+            let path = object(&prefix(), &link.id);
+            let good = store.inner.get(&path).await.unwrap().bytes().await.unwrap();
             for bad in [vec![b' '; good.len()], good[1..].to_vec()] {
-                store.put(&at, bad.into(), PutMode::Overwrite).await.unwrap();
+                store.inner.put(&path, bad.into()).await.unwrap();
                 store.cache = Arc::default();
-                let tree = at_shape(&store, &shape);
+                let tree = at(&store, &root);
                 let got = match tree.get("k/00").await {
                     Ok(Some(item)) => tree.value(&item).await.map(drop),
                     Ok(None) => Ok(()),
                     Err(e) => Err(e),
                 };
                 let err = got.unwrap_err();
-                assert!(format!("{err:#}").contains("is not what its link says"), "{what}: {err:#}");
+                assert!(
+                    matches!(&err, Error::Corrupt(why) if why.contains("is not what its link says")),
+                    "{what}: {err}"
+                );
             }
-            store.put(&at, good, PutMode::Overwrite).await.unwrap();
+            store.inner.put(&path, good.into()).await.unwrap();
         }
-    }
-
-    fn at_shape(store: &Store, shape: &Shape) -> Tree {
-        at(store, shape)
     }
 
     #[tokio::test]
@@ -1778,35 +1941,35 @@ mod tests {
             bad(|l| l.v = Some("a b".into())),
             bad(|l| l.v = Some("v".repeat(VERSION_MAX + 1))),
         ];
+        let malformed = |e: &Error| matches!(e, Error::Corrupt(why) if why.contains("malformed"));
         for link in bads {
             assert!(link.check().is_err(), "{link:?}");
-            let shape =
-                Shape { root: Body::Branch(vec![(String::new(), link.clone()).into()]), bytes: 0, entries: 0, seq: 0 };
-            let tree = at(&store, &shape);
+            let root = Root { root: Body::Branch(vec![(String::new(), link.clone()).into()]), ..Root::default() };
+            let tree = at(&store, &root);
             let err = tree.get("k/a").await.unwrap_err();
-            assert!(format!("{err:#}").contains("malformed"), "{err:#}");
-            let err = tree.value(&Item::Object(link)).await.unwrap_err();
-            assert!(format!("{err:#}").contains("malformed"), "{err:#}");
+            assert!(malformed(&err), "{err}");
+            let err = tree.value(&Item(Value::Object(link))).await.unwrap_err();
+            assert!(malformed(&err), "{err}");
         }
         assert_eq!(counts.gets.load(SeqCst), 0, "nothing was asked of the store");
 
-        // The head's own words about a link are kept to as well.
+        // The root's own words about a link are kept to as well.
         assert!(serde_json::from_str::<Link>(r#"{"id":"a","h":"b","n":1,"x":2}"#).is_err());
-        assert!(serde_json::from_str::<Shape>(r#"{"entries":1,"x":2}"#).is_err());
+        assert!(serde_json::from_str::<Root>(r#"{"entries":1,"x":2}"#).is_err());
     }
 
     #[test]
-    fn an_empty_tree_is_not_in_the_head() {
-        assert_eq!(serde_json::to_string(&Shape::default()).unwrap(), "{}");
-        assert!(Shape::default().is_empty());
-        let shape: Shape = serde_json::from_str("{}").unwrap();
-        assert!(shape.is_empty());
+    fn an_empty_tree_is_an_empty_root() {
+        assert_eq!(serde_json::to_string(&Root::default()).unwrap(), "{}");
+        assert!(Root::default().is_empty());
+        let root: Root = serde_json::from_str("{}").unwrap();
+        assert!(root.is_empty());
     }
 
     #[tokio::test]
     async fn lists_what_a_prefix_a_start_and_a_limit_pick_out() {
         let (mut store, counts) = counting();
-        let mut tree = at(&store, &Shape::default());
+        let mut tree = at(&store, &Root::default());
         let mut model = BTreeMap::<String, Vec<u8>>::new();
         for prefix in ["a", "k", "k0", "z"] {
             for i in 0..120 {
@@ -1816,16 +1979,16 @@ mod tests {
                 model.insert(key, value.into_bytes());
             }
         }
-        let shape = commit(&mut tree).await;
+        let root = commit(&mut tree).await;
         drop(tree);
-        let levels = audit(&store, &shape).await.depth;
+        let levels = audit(&store, &root).await.depth;
         assert!(levels >= 3, "{levels} levels");
 
         // A listing reads the nodes on its way to the first key, and no others.
         for (prefix, found) in [("k/", "k/000"), ("k/119", "k/119")] {
             store.cache = Arc::default();
             counts.gets.store(0, SeqCst);
-            let tree = at(&store, &shape);
+            let tree = at(&store, &root);
             assert_eq!(tree.scan(prefix, None, 1).await.unwrap(), [found]);
             assert_eq!(counts.gets.load(SeqCst), levels - 1, "{prefix}");
         }
@@ -1834,7 +1997,7 @@ mod tests {
         let afters =
             [None, Some(""), Some("a/050"), Some("k/"), Some("k/100"), Some("k/1005"), Some("k/999"), Some("zzz")];
         store.cache = Arc::default();
-        let mut tree = at(&store, &shape);
+        let mut tree = at(&store, &root);
         for round in 0..2 {
             if round == 1 {
                 // With changes in memory: a whole range removed, and values added and replaced in the others.
@@ -1875,8 +2038,8 @@ mod tests {
     #[tokio::test]
     async fn a_fork_is_a_tree_of_its_own() {
         let (store, counts) = counting();
-        let shape = grown(&store).await;
-        let mut tree = at(&store, &shape);
+        let root = grown(&store).await;
+        let mut tree = at(&store, &root);
         set(&mut tree, "k/000", b"was").await;
         set(&mut tree, "k/001", &[7; 90]).await; // a value to upload, held in the node
 
@@ -1895,10 +2058,16 @@ mod tests {
         assert!(tree.get("k/200").await.unwrap().is_none() && fork.get("k/200").await.unwrap().is_some());
         assert!(tree.get("k/300").await.unwrap().is_some() && fork.get("k/300").await.unwrap().is_none());
 
+        // Each is finished as a tree of its own.
+        let (mine, theirs) = (commit(&mut tree).await, commit(&mut fork).await);
+        let (mine, theirs) = (at(&store, &mine), at(&store, &theirs));
+        assert_eq!((text(&mine, "k/000").await, text(&mine, "k/001").await), (b"tree".to_vec(), vec![7; 90]));
+        assert_eq!((text(&theirs, "k/000").await, text(&theirs, "k/001").await), (b"was".to_vec(), b"fork".to_vec()));
+
         // Whatever a tree uploaded before, a fork reads, and dropping either deletes none of it.
         drop((fork, tree));
         counts.puts.store(0, SeqCst);
-        let mut tree = at(&store, &shape);
+        let mut tree = at(&store, &root);
         for i in 0..60 {
             set(&mut tree, &format!("k/{i:03}"), &[i as u8; 100]).await;
         }
@@ -1912,54 +2081,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn numbers_keep_counting_and_a_lost_turn_gives_back_its_own() {
-        let store = versioned();
-        let mut tree = at(&store, &Shape::default());
-        assert_eq!((tree.alloc(), tree.alloc()), (2, 3), "the root is 1");
-        set(&mut tree, "f/2", b"x").await;
-        let shape = commit(&mut tree).await;
-        assert_eq!(shape.seq, 3);
-        let shape: Shape = serde_json::from_str(&serde_json::to_string(&shape).unwrap()).unwrap();
-        assert_eq!(shape.seq, 3);
+    async fn a_sequence_is_kept_in_the_root() {
+        let store = memory();
+        let mut tree = at(&store, &Root::default());
+        assert_eq!(tree.sequence(), 0);
+        tree.set_sequence(3);
+        assert!(!tree.edited(), "a number alone is not a change");
+        set(&mut tree, "f/3", b"x").await;
+        let root = commit(&mut tree).await;
+        let root: Root = serde_json::from_str(&serde_json::to_string(&root).unwrap()).unwrap();
+        assert_eq!(root.seq, 3);
 
-        // A tree goes on from the shape, and a turn that is lost leaves its numbers to the next.
-        let mut next = at(&store, &shape);
-        assert_eq!((next.alloc(), next.alloc()), (4, 5));
+        // A tree goes on from the root, and one that is reset gives back what it set.
+        let mut next = at(&store, &root);
+        assert_eq!(next.sequence(), 3);
+        next.set_sequence(5);
         next.reset();
-        assert_eq!(next.alloc(), 4);
+        assert_eq!(next.sequence(), 3);
 
-        // A name emptied has still used its numbers up, so its head is not empty.
-        next.write(vec![("f/2".into(), None)]).await.unwrap();
+        // A tree emptied keeps its number, so its root is not empty.
+        next.set_sequence(4);
+        next.write(vec![("f/3".into(), None)]).await.unwrap();
         let emptied = next.finish().await.unwrap();
         assert!(emptied.root.is_empty() && emptied.entries == 0 && emptied.bytes == 0);
         assert!(!emptied.is_empty());
         assert_eq!(serde_json::to_string(&emptied).unwrap(), r#"{"seq":4}"#);
-        assert_eq!(at(&store, &emptied).alloc(), 5);
-
-        // One that never allocated starts at 2, and so does one whose root is the only inode.
-        assert_eq!(at(&store, &Shape::default()).alloc(), 2);
-        assert_eq!(at(&store, &Shape { seq: 1, ..Shape::default() }).alloc(), 2);
+        assert_eq!(at(&store, &emptied).sequence(), 4);
     }
 
     #[tokio::test]
     async fn an_object_is_read_once_and_is_what_its_link_says_each_time() {
         let (mut store, counts) = counting();
-        let mut tree = at(&store, &Shape::default());
+        let mut tree = at(&store, &Root::default());
         set(&mut tree, "k/a", &[1; 60]).await;
         set(&mut tree, "k/b", &[2; 60]).await;
-        let shape = commit(&mut tree).await;
+        let root = commit(&mut tree).await;
         drop(tree);
 
-        // What a turn uploaded is kept for the next request, so a read of it is not a GET.
+        // What a tree uploaded is kept for the next read, so a read of it is not a GET.
         counts.gets.store(0, SeqCst);
-        assert_eq!(text(&at(&store, &shape), "k/a").await, [1; 60]);
+        assert_eq!(text(&at(&store, &root), "k/a").await, [1; 60]);
         assert_eq!(counts.gets.load(SeqCst), 0);
 
         // What is not, is fetched once.
         store.cache = Arc::default();
-        let tree = at(&store, &shape);
+        let tree = at(&store, &root);
         let item = tree.get("k/a").await.unwrap().unwrap();
-        let Item::Object(link) = item.clone() else { panic!("a value in its node") };
+        let Value::Object(link) = item.0.clone() else { panic!("a value in its node") };
         for _ in 0..3 {
             assert_eq!(tree.value(&item).await.unwrap().as_ref(), &[1; 60]);
         }
@@ -1968,18 +2136,18 @@ mod tests {
 
         // A link that names the same object, but another hash, is not answered from the cache: the store is asked, and
         // what it gives is not what that link says.
-        let other = Link { h: store::hash(b"another"), ..link.clone() };
-        let err = tree.value(&Item::Object(other)).await.unwrap_err();
-        assert!(format!("{err:#}").contains("is not what its link says"), "{err:#}");
+        let other = Link { h: hash(b"another"), ..link.clone() };
+        let err = tree.value(&Item(Value::Object(other))).await.unwrap_err();
+        assert!(matches!(&err, Error::Corrupt(why) if why.contains("is not what its link says")), "{err}");
         assert_eq!(counts.gets.load(SeqCst), 2);
         assert_eq!(tree.value(&item).await.unwrap().as_ref(), &[1; 60], "the cache has not been spoilt");
         assert_eq!(counts.gets.load(SeqCst), 2);
 
-        // Nor is it answered for another app or name: those are other objects, which are not there.
-        for (app, name) in [("b", "n"), ("a", "m")] {
-            let tree = Tree::open(&store, app, name, &Shape::default(), tiny()).unwrap();
+        // Nor is it answered for another prefix: that is another object, which is not there.
+        for other in ["t/m", "u/n"] {
+            let tree = Tree::open(store.inner.clone(), Path::from(other), store.cache.clone(), &root, tiny()).unwrap();
             let err = tree.value(&item).await.unwrap_err();
-            assert!(format!("{err:#}").contains("is missing"), "{app}/{name}: {err:#}");
+            assert!(matches!(&err, Error::Corrupt(why) if why.contains("is missing")), "{other}: {err}");
         }
         assert_eq!(counts.gets.load(SeqCst), 4);
     }
@@ -1987,17 +2155,17 @@ mod tests {
     #[tokio::test]
     async fn a_block_that_is_being_fetched_is_waited_for_by_the_reads_that_come_to_it() {
         let (mut store, counts) = counting();
-        let mut tree = at(&store, &Shape::default());
+        let mut tree = at(&store, &Root::default());
         set(&mut tree, "k/a", &[1; 60]).await;
-        let shape = commit(&mut tree).await;
+        let root = commit(&mut tree).await;
         drop(tree);
         store.cache = Arc::default();
-        let tree = Arc::new(at(&store, &shape));
+        let tree = Arc::new(at(&store, &root));
         let item = tree.get("k/a").await.unwrap().unwrap();
         counts.gets.store(0, SeqCst);
         counts.delay.store(50, SeqCst);
 
-        // Eight reads at once are one fetch, and each has the block.
+        // Eight reads at once are one fetch, and each has the value.
         let reads = (0..8).map(|_| {
             let (tree, item) = (tree.clone(), item.clone());
             tokio::spawn(async move { tree.value(&item).await.unwrap() })
@@ -2006,11 +2174,11 @@ mod tests {
             assert_eq!(read.unwrap().as_ref(), &[1; 60]);
         }
         assert_eq!(counts.gets.load(SeqCst), 1);
-        assert!(store.cache.flights.lock().unwrap().is_empty(), "the gate of a block is gone with the fetch");
+        assert!(store.cache.flights.lock().unwrap().is_empty(), "the gate of a value is gone with the fetch");
 
         // The one that is fetching is cancelled: the next in turn fetches, and none of them is left waiting.
         store.cache = Arc::default();
-        let tree = Arc::new(at(&store, &shape));
+        let tree = Arc::new(at(&store, &root));
         counts.gets.store(0, SeqCst);
         counts.delay.store(200, SeqCst);
         let first = tokio::spawn({
@@ -2034,12 +2202,12 @@ mod tests {
     #[tokio::test]
     async fn a_read_that_is_cancelled_at_the_gate_leaves_no_gate_behind() {
         let (mut store, counts) = counting();
-        let mut tree = at(&store, &Shape::default());
+        let mut tree = at(&store, &Root::default());
         set(&mut tree, "k/a", &[1; 60]).await;
-        let shape = commit(&mut tree).await;
+        let root = commit(&mut tree).await;
         drop(tree);
         store.cache = Arc::default();
-        let tree = Arc::new(at(&store, &shape));
+        let tree = Arc::new(at(&store, &root));
         let item = tree.get("k/a").await.unwrap().unwrap();
         let comers = || store.cache.flights.lock().unwrap().values().map(|gate| gate.comers).sum::<usize>();
         let read = |tree: &Arc<Tree>| {
@@ -2047,7 +2215,7 @@ mod tests {
             tokio::spawn(async move { tree.value(&item).await })
         };
 
-        // The one that fetches has the block to itself, and the waiter that is cancelled while it does is counted out
+        // The one that fetches has the value to itself, and the waiter that is cancelled while it does is counted out
         // at once, and not when the one that fetches is done: its gate is there until then, and no later.
         counts.delay.store(300, SeqCst);
         let leader = read(&tree);
@@ -2069,15 +2237,15 @@ mod tests {
     #[tokio::test]
     async fn reads_that_are_cancelled_at_any_moment_of_a_fetch_leave_no_gate_behind() {
         let (store, counts) = counting();
-        let mut tree = at(&store, &Shape::default());
+        let mut tree = at(&store, &Root::default());
         set(&mut tree, "k/a", &[1; 60]).await;
-        let shape = commit(&mut tree).await;
+        let root = commit(&mut tree).await;
         drop(tree);
         // That includes when the one that fetches lets go of the gate and wakes the next in turn: whichever way the
         // drops of the cancelled read and of what it waits on fall, none of them leaves a gate behind.
         for round in 0..4 {
             let store = Store { cache: Arc::default(), ..store.clone() };
-            let tree = Arc::new(at(&store, &shape));
+            let tree = Arc::new(at(&store, &root));
             let item = tree.get("k/a").await.unwrap().unwrap();
             counts.delay.store(20, SeqCst);
             let reads: Vec<_> = (0..24)
@@ -2105,15 +2273,15 @@ mod tests {
     fn a_cache_entry_is_for_one_path_version_and_hash() {
         let mut lru = Lru::<u32>::new(100).into_inner().unwrap();
         let key = |path: &str, version: Option<&str>| (Path::from(path), version.map(str::to_owned));
-        lru.put(key("apps/a/values/n/x", Some("v1")), 7, "h1".into(), 10);
-        assert_eq!(lru.get(&key("apps/a/values/n/x", Some("v1")), "h1"), Some(7));
+        lru.put(key("t/n/x", Some("v1")), 7, "h1".into(), 10);
+        assert_eq!(lru.get(&key("t/n/x", Some("v1")), "h1"), Some(7));
         for (path, version, hash, what) in [
-            ("apps/a/values/n/x", Some("v2"), "h1", "another version"),
-            ("apps/a/values/n/x", None, "h1", "no version"),
-            ("apps/b/values/n/x", Some("v1"), "h1", "another app"),
-            ("apps/a/values/m/x", Some("v1"), "h1", "another name"),
-            ("apps/a/values/n/y", Some("v1"), "h1", "another id"),
-            ("apps/a/values/n/x", Some("v1"), "h2", "another hash"),
+            ("t/n/x", Some("v2"), "h1", "another version"),
+            ("t/n/x", None, "h1", "no version"),
+            ("u/n/x", Some("v1"), "h1", "another prefix"),
+            ("t/m/x", Some("v1"), "h1", "another prefix that ends the same"),
+            ("t/n/y", Some("v1"), "h1", "another id"),
+            ("t/n/x", Some("v1"), "h2", "another hash"),
         ] {
             assert_eq!(lru.get(&key(path, version), hash), None, "{what}");
         }

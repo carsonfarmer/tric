@@ -1,6 +1,17 @@
+[workspace]
+members = ["crates/tree"]
+
+# Every crate's version, as one tag publishes them all: the publish workflow reads it from the first line like it, and
+# tric's dependency on the tree names it too.
+[workspace.package]
+version = "0.1.0"
+
+[workspace.dependencies]
+tric-tree = { path = "crates/tree", version = "0.1.0" }
+
 [package]
 name = "tric"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version = "1.96" # Wasmtime 49's
 license = "Apache-2.0"
@@ -42,6 +53,7 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tric-tree.workspace = true
 url = "2" # as object_store has it, to follow a middleware URL's redirects
 wac-graph = "0.12"
 # Mozilla's roots, as whole certificates, which is how the S3 client takes them, and outbound too.
@@ -60,6 +72,7 @@ wasmtime-wasi-http = { version = "=49.0.2", default-features = false, features =
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "process", "test-util"] }
+tric-tree = { workspace = true, features = ["testing"] }
 
 # Test binaries link side by side, and full debug info for Wasmtime sent `ld` past the 7.7 GiB Podman VM.
 [profile.dev]
