@@ -1,6 +1,8 @@
-//! The `/files` route: wasi:filesystem of 0.2, through `std::fs`, on `/`, which under `/@name` is the name's tree. The
-//! reply is `{"ok": value}` or `{"err": "<kind>: <message>"}`, with `status=N` as for any route. A file's bytes are
-//! `pattern(i)`, so a reader can tell any byte from any other, and a block that lands in the wrong place.
+//! The `/files` route: `wasi:filesystem` on the preopened `/`, which under `/@name` is the name's tree. What is read,
+//! written and listed goes through the streams of the binding, and the rest through the methods of the descriptor. The
+//! reply is `{"ok": value}` or `{"err": code}`, the code the Debug of the `error-code`, as `ErrorCode::NoEntry`, with
+//! `status=N` as for any route. A file's bytes are `pattern(i)`, so a reader can tell any byte from any other, and a
+//! block that lands in the wrong place.
 //!
 //! `/files?op=OP&path=P&to=T&data=D&n=N&at=A&chunk=C&key=K&value=V`:
 //! - `write` stores D at P, and `append` adds it; `read` is P as text; `ls` is `{"count", "first", "last"}` of the
@@ -8,171 +10,303 @@
 //! - `mkdir` (and `mkdirs`), `rm`, `rmdir`, `rmtree` take P; `mv` renames P to T, `ln` links T to P, `symlink` makes P
 //!   a symlink to T, and `readlink` is P's target;
 //! - `big` writes N bytes of the pattern at P in chunks of C (64 KiB by default); `sum` is `{"len", "fnv"}`, the length
-//!   and FNV-1a of P, which is read in chunks; `patch` writes D at the offset A of P; `slice` is N bytes of P from A;
-//!   `trunc` sets the length of P to N;
+//!   and FNV-1a of P, which is read in chunks; `patch` writes D at the offset A of P; `slice` is N bytes of P from A,
+//!   fewer if the file ends first; `trunc` sets the length of P to N;
 //! - `many` makes N files in the directory P, named `f00000` and on, each holding its number;
 //! - `incr` adds one to the number in P, which is none to begin with, and is the new number;
 //! - `orphan` unlinks a file it has open, reads and writes it, and closes it; `held` and `late` are answered before
 //!   they are done, and say what they found then: `held` unlinks a file it has open, and reads it, and `late` writes
 //!   to a file it has open, and makes others.
 //!
-//! With `key`, an op also sets that key of the name to `value`, in the turn.
+//! With `key`, an op also sets that key of the name to `value`, in the turn. Where an op has no `error-code` of its own
+//! it is the nearest: text that is not UTF-8 is `illegal-byte-sequence`, an op that is not one is `other`, and no
+//! preopen is `no-entry`.
 use crate::kv;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use wasip3::http::types::{ErrorCode, Fields, Response};
+use wasip3::clocks::monotonic_clock;
+use wasip3::filesystem::preopens;
+use wasip3::filesystem::types::{Descriptor, DescriptorFlags, DescriptorType, ErrorCode, OpenFlags, PathFlags};
+use wasip3::http::types::{ErrorCode as HttpError, Fields, Response};
 use wasip3::http_compat::http_into_wasi_response;
-use wasip3::{clocks::monotonic_clock, wit_future, wit_stream};
+use wasip3::{wit_bindgen::StreamResult, wit_future, wit_stream};
 
 /// How long `held` and `late` wait, which is for the turn to answer, and to commit.
-pub(crate) const LATER: u64 = 500_000_000;
+const LATER: u64 = 500_000_000;
 
-pub(crate) fn pattern(i: u64) -> u8 {
+/// How much a read asks for, and a `big` writes at once if it is not told.
+const CHUNK: usize = 64 << 10;
+
+fn pattern(i: u64) -> u8 {
     (i % 251) as u8
 }
 
 /// FNV-1a of `bytes`, as an accumulator: start from `OFFSET`.
-pub(crate) fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
+fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
     for b in bytes {
         hash = (hash ^ *b as u64).wrapping_mul(0x100000001b3);
     }
     hash
 }
 
-pub(crate) const OFFSET: u64 = 0xcbf29ce484222325;
+const OFFSET: u64 = 0xcbf29ce484222325;
 
-pub fn respond(name: Option<&str>, q: &HashMap<String, String>) -> Result<Response, ErrorCode> {
+pub async fn respond(name: Option<&str>, q: &HashMap<String, String>) -> Result<Response, HttpError> {
     let arg = |k: &str| q.get(k).map_or("", |v| v);
-    let body = match arg("op") {
-        "held" => return Ok(streamed(held(arg("path").to_owned()))),
-        "late" => return Ok(streamed(late(arg("path").to_owned()))),
-        _ => match (run(q), name.zip(q.get("key"))) {
-            (Ok(v), Some((name, key))) => match kv::keep(name, key, arg("value").as_bytes()) {
-                Ok(()) => json!({ "ok": v }),
-                Err(e) => json!({ "err": e }),
-            },
-            (Ok(v), None) => json!({ "ok": v }),
-            (Err(e), _) => json!({ "err": e }),
+    let root = preopens::get_directories().into_iter().find_map(|(dir, path)| (path == "/").then_some(dir));
+    let path = arg("path").to_owned();
+    let result = match (root.ok_or(ErrorCode::NoEntry), arg("op")) {
+        (Ok(root), "held") => return Ok(streamed(async move { held(root, path).await.unwrap_or_else(failed) })),
+        (Ok(root), "late") => return Ok(streamed(async move { late(root, path).await.unwrap_or_else(failed) })),
+        (Ok(root), _) => run(&root, q).await,
+        (Err(err), _) => Err(err),
+    };
+    let body = match (result, name.zip(q.get("key"))) {
+        (Ok(v), Some((name, key))) => match kv::keep(name, key, arg("value").as_bytes()) {
+            Ok(()) => json!({ "ok": v }),
+            Err(e) => json!({ "err": e }),
         },
+        (Ok(v), None) => json!({ "ok": v }),
+        (Err(err), _) => failed(err),
     };
     let status = q.get("status").and_then(|s| s.parse::<u16>().ok()).unwrap_or(200);
     http_into_wasi_response(http::Response::builder().status(status).body(body.to_string()).unwrap())
 }
 
-fn e(err: io::Error) -> String {
-    format!("{:?}: {err}", err.kind())
+/// `{"err": ..}`: the code, as `ErrorCode::NoEntry`.
+fn failed(err: ErrorCode) -> Value {
+    json!({ "err": format!("{err:?}") })
 }
 
 /// `{"ok": value}` or `{"err": ..}`.
-fn outcome<T: Into<Value>>(result: io::Result<T>) -> Value {
-    result.map_or_else(|err| json!({ "err": e(err) }), |v| json!({ "ok": v.into() }))
+fn outcome<T: Into<Value>>(result: Result<T, ErrorCode>) -> Value {
+    result.map_or_else(failed, |v| json!({ "ok": v.into() }))
 }
 
-fn run(q: &HashMap<String, String>) -> Result<Value, String> {
+/// `path`, which the guest gives from `/`, as the descriptor of `/` has it: from there.
+fn rel(path: &str) -> String {
+    match path.trim_start_matches('/') {
+        "" => ".".into(),
+        path => path.into(),
+    }
+}
+
+async fn run(root: &Descriptor, q: &HashMap<String, String>) -> Result<Value, ErrorCode> {
     let arg = |k: &str| q.get(k).map_or("", |v| v);
     let num = |k: &str| arg(k).parse::<u64>().unwrap_or(0);
     let (path, to, data) = (arg("path"), arg("to"), arg("data").as_bytes());
+    let (read, write, none) = (DescriptorFlags::READ, DescriptorFlags::WRITE, OpenFlags::empty());
     Ok(match arg("op") {
-        "write" => json!(fs::write(path, data).map_err(e)?),
+        "write" => json!(put(root, path, [data.to_vec()]).await?),
         "append" => {
-            let mut file = OpenOptions::new().append(true).create(true).open(path).map_err(e)?;
-            json!(file.write_all(data).map_err(e)?)
+            let file = open(root, path, OpenFlags::CREATE, write).await?;
+            json!(push(&file, None, [data.to_vec()]).await?)
         }
-        "read" => json!(fs::read_to_string(path).map_err(e)?),
+        "read" => json!(slurp(root, path).await?),
         "ls" => {
-            let mut names = vec![];
-            for entry in fs::read_dir(path).map_err(e)? {
-                names.push(entry.map_err(e)?.file_name().to_string_lossy().into_owned());
-            }
+            let dir = open(root, path, OpenFlags::DIRECTORY, read).await?;
+            let (entries, done) = dir.read_directory();
+            let mut names: Vec<_> = entries.collect().await.into_iter().map(|entry| entry.name).collect();
+            done.await?;
             names.sort();
             json!({ "count": names.len(), "first": names.first(), "last": names.last() })
         }
         "stat" => {
-            let meta = fs::symlink_metadata(path).map_err(e)?;
-            let kind = if meta.is_dir() {
-                "dir"
-            } else if meta.is_symlink() {
-                "symlink"
-            } else {
-                "file"
+            let stat = root.stat_at(PathFlags::empty(), rel(path)).await?;
+            let kind = match stat.type_ {
+                DescriptorType::Directory => "dir",
+                DescriptorType::SymbolicLink => "symlink",
+                _ => "file",
             };
-            json!({ "type": kind, "len": meta.len() })
+            json!({ "type": kind, "len": stat.size })
         }
-        "mkdir" => json!(fs::create_dir(path).map_err(e)?),
-        "mkdirs" => json!(fs::create_dir_all(path).map_err(e)?),
-        "rm" => json!(fs::remove_file(path).map_err(e)?),
-        "rmdir" => json!(fs::remove_dir(path).map_err(e)?),
-        "rmtree" => json!(fs::remove_dir_all(path).map_err(e)?),
-        "mv" => json!(fs::rename(path, to).map_err(e)?),
-        "ln" => json!(fs::hard_link(path, to).map_err(e)?),
-        #[allow(deprecated)] // `std::os::wasi::fs::symlink_path` is not stable
-        "symlink" => json!(fs::soft_link(to, path).map_err(e)?),
-        "readlink" => json!(fs::read_link(path).map_err(e)?.display().to_string()),
+        "mkdir" => json!(root.create_directory_at(rel(path)).await?),
+        "mkdirs" => json!(mkdirs(root, path).await?),
+        "rm" => json!(root.unlink_file_at(rel(path)).await?),
+        "rmdir" => json!(root.remove_directory_at(rel(path)).await?),
+        "rmtree" => json!(rmtree(root, path).await?),
+        "mv" => json!(root.rename_at(rel(path), root, rel(to)).await?),
+        "ln" => json!(root.link_at(PathFlags::empty(), rel(path), root, rel(to)).await?),
+        "symlink" => json!(root.symlink_at(to.into(), rel(path)).await?), // what a link says is not a path of `/`
+        "readlink" => json!(root.readlink_at(rel(path)).await?),
         "big" => {
-            let (n, chunk) = (num("n"), if num("chunk") > 0 { num("chunk") } else { 64 << 10 });
-            let mut file = File::create(path).map_err(e)?;
-            for start in (0..n).step_by(chunk as usize) {
-                let bytes: Vec<u8> = (start..(start + chunk).min(n)).map(pattern).collect();
-                file.write_all(&bytes).map_err(e)?;
-            }
+            let (n, chunk) = (num("n"), if num("chunk") > 0 { num("chunk") } else { CHUNK as u64 });
+            let chunks =
+                (0..n).step_by(chunk as usize).map(|start| (start..(start + chunk).min(n)).map(pattern).collect());
+            put(root, path, chunks).await?;
             json!(n)
         }
         "sum" => {
-            let mut file = File::open(path).map_err(e)?;
-            let (mut len, mut hash, mut buf) = (0, OFFSET, vec![0; 64 << 10]);
-            loop {
-                let n = file.read(&mut buf).map_err(e)?;
-                if n == 0 {
-                    break json!({ "len": len, "fnv": hash.to_string() });
-                }
-                (len, hash) = (len + n, fnv(hash, &buf[..n]));
-            }
+            let file = open(root, path, none, read).await?;
+            let (mut len, mut hash) = (0, OFFSET);
+            pull(&file, 0, |chunk| {
+                (len, hash) = (len + chunk.len(), fnv(hash, chunk));
+                true
+            })
+            .await?;
+            json!({ "len": len, "fnv": hash.to_string() })
         }
         "patch" => {
-            let mut file = OpenOptions::new().write(true).open(path).map_err(e)?;
-            file.seek(SeekFrom::Start(num("at"))).map_err(e)?;
-            json!(file.write_all(data).map_err(e)?)
+            let file = open(root, path, none, write).await?;
+            json!(push(&file, Some(num("at")), [data.to_vec()]).await?)
         }
         "slice" => {
-            let mut file = File::open(path).map_err(e)?;
-            file.seek(SeekFrom::Start(num("at"))).map_err(e)?;
-            let mut buf = vec![0; num("n") as usize];
-            file.read_exact(&mut buf).map_err(e)?;
-            json!(buf)
+            let (file, n) = (open(root, path, none, read).await?, num("n") as usize);
+            let mut bytes = Vec::new();
+            pull(&file, num("at"), |chunk| {
+                bytes.extend_from_slice(&chunk[..chunk.len().min(n - bytes.len())]);
+                bytes.len() < n
+            })
+            .await?;
+            json!(bytes)
         }
-        "trunc" => json!(OpenOptions::new().write(true).open(path).and_then(|f| f.set_len(num("n"))).map_err(e)?),
+        "trunc" => {
+            let file = open(root, path, none, write).await?;
+            json!(file.set_size(num("n")).await?)
+        }
         "many" => {
-            fs::create_dir_all(path).map_err(e)?;
+            mkdirs(root, path).await?;
             for i in 0..num("n") {
-                fs::write(format!("{path}/f{i:05}"), i.to_string()).map_err(e)?;
+                put(root, &format!("{path}/f{i:05}"), [i.to_string().into_bytes()]).await?;
             }
             json!(num("n"))
         }
         "incr" => {
-            let n = fs::read_to_string(path).ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0) + 1;
-            fs::write(path, n.to_string()).map_err(e)?;
+            let n = slurp(root, path).await.ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0) + 1;
+            put(root, path, [n.to_string().into_bytes()]).await?;
             json!(n)
         }
         "orphan" => {
-            let mut options = OpenOptions::new();
-            let mut file = options.read(true).write(true).create(true).truncate(true).open(path).map_err(e)?;
-            file.write_all(b"abc").map_err(e)?;
-            fs::remove_file(path).map_err(e)?;
-            let (listed, mut text) = (fs::exists(path).map_err(e)?, String::new());
-            file.write_all(b"def").map_err(e)?;
-            file.seek(SeekFrom::Start(0)).map_err(e)?;
-            file.read_to_string(&mut text).map_err(e)?;
+            let file = open(root, path, OpenFlags::CREATE | OpenFlags::TRUNCATE, read | write).await?;
+            push(&file, Some(0), [b"abc".to_vec()]).await?;
+            root.unlink_file_at(rel(path)).await?;
+            let listed = exists(root, path).await?;
+            push(&file, None, [b"def".to_vec()]).await?;
+            let body = text(&file).await?;
             drop(file);
-            json!({ "listed": listed, "text": text, "after": fs::exists(path).map_err(e)? })
+            json!({ "listed": listed, "text": body, "after": exists(root, path).await? })
         }
-        op => return Err(format!("unknown op {op:?}")),
+        op => return Err(ErrorCode::Other(Some(format!("unknown op {op:?}")))),
     })
 }
 
+/// Opens `path`, following a link.
+async fn open(
+    root: &Descriptor,
+    path: &str,
+    create: OpenFlags,
+    flags: DescriptorFlags,
+) -> Result<Descriptor, ErrorCode> {
+    root.open_at(PathFlags::SYMLINK_FOLLOW, rel(path), create, flags).await
+}
+
+async fn exists(root: &Descriptor, path: &str) -> Result<bool, ErrorCode> {
+    match root.stat_at(PathFlags::SYMLINK_FOLLOW, rel(path)).await {
+        Ok(_) => Ok(true),
+        Err(ErrorCode::NoEntry) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+async fn is_dir(root: &Descriptor, path: &str) -> bool {
+    let stat = root.stat_at(PathFlags::SYMLINK_FOLLOW, rel(path)).await;
+    stat.is_ok_and(|stat| matches!(stat.type_, DescriptorType::Directory))
+}
+
+/// Makes the directory `path`, and those above it that are not.
+async fn mkdirs(root: &Descriptor, path: &str) -> Result<(), ErrorCode> {
+    let mut at = String::new();
+    for part in path.split('/').filter(|part| !part.is_empty()) {
+        at.push_str(part);
+        if !is_dir(root, &at).await {
+            root.create_directory_at(at.clone()).await?;
+        }
+        at.push('/');
+    }
+    Ok(())
+}
+
+/// Removes `path` and all below it, without following links: the files of a directory, then the directory, the deepest
+/// first.
+async fn rmtree(root: &Descriptor, path: &str) -> Result<(), ErrorCode> {
+    let (mut todo, mut dirs) = (vec![rel(path)], vec![]);
+    while let Some(dir) = todo.pop() {
+        let handle = root.open_at(PathFlags::empty(), dir.clone(), OpenFlags::DIRECTORY, DescriptorFlags::READ).await?;
+        let (entries, done) = handle.read_directory();
+        let entries = entries.collect().await;
+        done.await?;
+        for entry in entries {
+            let below = format!("{dir}/{}", entry.name);
+            match entry.type_ {
+                DescriptorType::Directory => todo.push(below),
+                _ => root.unlink_file_at(below).await?,
+            }
+        }
+        dirs.push(dir);
+    }
+    for dir in dirs.into_iter().rev() {
+        root.remove_directory_at(dir).await?;
+    }
+    Ok(())
+}
+
+/// Makes or empties the file at `path`, and writes `chunks` to it.
+async fn put(root: &Descriptor, path: &str, chunks: impl IntoIterator<Item = Vec<u8>>) -> Result<(), ErrorCode> {
+    let file = open(root, path, OpenFlags::CREATE | OpenFlags::TRUNCATE, DescriptorFlags::WRITE).await?;
+    push(&file, Some(0), chunks).await
+}
+
+/// Writes `chunks` to the stream of a write to `file`, from `at` or, if there is none, at its end, and waits for it to
+/// say it is done.
+async fn push(file: &Descriptor, at: Option<u64>, chunks: impl IntoIterator<Item = Vec<u8>>) -> Result<(), ErrorCode> {
+    let (mut tx, rx) = wit_stream::new();
+    let done = match at {
+        Some(at) => file.write_via_stream(rx, at),
+        None => file.append_via_stream(rx),
+    };
+    for chunk in chunks.into_iter().filter(|chunk| !chunk.is_empty()) {
+        if !tx.write_all(chunk).await.is_empty() {
+            break; // the host closed the stream: `done` says why
+        }
+    }
+    drop(tx);
+    done.await
+}
+
+/// Hands `each` what the stream of a read of `file` from `at` yields, a chunk at a time, until the end or until it
+/// says it has enough, and waits for the stream to say how it ended.
+async fn pull(file: &Descriptor, at: u64, mut each: impl FnMut(&[u8]) -> bool) -> Result<(), ErrorCode> {
+    let (mut rx, done) = file.read_via_stream(at);
+    let mut buf = Vec::with_capacity(CHUNK);
+    while let (StreamResult::Complete(_), got) = rx.read(buf).await {
+        buf = got;
+        if !each(&buf) {
+            break;
+        }
+        buf.clear();
+    }
+    drop(rx);
+    done.await
+}
+
+/// What `file` holds, as text.
+async fn text(file: &Descriptor) -> Result<String, ErrorCode> {
+    let mut bytes = Vec::new();
+    pull(file, 0, |chunk| {
+        bytes.extend_from_slice(chunk);
+        true
+    })
+    .await?;
+    String::from_utf8(bytes).map_err(|_| ErrorCode::IllegalByteSequence)
+}
+
+/// What the file at `path` holds, as text.
+async fn slurp(root: &Descriptor, path: &str) -> Result<String, ErrorCode> {
+    text(&open(root, path, OpenFlags::empty(), DescriptorFlags::READ).await?).await
+}
+
 /// A response whose body is what `body` gives, once it is done: after the handler has answered.
-pub(crate) fn streamed(body: impl Future<Output = Value> + 'static) -> Response {
+fn streamed(body: impl Future<Output = Value> + 'static) -> Response {
     let (mut tx, rx) = wit_stream::new();
     let (done, trailers) = wit_future::new(|| Ok(None));
     wasip3::wit_bindgen::spawn_local(async move {
@@ -184,30 +318,22 @@ pub(crate) fn streamed(body: impl Future<Output = Value> + 'static) -> Response 
 }
 
 /// Unlinks a file that is open, then, after the turn has committed, reads it, and looks for it by name.
-async fn held(path: String) -> Value {
-    let opened = File::open(&path).and_then(|file| fs::remove_file(&path).map(|()| file));
-    let mut file = match opened {
-        Ok(file) => file,
-        Err(err) => return json!({ "err": e(err) }),
-    };
+async fn held(root: Descriptor, path: String) -> Result<Value, ErrorCode> {
+    let file = open(&root, &path, OpenFlags::empty(), DescriptorFlags::READ).await?;
+    root.unlink_file_at(rel(&path)).await?;
     monotonic_clock::wait_for(LATER).await;
-    let mut text = String::new();
-    let read = file.read_to_string(&mut text).map(|_| text);
-    json!({ "read": outcome(read), "listed": outcome(fs::exists(&path)) })
+    Ok(json!({ "read": outcome(text(&file).await), "listed": outcome(exists(&root, &path).await) }))
 }
 
 /// Opens a file to write, then, after the turn has answered, writes it, and makes a file, a directory, and removes one.
-async fn late(path: String) -> Value {
-    let opened = OpenOptions::new().write(true).create(true).truncate(true).open(&path);
-    let mut file = match opened {
-        Ok(file) => file,
-        Err(err) => return json!({ "err": e(err) }),
-    };
+async fn late(root: Descriptor, path: String) -> Result<Value, ErrorCode> {
+    let flags = OpenFlags::CREATE | OpenFlags::TRUNCATE;
+    let file = open(&root, &path, flags, DescriptorFlags::WRITE).await?;
     monotonic_clock::wait_for(LATER).await;
-    json!({
-        "write": outcome(file.write_all(b"late").and_then(|()| file.flush())),
-        "create": outcome(fs::write("/late-file", b"x")),
-        "mkdir": outcome(fs::create_dir("/late-dir")),
-        "remove": outcome(fs::remove_file(&path)),
-    })
+    Ok(json!({
+        "write": outcome(push(&file, Some(0), [b"late".to_vec()]).await),
+        "create": outcome(put(&root, "/late-file", [b"x".to_vec()]).await),
+        "mkdir": outcome(root.create_directory_at(rel("/late-dir")).await),
+        "remove": outcome(root.unlink_file_at(rel(&path)).await),
+    }))
 }

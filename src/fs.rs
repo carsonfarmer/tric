@@ -1,7 +1,6 @@
 //! The file system the guest sees: a name's tree, as directories and files, under a preopened `/`. Which turn's tree it
 //! is, is the request's: the turn on the name it addresses, to read and write until it answers, and a snapshot of the
-//! name if it only reads. A [`Handle`] is a descriptor on it, and [`p2`] and [`p3`] serve `wasi:filesystem` of 0.2 and
-//! of 0.3 with them.
+//! name if it only reads. A [`Handle`] is a descriptor on it, and [`p3`] serves `wasi:filesystem` with them.
 //!
 //! Descriptors outlive the calls that made them, and so do the streams a descriptor makes, so the rules for the turn
 //! are these:
@@ -30,66 +29,9 @@
 //!   read, while the commit leaves it out.
 //! * What descriptors read after the answer is the tree as the commit left it, or as it was if the turn was discarded:
 //!   so a file that was made in a turn that was discarded is no more, and reads fail with `io`.
-/// The conversions of an [`Errno`], a [`Kind`] and a [`Stat`] to the error code, the descriptor type and the stat that
-/// a binding generates, which name the same codes, types and fields, in types of their own. `$stamp` makes a timestamp
-/// of nanoseconds.
-macro_rules! convert {
-    ($code:ty, $type:ty, $stat:ty, $stamp:ident) => {
-        impl From<Errno> for $code {
-            fn from(e: Errno) -> Self {
-                match e {
-                    Errno::BadDescriptor => Self::BadDescriptor,
-                    Errno::Busy => Self::Busy,
-                    Errno::Exist => Self::Exist,
-                    Errno::FileTooLarge => Self::FileTooLarge,
-                    Errno::Invalid => Self::Invalid,
-                    Errno::Io => Self::Io,
-                    Errno::IsDirectory => Self::IsDirectory,
-                    Errno::Loop => Self::Loop,
-                    Errno::NameTooLong => Self::NameTooLong,
-                    Errno::NoEntry => Self::NoEntry,
-                    Errno::InsufficientMemory => Self::InsufficientMemory,
-                    Errno::InsufficientSpace => Self::InsufficientSpace,
-                    Errno::NotDirectory => Self::NotDirectory,
-                    Errno::NotEmpty => Self::NotEmpty,
-                    Errno::Overflow => Self::Overflow,
-                    Errno::Unsupported => Self::Unsupported,
-                    Errno::NotPermitted => Self::NotPermitted,
-                    Errno::ReadOnly => Self::ReadOnly,
-                    Errno::TooManyLinks => Self::TooManyLinks,
-                }
-            }
-        }
-
-        impl From<Kind> for $type {
-            fn from(k: Kind) -> Self {
-                match k {
-                    Kind::Dir => Self::Directory,
-                    Kind::File => Self::RegularFile,
-                    Kind::Link => Self::SymbolicLink,
-                }
-            }
-        }
-
-        impl From<Stat> for $stat {
-            fn from(s: Stat) -> Self {
-                Self {
-                    type_: s.kind.into(),
-                    link_count: s.links,
-                    size: s.size,
-                    data_access_timestamp: Some($stamp(s.atime)),
-                    data_modification_timestamp: Some($stamp(s.mtime)),
-                    status_change_timestamp: Some($stamp(s.ctime)),
-                }
-            }
-        }
-    };
-}
-
 #[cfg(test)]
 mod conformance;
 mod ops;
-pub mod p2;
 pub mod p3;
 
 use crate::engine::Host;
@@ -462,7 +404,7 @@ pub struct Handle {
     read: bool,
     write: bool,
     /// For a directory: whether it was opened to change its entries. Only what `get-flags` says: what the turn allows
-    /// is what decides, as the adapter of WASI 0.1 asks for no more than reading of a directory it opens, and as
+    /// is what decides, as wasi-libc asks for it only with `O_WRONLY`, which no directory is opened with, and as
     /// Wasmtime's own host does not hold a directory to it either.
     mutate: bool,
 }
@@ -619,7 +561,9 @@ impl Handle {
         ops::plan(&tree, self.ino(), offset, len).await
     }
 
-    /// Writes `data`, and returns how much of it: fewer than all if the name filled.
+    /// Writes `data`, and returns how much of it: fewer than all if the name filled. A stream writes with
+    /// [`Handle::write_task`].
+    #[cfg(test)]
     pub async fn write(&self, at: At, data: &[u8]) -> Res<usize> {
         self.writing()?;
         let mut tree = edit(self.turn()).await?;
@@ -627,7 +571,7 @@ impl Handle {
     }
 
     /// Starts a write for a stream, which is admitted now and runs as a task of its own, which nothing cancels. It
-    /// returns how much was written, like [`Handle::write`].
+    /// returns how much was written: fewer than all if the name filled.
     pub fn write_task(&self, at: At, data: Bytes) -> Res<JoinHandle<Res<usize>>> {
         self.writing()?;
         let (pin, turn) = (self.pin.clone(), self.turn().clone());
@@ -786,6 +730,8 @@ impl Entries {
         self.page.pop_front()
     }
 
+    /// The next entry, reading the page it is on if need be.
+    #[cfg(test)]
     pub async fn next(&mut self) -> Res<Option<(String, Kind)>> {
         if let Some(more) = self.more() {
             self.fill(more.await?);
@@ -796,7 +742,7 @@ impl Entries {
 
 /// A task that is aborted when it is dropped: a read, which holds nothing of the turn's but the tree, shared, while it
 /// plans, and which closing the stream it is for cancels.
-pub struct Task<T>(pub JoinHandle<T>);
+struct Task<T>(JoinHandle<T>);
 
 impl<T> Drop for Task<T> {
     fn drop(&mut self) {
@@ -836,16 +782,6 @@ impl Ahead {
         self.task = Some(Task(tokio::spawn(async move {
             let _ = file.warm(from, to - from).await;
         })));
-    }
-}
-
-#[cfg(test)]
-impl Ahead {
-    /// Waits for the blocks that are being fetched to be in the cache.
-    pub async fn settled(&mut self) {
-        if let Some(mut task) = self.task.take() {
-            let _ = (&mut task.0).await;
-        }
     }
 }
 
@@ -1225,6 +1161,33 @@ mod tests {
         assert_eq!(file.write_task(At::End, Bytes::from_static(b"x")).err(), Some(Errno::ReadOnly));
         let next = Handle::root(&turn(&store).await);
         assert_eq!(text(&next, "f").await.as_deref(), Ok(&b"admitted"[..]));
+    }
+
+    /// The read-ahead has the file open while it fetches, and is cancelled when it is dropped, as with its stream.
+    #[tokio::test]
+    async fn a_read_ahead_that_is_dropped_stops() {
+        let (mut store, counts) = counting();
+        let first = turn(&store).await;
+        put(&Handle::root(&first), "f", &vec![1; 12 * ops::BLOCK as usize]).await;
+        commit(&first).await;
+        store.cache = Arc::default();
+        let file = Handle::root(&turn(&store).await).open("f", read()).await.unwrap();
+        let until = async |what: &str, done: &dyn Fn() -> bool| {
+            let wait = async {
+                while !done() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(5), wait).await.expect(what);
+        };
+
+        counts.delay.store(60_000, SeqCst);
+        let mut ahead = Ahead::default();
+        ahead.landed(&file, 0, ops::BLOCK);
+        ahead.landed(&file, ops::BLOCK, ops::BLOCK); // a read that carries on: the four blocks after are fetched
+        until("under way", &|| counts.flight.load(SeqCst) == 4 && Arc::strong_count(&file.pin) == 2).await;
+        drop(ahead);
+        until("cancelled", &|| Arc::strong_count(&file.pin) == 1).await;
     }
 
     /// A read, or the read-ahead, of four blocks that the store is slow to give: the guest's write and the commit are

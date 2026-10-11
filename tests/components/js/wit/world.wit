@@ -1,8 +1,8 @@
 package tric:js-fixture;
 
 // What tric grants an app, and no more. The WASI packages are wasip3's, and wasi:keyvalue is in
-// ../../../../wit/keyvalue: build.sh copies both into wit/deps. The WASI 0.2 interfaces that componentize-qjs's
-// runtime itself imports are not listed here.
+// ../../../../wit/keyvalue: build.sh copies both into wit/deps. The WASI interfaces that componentize-qjs's runtime
+// itself imports are not listed here.
 world app {
   import wasi:http/types@0.3.0;
   import wasi:http/client@0.3.0;

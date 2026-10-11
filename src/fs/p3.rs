@@ -1,6 +1,6 @@
-//! `wasi:filesystem@0.3` over [`Handle`]s: the same descriptors as [`super::p2`], with the streams of the component
-//! model's own async, which carry a read, a write or a listing, and a future that tells how it ended. The preopen is
-//! the one directory `/`, and only for a request that addresses a name; any other has none.
+//! `wasi:filesystem@0.3` over [`Handle`]s, with the streams of the component model's own async, which carry a read, a
+//! write or a listing, and a future that tells how it ended. The preopen is the one directory `/`, and only for a
+//! request that addresses a name; any other has none.
 //!
 //! The stream of a read or a listing is a producer, and the stream of a write is a consumer, which the guest's runtime
 //! polls. A producer reads when it is polled and the guest has room, and drops the read it is waiting for if the guest
@@ -58,8 +58,56 @@ pub fn add_to_linker(linker: &mut Linker<Host>) -> wasmtime::Result<()> {
     preopens::add_to_linker::<Host, HasSelf<Host>>(linker, |h| h)
 }
 
-convert!(ErrorCode, DescriptorType, DescriptorStat, instant);
+impl From<Errno> for ErrorCode {
+    fn from(e: Errno) -> Self {
+        match e {
+            Errno::BadDescriptor => Self::BadDescriptor,
+            Errno::Busy => Self::Busy,
+            Errno::Exist => Self::Exist,
+            Errno::FileTooLarge => Self::FileTooLarge,
+            Errno::Invalid => Self::Invalid,
+            Errno::Io => Self::Io,
+            Errno::IsDirectory => Self::IsDirectory,
+            Errno::Loop => Self::Loop,
+            Errno::NameTooLong => Self::NameTooLong,
+            Errno::NoEntry => Self::NoEntry,
+            Errno::InsufficientMemory => Self::InsufficientMemory,
+            Errno::InsufficientSpace => Self::InsufficientSpace,
+            Errno::NotDirectory => Self::NotDirectory,
+            Errno::NotEmpty => Self::NotEmpty,
+            Errno::Overflow => Self::Overflow,
+            Errno::Unsupported => Self::Unsupported,
+            Errno::NotPermitted => Self::NotPermitted,
+            Errno::ReadOnly => Self::ReadOnly,
+            Errno::TooManyLinks => Self::TooManyLinks,
+        }
+    }
+}
 
+impl From<Kind> for DescriptorType {
+    fn from(k: Kind) -> Self {
+        match k {
+            Kind::Dir => Self::Directory,
+            Kind::File => Self::RegularFile,
+            Kind::Link => Self::SymbolicLink,
+        }
+    }
+}
+
+impl From<Stat> for DescriptorStat {
+    fn from(s: Stat) -> Self {
+        Self {
+            type_: s.kind.into(),
+            link_count: s.links,
+            size: s.size,
+            data_access_timestamp: Some(instant(s.atime)),
+            data_modification_timestamp: Some(instant(s.mtime)),
+            status_change_timestamp: Some(instant(s.ctime)),
+        }
+    }
+}
+
+/// The instant `nanos` nanoseconds after the epoch.
 fn instant(nanos: u64) -> Instant {
     Instant { seconds: (nanos / 1_000_000_000) as i64, nanoseconds: (nanos % 1_000_000_000) as u32 }
 }
@@ -713,6 +761,18 @@ mod tests {
         let file = put(&Handle::root(&first), "f", b"0123456789").await;
         commit(&first).await;
         assert_eq!(drain(&file, 2).await, (b"23456789".to_vec(), Ok(())));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_on_a_file_the_commit_left_out_reads_it() {
+        let first = turn(&Store::memory()).await;
+        let root = Handle::root(&first);
+        let big = pattern(300_000);
+        let file = put(&root, "f", &big).await;
+        root.unlink_at("f").await.unwrap();
+        commit(&first).await;
+        assert!(first.fs.kept(file.ino()).is_some());
+        assert_eq!(drain(&file, 0).await, (big, Ok(())));
     }
 
     #[tokio::test(flavor = "multi_thread")]
