@@ -1,6 +1,7 @@
-# Publishes the CLI to crates.io from a tag like v0.1.0, whose version must be Cargo.toml's, through crates.io's trusted
-# publishing: GitHub's OIDC token buys a token that lasts the job, so no token is stored. It works once the crate has a
-# trusted publisher for this repository and this workflow, which needs a first publish by hand.
+# Publishes the workspace's crates to crates.io, the tree and then the CLI, from a tag like v0.1.0, whose version must
+# be Cargo.toml's, through crates.io's trusted publishing: GitHub's OIDC token buys a token that lasts the job, so no
+# token is stored. It works once each crate has a trusted publisher for this repository and this workflow, which needs
+# a first publish by hand.
 name: publish
 on:
   push: { tags: ["v*"] }
@@ -17,5 +18,5 @@ jobs:
       - run: docker compose build dev
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
-      - run: docker compose run --rm -T -e CARGO_REGISTRY_TOKEN dev cargo publish --locked
+      - run: docker compose run --rm -T -e CARGO_REGISTRY_TOKEN dev cargo publish --workspace --locked
         env: { CARGO_REGISTRY_TOKEN: "${{ steps.auth.outputs.token }}" }
