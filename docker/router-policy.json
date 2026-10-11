@@ -25,8 +25,14 @@
       "Action": ["s3:ListBucket"],
       "Resource": ["arn:aws:s3:::tric"],
       "Condition": {
-        "StringLike": { "s3:prefix": ["apps/", "apps/*/names/*", "apps/*/values/*", "ws/channels/*"] }
+        "StringLike": { "s3:prefix": ["apps/", "apps/*/values/*", "ws/channels/*"] }
       }
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucketVersions"],
+      "Resource": ["arn:aws:s3:::tric"],
+      "Condition": { "StringLike": { "s3:prefix": ["apps/*/names/*"] } }
     }
   ]
 }

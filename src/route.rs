@@ -11,7 +11,7 @@ use crate::outbound;
 use crate::outbox::{self, Delivered};
 use crate::retry::Waiting;
 use crate::store::{self, Store};
-use crate::sweep;
+use crate::sweep::{self, Every};
 use crate::tric::{self, CREDENTIALS, Request, Response, TENANT, app_at, forward, forwarded, label, status};
 use bytes::Bytes;
 use http::header::{FORWARDED, HOST};
@@ -44,6 +44,8 @@ pub(crate) struct Route {
     origin: Option<String>,
     /// On Lambda, where a delivery that fails waits to be tried again.
     pub(crate) retries: Option<Scheduler>,
+    /// Locally, where the router ticks cron itself, how often each app is swept.
+    every: Every,
     pub(crate) store: Store,
     pub(crate) aws: Aws,
     known: Cache<bool>,
@@ -75,7 +77,7 @@ async fn cached<V: Clone>(
 
 /// Routes requests for `<app>.<domain>` on `listen` to serve, with credentials for `bucket` minted as `role`. serve is
 /// a Lambda function, by its ARN, and then `retries` is where deliveries wait, or else at `host:port`, and then the
-/// router takes invocations on `outbox`.
+/// router takes invocations on `outbox`, and ticks cron, sweeping each app `every` so often.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     listen: SocketAddr,
@@ -86,6 +88,7 @@ pub async fn run(
     role: Option<String>,
     origin: Option<String>,
     retries: Option<Scheduler>,
+    every: Every,
 ) -> Result<()> {
     ensure!(
         serve.starts_with("arn:") == retries.is_some(),
@@ -94,8 +97,8 @@ pub async fn run(
     let s3 = store::s3(&bucket, None)?;
     let aws = Aws::new(&s3)?;
     let (known, creds) = (Mutex::default(), Mutex::default());
-    let route =
-        Arc::new(Route { domain, bucket, serve, role, origin, retries, store: Store::s3(s3), aws, known, creds });
+    let store = Store::s3(s3);
+    let route = Arc::new(Route { domain, bucket, serve, role, origin, retries, every, store, aws, known, creds });
     let clients = TcpListener::bind(listen).await?;
     // Locally, events have a listener of their own, which is up before the router says it is.
     let events = match route.serve.starts_with("arn:") {
@@ -216,7 +219,7 @@ impl Route {
         Ok(Some(self.send(app, creds, req).await))
     }
 
-    /// Fires the cron jobs, of every app, that match the minute `t`, and sweeps the apps whose day it is.
+    /// Fires the cron jobs, of every app, that match the minute `t`, and sweeps the apps whose time it is.
     async fn cron(self: Arc<Self>, t: u64) {
         let apps = match self.store.list(&Path::from("apps")).await {
             Ok(list) => list.common_prefixes,
@@ -227,7 +230,7 @@ impl Route {
             else {
                 continue;
             };
-            if Cron::parse(&sweep::schedule(app)).is_ok_and(|c| c.matches(t)) {
+            if Cron::parse(&sweep::schedule(app, self.every)).is_ok_and(|c| c.matches(t)) {
                 tracing::info!(app, "cron: sweep due");
                 let (route, app) = (self.clone(), app.to_owned());
                 tokio::spawn(async move { route.sweep(&app).await });
@@ -380,12 +383,14 @@ pub(crate) async fn body<T: DeserializeOwned>(req: hyper::Request<Incoming>) -> 
 }
 
 /// The session policy of `app`'s credentials: its names, values and native code to read and write, the rest of its
-/// objects to read, and to list its names and its values, and nothing else of the bucket: a list names the keys under
-/// its prefix, which here are `app`'s own. The sweep lists, and that is all it lists for.
+/// objects to read, to list its values, and the versions of its names, and nothing else of the bucket: a list names
+/// the keys under its prefix, which here are `app`'s own. The sweep lists, and that is all it lists for: the names it
+/// sweeps, from `values/`, and the versions of each one's head, from `names/`, which nothing lists otherwise. Nor can a
+/// version be deleted: a delete is a delete marker, and the lifecycle alone expires what is noncurrent.
 fn policy(bucket: &str, app: &str) -> String {
     let arn = |p: &str| format!("arn:aws:s3:::{bucket}/{p}");
     let rw = ["apps/{app}/names/*", "apps/{app}/values/*", "native/{app}/*"].map(|p| arn(&p.replace("{app}", app)));
-    let listed = ["apps/{app}/names/*", "apps/{app}/values/*"].map(|p| p.replace("{app}", app));
+    let (values, names) = (format!("apps/{app}/values/*"), format!("apps/{app}/names/*"));
     serde_json::json!({
         "Version": "2012-10-17",
         "Statement": [
@@ -403,7 +408,13 @@ fn policy(bucket: &str, app: &str) -> String {
                 "Effect": "Allow",
                 "Action": ["s3:ListBucket"],
                 "Resource": [format!("arn:aws:s3:::{bucket}")],
-                "Condition": { "StringLike": { "s3:prefix": listed } },
+                "Condition": { "StringLike": { "s3:prefix": [values] } },
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["s3:ListBucketVersions"],
+                "Resource": [format!("arn:aws:s3:::{bucket}")],
+                "Condition": { "StringLike": { "s3:prefix": [names] } },
             },
         ],
     })
@@ -437,25 +448,27 @@ mod tests {
     }
 
     #[test]
-    fn credentials_list_the_apps_own_names_and_values_and_nothing_else() {
+    fn credentials_list_the_apps_own_values_and_the_versions_of_its_names_and_nothing_else() {
         let policy: Value = serde_json::from_str(&policy("b", "shop")).unwrap();
         let statements = policy["Statement"].as_array().unwrap();
         let lists = |s: &&Value| s["Action"].as_array().unwrap().iter().any(|a| a.as_str().unwrap().contains("List"));
         let listing: Vec<_> = statements.iter().filter(lists).collect();
-        // Exactly one statement lists: on the bucket, for those two prefixes only.
-        assert_eq!(listing.len(), 1);
-        assert_eq!(listing[0]["Effect"], "Allow");
-        assert_eq!(listing[0]["Action"], serde_json::json!(["s3:ListBucket"]));
-        assert_eq!(listing[0]["Resource"], serde_json::json!(["arn:aws:s3:::b"]));
-        assert_eq!(
-            listing[0]["Condition"],
-            serde_json::json!({ "StringLike": { "s3:prefix": ["apps/shop/names/*", "apps/shop/values/*"] } })
-        );
-        // The statements that read and write are as they were: objects of the app, and no list.
+        // Exactly two statements list, each one action on the bucket, for one prefix only: the objects of its values,
+        // and the versions of its names.
+        let want = [("s3:ListBucket", "apps/shop/values/*"), ("s3:ListBucketVersions", "apps/shop/names/*")];
+        assert_eq!(listing.len(), want.len());
+        for (statement, (action, prefix)) in listing.iter().zip(want) {
+            assert_eq!(statement["Effect"], "Allow");
+            assert_eq!(statement["Action"], serde_json::json!([action]));
+            assert_eq!(statement["Resource"], serde_json::json!(["arn:aws:s3:::b"]));
+            assert_eq!(statement["Condition"], serde_json::json!({ "StringLike": { "s3:prefix": [prefix] } }));
+        }
+        // The statements that read and write are as they were: objects of the app, no list, and no version deleted.
         for s in statements.iter().filter(|s| !lists(s)) {
             assert!(s["Condition"].is_null());
             let resources = s["Resource"].as_array().unwrap();
             assert!(resources.iter().all(|r| r.as_str().unwrap().starts_with("arn:aws:s3:::b/")));
         }
+        assert!(!policy.to_string().contains("DeleteObjectVersion"));
     }
 }

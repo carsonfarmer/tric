@@ -207,6 +207,20 @@ impl Store {
         Ok(Some((got.bytes().await?, version)))
     }
 
+    /// The object at `path` as it was at `version`, if the bucket keeps that version still; it must be `max` bytes or
+    /// less. Only a 404 says that the version is gone: a 403 is an error here, so that a caller refused the read does
+    /// not take the version for one that is gone.
+    pub async fn version(&self, path: &Path, version: &str, max: u64) -> Result<Option<Bytes>> {
+        let got =
+            match self.inner.get_opts(path, GetOptions { version: Some(version.into()), ..Default::default() }).await {
+                Ok(got) => got,
+                Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                Err(e) => return Err(e.into()),
+            };
+        ensure!(got.meta.size <= max, "{path} at {version} is over {max} bytes");
+        Ok(Some(got.bytes().await?))
+    }
+
     pub async fn json<T: DeserializeOwned>(&self, path: &Path, max: u64) -> Result<Option<(T, UpdateVersion)>> {
         let Some((bytes, version)) = self.get(path, None, max).await? else { return Ok(None) };
         Ok(Some((serde_json::from_slice(&bytes).with_context(|| format!("{path}"))?, version)))

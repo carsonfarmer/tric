@@ -5,7 +5,7 @@ use crate::cron::Cron;
 use crate::engine::Engine;
 use crate::manifest;
 use crate::store::{self, Store};
-use crate::sweep;
+use crate::sweep::{self, Every};
 use crate::tric::label;
 use bytes::Bytes;
 use http::header::CONTENT_TYPE;
@@ -38,13 +38,15 @@ pub struct Scheduler {
     pub role: String,
 }
 
-/// Deploys the app at `path` to `bucket`, with `env` as its environment and `allow` added to its allowed hosts.
+/// Deploys the app at `path` to `bucket`, with `env` as its environment and `allow` added to its allowed hosts, and its
+/// sweep `every` so often.
 pub async fn run(
     path: &Path,
     allow: &[String],
     env: Vec<(String, String)>,
     bucket: &str,
     scheduler: Option<Scheduler>,
+    every: Every,
 ) -> Result<()> {
     let app = manifest::read(path, allow).await?;
     ensure!(label(&app.name), "the app's name, {:?}, is not 2 to 63 of a-z, 0-9 and - (a DNS label)", app.name);
@@ -62,18 +64,18 @@ pub async fn run(
     };
     store.put(&store::app(&app.name, &["current"]), serde_json::to_vec(&release)?.into(), PutMode::Overwrite).await?;
     if let Some(scheduler) = scheduler {
-        schedule(&aws, &app.name, &release.cron, &scheduler).await?;
+        schedule(&aws, &app.name, &release.cron, &scheduler, every).await?;
     }
     println!("{} {sha}", app.name);
     Ok(())
 }
 
-/// Makes the app's schedules those of `cron` and its sweep, each an event: `{"app", "path"}` for a cron job and
-/// `{"app", "sweep": true}` for the sweep. A schedule is named for its app and for all it is, so one that changes is
-/// another: made before the old one is deleted.
-async fn schedule(aws: &Aws, app: &str, cron: &BTreeMap<String, String>, s: &Scheduler) -> Result<()> {
+/// Makes the app's schedules those of `cron` and its sweep `every` so often, each an event: `{"app", "path"}` for a
+/// cron job and `{"app", "sweep": true}` for the sweep. A schedule is named for its app and for all it is, so one that
+/// changes, as the sweep does when the interval does, is another: made before the old one is deleted.
+async fn schedule(aws: &Aws, app: &str, cron: &BTreeMap<String, String>, s: &Scheduler, every: Every) -> Result<()> {
     let prefix = &store::hash(app.as_bytes())[..24];
-    let want = wanted(app, cron, s)?;
+    let want = wanted(app, cron, s, every)?;
     let path = format!("/schedules?ScheduleGroup={}&NamePrefix={prefix}-&MaxResults=100", query(&s.group));
     let page: Value = serde_json::from_slice(&scheduler(aws, Method::GET, &path, vec![], StatusCode::OK).await?)?;
     ensure!(page["NextToken"].is_null(), "{app} has over 100 schedules, after failed deploys: delete them by hand");
@@ -91,12 +93,17 @@ async fn schedule(aws: &Aws, app: &str, cron: &BTreeMap<String, String>, s: &Sch
 }
 
 /// The schedules the app is to have, by name, with the body that makes each: one for each of its cron jobs, and its
-/// sweep, which is there whatever its cron is. A name is the app's hash, which the listing of its schedules goes by,
-/// and the body's, so no schedule of another app is one of this.
-fn wanted(app: &str, cron: &BTreeMap<String, String>, s: &Scheduler) -> Result<BTreeMap<String, Vec<u8>>> {
+/// sweep `every` so often, which is there whatever its cron is. A name is the app's hash, which the listing of its
+/// schedules goes by, and the body's, so no schedule of another app is one of this.
+fn wanted(
+    app: &str,
+    cron: &BTreeMap<String, String>,
+    s: &Scheduler,
+    every: Every,
+) -> Result<BTreeMap<String, Vec<u8>>> {
     let prefix = &store::hash(app.as_bytes())[..24];
     let jobs = cron.iter().map(|(expr, path)| (expr.clone(), json!({ "app": app, "path": path })));
-    let sweep = (sweep::schedule(app), json!({ "app": app, "sweep": true }));
+    let sweep = (sweep::schedule(app, every), json!({ "app": app, "sweep": true }));
     let mut want = BTreeMap::new();
     for (expr, input) in jobs.chain([sweep]) {
         let body = serde_json::to_vec(&json!({
@@ -133,6 +140,8 @@ pub(crate) async fn scheduler(aws: &Aws, method: Method, path: &str, body: Vec<u
 mod tests {
     use super::*;
 
+    const DAILY: Every = Every::Days(1);
+
     fn scheduler() -> Scheduler {
         Scheduler {
             group: "apps".into(),
@@ -157,11 +166,11 @@ mod tests {
 
     #[test]
     fn an_app_with_no_cron_has_its_sweep() {
-        let want = wanted("shop", &cron(&[]), &scheduler()).unwrap();
+        let want = wanted("shop", &cron(&[]), &scheduler(), DAILY).unwrap();
         assert_eq!(inputs(&want), [json!({ "app": "shop", "sweep": true })]);
         let body: Value = serde_json::from_slice(want.values().next().unwrap()).unwrap();
         // Once a day, at a minute that is the app's, as the expression the router runs locally says.
-        let at = Cron::parse(&sweep::schedule("shop")).unwrap().eventbridge();
+        let at = Cron::parse(&sweep::schedule("shop", DAILY)).unwrap().eventbridge();
         assert_eq!(body["ScheduleExpression"], at);
         assert_eq!(body["Target"]["Arn"], scheduler().target);
         assert_eq!(body["Target"]["RoleArn"], scheduler().role);
@@ -172,7 +181,7 @@ mod tests {
     #[test]
     fn the_sweep_is_made_with_the_cron_jobs() {
         let jobs = cron(&[("0 8 * * *", "/@digest/run"), ("*/5 * * * *", "/tick")]);
-        let want = wanted("shop", &jobs, &scheduler()).unwrap();
+        let want = wanted("shop", &jobs, &scheduler(), DAILY).unwrap();
         assert_eq!(
             inputs(&want),
             [
@@ -189,10 +198,10 @@ mod tests {
     #[test]
     fn the_sweep_is_the_same_schedule_each_deploy() {
         let jobs = cron(&[("0 8 * * *", "/run")]);
-        let (first, again) = (wanted("shop", &jobs, &scheduler()), wanted("shop", &jobs, &scheduler()));
+        let (first, again) = (wanted("shop", &jobs, &scheduler(), DAILY), wanted("shop", &jobs, &scheduler(), DAILY));
         assert_eq!(first.unwrap(), again.unwrap());
         let have: BTreeSet<&str> = BTreeSet::new();
-        let want = wanted("shop", &jobs, &scheduler()).unwrap();
+        let want = wanted("shop", &jobs, &scheduler(), DAILY).unwrap();
         let (make, delete) = changes(&have, &want);
         assert_eq!((make.len(), delete.len()), (2, 0));
         let have: BTreeSet<&str> = want.keys().map(String::as_str).collect();
@@ -202,8 +211,9 @@ mod tests {
 
     #[test]
     fn a_cron_job_removed_is_deleted_and_the_sweep_stays() {
-        let before = wanted("shop", &cron(&[("0 8 * * *", "/run"), ("0 9 * * *", "/more")]), &scheduler()).unwrap();
-        let after = wanted("shop", &cron(&[("0 9 * * *", "/more")]), &scheduler()).unwrap();
+        let before =
+            wanted("shop", &cron(&[("0 8 * * *", "/run"), ("0 9 * * *", "/more")]), &scheduler(), DAILY).unwrap();
+        let after = wanted("shop", &cron(&[("0 9 * * *", "/more")]), &scheduler(), DAILY).unwrap();
         let have: BTreeSet<&str> = before.keys().map(String::as_str).collect();
         let (make, delete) = changes(&have, &after);
         assert!(make.is_empty());
@@ -214,8 +224,30 @@ mod tests {
     }
 
     #[test]
+    fn a_new_interval_is_a_new_sweep_made_before_the_old_is_deleted_and_the_cron_jobs_stay() {
+        let jobs = cron(&[("0 8 * * *", "/run")]);
+        let before = wanted("shop", &jobs, &scheduler(), DAILY).unwrap();
+        let after = wanted("shop", &jobs, &scheduler(), Every::Hours(6)).unwrap();
+        let have: BTreeSet<&str> = before.keys().map(String::as_str).collect();
+        let (make, delete) = changes(&have, &after);
+        assert_eq!((make.len(), delete.len()), (1, 1));
+        let made: Value = serde_json::from_slice(make[0].1).unwrap();
+        let gone: Value = serde_json::from_slice(&before[delete[0]]).unwrap();
+        for body in [&made, &gone] {
+            assert_eq!(body["Target"]["Input"], json!({ "app": "shop", "sweep": true }).to_string());
+        }
+        let six = Cron::parse(&sweep::schedule("shop", Every::Hours(6))).unwrap().eventbridge();
+        assert_eq!(made["ScheduleExpression"], six);
+        assert_ne!(made["ScheduleExpression"], gone["ScheduleExpression"]);
+        // And back again is as it was.
+        let have: BTreeSet<&str> = after.keys().map(String::as_str).collect();
+        let (make, _) = changes(&have, &before);
+        assert_eq!(make.iter().map(|(name, _)| *name).collect::<Vec<_>>(), [delete[0]]);
+    }
+
+    #[test]
     fn a_removed_app_has_no_schedule_left_not_even_its_sweep() {
-        let before = wanted("shop", &cron(&[("0 8 * * *", "/run")]), &scheduler()).unwrap();
+        let before = wanted("shop", &cron(&[("0 8 * * *", "/run")]), &scheduler(), DAILY).unwrap();
         let have: BTreeSet<&str> = before.keys().map(String::as_str).collect();
         let nothing = BTreeMap::new();
         let (make, mut delete) = changes(&have, &nothing);
@@ -227,7 +259,8 @@ mod tests {
 
     #[test]
     fn apps_share_no_schedule() {
-        let (shop, blog) = (wanted("shop", &cron(&[]), &scheduler()), wanted("blog", &cron(&[]), &scheduler()));
+        let (shop, blog) =
+            (wanted("shop", &cron(&[]), &scheduler(), DAILY), wanted("blog", &cron(&[]), &scheduler(), DAILY));
         let (shop, blog) = (shop.unwrap(), blog.unwrap());
         assert!(shop.keys().all(|name| !blog.contains_key(name)));
         let prefix = format!("{}-", &store::hash(b"blog")[..24]);

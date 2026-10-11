@@ -1,24 +1,39 @@
-//! The sweep: what a turn could not clean up. A tree's objects leak when the host of a turn died after it uploaded
-//! them, and when a commit's outcome was never known. Once a day for each app, serve lists the app's names, and for
-//! each one walks its tree from its head, lists its objects, and deletes those that the tree does not name and that
-//! are too old for any turn to be about to name them. A delete is a delete marker: readers go on by version, and the
-//! lifecycle expires what is noncurrent. `docs/decisions.md` has the argument that this is safe, and its limits.
+//! The sweep, which is the collector: a commit deletes nothing, so what a tree no longer names, and what a turn made
+//! and never committed, is left in the bucket for it. Every so often for each app, a day unless the operator sets
+//! another interval, serve lists the app's names, and for each one lists the versions of its head that the bucket
+//! keeps, reads them, marks what their trees name, lists the name's objects, and deletes those that are not marked and
+//! are too old for any turn to be about to name them. A head that is replaced, or deleted, is a version the lifecycle
+//! keeps for its noncurrent days: that is a name's history, and the objects its trees name are kept as long, so that a
+//! head can be put back as it was. A delete is a delete marker: readers go on by version, and the lifecycle expires
+//! what is noncurrent.
+//!
+//! It is safe in this order: the time that sets the age, then a name's versions, then its objects. A head put after the
+//! versions were listed is a commit's, which writes over the head that was current then, or over one put since, and so
+//! names what that head named and what turns made that ended after the listing, which are younger than the age. So the
+//! versions listed are the roots. The latest of them cannot expire within a run, so one that reads as gone is an error;
+//! one that is noncurrent and has expired since it was listed is no root, as no commit writes over a version that is
+//! not current. Putting a version back is no commit, and must keep clear of that: `docs/decisions.md` has what it must
+//! do, the rest of the argument, and its limits.
+use crate::aws::{Aws, Version, Versions};
 use crate::engine::TOTAL;
-use crate::name::{self, is_name};
+use crate::name::{self, Head, is_name};
 use crate::store::{self, Store};
 use crate::tree;
-use futures_util::TryStreamExt;
-use futures_util::future::{try_join, try_join_all};
+use bytes::Bytes;
+use futures_util::future::try_join_all;
+use futures_util::{StreamExt, TryStreamExt, stream};
 use object_store::{ObjectMeta, PutMode, path::Path};
 use percent_encoding::percent_decode_str;
 use std::collections::{BTreeSet, HashSet};
 use std::ops::Bound::{Excluded, Unbounded};
+use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{Instant, timeout_at};
-use wasmtime::{Result, bail};
+use wasmtime::{Result, bail, error::Context};
 
 /// How old an object must be to be deleted. An object that a head may yet name was made by a turn that is still under
-/// way, or by one that has landed since the sweep read the head: the assertions below tie this to how long one lasts.
+/// way, or by one that has landed since the sweep listed the versions: the assertions below tie this to how long one
+/// lasts.
 const GRACE: Duration = Duration::from_secs(3600);
 /// The longest an invocation can last, whatever its function is set to: Lambda's own limit.
 const LAMBDA_MAX: Duration = Duration::from_secs(900);
@@ -26,20 +41,28 @@ const LAMBDA_MAX: Duration = Duration::from_secs(900);
 const SKEW: Duration = Duration::from_secs(300);
 /// How long a run goes on, of serve's `TOTAL` and 30 seconds: what is left is for the cursor, the log and the response.
 pub const RUN: Duration = Duration::from_secs(240);
-/// The most nodes a name's walk reads. A walk reads `IN_FLIGHT` at once, some 600 in a second, so this is most of a
-/// run: more than that cannot be finished, and is not begun. A name has nothing like it unless it holds millions of
-/// values of a kilobyte or more in its nodes (`docs/decisions.md`).
+/// The most nodes a name's marks read, of all its versions' trees together, in which a node that several share is read
+/// once. A mark reads `IN_FLIGHT` at once, some 600 in a second, so this is most of a run: more than that cannot be
+/// finished, and is not begun. A name has nothing like it unless it holds millions of values of a kilobyte or more in
+/// its nodes (`docs/decisions.md`).
 const NODES_MAX: usize = 100_000;
+/// The most versions of a name's head, delete markers among them, that a run lists and reads. Their heads are read
+/// `IN_FLIGHT` at once, some 15 seconds of a run, and their trees marked one after another, each reading only what none
+/// before it did, which is what its commit changed. The versions kept are those of the last day or two, so a name has
+/// more only if it commits more often than every 9 to 17 seconds, all day, and such a name is not swept
+/// (`docs/decisions.md`).
+const VERSIONS_MAX: usize = 10_000;
 /// The key, in `values/`, of where a run that stopped early got to. A name starts with a letter or a digit.
 const CURSOR: &str = ".sweep";
 /// The keys in a page of a listing: S3 gives 1,000 at most, whatever `max-keys` asks for.
 const PAGE: usize = 1000;
 
 // Every object a head names was made in a turn, which lasts `TOTAL` at most (and Lambda's `LAMBDA_MAX` whatever
-// serve's own limits are) and commits at its end, or is in the tree of the head the turn began from. The sweep reads a
-// head after it takes the time that sets the age to delete at, so an object a later head names is younger than that
-// time less `TOTAL` or `LAMBDA_MAX`, and `SKEW` for the clocks, and `GRACE` is more than that. Were a limit raised past
-// this, the sweep would delete what a commit is about to name, so the build fails instead.
+// serve's own limits are) and commits at its end, or is in the tree of the head the turn's commit wrote over. The sweep
+// lists a name's versions after it takes the time that sets the age to delete at, so an object that a head put since
+// names, and that no version listed names, is younger than that time less `TOTAL` or `LAMBDA_MAX`, and `SKEW` for the
+// clocks, and `GRACE` is more than that. Were a limit raised past this, the sweep would delete what a commit is about
+// to name, so the build fails instead.
 const _: () = assert!(GRACE.as_secs() >= 3600, "the grace is an hour at least");
 const _: () = assert!(TOTAL.as_secs() + SKEW.as_secs() < GRACE.as_secs(), "a guest can outlast the grace");
 const _: () = assert!(LAMBDA_MAX.as_secs() + SKEW.as_secs() < GRACE.as_secs(), "an invocation can outlast the grace");
@@ -61,28 +84,103 @@ pub struct Report {
     pub done: bool,
 }
 
-/// When the app's sweep runs, as a cron expression in UTC: a minute of the day taken from the SHA-256 of its name, so
-/// that apps are spread over the day, with no state and no flexible window.
-pub fn schedule(app: &str) -> String {
-    let minute = u64::from_str_radix(&store::hash(app.as_bytes())[..16], 16).unwrap_or_default() % 1440;
-    format!("{} {} * * *", minute % 60, minute / 60)
+/// The versions of heads that the bucket keeps. S3's are listed with ListObjectVersions, which object_store has no
+/// call for, and read by their ids; a test's are its own, as the memory store keeps none.
+#[async_trait::async_trait]
+pub trait History: Sync {
+    /// A page of the versions and the delete markers of the objects whose keys begin with `prefix`, after the key and
+    /// version id `from` if given. Pages are in the order of their keys, and the keys in a page are not in order.
+    async fn versions(&self, prefix: &Path, from: Option<(String, String)>) -> Result<Versions>;
+
+    /// The object at `path` as it was at `version`, if the bucket keeps that version still; it must be `max` bytes or
+    /// less. Only an answer that it is not there is `None`: anything else that keeps it from being read is an error.
+    async fn read(&self, path: &Path, version: &str, max: u64) -> Result<Option<Bytes>>;
 }
 
-/// Sweeps `app` as far as `until`, deleting what is older than `GRACE` before `now` and is no name's: see the module.
-pub async fn run(store: &Store, app: &str, now: SystemTime, until: Instant) -> Result<Report> {
-    sweep(store, app, (now, until), NODES_MAX).await
+/// A bucket on S3, its versions listed with `aws` and read with `store`, which have the same credentials.
+pub struct Bucket {
+    pub aws: Aws,
+    pub name: String,
+    pub store: Store,
 }
 
-async fn sweep(store: &Store, app: &str, (now, until): (SystemTime, Instant), nodes: usize) -> Result<Report> {
+#[async_trait::async_trait]
+impl History for Bucket {
+    async fn versions(&self, prefix: &Path, from: Option<(String, String)>) -> Result<Versions> {
+        self.aws.versions(&self.name, prefix.as_ref(), from).await
+    }
+
+    async fn read(&self, path: &Path, version: &str, max: u64) -> Result<Option<Bytes>> {
+        self.store.version(path, version, max).await
+    }
+}
+
+/// How often each app is swept: every so many hours, which divide a day, or every so many days. The operator sets it
+/// with `TRIC_SWEEP_EVERY`, as `6h` or `2d`, and a day is the default.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Every {
+    Hours(u32),
+    Days(u32),
+}
+
+impl FromStr for Every {
+    type Err = String;
+
+    /// `<n>h`, for n of 1, 2, 3, 4, 6, 8, 12 or 24, or `<n>d`, for n of 1 to 31; `24h` is `1d`.
+    fn from_str(s: &str) -> Result<Self, String> {
+        let number = |n: &str| n.bytes().all(|b| b.is_ascii_digit()).then(|| n.parse::<u32>().ok()).flatten();
+        let every = match (s.strip_suffix('h').and_then(number), s.strip_suffix('d').and_then(number)) {
+            (Some(24), _) => Some(Every::Days(1)),
+            (Some(h), _) if h > 0 && 24 % h == 0 => Some(Every::Hours(h)),
+            (_, Some(d)) if (1..=31).contains(&d) => Some(Every::Days(d)),
+            _ => None,
+        };
+        every.ok_or_else(|| {
+            format!("{s:?} is not hours that divide a day (1h, 2h, 3h, 4h, 6h, 8h, 12h or 24h) nor days from 1d to 31d")
+        })
+    }
+}
+
+/// When the app's sweep runs, every `every`, as a cron expression in UTC: at a minute of its own within the interval,
+/// taken from the SHA-256 of its name, so that apps are spread over it, with no state and no flexible window. Every so
+/// many hours is at that minute of each of them from the first; every so many days is at that minute of the day, on the
+/// days of the month that are one more than a multiple of them, so a month's last interval may be shorter.
+pub fn schedule(app: &str, every: Every) -> String {
+    let hash = u64::from_str_radix(&store::hash(app.as_bytes())[..16], 16).unwrap_or_default();
+    match every {
+        Every::Hours(hours) => {
+            let minute = hash % (u64::from(hours) * 60);
+            format!("{} {}-23/{hours} * * *", minute % 60, minute / 60)
+        }
+        Every::Days(days) => {
+            let minute = hash % 1440;
+            let days = if days == 1 { "*".to_owned() } else { format!("*/{days}") };
+            format!("{} {} {days} * *", minute % 60, minute / 60)
+        }
+    }
+}
+
+/// Sweeps `app` as far as `until`, deleting what is older than `GRACE` before `now` and is named by no version of a
+/// head that `history` keeps: see the module.
+pub async fn run(store: &Store, history: &dyn History, app: &str, now: SystemTime, until: Instant) -> Result<Report> {
+    sweep(store, history, app, (now, until), (NODES_MAX, VERSIONS_MAX)).await
+}
+
+async fn sweep(
+    store: &Store,
+    history: &dyn History,
+    app: &str,
+    (now, until): (SystemTime, Instant),
+    max: (usize, usize),
+) -> Result<Report> {
     let mut report = Report { done: true, ..Default::default() };
     // A store that keeps no versions deletes nothing, as a snapshot may still read it, and a clock before `GRACE` has
     // no object that old.
     let cutoff = now.checked_sub(GRACE).and_then(|t| t.duration_since(UNIX_EPOCH).ok()).filter(|_| store.versioned);
     let Some(cutoff) = cutoff.map(|t| t.as_millis() as u64) else { return Ok(report) };
-    // The heads are listed before any is read, and the age is set before they are listed: a name that has none yet has
-    // objects of turns that are not yet over, which are younger than the age. (The names are listed at the same time:
-    // a list of them is of the objects there are, and the heads decide which of those a tree names.)
-    let (heads, names) = try_join(heads(store, app), names(store, app)).await?;
+    // The age is set before anything is listed. The names are those with objects, which a name's versions decide
+    // among; a name with objects and no version yet has those of turns that are not over, which are younger.
+    let names = names(store, app).await?;
     let from = cursor(store, app).await;
     let todo = names.range::<str, _>((from.as_deref().map_or(Unbounded, Excluded), Unbounded));
     let mut last = None;
@@ -91,11 +189,11 @@ async fn sweep(store: &Store, app: &str, (now, until): (SystemTime, Instant), no
             report.done = false;
             break;
         }
-        let walked = timeout_at(until, survey(store, app, name, (&heads, cutoff), nodes)).await;
+        let walked = timeout_at(until, survey(store, history, app, name, cutoff, max)).await;
         let garbage = match walked {
-            Ok(Ok(Some(garbage))) => garbage,
-            Ok(Ok(None)) => {
-                tracing::warn!(app, name, nodes, "sweep: the name has more nodes than a run reads, so it is not swept");
+            Ok(Ok(Survey::Garbage(garbage))) => garbage,
+            Ok(Ok(Survey::Over(what))) => {
+                tracing::warn!(app, name, "sweep: the name has more {what} than a run reads, so it is not swept");
                 report.skipped += 1;
                 last = Some(name);
                 continue;
@@ -142,29 +240,79 @@ async fn sweep(store: &Store, app: &str, (now, until): (SystemTime, Instant), no
     Ok(report)
 }
 
-/// The objects of `name` that nothing names and that were made at `cutoff` (Unix milliseconds) or before, with their
-/// sizes, if its tree was read in full; `None` if it has more than `nodes`. An error if the head or any node cannot be
-/// read, or is not what it should be, and so there is no telling what is named.
+/// What a survey of a name finds: the objects to delete, with their sizes, or what the name has more of than a run
+/// reads, which is not read.
+#[derive(Debug)]
+enum Survey {
+    Garbage(Vec<(Path, u64)>),
+    Over(&'static str),
+}
+
+/// The objects of `name` that no version of its head names and that were made at `cutoff` (Unix milliseconds) or
+/// before, if its versions and their trees were read in full, which `max` bounds: at most so many nodes, and so many
+/// versions. An error if the versions cannot be listed, if one that is listed cannot be read for any reason but that it
+/// has expired, or if a tree cannot be read whole: then there is no telling what is named.
 async fn survey(
     store: &Store,
+    history: &dyn History,
     app: &str,
     name: &str,
-    (heads, cutoff): (&HashSet<String>, u64),
-    nodes: usize,
-) -> Result<Option<Vec<(Path, u64)>>> {
-    // A name with no head names no object. One that has a head is read from the store, and must be there: it was
-    // listed, and no head is ever deleted, so an answer that it is missing says only that it cannot be read.
-    let mut live = HashSet::new();
-    if heads.contains(name) {
-        let Some((head, _)) = name::read(store, &name::path(app, name)).await? else {
-            bail!("the head is listed, and is not there to be read")
+    cutoff: u64,
+    (nodes, versions): (usize, usize),
+) -> Result<Survey> {
+    let path = name::path(app, name);
+    let Some(kept) = listed(history, &path, versions).await? else { return Ok(Survey::Over("versions")) };
+    // A name whose head is not among the versions has none, as a head is never deleted but by a delete marker. One
+    // that is there all the same was missed by the listing, or was made since, and its tree is not to be deleted
+    // either way: the name waits for the next run.
+    if !kept.iter().any(|v| v.latest && !v.marker) && store.head(&path).await? {
+        bail!("the head is there, and is not among the versions listed")
+    }
+    let heads: Vec<Version> = kept.into_iter().filter(|v| !v.marker).collect();
+    let path = &path;
+    let read = |version: Version| async move {
+        let read = history.read(path, &version.id, name::HEAD_MAX as u64).await;
+        (version, read)
+    };
+    let mut reads = stream::iter(heads).map(read).buffer_unordered(tree::IN_FLIGHT);
+    // One set for every version, so that what their trees share is read once, and one bound for them all.
+    let (mut live, mut left) = (HashSet::new(), nodes);
+    while let Some((version, read)) = reads.next().await {
+        let head: Head = match read? {
+            Some(json) => serde_json::from_slice(&json).with_context(|| format!("{path} at {}", version.id))?,
+            None if version.latest => bail!("the head's version {} is listed, and is not there to be read", version.id),
+            // It expired after it was listed, and no commit writes over a version that is not current.
+            None => continue,
         };
-        match head.reachable(store, app, name, nodes).await? {
-            Some(ids) => live = ids,
-            None => return Ok(None),
+        let Some(read) = head.mark(store, app, name, &mut live, left).await? else { return Ok(Survey::Over("nodes")) };
+        left -= read;
+    }
+    Ok(Survey::Garbage(unnamed(store, app, name, (cutoff, &live)).await?))
+}
+
+/// The versions of the head at `path`, and its delete markers, as the bucket lists them now; `None` if there are more
+/// than `max`, which are not listed further. The listing is of the key as a prefix, which lists the keys that begin
+/// with it too, and those come after it: a page with one of them is the last that has any of the key's.
+async fn listed(history: &dyn History, path: &Path, max: usize) -> Result<Option<Vec<Version>>> {
+    let mut kept = vec![];
+    let mut from = None;
+    loop {
+        let page = history.versions(path, from).await?;
+        let mut past = false;
+        for version in page.versions {
+            match version.key == path.as_ref() {
+                true => kept.push(version),
+                false => past = true,
+            }
+        }
+        if kept.len() > max {
+            return Ok(None);
+        }
+        match page.next {
+            Some(next) if !past => from = Some(next),
+            _ => return Ok(Some(kept)),
         }
     }
-    Ok(Some(unnamed(store, app, name, (cutoff, &live)).await?))
 }
 
 /// The objects of `name` that are not in `live` and were made at `cutoff` or before, with their sizes. A name of a page
@@ -241,12 +389,6 @@ fn candidate(app: &str, name: &str, path: &Path) -> Option<u128> {
     (*path == tree::object(app, name, id)).then_some(number)
 }
 
-/// The names that have a head, as the engine could have made them.
-async fn heads(store: &Store, app: &str) -> Result<HashSet<String>> {
-    let listed = store.list(&store::app(app, &["names"])).await?;
-    Ok(listed.objects.iter().filter_map(|o| named(app, "names", &o.location)).collect())
-}
-
 /// The names that have objects, in order, as the engine could have made them.
 async fn names(store: &Store, app: &str) -> Result<BTreeSet<String>> {
     let listed = store.list(&store::app(app, &["values"])).await?;
@@ -296,12 +438,15 @@ async fn forget(store: &Store, app: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cron::Cron;
     use crate::tree::counting::{Counts, counting};
     use crate::tree::{Config, Root};
-    use bytes::Bytes;
+    use std::collections::BTreeMap;
     use std::io;
-    use std::sync::atomic::Ordering::SeqCst;
+    use std::ops::Bound::Included;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     use std::sync::{Arc, Mutex};
+    use wasmtime::{ensure, format_err};
 
     const ID: &str = "0123456789abcdef0123456789abcdef";
 
@@ -310,18 +455,139 @@ mod tests {
         Config { node: 1400, inline: 8, budget: 2048, entries: 1000, data: 100_000, blob: 100, ..tree::config() }
     }
 
-    /// A tree of `keys` values that are each an object, in `name`, with its head: the objects that are in `name` now.
-    async fn plant(store: &Store, name: &str, keys: usize) -> BTreeSet<Path> {
-        let mut tree = tree::open(store, "a", name, &Root::default(), tiny()).unwrap();
+    /// A key's versions, the newest first: an id, and the head, or nothing for a delete marker.
+    type Lineage = Vec<(String, Option<Bytes>)>;
+
+    /// The versions of heads that a test's bucket keeps, as S3 keeps them: a put of a head is a version, and a delete
+    /// a delete marker, each the latest when it is made, and kept until a test expires it. They are listed `page` at a
+    /// time, a page's delete markers first, as RustFS lists them. A version is read as slowly as a get of the store
+    /// is, and counted; a delete marker cannot be read (S3 answers 405), nor can what a test refuses.
+    struct Kept {
+        store: Store,
+        counts: Arc<Counts>,
+        /// The versions read.
+        reads: AtomicUsize,
+        /// The versions of each key.
+        keys: Mutex<BTreeMap<String, Lineage>>,
+        made: AtomicUsize,
+        page: usize,
+        /// The pages listed.
+        pages: AtomicUsize,
+        /// The versions that are listed, and are gone when they are read: they expired in between.
+        gone: Mutex<HashSet<String>>,
+        /// The versions that cannot be read, as when the read is refused.
+        refused: Mutex<HashSet<String>>,
+    }
+
+    impl Kept {
+        fn new(store: &Store, counts: Arc<Counts>) -> Self {
+            Self {
+                store: store.clone(),
+                counts,
+                reads: AtomicUsize::new(0),
+                keys: Mutex::default(),
+                made: AtomicUsize::new(0),
+                page: 3,
+                pages: AtomicUsize::new(0),
+                gone: Mutex::default(),
+                refused: Mutex::default(),
+            }
+        }
+
+        /// Puts `json` as the head of `name`, in the store and as its latest version, whose id it returns.
+        async fn put(&self, name: &str, json: Vec<u8>) -> String {
+            self.store.put(&name::path("a", name), json.clone().into(), PutMode::Overwrite).await.unwrap();
+            self.made(name, Some(json.into()))
+        }
+
+        /// Deletes the head of `name`, from the store and as a delete marker that is its latest version.
+        async fn delete(&self, name: &str) -> String {
+            self.store.delete(&name::path("a", name)).await.unwrap();
+            self.made(name, None)
+        }
+
+        fn made(&self, name: &str, json: Option<Bytes>) -> String {
+            let id = format!("v{:04}", self.made.fetch_add(1, SeqCst));
+            let mut keys = self.keys.lock().unwrap();
+            keys.entry(name::path("a", name).to_string()).or_default().insert(0, (id.clone(), json));
+            id
+        }
+
+        /// Expires the version `id`, as the lifecycle does one that is noncurrent.
+        fn expire(&self, id: &str) {
+            for versions in self.keys.lock().unwrap().values_mut() {
+                versions.retain(|(v, _)| v != id);
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl History for Kept {
+        async fn versions(&self, prefix: &Path, from: Option<(String, String)>) -> Result<Versions> {
+            self.pages.fetch_add(1, SeqCst);
+            let keys = self.keys.lock().unwrap();
+            let range = (Included(prefix.as_ref()), Unbounded);
+            let under = keys.range::<str, _>(range).take_while(|(key, _)| key.starts_with(prefix.as_ref()));
+            let all: Vec<Version> = under
+                .flat_map(|(key, versions)| {
+                    versions.iter().enumerate().map(|(i, (id, json))| Version {
+                        key: key.clone(),
+                        id: id.clone(),
+                        latest: i == 0,
+                        marker: json.is_none(),
+                    })
+                })
+                .collect();
+            let start =
+                from.map_or(0, |(key, id)| all.iter().position(|v| (&v.key, &v.id) == (&key, &id)).unwrap() + 1);
+            let mut versions: Vec<_> = all[start..].iter().take(self.page).cloned().collect();
+            let next = (all.len() > start + self.page).then(|| versions.last().map(|v| (v.key.clone(), v.id.clone())));
+            versions.sort_by_key(|v| !v.marker);
+            Ok(Versions { versions, next: next.flatten() })
+        }
+
+        async fn read(&self, path: &Path, version: &str, max: u64) -> Result<Option<Bytes>> {
+            self.reads.fetch_add(1, SeqCst);
+            let delay = self.counts.delay.load(SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            ensure!(!self.refused.lock().unwrap().contains(version), "403 Forbidden: {path} at {version}");
+            if self.gone.lock().unwrap().contains(version) {
+                return Ok(None);
+            }
+            let keys = self.keys.lock().unwrap();
+            let Some((_, json)) = keys.get(path.as_ref()).and_then(|v| v.iter().find(|(id, _)| id == version)) else {
+                return Ok(None);
+            };
+            let json =
+                json.clone().ok_or_else(|| format_err!("405 Method Not Allowed: {version} is a delete marker"))?;
+            ensure!(json.len() as u64 <= max, "{path} at {version} is over {max} bytes");
+            Ok(Some(json))
+        }
+    }
+
+    /// A store that keeps versions, with the versions of its heads.
+    fn kept() -> (Store, Kept) {
+        let (store, counts) = counting();
+        let kept = Kept::new(&store, counts);
+        (store, kept)
+    }
+
+    /// A tree of `keys` values that are each an object, in `name`, from the tree of `from` if given, with its head as
+    /// the name's latest version: the head's id, its tree, and the objects that are in `name` now.
+    async fn commit(kept: &Kept, name: &str, keys: usize, from: &Root) -> (String, Root, BTreeSet<Path>) {
+        let mut tree = tree::open(&kept.store, "a", name, from, tiny()).unwrap();
         let edits = (0..keys).map(|i| (format!("k/{i:03}"), Some(Bytes::from(vec![i as u8; 40])))).collect();
         tree.write(edits).await.unwrap();
         let root = tree.finish().await.unwrap();
-        head(store, name, serde_json::to_vec(&serde_json::json!({ "tree": root })).unwrap()).await;
-        held(store, name).await
+        let id = kept.put(name, serde_json::to_vec(&serde_json::json!({ "tree": root })).unwrap()).await;
+        (id, root, held(&kept.store, name).await)
     }
 
-    async fn head(store: &Store, name: &str, json: Vec<u8>) {
-        store.put(&name::path("a", name), json.into(), PutMode::Overwrite).await.unwrap();
+    /// A tree of `keys` values that are each an object, in `name`, with its head: the objects that are in `name` now.
+    async fn plant(kept: &Kept, name: &str, keys: usize) -> BTreeSet<Path> {
+        commit(kept, name, keys, &Root::default()).await.2
     }
 
     /// The objects of `name`, as `a` has them.
@@ -387,6 +653,10 @@ mod tests {
         fn text(&self) -> String {
             String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
         }
+
+        fn warned(&self) -> Vec<String> {
+            self.text().lines().filter(|line| line.contains("WARN")).map(str::to_owned).collect()
+        }
     }
 
     #[test]
@@ -425,7 +695,6 @@ mod tests {
         assert!(!is_name(CURSOR), "the cursor is no name's");
         for name in ["n", "a.b", "x~y", "Z:1", "a-b_c", "9", &"n".repeat(128)] {
             assert_eq!(named("a", "values", &at("values", name)).as_deref(), Some(name), "{name}");
-            assert_eq!(named("a", "names", &at("names", name)).as_deref(), Some(name), "{name}");
         }
         let long = "n".repeat(129);
         for name in [CURSOR, ".hidden", "_x", "-x", "~x", "a b", "a/b", "a\\b", "é", "a\u{0}b", &long] {
@@ -434,21 +703,70 @@ mod tests {
         let parse = |s: &str| Path::parse(s).unwrap();
         assert_eq!(named("a", "values", &parse("apps/a/values/x%7ey")), None, "an escape in the wrong case");
         assert_eq!(named("a", "values", &at("names", "n")), None, "a name of another kind");
-        assert_eq!(named("a", "names", &at("values", "n")), None, "a name of another kind");
         assert_eq!(named("a", "values", &store::app("b", &["values", "n"])), None, "another app's");
         assert_eq!(named("a", "values", &store::app("a", &["values", "n", "m"])), None, "deeper than a name");
         assert_eq!(named("a", "values", &store::app("a", &["values"])), None, "no name at all");
     }
 
     #[test]
-    fn schedules_spread_the_apps_over_the_day() {
-        assert_eq!(schedule("app"), schedule("app"));
-        let times: HashSet<_> = (0..500).map(|i| schedule(&format!("app{i}"))).collect();
+    fn an_interval_is_hours_that_divide_a_day_or_whole_days() {
+        let every = |s: &str| s.parse::<Every>();
+        for h in [1, 2, 3, 4, 6, 8, 12] {
+            assert_eq!(every(&format!("{h}h")), Ok(Every::Hours(h)));
+        }
+        for d in [1, 2, 7, 31] {
+            assert_eq!(every(&format!("{d}d")), Ok(Every::Days(d)));
+        }
+        assert_eq!(every("24h"), Ok(Every::Days(1)), "a day of hours is a day");
+        assert_eq!(every("06h"), Ok(Every::Hours(6)));
+        let bad =
+            ["0h", "5h", "7h", "9h", "48h", "0d", "32d", "1w", "h", "d", "", "1", "+6h", "-1d", "1.5d", "6H", " 1d"];
+        for s in bad {
+            let e = every(s).unwrap_err();
+            assert!(e.contains(&format!("{s:?}")) && e.contains("1h, 2h, 3h, 4h, 6h, 8h, 12h or 24h"), "{e}");
+        }
+    }
+
+    /// The minutes of `day` (a Unix second at its start) at which `expr` fires.
+    fn fires(expr: &str, day: u64) -> Vec<u64> {
+        let cron = Cron::parse(expr).unwrap();
+        (0..1440).map(|m| day + m * 60).filter(|t| cron.matches(*t)).collect()
+    }
+
+    /// 2026-10-01, a Thursday, at midnight UTC; the month has 31 days.
+    const OCTOBER: u64 = 1_790_812_800;
+
+    #[test]
+    fn schedules_spread_the_apps_over_the_interval_and_a_day_is_as_it_was() {
+        // Daily, at a minute of the day, as the sweep always was: a change of interval is a change of expression.
+        assert_eq!(schedule("app", Every::Days(1)), schedule("app", "24h".parse().unwrap()));
+        let times: HashSet<_> = (0..500).map(|i| schedule(&format!("app{i}"), Every::Days(1))).collect();
         assert!(times.len() > 300, "{} times for 500 apps", times.len());
         for time in times {
             let fields: Vec<_> = time.split(' ').collect();
             let (minute, hour) = (fields[0].parse::<u32>().unwrap(), fields[1].parse::<u32>().unwrap());
             assert!(minute < 60 && hour < 24 && fields[2..] == ["*", "*", "*"], "{time}");
+        }
+        // Every so many hours: that many times a day, as far apart, at the app's minute within them.
+        for h in [1, 2, 3, 4, 6, 8, 12] {
+            let mut minutes = HashSet::new();
+            for i in 0..200 {
+                let expr = schedule(&format!("app{i}"), Every::Hours(h));
+                let at = fires(&expr, OCTOBER);
+                assert_eq!(at.len() as u32, 24 / h, "{expr}");
+                assert!(at.windows(2).all(|w| w[1] - w[0] == u64::from(h) * 3600), "{expr}");
+                assert_eq!(expr, schedule(&format!("app{i}"), Every::Hours(h)));
+                minutes.insert((at[0] - OCTOBER) / 60);
+            }
+            assert!(minutes.len() > (200.min(h * 60) / 2) as usize, "{} minutes of {h}h for 200 apps", minutes.len());
+        }
+        // Every so many days: once on each of those days of the month, so never longer apart than that.
+        for d in [2, 3, 7, 31] {
+            let expr = schedule("app", Every::Days(d));
+            let days: Vec<u64> = (0..31).filter(|i| !fires(&expr, OCTOBER + i * 86_400).is_empty()).collect();
+            assert_eq!(days, (0..31).step_by(d as usize).collect::<Vec<u64>>(), "{expr}");
+            assert!((0..31).all(|i| fires(&expr, OCTOBER + i * 86_400).len() <= 1), "{expr}");
+            assert!(Cron::parse(&expr).unwrap().eventbridge().starts_with("cron("));
         }
     }
 
@@ -472,29 +790,29 @@ mod tests {
 
     #[tokio::test]
     async fn deletes_what_no_tree_names_and_leaves_the_trees() {
-        let (store, _) = counting();
-        let live = plant(&store, "n", 60).await;
-        let other = plant(&store, "m", 5).await;
+        let (store, kept) = kept();
+        let live = plant(&kept, "n", 60).await;
+        let other = plant(&kept, "m", 5).await;
         assert!(live.len() > 60 + 3, "{} objects are too few for a tree of nodes", live.len());
         for _ in 0..3 {
             stray(&store, "a", "n").await;
         }
         let elsewhere = stray(&store, "b", "n").await;
-        let report = run(&store, "a", later(), long()).await.unwrap();
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
         assert_eq!(report, Report { swept: 2, deleted: 3, bytes: 15, done: true, ..Default::default() });
         assert_eq!(held(&store, "n").await, live);
         assert_eq!(held(&store, "m").await, other);
         assert!(there(&store, &elsewhere).await, "another app's is not this app's to delete");
 
         // What is left is a tree that is whole, which a second run reads through again and finds nothing in.
-        let report = run(&store, "a", later(), long()).await.unwrap();
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
         assert_eq!(report, Report { swept: 2, done: true, ..Default::default() });
     }
 
     #[tokio::test]
     async fn keeps_what_is_younger_than_the_grace_to_the_millisecond() {
-        let (store, _) = counting();
-        plant(&store, "n", 3).await;
+        let (store, kept) = kept();
+        plant(&kept, "n", 3).await;
         let old = stray(&store, "a", "n").await;
         std::thread::sleep(Duration::from_millis(20));
         let edge = SystemTime::now();
@@ -502,16 +820,16 @@ mod tests {
         let young = stray(&store, "a", "n").await;
 
         // The grace before `edge + GRACE` is `edge`: what was made before it is old enough, and nothing after.
-        let report = run(&store, "a", edge + GRACE, long()).await.unwrap();
+        let report = run(&store, &kept, "a", edge + GRACE, long()).await.unwrap();
         assert_eq!(report.deleted, 1);
         assert!(!there(&store, &old).await && there(&store, &young).await);
         // Now nothing is old enough, and a clock that is before the grace has nothing that old.
-        let report = run(&store, "a", SystemTime::now(), long()).await.unwrap();
+        let report = run(&store, &kept, "a", SystemTime::now(), long()).await.unwrap();
         assert_eq!(report, Report { swept: 1, done: true, ..Default::default() });
-        let report = run(&store, "a", UNIX_EPOCH + Duration::from_secs(10), long()).await.unwrap();
+        let report = run(&store, &kept, "a", UNIX_EPOCH + Duration::from_secs(10), long()).await.unwrap();
         assert_eq!(report, Report { done: true, ..Default::default() });
         assert!(there(&store, &young).await);
-        let report = run(&store, "a", later(), long()).await.unwrap();
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
         assert_eq!(report.deleted, 1);
         assert!(!there(&store, &young).await);
     }
@@ -520,15 +838,17 @@ mod tests {
     async fn deletes_nothing_where_versions_are_not_kept() {
         let store = Store::memory();
         let path = stray(&store, "a", "n").await;
-        let report = run(&store, "a", later(), long()).await.unwrap();
+        let kept = Kept::new(&store, Arc::default());
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
         assert_eq!(report, Report { done: true, ..Default::default() });
         assert!(there(&store, &path).await, "a snapshot may still read it");
+        assert_eq!(kept.pages.load(SeqCst), 0, "nor lists a version");
     }
 
     #[tokio::test]
     async fn deletes_only_keys_a_tree_could_have_made() {
-        let (store, _) = counting();
-        let live = plant(&store, "n", 3).await;
+        let (store, kept) = kept();
+        let live = plant(&kept, "n", 3).await;
         let id = store::random();
         let (upper, short, long_id) = (id.to_uppercase(), &id[1..], format!("{id}0"));
         let (tmp, wide) = (format!("{id}.tmp"), "n".repeat(129));
@@ -556,7 +876,7 @@ mod tests {
         // Two that go, to show the sweep went through the rest: one in a name with a tree, and one with no head.
         let (one, other) = (stray(&store, "a", "n").await, stray(&store, "a", "m").await);
 
-        let report = run(&store, "a", later(), long()).await.unwrap();
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
         assert_eq!(report, Report { swept: 2, deleted: 2, bytes: 10, done: true, ..Default::default() });
         assert!(!there(&store, &one).await && !there(&store, &other).await);
         for key in &odd {
@@ -566,89 +886,279 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_name_without_a_head_names_nothing_and_a_head_is_read_at_each_run() {
-        let (store, _) = counting();
+    async fn a_name_without_a_head_names_nothing_and_its_versions_are_read_at_each_run() {
+        let (store, kept) = kept();
         // No head: no object of the name is named, however many. Nor is any when the head's tree is empty.
         let (one, two) = (stray(&store, "a", "m").await, stray(&store, "a", "m").await);
         let three = stray(&store, "a", "e").await;
-        head(&store, "e", b"{}".to_vec()).await;
-        let report = run(&store, "a", later(), long()).await.unwrap();
+        kept.put("e", b"{}".to_vec()).await;
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
         assert_eq!(report, Report { swept: 2, deleted: 3, bytes: 15, done: true, ..Default::default() });
         for path in [one, two, three] {
             assert!(!there(&store, &path).await);
         }
 
-        // A head is read from the store when its name is swept, and no earlier answer is kept: the tree that the head
-        // names now is whole, and the tree that it named before is not named by it.
-        let first = plant(&store, "n", 20).await;
-        assert_eq!(run(&store, "a", later(), long()).await.unwrap().deleted, 0);
-        let both = plant(&store, "n", 20).await;
-        let second: BTreeSet<_> = both.difference(&first).cloned().collect();
-        assert_eq!(second.len(), both.len() - first.len());
-        assert_eq!(run(&store, "a", later(), long()).await.unwrap().deleted, first.len());
+        // The versions are listed and read when the name is swept, and no earlier answer is kept: a tree that a
+        // version names now is whole, and one that no version names any more is not named.
+        let (first, _, before) = commit(&kept, "n", 20, &Root::default()).await;
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
+        assert_eq!((report.deleted, report.failed), (0, 0));
+        let both = plant(&kept, "n", 20).await;
+        let second: BTreeSet<_> = both.difference(&before).cloned().collect();
+        assert_eq!(second.len(), both.len() - before.len());
+        assert_eq!(run(&store, &kept, "a", later(), long()).await.unwrap().deleted, 0, "the first is kept still");
+        kept.expire(&first);
+        assert_eq!(run(&store, &kept, "a", later(), long()).await.unwrap().deleted, before.len());
         assert_eq!(held(&store, "n").await, second);
+    }
+
+    #[tokio::test]
+    async fn what_a_noncurrent_version_alone_names_is_kept_while_the_version_is() {
+        let (store, kept) = kept();
+        // A head and then another from it, as commits are: the second shares most of the first's tree, and replaces a
+        // value and the nodes above it, which the first alone names now.
+        let (first, root, before) = commit(&kept, "n", 60, &Root::default()).await;
+        let (second, _, after) = commit(&kept, "n", 1, &root).await;
+        let made: BTreeSet<_> = after.difference(&before).cloned().collect();
+        assert!(made.len() >= 2, "the second made a value and a node at least");
+        let strays = [stray(&store, "a", "n").await, stray(&store, "a", "n").await];
+
+        // Both versions are roots: the strays go, and every object of either tree stays.
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
+        assert_eq!(report, Report { swept: 1, deleted: 2, bytes: 10, done: true, ..Default::default() });
+        assert_eq!(held(&store, "n").await, after);
+        assert!(!there(&store, &strays[0]).await && !there(&store, &strays[1]).await);
+        assert_eq!(kept.reads.load(SeqCst), 2);
+
+        // Once the first has expired, what only it named goes, and what the second names stays.
+        kept.expire(&first);
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
+        let left = held(&store, "n").await;
+        assert!(report.deleted >= 2 && report.failed == 0, "{report:?}");
+        assert_eq!(report.deleted, after.len() - left.len());
+        assert!(left.is_superset(&made) && left.is_subset(&after));
+
+        // And once the second has too, with a head of an empty tree after it, what is left was the second's alone.
+        kept.expire(&second);
+        kept.put("n", b"{}".to_vec()).await;
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
+        assert_eq!(report.deleted, left.len());
+        assert!(held(&store, "n").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_versions_of_a_name_are_marked_into_one_set_under_one_bound() {
+        let (mut store, kept) = kept();
+        let (_, first, _) = commit(&kept, "n", 60, &Root::default()).await;
+        let (_, second, _) = commit(&kept, "n", 1, &first).await;
+        let mut each = vec![];
+        for root in [&first, &second] {
+            let tree = tree::open(&store, "a", "n", root, tiny()).unwrap();
+            each.push(tree.mark(&mut HashSet::new(), usize::MAX).await.unwrap().unwrap());
+        }
+        store.cache = Arc::default(); // so that each node marked is a get, as a mark keeps none in the cache
+        kept.counts.gets.store(0, SeqCst);
+        let report = sweep(&store, &kept, "a", (later(), long()), (NODES_MAX, VERSIONS_MAX)).await.unwrap();
+        assert_eq!((report.swept, report.skipped), (1, 0));
+        let read = kept.counts.gets.load(SeqCst) - 1; // and the cursor
+
+        // A node that both trees have is read once: so fewer are read than the two have, and more than either has.
+        assert!(read < each[0] + each[1] && read > each[0].max(each[1]), "{read} nodes read, of {each:?}");
+        // The bound is of what they read together, which each alone is under.
+        let report = sweep(&store, &kept, "a", (later(), long()), (read - 1, VERSIONS_MAX)).await.unwrap();
+        assert_eq!((report.swept, report.skipped), (0, 1));
+        let report = sweep(&store, &kept, "a", (later(), long()), (read, VERSIONS_MAX)).await.unwrap();
+        assert_eq!((report.swept, report.skipped), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_deleted_head_keeps_its_objects_while_its_versions_are_kept() {
+        let (store, kept) = kept();
+        let (id, _, live) = commit(&kept, "n", 20, &Root::default()).await;
+        kept.delete("n").await;
+        let stray = stray(&store, "a", "n").await;
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
+        assert_eq!(report, Report { swept: 1, deleted: 1, bytes: 5, done: true, ..Default::default() });
+        assert!(!there(&store, &stray).await);
+        assert_eq!(held(&store, "n").await, live, "a head can be put back as it was while its version is kept");
+
+        // When it expires, only the delete marker is left, and that names nothing.
+        kept.expire(&id);
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
+        assert_eq!((report.swept, report.deleted, report.failed), (1, live.len(), 0));
+        assert!(held(&store, "n").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_delete_marker_is_no_root_and_is_not_read() {
+        let (store, kept) = kept();
+        // Markers that are the latest and that are not, among versions: a marker read would fail the name.
+        let (first, _, live) = commit(&kept, "n", 5, &Root::default()).await;
+        kept.delete("n").await;
+        kept.put("n", b"{}".to_vec()).await;
+        kept.delete("n").await;
+        let (m1, m2) = (stray(&store, "a", "n").await, stray(&store, "a", "m").await);
+        kept.put("m", b"{}".to_vec()).await;
+        kept.delete("m").await;
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
+        assert_eq!(report, Report { swept: 2, deleted: 2, bytes: 10, done: true, ..Default::default() });
+        assert!(!there(&store, &m1).await && !there(&store, &m2).await);
+        assert_eq!(held(&store, "n").await, live);
+        // The two versions of `n` and the one of `m`, and no marker.
+        assert_eq!(kept.reads.load(SeqCst), 3);
+        kept.expire(&first);
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
+        assert_eq!(report.deleted, live.len());
+    }
+
+    #[tokio::test]
+    async fn the_latest_version_gone_is_an_error_and_a_noncurrent_one_gone_is_no_root() {
+        let log = Log::default();
+        let _logging = log.capture();
+        let (store, kept) = kept();
+        let (first, _, before) = commit(&kept, "n", 20, &Root::default()).await;
+        let (second, _, _) = commit(&kept, "n", 20, &Root::default()).await;
+        let stray = stray(&store, "a", "n").await;
+
+        // The latest cannot expire within a run, so one that reads as gone says only that it cannot be read.
+        kept.gone.lock().unwrap().insert(second.clone());
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
+        assert_eq!(report, Report { failed: 1, done: true, ..Default::default() });
+        assert!(there(&store, &stray).await);
+        assert!(log.warned()[0].contains(&second), "{}", log.text());
+
+        // A noncurrent one that expired after it was listed is no root.
+        kept.gone.lock().unwrap().clear();
+        kept.gone.lock().unwrap().insert(first);
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
+        assert_eq!(report.deleted, before.len() + 1);
+        assert!(!there(&store, &stray).await);
+    }
+
+    #[tokio::test]
+    async fn a_version_that_cannot_be_read_or_a_head_the_listing_misses_loses_nothing() {
+        let log = Log::default();
+        let _logging = log.capture();
+        let (store, kept) = kept();
+        let mut strays = vec![];
+        let mut firsts = vec![];
+        for name in ["a1", "a2", "a3"] {
+            firsts.push(commit(&kept, name, 5, &Root::default()).await.0);
+            commit(&kept, name, 5, &Root::default()).await;
+            strays.push(stray(&store, "a", name).await);
+        }
+        // A noncurrent version whose read is refused, as a 403 is: only a 404 says that it is gone.
+        kept.refused.lock().unwrap().insert(firsts[0].clone());
+        // A head that is there, and that the listing does not have.
+        kept.keys.lock().unwrap().remove(name::path("a", "a2").as_ref());
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
+        assert_eq!(report, Report { swept: 1, deleted: 1, bytes: 5, failed: 2, done: true, ..Default::default() });
+        assert!(there(&store, &strays[0]).await && there(&store, &strays[1]).await && !there(&store, &strays[2]).await);
+        let warned = log.warned();
+        assert_eq!(warned.len(), 2, "{}", log.text());
+        assert!(warned[0].contains("name=\"a1\"") && warned[0].contains("403"), "{}", warned[0]);
+        assert!(warned[1].contains("name=\"a2\"") && warned[1].contains("not among the versions"), "{}", warned[1]);
     }
 
     #[tokio::test]
     async fn a_name_that_cannot_be_read_whole_loses_nothing_and_the_rest_are_swept() {
         let log = Log::default();
         let _logging = log.capture();
-        let (mut store, _) = counting();
+        let (mut store, kept) = kept();
         let mut strays = vec![];
         let mut planted = vec![];
         for name in ["a1", "a2", "a3", "a4", "a5"] {
-            planted.push(plant(&store, name, 20).await);
+            planted.push(plant(&kept, name, 20).await);
             strays.push(stray(&store, "a", name).await);
         }
-        head(&store, "a1", b"{".to_vec()).await; // not JSON
+        kept.put("a1", b"{".to_vec()).await; // not JSON
         let missing = node(&store, &planted[1]).await;
         store.delete(&missing).await.unwrap(); // a node that is gone
         let changed = node(&store, &planted[2]).await;
         store.put(&changed, Bytes::from_static(b"{}"), PutMode::Overwrite).await.unwrap(); // and one that is not it
         store.cache = Arc::default(); // a node in the cache was whole when it was put there
 
-        let report = run(&store, "a", later(), long()).await.unwrap();
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
         assert_eq!(report, Report { swept: 2, deleted: 2, bytes: 10, failed: 3, done: true, ..Default::default() });
         for (i, stray) in strays.iter().enumerate() {
             assert_eq!(there(&store, stray).await, i < 3, "the stray of a{}", i + 1);
         }
-        let text = log.text();
-        let warned: Vec<_> = text.lines().filter(|line| line.contains("WARN")).collect();
-        assert_eq!(warned.len(), 3, "{text}");
+        let warned = log.warned();
+        assert_eq!(warned.len(), 3, "{}", log.text());
         for (name, line) in ["a1", "a2", "a3"].into_iter().zip(warned) {
             assert!(line.contains("app=\"a\"") && line.contains(&format!("name=\"{name}\"")), "{line}");
         }
     }
 
     #[tokio::test]
-    async fn a_head_that_is_listed_and_not_there_is_an_error_and_one_never_listed_is_not() {
-        let (store, _) = counting();
-        let strays = [stray(&store, "a", "n").await, stray(&store, "a", "n").await];
-        let cutoff = (later() - GRACE).duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        let listed: HashSet<String> = ["n".to_owned()].into();
-        let err = survey(&store, "a", "n", (&listed, cutoff), usize::MAX).await.unwrap_err();
-        assert!(format!("{err:#}").contains("listed"), "{err:#}");
-        let garbage = survey(&store, "a", "n", (&HashSet::new(), cutoff), usize::MAX).await.unwrap().unwrap();
-        assert_eq!(garbage.iter().map(|(path, _)| path).collect::<BTreeSet<_>>(), strays.iter().collect());
+    async fn the_versions_of_a_name_are_its_own_and_not_those_of_a_name_it_begins() {
+        let (store, kept) = kept();
+        // `n` has two versions, and `n2` and `n~` (`n%7E`), whose keys begin with `n`'s, have more after them.
+        for _ in 0..2 {
+            kept.put("n", b"{}".to_vec()).await;
+        }
+        for _ in 0..7 {
+            kept.put("n2", b"{}".to_vec()).await;
+            kept.put("n~", b"{}".to_vec()).await;
+        }
+        let path = name::path("a", "n");
+        let versions = listed(&kept, &path, 2).await.unwrap().unwrap();
+        assert_eq!(versions.len(), 2);
+        assert!(versions.iter().all(|v| v.key == path.as_ref()));
+        assert_eq!(kept.pages.load(SeqCst), 1, "a page with another key is the last");
+        // A bound of the name's own versions is not reached by another's.
+        assert_eq!(listed(&kept, &path, 1).await.unwrap(), None);
+        let all = listed(&kept, &name::path("a", "n2"), 7).await.unwrap().unwrap();
+        assert_eq!((all.len(), all.iter().filter(|v| v.latest).count()), (7, 1), "over pages");
+
+        let (strays, other) = ([stray(&store, "a", "n").await], stray(&store, "a", "n2").await);
+        let report = sweep(&store, &kept, "a", (later(), long()), (NODES_MAX, 7)).await.unwrap();
+        assert_eq!(report, Report { swept: 2, deleted: 2, bytes: 10, done: true, ..Default::default() });
+        assert!(!there(&store, &strays[0]).await && !there(&store, &other).await);
+    }
+
+    #[tokio::test]
+    async fn a_name_of_more_versions_than_a_run_reads_is_passed_over_and_logged() {
+        let log = Log::default();
+        let _logging = log.capture();
+        let (store, kept) = kept();
+        let hot = plant(&kept, "hot", 3).await;
+        for _ in 0..9 {
+            kept.put("hot", b"{}".to_vec()).await;
+        }
+        plant(&kept, "cold", 3).await;
+        let (in_hot, in_cold) = (stray(&store, "a", "hot").await, stray(&store, "a", "cold").await);
+
+        let report = sweep(&store, &kept, "a", (later(), long()), (NODES_MAX, 4)).await.unwrap();
+        assert_eq!(report, Report { swept: 1, deleted: 1, bytes: 5, skipped: 1, done: true, ..Default::default() });
+        assert!(there(&store, &in_hot).await && !there(&store, &in_cold).await);
+        assert!(held(&store, "hot").await.is_superset(&hot));
+        // `cold`'s version and none of `hot`'s ten, whose listing stops at the page that is past the bound: the first
+        // of `cold`'s, and two of the four of `hot`'s.
+        assert_eq!(kept.reads.load(SeqCst), 1);
+        assert_eq!(kept.pages.load(SeqCst), 1 + 2);
+        let warned = log.warned();
+        assert_eq!(warned.len(), 1, "{}", log.text());
+        assert!(warned[0].contains("name=\"hot\"") && warned[0].contains("more versions"), "{}", warned[0]);
     }
 
     #[tokio::test]
     async fn a_name_of_more_nodes_than_a_run_reads_is_passed_over_and_logged() {
         let log = Log::default();
         let _logging = log.capture();
-        let (store, _) = counting();
-        let big = plant(&store, "big", 60).await;
-        plant(&store, "small", 2).await;
+        let (store, kept) = kept();
+        let big = plant(&kept, "big", 60).await;
+        plant(&kept, "small", 2).await;
         assert!(big.len() > 60 + 3, "{} objects are too few to pass over", big.len());
         let (in_big, in_small) = (stray(&store, "a", "big").await, stray(&store, "a", "small").await);
 
-        let report = sweep(&store, "a", (later(), long()), 3).await.unwrap();
+        let report = sweep(&store, &kept, "a", (later(), long()), (3, VERSIONS_MAX)).await.unwrap();
         assert_eq!(report, Report { swept: 1, deleted: 1, bytes: 5, skipped: 1, done: true, ..Default::default() });
         assert!(there(&store, &in_big).await && !there(&store, &in_small).await);
-        let text = log.text();
-        let warned: Vec<_> = text.lines().filter(|line| line.contains("WARN")).collect();
-        assert_eq!(warned.len(), 1, "{text}");
-        assert!(warned[0].contains("app=\"a\"") && warned[0].contains("name=\"big\""), "{text}");
+        let warned = log.warned();
+        assert_eq!(warned.len(), 1, "{}", log.text());
+        assert!(warned[0].contains("app=\"a\"") && warned[0].contains("name=\"big\""), "{}", warned[0]);
+        assert!(warned[0].contains("more nodes"), "{}", warned[0]);
     }
 
     /// `n` distinct ids, evenly spread over the 128 bits, and so over every first digit, each ending in a `1`.
@@ -691,7 +1201,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_listing_by_digit_has_every_id_once_and_no_key_that_is_not_one() {
-        let (store, counts) = counting();
+        let (store, kept) = kept();
+        let counts = kept.counts.clone();
         // Ids at both ends of every digit's range and one in the middle, so that every boundary has an id beside it on
         // each side; and keys that no tree made, which sort among them: after each range, and outside them all. A
         // page and one more of keys, so that the name is listed by digit.
@@ -716,7 +1227,7 @@ mod tests {
         assert_eq!(counts.listings.load(SeqCst), 1 + 16);
 
         // A run deletes every id of a name with no head, each once, and not a key that no tree made.
-        let report = run(&store, "a", later(), long()).await.unwrap();
+        let report = run(&store, &kept, "a", later(), long()).await.unwrap();
         let count = ids.len() + rest.len();
         assert_eq!(report, Report { swept: 1, deleted: count, bytes: count as u64, done: true, ..Default::default() });
         assert_eq!(counts.deletes.load(SeqCst), count, "each once");
@@ -724,27 +1235,28 @@ mod tests {
     }
 
     /// Names `n1` to `n4`, each with a head, a tree whose root the head holds, and an object that nothing names. A read
-    /// takes a second of the clock, which a test pauses: a name costs its head, and a run costs its cursor besides.
-    async fn slow() -> (Store, Arc<Counts>, Vec<Path>) {
-        let (store, counts) = counting();
+    /// takes a second of the clock, which a test pauses: a name costs its head's version, and a run its cursor besides.
+    async fn slow() -> (Store, Kept, Vec<Path>) {
+        let (store, kept) = kept();
         let mut strays = vec![];
         for name in ["n1", "n2", "n3", "n4"] {
-            plant(&store, name, 2).await;
+            plant(&kept, name, 2).await;
             strays.push(stray(&store, "a", name).await);
         }
-        counts.delay.store(1000, SeqCst);
-        (store, counts, strays)
+        kept.counts.delay.store(1000, SeqCst);
+        (store, kept, strays)
     }
 
     #[tokio::test(start_paused = true)]
     async fn stops_at_its_time_and_the_next_run_goes_on_from_there() {
-        let (store, counts, strays) = slow().await;
-        // The cursor is read in a second, and the heads of `n1` in another: `n2` would be read at three.
+        let (store, kept, strays) = slow().await;
+        let counts = kept.counts.clone();
+        // The cursor is read in a second, and the head of `n1` in another: `n2`'s would be read at three.
         let until = Instant::now() + Duration::from_millis(2500);
-        let report = sweep(&store, "a", (later(), until), NODES_MAX).await.unwrap();
+        let report = sweep(&store, &kept, "a", (later(), until), (NODES_MAX, VERSIONS_MAX)).await.unwrap();
         assert_eq!(report, Report { swept: 1, deleted: 1, bytes: 5, ..Default::default() });
-        assert_eq!(cursor(&store, "a").await.as_deref(), Some("n1"));
         counts.delay.store(0, SeqCst);
+        assert_eq!(cursor(&store, "a").await.as_deref(), Some("n1"));
         assert!(!there(&store, &strays[0]).await);
         for stray in &strays[1..] {
             assert!(there(&store, stray).await, "n2 to n4 are not swept");
@@ -753,9 +1265,10 @@ mod tests {
         // The next run begins after `n1`: the cursor, and the heads of `n2` to `n4`, and no more.
         counts.delay.store(1000, SeqCst);
         counts.gets.store(0, SeqCst);
-        let report = sweep(&store, "a", (later(), long()), NODES_MAX).await.unwrap();
+        kept.reads.store(0, SeqCst);
+        let report = sweep(&store, &kept, "a", (later(), long()), (NODES_MAX, VERSIONS_MAX)).await.unwrap();
         assert_eq!(report, Report { swept: 3, deleted: 3, bytes: 15, done: true, ..Default::default() });
-        assert_eq!(counts.gets.load(SeqCst), 4);
+        assert_eq!((counts.gets.load(SeqCst), kept.reads.load(SeqCst)), (1, 3));
         counts.delay.store(0, SeqCst);
         assert!(!there(&store, &cursor_path("a")).await, "a run that went through every name begins again");
         for stray in &strays {
@@ -765,12 +1278,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn passes_over_a_first_name_that_a_run_is_too_short_for() {
-        let (store, counts, strays) = slow().await;
+        let (store, kept, strays) = slow().await;
+        let counts = kept.counts.clone();
         // A run that has a second and a half reads the cursor, and then cannot read one head: every run is spent on
         // the name it begins with, and is not given it twice.
         for name in ["n1", "n2", "n3"] {
             let until = Instant::now() + Duration::from_millis(1500);
-            let report = sweep(&store, "a", (later(), until), NODES_MAX).await.unwrap();
+            let report = sweep(&store, &kept, "a", (later(), until), (NODES_MAX, VERSIONS_MAX)).await.unwrap();
             assert_eq!(report, Report { skipped: 1, ..Default::default() }, "{name}");
             counts.delay.store(0, SeqCst);
             assert_eq!(cursor(&store, "a").await.as_deref(), Some(name));
@@ -778,7 +1292,7 @@ mod tests {
         }
         // The last name is passed over too, and with no name after it the run has gone through them all.
         let until = Instant::now() + Duration::from_millis(1500);
-        let report = sweep(&store, "a", (later(), until), NODES_MAX).await.unwrap();
+        let report = sweep(&store, &kept, "a", (later(), until), (NODES_MAX, VERSIONS_MAX)).await.unwrap();
         assert_eq!(report, Report { skipped: 1, done: true, ..Default::default() });
         counts.delay.store(0, SeqCst);
         assert!(!there(&store, &cursor_path("a")).await);

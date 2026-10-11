@@ -130,7 +130,8 @@ ws/channels/<app>/<channel>/<id> a socket's subscription to a channel (router on
   - A turn deletes nothing, whether it lands, loses its race, fails or is discarded: what a commit replaces, and what
     a turn that does not land made, is left for the sweep; see "Garbage". With versioning, a delete only adds a delete
     marker, so old heads still read objects by version id.
-  - One lifecycle rule expires noncurrent versions after N days and removes expired delete markers.
+  - One lifecycle rule expires noncurrent versions after `noncurrent_days` (1 by default) and removes expired delete
+    markers. A head's noncurrent versions are its history, which the sweep keeps whole.
 - **`pending`.** Each commit drops pending entries older than the retry window (24 h) and an hour. A name holds at most
   1,000 live ones, so its head stays an eighth under its 1 MiB; the 1,001st background request is refused (503), and no
   old entry is ever dropped for it.
@@ -277,28 +278,36 @@ version, and a commit deletes nothing.
 1. **Not the committer.** A turn deletes nothing, whether it lands, is discarded, is doomed, loses its race or fails. A
    commit whose answer is lost can't know which of its objects the head names, and a delete chosen then can remove a
    live node (`docs/decisions.md`).
-2. **The lifecycle rule,** which the bucket has: a deleted object is a noncurrent version, and goes a day later.
-3. **The sweep,** last of the stages, for what the committer can't know (below).
+2. **The lifecycle rule,** which the bucket has: a deleted object is a noncurrent version, and goes a day or two
+   later (`noncurrent_days`, in whole days to midnight UTC). A replaced head is a noncurrent version too, and the
+   versions it keeps are a name's history.
+3. **The sweep,** last of the stages, and the only collector: it deletes what no head the bucket keeps names (below).
 
 *Why it is safe for readers.* A reader holds a head it read at most 300 s ago (`TOTAL`) and reads objects by version id.
-A delete adds a marker and leaves that version readable, and the lifecycle waits a day.
+A delete adds a marker and leaves that version readable, and the lifecycle waits a day at least.
 
-*What leaks.* A trap, a timeout, a lost race and a failed commit are all seen by the host, which deletes. What it can't
-delete is a current object of an attempt whose host died mid-attempt (killed, or out of memory), at most what a turn
-could upload in `TOTAL`, and of a commit whose outcome was unknown.
+*What leaks.* Everything no head names any more, as nothing is deleted at a commit: what a commit replaced, and what a
+turn made that did not land, whether it trapped, timed out, lost its race or failed, or its host died. It waits for the
+sweep.
 
 *The sweep* is a mark-and-sweep with a grace period, run by serve with the app's own credentials:
-- It lists the app's names, and for each walks the tree from its head, lists `values/<name>/` (in one request, if it
-  holds a page of objects or fewer, and else as 16 listings at once, one for each first digit of an id, so that a name
-  of millions of objects takes less than a run), and deletes what is older than the grace period (an hour at least) and
-  unreachable. No later head can refer to such an object, as no attempt lasts an hour, which the build asserts against
-  the limits of a turn. Only a key a tree could have made is ever deleted, and a head is read fresh.
-- It needs `s3:ListBucket` on the app's `names/*` and `values/*` only, by an `s3:prefix` condition, in the router's
-  policy (`src/route.rs`), `infra/aws/main.tf`, `docker/router-policy.json` and the module's test, with assertions.
-  `names/` is there because a missing head can't be told from a refused read by a GET, and can be by the listing.
-- It runs once a day for each app, from the Scheduler through the router and into serve, as a retry does, and never
-  always-on. It deletes nothing from a name unless that name's walk completed. A run is bounded (240 s), and resumes
-  where the last stopped. It logs what it reclaimed. A request to the events function's `cron` alias, with
+- It lists the app's names, and for each lists the versions of its head that the bucket keeps (ListObjectVersions),
+  the current one, those it replaced and those of a deleted head, reads each by its id, and marks what their trees
+  name into one set, under one bound. It then lists `values/<name>/` (in one request, if it holds a page of objects or
+  fewer, and else as 16 listings at once, one for each first digit of an id, so that a name of millions of objects
+  takes less than a run), and deletes what is older than the grace period (an hour at least) and not marked. No later
+  head can refer to such an object, as it descends by commits from a head listed, and no attempt lasts an hour, which
+  the build asserts against the limits of a turn. Only a key a tree could have made is ever deleted, and a head is
+  read fresh. So a name can be put back as any version the lifecycle keeps, which is its rollback window; nothing
+  puts one back yet, and `docs/decisions.md` has what that must keep to.
+- It needs `s3:ListBucket` on the app's `values/*` and `s3:ListBucketVersions` on its `names/*` only, each by an
+  `s3:prefix` condition, in the router's policy (`src/route.rs`), `infra/aws/main.tf`, `docker/router-policy.json` and
+  the module's test, with assertions. The listing of a head's versions is also what tells a missing head from a
+  refused read, which a GET can't. It has no `s3:DeleteObjectVersion`, so only the lifecycle shortens the history.
+- It runs every `TRIC_SWEEP_EVERY` (a day by default; hours that divide a day, or days) for each app, from the
+  Scheduler through the router and into serve, as a retry does, and never always-on. It deletes nothing from a name
+  unless every version listed was read or had expired and every tree was marked whole. A run is bounded (240 s), and
+  resumes where the last stopped. It logs what it reclaimed. A request to the events function's `cron` alias, with
   `{"app", "sweep": true}`, runs it on demand.
 - The design of the trigger, and the arguments for its safety, are in `docs/decisions.md`.
 
@@ -328,7 +337,7 @@ budgets. A turn has no cap on its changes: it spills.
 - Objects are under `apps/<app>/values/<name>/`, written and read with the app's own credentials. The name passes
   `is_name`, so it holds no `/`, and an id is random: nothing the guest controls forms a key. A link read back is
   checked before it is used, so a changed head or node can't point outside the prefix. The sweep's `ListBucket` on
-  `names/` and `values/` is the only IAM change, and lists no other prefix.
+  `values/` and `ListBucketVersions` on `names/` are the only IAM change, and list no other prefix.
 - Reads are checked against the link's hash and length. A mismatch is an error, and the object, version and detail are
   logged and never given to the guest.
 - Nothing is content-addressed, so there is no deduplication, within an app or between apps, and no way to learn from a
@@ -350,7 +359,7 @@ system: `cli`, `clocks`, `random` and `sockets` `add_to_linker`.
 | `src/fs.rs` | the core: descriptors, the gate, orphans, read-ahead, and the paths over the operations | 790 (built) |
 | `src/fs/ops.rs` | inodes, blocks, directories, rename, errors, on the tree | 850 (built) |
 | `src/fs/p3.rs` | 0.3: the descriptor's methods, preopens, `stream` and `future` | 650 (built) |
-| `src/sweep.rs`, and the trigger | listing, walk, delete, the cursor; the schedule, the router, serve | 480 (built) |
+| `src/sweep.rs`, and the trigger | versions, mark, listing, delete, cursor; schedule, router, serve | 480 (built) |
 
 The tree came to 1,080 lines, against an estimate of 800, because spilling, merging, the cache and the log are in it.
 The core and the 0.2 binding came to 2,200 against 1,250: the gate that keeps a stream's write from being lost to the
@@ -398,7 +407,8 @@ wasmtime-wasi; prolly trees; a file system component over `wasi:keyvalue`; separ
 overlay applied at the commit.
 
 **Decided,** by the choices behind the design (each with its reason in `docs/decisions.md`):
-1. **The sweep is built,** last, for the leaks above, with `s3:ListBucket` limited to the app's `names/` and `values/`.
+1. **The sweep is built,** last, for the leaks above, and keeps a name's history: `s3:ListBucket` limited to the app's
+   `values/`, and `s3:ListBucketVersions` to its `names/`.
 2. **The numbers** above, to be revisited once measured.
 3. **Only a turn's own name is mounted.** Mounting other names would need a path convention.
 4. **A turn edits the tree and spills at its budget,** with no cap on its changes.
@@ -596,9 +606,9 @@ overlay applied at the commit.
   - a file of several blocks, written across a block's end and cut short, reads back by its hash;
   - a path can't leave the tree;
   - racing turns each count once;
-- each app's daily sweep is in the cron group at its minute, and one sweep, through the cron alias, runs as the app's
-  tenant: it keeps what a tree names and what is under an hour old, and reports what it did; nothing else can ask
-  for one;
+- each app's sweep is in the cron group at its minute, every `TRIC_SWEEP_EVERY`, and one sweep, through the cron
+  alias, runs as the app's tenant: it keeps what a tree of any version kept names and what is under an hour old, and
+  reports what it did; nothing else can ask for one;
 - the lifecycle rules, roles and environments are as the module says;
 - for decisions to come, the run keeps the heads' reads and writes in a mix of turns, and what each turn fetched and
   put;
