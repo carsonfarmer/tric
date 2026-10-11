@@ -339,6 +339,7 @@ both!(
     confines_the_guest,
     turns_commit_or_discard,
     turns_on_one_name_serialize,
+    turns_with_an_idempotency_key_apply_once,
     delivers_the_outbox_once_committed,
     fetches_itself,
     runs_middleware,
@@ -496,6 +497,71 @@ async fn turns_on_one_name_serialize(kind: Kind) {
     assert_eq!((busy.status, busy.header("retry-after")), (429, Some("1")));
     assert_eq!(slow.await.unwrap().status, 200);
     assert_eq!(tric.value("held", "k").await, "1");
+}
+
+async fn turns_with_an_idempotency_key_apply_once(kind: Kind) {
+    let tric = Arc::new(Tric::app(kind).await);
+    let count = async |name: &str| {
+        let n = tric.post(&format!("/@{name}/kv?op=incr&key=n&delta=0")).await;
+        n.json()["ok"].as_i64().unwrap()
+    };
+    let incr = "/@once/kv?op=incr&key=n";
+    let first = tric.send("POST", incr, &[("idempotency-key", "a")]).await;
+    assert_eq!((first.status, first.json()["ok"].as_i64()), (200, Some(1)));
+    assert_eq!(first.header("idempotent-replayed"), None);
+    let again = tric.send("POST", incr, &[("idempotency-key", "a")]).await;
+    let replayed = (again.status, &*again.body, again.header("idempotent-replayed"), again.header("etag"));
+    assert_eq!(replayed, (200, "", Some("true"), None), "answered as it was, with no body");
+    assert_eq!(count("once").await, 1, "and not run again");
+
+    // The same key with another request is refused.
+    let other = exchange(&tric.addr, &tric.host, "POST", incr, &[("idempotency-key", "a")], Bytes::from("x")).await;
+    assert_eq!(other.status, 422);
+    assert_eq!(tric.send("POST", "/@once/kv?op=incr&key=n&delta=2", &[("idempotency-key", "a")]).await.status, 422);
+    assert_eq!(count("once").await, 1);
+
+    // A key is one field, of 1 to 255 bytes, with no comma, as Lambda joins fields with one; a safe method ignores it.
+    let long = "k".repeat(256);
+    let keys: [&[(&str, &str)]; 4] = [
+        &[("idempotency-key", "")],
+        &[("idempotency-key", long.as_str())],
+        &[("idempotency-key", "b,c")],
+        &[("idempotency-key", "b"), ("idempotency-key", "c")],
+    ];
+    for key in keys {
+        assert_eq!(tric.send("POST", incr, key).await.status, 400, "{key:?}");
+        let get = tric.send("GET", "/@once/kv?op=exists&key=n", key).await;
+        assert_eq!((get.status, get.header("idempotent-replayed")), (200, None), "{key:?}");
+    }
+    assert_eq!(count("once").await, 1);
+
+    // A 4xx commits, and so is answered again as it was; a 5xx discards, and so runs again.
+    for (status, replayed) in [(409, Some("true")), (500, None)] {
+        let (target, key) = (format!("/@once/kv?op=incr&key=n&status={status}"), status.to_string());
+        assert_eq!(tric.send("POST", &target, &[("idempotency-key", &key)]).await.status, status);
+        let again = tric.send("POST", &target, &[("idempotency-key", &key)]).await;
+        assert_eq!((again.status, again.header("idempotent-replayed")), (status, replayed));
+    }
+    assert_eq!(count("once").await, 2, "the 409 counted once, and the 500s not at all");
+
+    // Of the same keyed turn sent at once, one runs, and the others are answered as it was, or turned away.
+    let tasks: Vec<_> = (0..10)
+        .map(|_| {
+            let tric = tric.clone();
+            tokio::spawn(async move { tric.send("POST", "/@race/kv?op=incr&key=n", &[("idempotency-key", "e")]).await })
+        })
+        .collect();
+    let mut ran = 0;
+    for task in tasks {
+        let res = task.await.unwrap();
+        match (res.status, res.header("idempotent-replayed")) {
+            (200, None) => ran += 1,
+            (200, Some("true")) => assert_eq!(res.body, ""),
+            (429, None) => assert_eq!(res.header("retry-after"), Some("1")),
+            (s, r) => panic!("{s} {r:?}: {}", res.body),
+        }
+    }
+    assert_eq!((ran, count("race").await), (1, 1));
 }
 
 /// A route of the Rust app's to its files, and how each error that the tests look for is said: by `/files`, the binding

@@ -796,12 +796,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     pub(super) async fn turn(store: &Store) -> Arc<Turn> {
-        Turn::open(store, "a", "n", false, &Default::default(), Instant::now()).await.unwrap().ok().unwrap()
+        Turn::open(store, "a", "n", false, &Default::default(), None, Instant::now()).await.unwrap().ok().unwrap()
     }
 
     pub(super) async fn commit(turn: &Turn) {
         let sink: Sink = Arc::new(|_| Box::pin(async { Ok(()) }));
-        assert!(matches!(turn.commit("h", &sink).await.unwrap(), Committed::Done(_)));
+        assert!(matches!(turn.commit("h", &sink, http::StatusCode::OK, None).await.unwrap(), Committed::Done(_)));
     }
 
     /// To read a file or a directory, following symlinks.

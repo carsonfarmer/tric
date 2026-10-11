@@ -88,7 +88,7 @@ async fn run(engine: &Engine, app: &Arc<App>, wasm: &Path, config: &Config) -> R
         allow: Arc::from([]),
         sink: Arc::new(|_| Box::pin(async { Ok(()) })),
     });
-    let turn = Turn::open(&tric.store, "a", "n", false, &Default::default(), Instant::now()).await;
+    let turn = Turn::open(&tric.store, "a", "n", false, &Default::default(), None, Instant::now()).await;
     let turn = turn.map_err(|e| format!("open: {e:#}"))?.ok().ok_or("open: refused")?;
     if let Some(root) = &config.root {
         seed(&Handle::root(&turn), &wasm.with_file_name(root)).await;
@@ -111,7 +111,7 @@ async fn run(engine: &Engine, app: &Arc<App>, wasm: &Path, config: &Config) -> R
         }
     };
     let sink: Sink = Arc::new(|_| Box::pin(async { Ok(()) }));
-    match turn.commit("h", &sink).await {
+    match turn.commit("h", &sink, http::StatusCode::OK, None).await {
         Ok(Committed::Done(_)) => {}
         Ok(Committed::Conflict) => return Err("its commit lost a race, with no one else there".into()),
         Err(e) => return Err(format!("commit: {e:#}")),

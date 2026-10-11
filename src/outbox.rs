@@ -97,14 +97,17 @@ impl Held {
         })
     }
 
-    /// The request, as the `n`th of the commit `commit`.
+    /// The request, as the `n`th of the commit `commit`, with `Idempotency-Key: <commit>/<n>` unless the app gave it
+    /// its own: it carries one, as tric refuses two.
     fn request(&self, commit: &str, n: usize) -> Result<Request> {
         let mut req = http::Request::builder().method(Method::from_bytes(self.method.as_bytes())?).uri(&self.uri);
         for (k, v) in &self.headers {
             req = req.header(HeaderName::try_from(k)?, HeaderValue::try_from(v)?);
         }
         let body = Full::new(Bytes::from(B64.decode(&self.body)?)).map_err(|n| match n {}).boxed_unsync();
-        Ok(req.header("idempotency-key", format!("{commit}/{n}")).body(body)?)
+        let mut req = req.body(body)?;
+        req.headers_mut().entry(name::IDEMPOTENCY_KEY).or_insert(HeaderValue::try_from(format!("{commit}/{n}"))?);
+        Ok(req)
     }
 
     /// If this is a publish, a `POST` to `/publish/` at `host`, the app's own: the messages it publishes, which are
@@ -260,6 +263,18 @@ mod tests {
         }
         for no in [&[][..], &["wait=10"], &["respond-asyncx"], &["x=respond-async"]] {
             assert!(!h(no), "{no:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_held_request_carries_one_idempotency_key_its_own_or_its_commits() {
+        for (own, key) in [(None, "c/3"), (Some("mine"), "mine")] {
+            let req = http::Request::builder().method("POST").uri("https://h/x");
+            let req = own.into_iter().fold(req, |req, own| req.header(name::IDEMPOTENCY_KEY, own));
+            let req = Held::of(req.body(Default::default()).unwrap()).await.unwrap().request("c", 3).unwrap();
+            let keys: Vec<_> =
+                req.headers().get_all(name::IDEMPOTENCY_KEY).iter().map(|k| k.to_str().unwrap()).collect();
+            assert_eq!(keys, [key]);
         }
     }
 

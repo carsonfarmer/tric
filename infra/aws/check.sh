@@ -399,6 +399,14 @@ if awk -v f="$first" -v t="$total" 'BEGIN { exit !(t - f > 1.5) }'; then
   pass "the body streams (head at ${first}s, end at ${total}s)"
 else fail "the body streams" "head at ${first}s, end at ${total}s"; fi
 is "an unknown app is 404" "$(code "https://nobody-$run.$DOMAIN/")" 404
+# A keyed write sent twice writes once, and the second answer is marked as the first's, given again.
+idem="$A/@idem-$run/kv?op=incr&key=n"
+is "a keyed write answers" "$(code -X POST "$idem" -H "Idempotency-Key: k-$run")" 200
+again=$(post "$idem" -H "Idempotency-Key: k-$run" -D - -o /dev/null | tr -d '\r')
+is "a keyed write sent again is answered as it was, and marked" \
+  "$(awk 'NR == 1 { s = $2 } tolower($1) == "idempotent-replayed:" { r = $2 } END { print s, r }' <<<"$again")" \
+  "200 true"
+is "a keyed write sent twice writes once" "$(post "$A/@idem-$run/kv?op=incr&key=n&delta=0" | jq -c .ok)" 1
 
 echo "== around CloudFront"
 url=$(aws lambda get-function-url-config --function-name tric-route --query FunctionUrl --output text)

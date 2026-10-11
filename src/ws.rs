@@ -12,8 +12,8 @@ use crate::{aws, engine::ANSWER, name, route::Route, route::body, route::viewer,
 use base64::{Engine as _, prelude::BASE64_URL_SAFE_NO_PAD as B64};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt, future, stream};
-use http::header::UPGRADE;
 use http::header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_PROTOCOL};
+use http::header::{IF_MATCH, IF_NONE_MATCH, UPGRADE};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, request::Parts};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{body::Incoming, upgrade::OnUpgrade, upgrade::Upgraded};
@@ -73,11 +73,14 @@ struct Conn {
 
 impl Conn {
     /// A socket of `app` opened at `uri` with `headers`, of which each event carries those that are text, less the
-    /// upgrade's own, but for the subprotocols the client offers, and those each event sets.
+    /// upgrade's own, but for the subprotocols the client offers, and those each event sets. Its `Idempotency-Key` and
+    /// conditions are the upgrade's, and not the events': a key would answer each event after the first as the first,
+    /// and an `If-Match` refuse each after the first commit with 412.
     fn of(app: &str, uri: String, headers: &HeaderMap) -> Self {
         let ours = [HOST, CONNECTION, UPGRADE, CONTENT_TYPE, CONTENT_LENGTH, CONNECTION_ID];
+        let upgrades = [IF_MATCH, IF_NONE_MATCH, name::IDEMPOTENCY_KEY];
         let upgrade = |k: &HeaderName| k.as_str().starts_with("sec-websocket-") && k != SEC_WEBSOCKET_PROTOCOL;
-        let headers = headers.iter().filter(|(k, _)| !ours.contains(k) && !upgrade(k));
+        let headers = headers.iter().filter(|(k, _)| !ours.contains(k) && !upgrades.contains(k) && !upgrade(k));
         let headers = headers.filter_map(|(k, v)| Some((k.to_string(), v.to_str().ok()?.to_owned()))).collect();
         Self { app: app.into(), uri, headers, grip: false }
     }
@@ -459,6 +462,25 @@ mod tests {
         let events = [Event::Open, text("héllo"), Event::Close(None), Event::Close(Some(4001)), Event::Disconnect];
         events.into_iter().for_each(|e| assert_eq!(parse(&e.encode()).as_deref(), Some(&[e][..])));
         assert_eq!(Event::Close(Some(1000)).encode().as_ref(), b"CLOSE 2\r\n\x03\xe8\r\n");
+    }
+
+    #[test]
+    fn events_carry_the_upgrades_headers_less_its_own_its_key_and_its_conditions() {
+        let mut headers = HeaderMap::new();
+        for (k, v) in [
+            ("host", "h"),
+            ("sec-websocket-key", "x"),
+            ("sec-websocket-protocol", "p"),
+            ("cookie", "c"),
+            ("idempotency-key", "k"),
+            ("if-match", "\"e\""),
+            ("if-none-match", "*"),
+        ] {
+            headers.insert(HeaderName::from_static(k), HeaderValue::from_static(v));
+        }
+        let mut carried = Conn::of("a", "https://h/@n".into(), &headers).headers;
+        carried.sort();
+        assert_eq!(carried, [("cookie".into(), "c".into()), ("sec-websocket-protocol".into(), "p".into())]);
     }
 
     #[test]
