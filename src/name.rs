@@ -32,8 +32,8 @@ const PENDING_TTL: Duration = WINDOW.saturating_add(Duration::from_secs(3600));
 /// are refused, so the head stays far under `HEAD_MAX`, and no pending commit is dropped before its time.
 const PENDING_MAX: usize = 1000;
 /// How long a commit's put may take, with learning whether it landed when its answer is lost; past that, the commit
-/// fails with [`Failed::Unsettled`]. The guest's `ANSWER`, the claims it waits for and this fit in CloudFront's 60 s for an
-/// answer from the origin, so the client hears the 500, and not a 504 that it might try again.
+/// fails with [`Failed::Unsettled`]. The guest's `ANSWER`, the claims it waits for and this fit in CloudFront's 60 s
+/// for an answer from the origin, so the client hears the 500, and not a 504 that it might try again.
 pub const SETTLE: Duration = Duration::from_secs(30);
 /// The header that makes a turn apply once, however often it is sent: see [`Idempotency`].
 pub const IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("idempotency-key");
