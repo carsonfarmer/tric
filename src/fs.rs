@@ -488,13 +488,11 @@ impl Handle {
         ops::plan(&tree, self.ino(), offset, len).await
     }
 
-    /// Writes `data`, and returns how much of it: fewer than all if the name filled. A stream writes with
-    /// [`Handle::write_task`].
+    /// Writes `data` as a stream does, with [`Handle::write_task`], and returns how much of it: fewer than all if the
+    /// name filled.
     #[cfg(test)]
     pub async fn write(&self, at: At, data: &[u8]) -> Res<usize> {
-        self.writing()?;
-        let mut tree = edit(self.turn()).await?;
-        ops::write_at(&mut tree, self.ino(), at, data).await
+        self.write_task(at, Bytes::copy_from_slice(data))?.await.expect("the write finished")
     }
 
     /// Starts a write for a stream, which is admitted now and runs as a task of its own, which nothing cancels. It

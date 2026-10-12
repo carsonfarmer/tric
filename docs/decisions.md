@@ -830,7 +830,9 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   `write-via-stream` has 256 KiB of capacity (a `write` of more traps, as the WIT says), and a read is at most 1 MiB
   (`READ_MAX`). They hold their own handle on the inode and the turn, not a borrow of the descriptor, so closing a
   descriptor does not break a stream made from it. The `read` call's `end-of-stream` is true when fewer than
-  `min(len, READ_MAX)` bytes came back. Locking is described in the module documentation of `src/fs.rs`.
+  `min(len, READ_MAX)` bytes came back. Locking is described in the module documentation of `src/fs.rs`. A test's
+  `write` is `write_task` awaited, and its walk of a directory takes pages with `more` and `fill` as a stream does, so
+  the tests run the code a component runs, admission included.
 - **After a discard, a descriptor on an inode that is gone gets `io`.** A directory can be an orphan, as on Linux, and
   making a name inside a directory with no links is `no-entry`. A full descriptor table is `insufficient-memory`, and
   `get-directories` on a full table traps, as its WIT type has no error to say it with.
