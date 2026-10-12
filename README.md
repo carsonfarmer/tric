@@ -119,7 +119,9 @@ There is no web platform under QuickJS (no `TextEncoder`, `URL`, `fetch` or `con
   symlinks, hard links, `rename`, and files that can be unlinked while open. A path can't leave `/`, and a file's
   bytes are checked against the hash its parent holds. An app that never opens a file pays nothing for it.
 - **Turns commit at the answer**, unless it is a 5xx, or the instance traps. A turn that loses a race runs again,
-  unseen. A busy name answers 429 with `Retry-After`. The name's version is its `ETag`, and `If-Match` is honoured.
+  unseen, for up to 5 seconds, while it can: while tric holds all its body (6 MiB or less) and it has sent no unsafe
+  request. One that cannot lands nothing and answers 503 with `Retry-After`, and what it sent stays sent. The name's
+  `ETag` is the id of its last commit, and `If-Match` is honoured.
 - **`Idempotency-Key`.** A turn sent again with the key of one that committed is answered, for a day at least, with
   its status and `Location`, `Idempotent-Replayed: true` and no body, and does not run; another request with the key
   gets 422. A turn that answered 5xx is not recorded, and runs again.
@@ -127,8 +129,7 @@ There is no web platform under QuickJS (no `TextEncoder`, `URL`, `fetch` or `con
   answers 508.
 - **Background requests.** A request a turn sends with `Prefer: respond-async` is answered 202 at once, held, and sent
   only if the turn commits, with an `Idempotency-Key`. A delivery that gets a 5xx or a 429, or fails, is tried again
-  for 24 hours, honouring `Retry-After`. A name with 1,000 commits still undelivered refuses a new one: the `fetch`
-  gets 503.
+  for 24 hours, honouring `Retry-After`.
 - **`Forwarded`** is set by tric on every request, and is the only word on where it came from: the client, `for=_cron`
   or `for=_tric`.
 
@@ -147,7 +148,7 @@ by `tric dev`, or on AWS by API Gateway at the same URL, and the app speaks to i
   `Sec-WebSocket-Extensions: grip` sends `m:` and a message for the client, or `c:` and JSON that subscribes the socket
   to a channel, or unsubscribes it: `{"type":"subscribe","channel":"room"}`. A `POST` to `/publish/` at the app's own
   origin, in Pushpin's publish API with a `ws-message` of `content` and `Prefer: respond-async`, sends it to a
-  channel's sockets, once, if the turn commits.
+  channel's sockets if the turn commits, and may send it twice, as a background request may be.
 
 Messages are text, of 128 KiB at most. [tests/components/rust/src/chat.rs](tests/components/rust/src/chat.rs) is a
 chat room, and [the decisions](docs/decisions.md#websockets) give the rest. Not here: binary messages, `PING` and

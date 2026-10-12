@@ -89,19 +89,15 @@ reason.
   schedule can assume it. The module makes the two alike, a group and a role for each alias, named `<name>-cron` and
   `<name>-retry`. The router's two functions share its role, so `route` holds these grants as well; it takes no event,
   and the grants are narrow.
-- **`PENDING_TTL` is the window and an hour.** serve drops an event whose commit isn't pending, so an entry must
-  outlast the last try. The hour covers Scheduler's minute, Lambda's own two retries of a try, and an event that
-  Lambda was late to hand over. A hand-over later than that loses the tail of the window, not the first tries.
-- **A name with too many commits pending refuses a new background request.** The retries keep an entry in `pending`
-  for up to 25 hours, where it was 6, so an app sending to a host that is down would fill its head, and every commit
-  would fail at the 1 MiB `HEAD_MAX`. At `PENDING_MAX`, 1,000 live entries, about 130 KB, an eighth of that, the
-  guest's `fetch` gets a plain `503` and the request is not held. It is checked against the turn's snapshot, which is
-  exact: a commit writes over the head it started from, and adds one entry.
-  - 503 and not 429: it is the outbox that is full, and not a rate the app exceeded (RFC 9110, 15.6.4). It is a
-    response, not an error, which would read as a fault of the app or of tric; `508` is the precedent.
-  - An old entry is never dropped to make room: serve would then drop its event, and the delivery would be lost with
-    no word. The request is never sent at once instead: it would no longer wait for the commit.
-  - Entries past their age don't count.
+- **A delivery event's record is kept two to three days.** serve sends an event's requests only if the name's head holds
+  the record its commit made of it, so a record must outlast the last try: Lambda's queue holds an event 6 hours at
+  most, the window is 24 hours from the first failure, and Scheduler's minute and Lambda's own two retries of a try add
+  minutes. A commit deletes the records of events made two days or more before its own, by the Unix day, so one made
+  late in a day lasts two days at the least, which is more than all of that. A record is a key in the name's tree, and
+  counts against its budgets as the records of `Idempotency-Key`s do: a name that commits a background request every
+  second holds about 260,000, some 6% of its 4 Mi entries. Nothing else limits them, so an app that sends to a host that
+  is down is refused nothing. Before, the head held them as `pending`, and at 1,000 undelivered a name refused a new
+  background request with 503, so that the head stayed under its 1 MiB.
 - **When the router itself fails, an `outbox` or `retry` invocation is tried twice more and then dropped.** The S3
   write or read, or creating the schedule, failing is that: the router answers 503, and Lambda keeps to its
   configuration of two retries and 6 hours, with no destination. A failed `retry` loses the delivery with hours of its
@@ -115,9 +111,8 @@ reason.
   The listing of `apps/` is the local router's cron. Locally the one policy is also the ceiling of an app's session,
   so it lists `apps/*/values/*` and the versions of `apps/*/names/*` as well, for the sweep, which an app's session
   may list only for its own app.
-- **After the last try the router logs a warning** with the app and the commit, deletes the object, and leaves the
-  entry in `pending` to age out. Nothing is kept to replay: an event is delivered only while its commit is pending,
-  and that is as long as the window.
+- **After the last try the router logs a warning** with the app and the commit, and deletes the object. Nothing is
+  kept to replay: the record in the name's tree outlasts the window, but the event's bytes are gone.
 - **serve and the router run behind the Lambda Web Adapter,** as plain HTTP servers. Their package carries its own
   `bootstrap`, which runs `tric <handler>`, because `provided.al2023` has no wrapper for that. The adapter's
   readiness check is a `GET /`. Any status below 500 counts as ready, including the router's 403.
@@ -159,19 +154,55 @@ reason.
 
 ## Storage and turns
 
-- **A re-run claims its name when it opens.** A turn that runs past 1 s claims its name mid-run. A turn whose claim
-  fails is doomed: on a conflict it re-runs, and on a busy name it answers 429.
-- **Clearing `pending` never writes over a claimed head,** because that would break the claim. The age limit,
-  `PENDING_TTL`, clears what is left.
-- **A delivery event is dropped at once** when its turn's start version has moved on and its commit id isn't in
-  `pending`.
+- **A turn runs again only while it is repeatable, and nothing claims a name.** A turn that another commit beat runs
+  again, unseen, while tric holds all its body (`REPLAY_MAX`, 6 MiB) and it has sent no unsafe outbound request, and
+  until its deadline (`tric::DEADLINE`, 5 s after it began). A body over the buffer can be read once (`Body::Once`), and
+  an unsafe request only marks the turn (`Turn::repeatable`). One that may not run again, or whose deadline has passed,
+  lands nothing, and answers 503 with `Retry-After: 1`: what it sent stays sent, nothing it wrote landed, and the client
+  may try again knowing both. Before, a turn claimed its name at its first irreversible step, or after 1 s, with a put
+  of the head that kept other turns off it: a re-run claimed when it opened, a busy name answered 429, a turn whose
+  claim ran out (`CLAIM_TTL`, 15 s) as it committed answered 500, and clearing `pending` had to keep clear of a claimed
+  head. That was a put of the head for each claim and each release, a lease, two answers and their states, for one gain:
+  an irreversible turn was sure to commit unless its claim ran out. Now it is not, which is the cost. On a busy name
+  such a turn can lose, and answer 503 though it sent what it sent; and a long turn on a busy name runs again until its
+  deadline and then answers 503, where a claim would have held the name for it. A short turn whose body tric holds and
+  that sends nothing unsafe, the common case, loses nothing.
+- **A delivery event is sent once its record is in the name's tree, and dropped once it can never be.** A commit with
+  background requests hands them to the outbox as one event before it puts its head, and writes in its tree, so in
+  the same compare-and-swap, the empty key `o/<day>/<digest>`, the digest being the SHA-256 of the event's JSON. serve,
+  given the event, drops it unless it is of serve's own app, and then reads the name's head (`name::holds`). If the
+  head holds the record, it sends the requests. If not, and the head's commit is no longer the event's `base`, the
+  commit of the head the turn read, or `SETTLE` and 30 s more have passed (`outbox::LANDING`), it drops the event.
+  Else it reads again, after 50 ms, doubling to 1 s.
+  - It is safe because a commit puts its head only over the head it read, by that head's `ETag` in the bucket, and
+    each head's bytes are its own commit's. Once the head is another commit's, the base is gone for good, and the
+    commit can never land. A head that holds the record descends from the commit that made it, and every commit keeps
+    the records of events until two days after their own, longer than an event is tried, so a commit that landed is
+    never taken for one that did not.
+  - A turn that died during its put, or before it, leaves its event waiting on a head that does not change: `LANDING`
+    bounds that wait. The put cannot land after it unless S3 applies it more than 30 s after `SETTLE`, past what
+    object_store waits for an answer; such a commit lands with its requests dropped. `LANDING` was there before, for
+    the same case.
+  - A forged event is dropped. One of another app is not this app's. One whose commit never landed has no record in
+    any head. One that names a real commit, whose id was learnt from an `Idempotency-Key`, but holds other requests,
+    has a digest no commit recorded. An event sent again byte for byte is the commit's own, and is delivered again
+    while its record lasts, with the same requests and `Idempotency-Key`s, which delivery promises anyway.
+  - Delivery is at least once, and reads only. A delivery that the router takes for failed after serve sent the
+    requests sends them again at the next try. It was so before, up to the moment serve took the commit out of
+    `pending` after sending, which dropped a delivery sent again after that; only publishes relied on that, and they
+    change (see "A publish may be sent twice").
+  - Before, the head held `pending`, a digest and a time for each commit with an event undelivered, and delivery waited
+    for the head to move past the event's base, sent, and then took the commit out of `pending` with a put of its own.
+    That was a write of the head for each delivery, which had to keep clear of claims; a limit of 1,000 a name; and an
+    age, `PENDING_TTL`, for an entry whose delivery was lost. The records need none of these: they ride in the
+    commit's own put, and expire by day, as the records of `Idempotency-Key`s do.
 - **`deploy` writes with the owner's credentials,** from the environment, not with an app's.
 - **A name over its budgets fails at the write that takes it over,** and the write changes nothing. The budgets are the
   data (16 GiB) and the entries (4 Mi) of its tree, counted exactly from the head and the turn's own edits, and the
   guest is told which it passed, which is the one tree error it sees whole. A file write will fail as
-  `insufficient-space`. A head itself is at most 1 MiB (`HEAD_MAX`), which is only a sanity cap on a read and on a
-  commit now, so `TooLarge` (a 500, as for a trap, with the held requests not sent) is a backstop and not a path:
-  a head is its root node, at most 64 KiB, and its pending commits, at most an eighth of 1 MiB.
+  `insufficient-space`. A head is read up to 1 MiB (`HEAD_MAX`), which is only a sanity cap: a head is its root node,
+  at most 64 KiB, and a commit's id. `TooLarge` (a 500, as for a trap, with the held requests not sent) is a tree too
+  full for the commit's own records.
 - **A snapshot is a turn that has answered.** Both read the name as it was, and neither writes, so one type serves
   both. A write after the answer now fails with `access-denied`, the same as a write to a snapshot, where it used to
   fail with `other`. `wasi:keyvalue` names `access-denied` for exactly this.
@@ -411,8 +442,7 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   after a 5xx, a 429, a 408 or a dropped connection, and a conditional put again after a 409, and does not say that it
   did. So a put that landed but whose answer was lost was sent again, was refused for its own write, and read as a
   conflict: the turn deleted the objects that its landed head names, which is data loss, and ran again though it had
-  committed. A claim, a conditional put too, was taken for another's, and its own turn was refused with 429 until the
-  claim ran out (`CLAIM_TTL`, 15 s). Icechunk, which writes through object_store too, met the same bug
+  committed. Icechunk, which writes through object_store too, met the same bug
   (<https://github.com/earth-mover/icechunk/blob/main/design-docs/017-conditional-put-lost-response.md>).
 - **That a put which failed may have landed is general knowledge, and not something S3 documents.** No AWS page found
   says that a 5xx may answer a PUT that was applied. RFC 9110 (9.2.2) has a client repeat an idempotent request whose
@@ -431,91 +461,77 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   overwrite, which is idempotent, keeps object_store's retries. `Store::put` tries a conditional put again, as it was,
   after an error that is not a refusal, up to `TRIES` (4) times, from 50 to 100 ms apart and twice as long each time. A
   refusal at the first try is a conflict, as before, and the turn runs again at once. A refusal after a try that may
-  have landed is an error, for the caller to settle.
-- **A head names the commit that wrote it, and the version it was written over.** A head holds `commit`, the random id
-  of the commit that wrote it, which a claim, its release and `settle` keep, and `over`, the version id of the head it
-  was written over, which every put of a head sets (`name::put`); the first head has none. So no head's bytes are ever
-  another's, and no head's `ETag` is either: S3's `ETag` changes only with an object's contents, and for an object put
-  whole, unencrypted or under SSE-S3, it is the MD5 of its bytes
+  have landed is an error, and the caller reads the head to learn what landed.
+- **A head names the commit that wrote it, and that id is the name's `ETag`.** A head holds `commit`, the id of the
+  commit that wrote it, 128 random bits in hex, which every commit draws afresh. So no head's bytes are ever another's,
+  and no head's `ETag` in the bucket is either: S3's `ETag` changes only with an object's contents, and for an object
+  put whole, unencrypted or under SSE-S3, it is the MD5 of its bytes
   (<https://docs.aws.amazon.com/AmazonS3/latest/API/API_Object.html>). A put with `If-Match` lands only if the `ETag`
   matches (<https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html>), so a put on a head's
-  `ETag` lands on that head or not at all, and a head's versions form a chain, each written over the one before. Only
-  the version written over a commit's base can be the commit's. The bucket keeps every version, each read by its
-  version id (<https://docs.aws.amazon.com/AmazonS3/latest/userguide/versioning-workflows.html>), until the lifecycle
-  expires it, a day after it stops being current at the least; and a read after a write that S3 has applied sees it
-  (<https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel>). Before, a head held the ids
-  of its last 8 commits: a commit whose base's newest id had been dropped could not tell whether it landed, and a claim
-  taken and let go put a head back to its base's bytes, and so to its `ETag`, on which a commit sent before could still
-  land. Icechunk reads back a write id from an object's metadata
-  (<https://github.com/earth-mover/icechunk/blob/main/design-docs/017-conditional-put-lost-response.md>); a head
-  holds its commit's id in its bytes, which each version keeps.
-- **A commit with no answer reads the head's versions to learn whether it landed.** A commit whose put errs, other
-  than as `TooLarge`, or has no answer, asks the head (`name::fate`), and what it finds decides only whether the turn
-  runs again: nothing is deleted whatever it finds.
-  - If the head names the commit, it landed. It is done, and does not run again. Its answer carries the head's `ETag` if
-    the head is the commit's own, written over its base and holding no claim, and none if another write landed on it,
-    as that head has changes the turn never saw, and a client's `If-Match` with its `ETag` would be checked against
-    them.
-  - If the head is still the base, by its version id, nothing has landed on it, and the commit is put again, as it was.
-    That put lands only if the first has not, as the first one's landing makes the head another version; if it is
-    refused, the head is read again. A commit on a name with no head does the same while there is still none, with
+  `ETag` lands on that head or not at all, and once that head is written over, never; and a read after a write that S3
+  has applied sees it (<https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel>).
+  - The name's `ETag`, for `If-Match` and `If-None-Match` and in a turn's answer, is `"<commit>"`, where it was the
+    bucket's. A commit knows it before its put is answered, so one whose answer was lost, and which learns that it
+    landed, answers with it as one that heard does; and it changes only when a commit writes the name, as the bucket's
+    did. 128 random bits say no more of the head than an MD5 of its bytes.
+  - Before, a head held the ids of its last 8 commits: a commit whose base's newest id had been dropped could not tell
+    whether it landed, and a claim taken and let go put a head back to its base's bytes, and so to its `ETag`, on
+    which a commit sent before could still land. Icechunk reads back a write id from an object's metadata
+    (<https://github.com/earth-mover/icechunk/blob/main/design-docs/017-conditional-put-lost-response.md>); a head
+    holds its commit's id in its bytes.
+- **A commit with no answer reads the head to learn whether it landed.** A commit whose put errs, or has no answer,
+  reads the head (`Turn::land`), and what it finds decides only whether the turn is done: nothing is deleted whatever
+  it finds.
+  - If the head names the commit, it landed. It is done, and answers with its `ETag`.
+  - If the head is still the base, by its commit, nothing has landed on it, and the commit is put again, as it was.
+    That put lands only if the first has not, as the first one's landing changes the head's `ETag`; if it is refused,
+    the head is read again. A commit on a name with no head does the same while there is still none, with
     `If-None-Match: *`.
-  - Else the head's versions are read back along `over`, one GET by version id each, to the one written over the base.
-    If that one names the commit, the commit landed, and is done, with no `ETag`. If it does not, another write landed
-    on the base first, the head will never be the base again, and the commit never lands. It is a conflict, and the
-    turn runs again.
-  - Else it cannot tell. That is when there was a head and there is none, a version on the way back has expired or
-    has no `over`, or the bucket keeps no versions (`tric dev`'s memory store, which never loses an answer).
-  - While S3 errors, or a put again is refused, it asks again, after a wait that starts at 100 ms and doubles to 2 s.
-  - A claim whose put errs is held if the head holds its id, as before.
+  - Else another commit's head is there, which may have been written over the commit's or over the base, and the head
+    cannot say which. The commit fails with `Unsettled` (below).
+  - While S3 errors, or a put again is refused, it reads again, after a wait that starts at 100 ms and doubles to 2 s.
+  - The walk back along the head's versions goes. A head held `over`, the version id of the one it was written over,
+    and a commit that found another's head read the versions back along it to the one written over its base, which
+    said whether the commit was there. That was a field in every head, a GET by version id for each version on the
+    way, and the cases where it broke: a version expired, a head deleted, a version put back. It answered only when a
+    put lost its answer and another commit then landed within `SETTLE`, which on S3 is rare, and the cost of not
+    knowing is a 500 the client can act on.
 - **A commit that cannot learn whether it landed answers 500, with no `Retry-After`.** A commit's put, and learning
-  whether it landed, take `SETTLE` (30 s) at most from when the put is sent. Past that, or when the head cannot tell,
-  the commit fails with `Unsettled`, which is logged at warn with the path and the commit's id. The turn answers 500,
-  and is neither done nor run again; its objects are left for the sweep, as every turn's are. A 503 with
+  whether it landed, take `SETTLE` (30 s) at most from when the put is sent. Past that, or when the head is another
+  commit's, the commit fails with `Unsettled`, which is logged at warn with the path and the commit's id. The turn
+  answers 500, and is neither done nor run again; its objects are left for the sweep, as every turn's are. A 503 with
   `Retry-After` asks the client to try again (RFC 9110, 15.6.4 and 10.2.3,
   <https://www.rfc-editor.org/rfc/rfc9110#section-15.6.4>), and a turn that landed and runs again has run twice; a
-  500 asks nothing of the kind. An unclaimed turn's commit that fails before its put, in uploading its tree or
-  handing over its event, still answers 503 with `Retry-After: 1`, as nothing landed, and `TooLarge` answers 500, as
-  it never can. A claimed turn's answers 500, as for `Lapsed` (below): nothing landed, but the turn did what it
-  claimed the name for. Only an error marked `Unsent` answers 503 (`tric::failed`), and every other answers 500, so an
-  error that a later change adds after the put is taken for one that may have landed, and not for one that surely did
-  not.
-  - `SETTLE` is 30 s so that `ANSWER` (10 s), `BUSY` (5 s) and it fit in CloudFront's 60 s for an answer from the
+  500 asks nothing of the kind. A commit that fails before its put, in uploading its tree or handing over its event,
+  answers 503 with `Retry-After: 1`, as nothing landed, whether or not the turn sent an unsafe request, as a turn that
+  loses its race does; and `TooLarge` answers 500, as it never can land. Only an error marked `Unsent` answers 503
+  (`tric::failed`), and every other answers 500, so an error that a later change adds after the put is taken for one
+  that may have landed, and not for one that surely did not.
+  - `SETTLE` is 30 s so that the deadline (5 s), `ANSWER` (10 s) and it fit in CloudFront's 60 s for an answer from the
     origin, and the client hears the 500 and not a 504. A turn that runs again, or uploads slowly, can take longer.
   - object_store's request timeout is 30 s, so a put that waits it out uses all of `SETTLE`, and the turn answers 500.
   - The outbox waits for a commit to land for `SETTLE` and 30 s more, for a put that S3 applies late.
-- **Why a commit failed is one enum, `name::Failed`, and an error carries at most one.** It is `TooLarge`, `Unsent`,
-  `Unsettled` or `Lapsed`, which were four types, so an error could carry both `TooLarge` and `Unsent`, and
-  `tric::failed` had to check for the pair. A failure before the put is marked `Unsent` only if the turn is unclaimed
-  and the error is not a `Failed` already, so `TooLarge` never is, and `tric::failed` answers 503 for `Unsent` and 500
-  for any other. What `name::fate` learns is a `Committed`, done or a conflict, or `None` when the head cannot say,
-  where it was a `Fate` of its own, mapped onto `Committed` after. A turn keeps whether it holds its claim, and not the
-  claim's id, which only the claim's own put reads.
+- **Why a commit failed is one enum, `name::Failed`, and an error carries at most one.** It is `TooLarge`, `Unsent` or
+  `Unsettled`, which were types of their own, so an error could carry both `TooLarge` and `Unsent`, and
+  `tric::failed` had to check for the pair. A failure before the put is marked `Unsent` only if the error is not a
+  `Failed` already, so `TooLarge` never is, and `tric::failed` answers 503 for `Unsent` and 500 for any other.
+  `Lapsed`, for a claimed turn that lost its claim, went with the claims.
 - **A commit that does not land resets the tree itself, under its write lock.** `discard`, which a failed commit
   calls, resets the tree too, so the commit's reset looks redundant; but between the two the lock is free, and a
   descriptor that reads after the answer would see writes that never landed, where the file system promises the tree
   as the commit left it or as it was.
 - **What a lost answer still costs.**
   - A commit that cannot learn whether it landed answers 500. If the client runs the turn again all the same, and the
-    first put did land, the turn has run twice. That takes S3 failing for `SETTLE`, a version expiring during the
-    walk, a head that is deleted, or a version put back.
+    first put did land, the turn has run twice. That takes S3 failing for `SETTLE`, another commit landing over the
+    commit's head before the head is read, a head that is deleted, or a version put back.
   - An answer lost after a commit landed can still lead a client to try again: serve's answer may not reach the
     router, which answers 502; CloudFront answers 504 past its 60 s; a connection may drop. Nothing in the head tells
     such a retry from a new request. Only a key that the client sends with a request, and again with its retry, can,
     and tric takes one: a turn with an `Idempotency-Key` that landed is answered again as it was, and does not run
     (see "Idempotency keys").
-  - A claimed turn runs once at most. A claim lasts `CLAIM_TTL` (15 s) from when it is taken, 5 s past the turn's
-    deadline at the least, and a commit learning whether it landed can outlast it. Another turn may then claim the
-    name and commit, so a claimed turn whose commit is a conflict fails with `Lapsed`, and answers 500: it sent what
-    it claimed the name for, an unsafe request or a body read past its buffer, and running again would send it
-    again. Its writes are lost, and the client hears that it failed. A longer claim would make this rarer, and keep
-    a name from every other turn longer when a host dies holding it, so the claim stays at 15 s. A claimed turn whose
-    commit fails before its put answers 500 for the same reason, and is not marked `Unsent`.
   - A 409 on a head is a conflict, and the turn runs again, where object_store sent the put again.
   - A conditional put that times out is tried again, where object_store did not; the tries, and what follows them,
     stop at `SETTLE`.
-  - A claim whose put errs, when the head cannot then be read, is taken for another's, as before: the turn answers
-    429, and the claim runs out in 15 s. That costs availability and not data.
 - **The sweep is built, last, and is the collector.** A commit deletes nothing (the bullet on that above), so what
   leaks is all that no head names any more: what a commit replaced, and what a turn made that did not land, whether
   it trapped, timed out, lost its race or failed, or its host died. The sweep lists the app's names, and for each one
@@ -629,15 +645,14 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   only objects younger than the grace. The grant widens an app's session by the history of its own heads, which are
   names it already knows, and no other app's.
 - **Every version of a head that the bucket keeps is a root, and nothing else is.** What points into `values/` is a
-  head's tree, and nothing else does. A head also holds `pending`, which is digests of requests (the requests are in
-  the outbox, under `outbox/`, and not under `values/`), the claim, a lease, `commit`, the id of the commit that wrote
-  it, and `over`, a version id of the head itself, none of which are links. The outbox and retry objects hold a
-  request and its digest, and no link. A snapshot or a fork, which a read or a descriptor that outlives the answer
-  holds, is a copy of a root read from a head and reads by version, which a delete marker does not hide, and for at
-  most `TOTAL`, so it needs no mark of its own. A link read from a head or a node is checked to name an object of its
-  own name, so a changed head cannot make the sweep mark, or keep, another's. If anything else were ever to point into
-  `values/`, the sweep would have to mark through it as well, and `tree::object` is where to look for who builds those
-  paths.
+  head's tree, and nothing else does. A head also holds `commit`, the id of the commit that wrote it, which is no link.
+  The records of `Idempotency-Key`s and of delivery events are values in the tree, and no links either. The outbox and
+  retry objects hold an event's requests (under `outbox/`, and not under `values/`), and no link. A snapshot or a fork,
+  which a read or a descriptor that outlives the answer holds, is a copy of a root read from a head and reads by
+  version, which a delete marker does not hide, and for at most `TOTAL`, so it needs no mark of its own. A link read
+  from a head or a node is checked to name an object of its own name, so a changed head cannot make the sweep mark, or
+  keep, another's. If anything else were ever to point into `values/`, the sweep would have to mark through it as well,
+  and `tree::object` is where to look for who builds those paths.
 - **The grace outlasts the longest turn, by construction.** A head is put by a commit, which lands only if its base is
   the head then (a conditional put on its ETag, so a turn from an older head never lands), and names what its base
   named and what its turn made. The sweep takes `cutoff = now - GRACE` before it lists a name's versions, and reads
@@ -654,17 +669,18 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   limit raised past the grace cannot be built. A node the mark finds in the process cache was verified when it was
   cached, and the cache's key is its path and version, so the mark uses what a read would. Only putting a version
   back breaks the chain, as it descends from no current head: the next bullet has what it must keep to.
-- **Putting a version back is no commit, and must keep to two things.** Nothing in tric puts a version back; an
-  operator could, by copying a version of `names/<name>` over the key. Such a head names objects that may be older
-  than the grace and that the current head does not, and it is safe only because they are marked through the version
-  itself, which every run that listed before the put must then read whole. So a put back must be of a version that the
-  lifecycle keeps for an hour (`GRACE`) after the put at least, as a run lasts 900 s at most: S3 may expire a version
-  from the first midnight UTC that is `noncurrent_days` after its successor was put, and the version is not put back in
-  the hour before. And it must be a conditional put on the current head's ETag, as a commit is, so that it writes over
-  no commit. A tool that puts versions back states both in its own code, and tests them against a run under way. Its
-  `over` should be the current head's version id, as a commit's is; one that keeps the old version's `over` only makes
-  a commit that lost its answer at that moment answer 500, as its walk back along `over` breaks (the bullets on a lost
-  answer).
+- **Putting a version back is no commit, and must keep to three things.** Nothing in tric puts a version back; an
+  operator could, by copying a version of `names/<name>` over the key. Such a head names objects that may be older than
+  the grace and that the current head does not, and it is safe only because they are marked through the version itself,
+  which every run that listed before the put must then read whole. So a put back must be of a version that the lifecycle
+  keeps for an hour (`GRACE`) after the put at least, as a run lasts 900 s at most: S3 may expire a version from the
+  first midnight UTC that is `noncurrent_days` after its successor was put, and the version is not put back in the hour
+  before. And it must be a conditional put on the current head's ETag, as a commit is, so that it writes over no commit.
+  And it must carry a fresh `commit` id, as a commit does: the old version's bytes have the old version's `ETag` in the
+  bucket, so a commit sent over that version before could still land on the put back, after its delivery event was
+  dropped as never to land; and a client's `If-Match` with the old `ETag` would hold again. A tool that puts versions
+  back states all three in its own code, and tests them against a run under way. A version put back holds the records of
+  the commits up to it, and not of those after, so their delivery events not yet sent are dropped.
 - **A name's marks are bounded by their size together, and the valve is a last resort.** The versions of a name's head
   are marked one after another into one set of `u128` (`Head::mark`, which is `Tree::mark`), each reading its tree's
   nodes level by level, `IN_FLIGHT` (16) at once, each checked against its link, and passing over what the set holds.
@@ -683,18 +699,18 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   app and the name, and each deleting nothing, as its marks did not complete. After a mark that stops or fails, the
   set holds part of the trees, and is dropped with the name. Only the first is expected to fire, for a name that puts
   its head all day, and a name that makes one of the others is at its limits.
-- **A name's versions are bounded, and a name that puts its head all day is not swept.** `VERSIONS_MAX` (10,000) is
-  the most versions of a head, delete markers among them, that a run lists and reads. The listing is 1,000 a request,
-  ten in sequence, and the reads are `IN_FLIGHT` at once, some 15 s at 25 ms; the marks after the first read what
-  each commit changed, a few nodes one level after another, so 10,000 versions of a deep tree could take longer than
-  a run, and such a name is passed over as the first of a run is. The lifecycle keeps a version from one day to two
-  at the default, so a name has more than 10,000 only if it puts its head (a commit, or a claim) more often than
-  every 9 to 17 s all that time. Such a name is skipped, with a warning, at every run while it is that busy, and its
-  garbage stays until it is quieter: that costs space and not data. The alternative is to read fewer versions: a
-  name's versions from the oldest kept are a chain of commits, so what any of them names is what the oldest and the
-  current name and what was made since the oldest's `LastModified` less the grace, and a sweep could mark those two
-  and keep everything younger. That reads two heads where this reads thousands, and keeps more, and rests on the
-  chain, which a version put back breaks; it is not built, and is the choice to make if a name is ever that busy.
+- **A name's versions are bounded, and a name that puts its head all day is not swept.** `VERSIONS_MAX` (10,000) is the
+  most versions of a head, delete markers among them, that a run lists and reads. The listing is 1,000 a request, ten in
+  sequence, and the reads are `IN_FLIGHT` at once, some 15 s at 25 ms; the marks after the first read what each commit
+  changed, a few nodes one level after another, so 10,000 versions of a deep tree could take longer than a run, and such
+  a name is passed over as the first of a run is. The lifecycle keeps a version from one day to two at the default, so a
+  name has more than 10,000 only if it commits more often than every 9 to 17 s all that time. Such a name is skipped,
+  with a warning, at every run while it is that busy, and its garbage stays until it is quieter: that costs space and
+  not data. The alternative is to read fewer versions: a name's versions from the oldest kept are a chain of commits, so
+  what any of them names is what the oldest and the current name and what was made since the oldest's `LastModified`
+  less the grace, and a sweep could mark those two and keep everything younger. That reads two heads where this reads
+  thousands, and keeps more, and rests on the chain, which a version put back breaks; it is not built, and is the choice
+  to make if a name is ever that busy.
 - **One rule expires what is noncurrent, after `noncurrent_days`, and that is the history.** The module's rule
   `noncurrent` expires every noncurrent version after `noncurrent_days` (a variable, 1 by default, a whole number of 1
   or more, validated) and removes a delete marker that is all that is left of a key. A head's noncurrent versions are
@@ -798,7 +814,7 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   turn open therefore holds a permit the commit waits for, so it is in the commit, and one that comes later fails with
   `read-only`: none falls between. A stream's write is admitted when the guest makes it, not when
   it is later flushed to the tree, and the task that applies it is detached and never aborted, as an abort could leave
-  half a write. Lock order, to avoid a deadlock: the claim, the gate, the tree, the turn's state.
+  half a write. Lock order, to avoid a deadlock: the gate, the tree, the turn's state.
 - **A directory is as mutable as its mount, and `MUTATE_DIRECTORY` is only what `get-flags` says.** The preopen is
   opened to change its entries, and a directory opened by `open-at` reports the flag if it was asked for, and only
   while the turn can still change anything. The turn decides what is allowed, not the descriptor: a change fails when
@@ -948,8 +964,8 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
     that a replay goes to whoever had the first answer. A replay with no body tells the client what it needs, that the
     turn landed and how it ended; a GET reads what it made.
   - Leaving it to apps. An app can keep its own record among its keys, which commit with its writes, but each would
-    build the same thing again, and the host checks a turn's conditions and waits for a claim before the app runs: a
-    retry with `If-Match`, whose first try landed and moved the head, would get 412, and not the first answer.
+    build the same thing again, and the host checks a turn's conditions before the app runs: a retry with `If-Match`,
+    whose first try landed and moved the head, would get 412, and not the first answer.
 - **The sources.** Stripe v1 keeps a key 24 hours at least, takes up to 255 characters, and errors if the parameters
   differ (above). Stripe v2 runs a request that failed again, rather than replaying the failure, and keeps a key 30
   days (<https://docs.stripe.com/api-v2-overview#idempotency>). EC2's `ClientToken` is up to 64 ASCII characters, and
@@ -980,12 +996,12 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   is a put for a keyed turn that changed nothing, which a client that sends a key means as a write. A 5xx, a trap or
   an error discards the turn and records nothing, so a retry runs it again, as Stripe's v2 does. A 4xx that commits
   records its status, as its writes landed.
-- **The record is looked for on each pass of `Turn::open`, before the claim and the conditions.** So a retry is
-  answered at once, even while another turn holds the name, and even if its `If-Match` no longer holds because its
-  own first try moved the head. Of duplicates sent together, the first to commit records; one that ran beside it
-  loses the compare-and-swap, runs again, finds the record and replays. One that finds the name claimed waits up to
-  `BUSY` as any turn does, and then gets 429 with `Retry-After`, and not the draft's 409: a claim does not say whose
-  key it is under, and a 429 already asks for the retry that will then replay.
+- **The record is looked for on each pass of `Turn::open`, before the conditions.** So a retry is answered at once, even
+  if its `If-Match` no longer holds because its own first try moved the head. Of duplicates sent together, the first to
+  commit records; one that ran beside it loses the compare-and-swap, runs again, finds the record and replays. One that
+  loses and may not run again, having sent an unsafe request or reached its deadline, answers 503 with `Retry-After` as
+  any such turn does, and not the draft's 409: nothing says whose key the turn that beat it was under, and a 503 with
+  `Retry-After` already asks for the retry that will then replay.
 - **Another request with a key that has a record is 422,** as the draft says, and as EC2's mismatch is an error.
 - **Records are kept by the day they were made, for one to two days.** A record is at `i/<day>/<key>`, the day being
   Unix days in six digits, so the records sort by age. A lookup reads yesterday's, today's and tomorrow's, so hosts
@@ -998,10 +1014,10 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
 - **The marker is Stripe's `Idempotent-Replayed: true`.** A client that ignores it can take a replay for a new
   outcome: CVE-2026-34210 is mppx accepting a replayed Stripe PaymentIntent as a new payment, as it did not check the
   header (<https://nvd.nist.gov/vuln/detail/CVE-2026-34210>). A replay carries no `ETag`, as the head may have moved.
-- **A key changes no status code, and leaves one case.** A claimed turn that did not land has no record: one that
-  failed with `Lapsed`, one whose commit failed before its put, or one whose app answered 5xx after an unsafe request
-  went out. Its 500 is not replayed, so a client that retries it anyway runs it again, and sends again what it sent. An
-  app that calls out should pass a key derived from its own on to what it calls, so the far side applies it once.
+- **A key changes no status code, and leaves one case.** A turn that sent an unsafe request and did not land has no
+  record: one that lost its race, one whose commit failed before its put, or one whose app answered 5xx. Its answer is
+  not replayed, so a client that retries it runs it again, and sends again what it sent. An app that calls out should
+  pass a key derived from its own on to what it calls, so the far side applies it once.
 - **The outbox's `Idempotency-Key: <commit>/<n>` now counts at home.** A background request to the app's own origin
   that is delivered again within a day is applied once. A held request that the app gave a key of its own keeps it,
   and gets no second, which tric would refuse at home with 400: the app's key may be one it derived to dedupe across
@@ -1010,7 +1026,7 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   - no `Content-Location` is kept or replayed, as with no body it says little;
   - the key is the bytes sent, checked byte by byte and by its length, with no Structured Field parsing;
   - every keyed commit records, so only a turn that did not commit goes unrecorded;
-  - a duplicate that meets a claim gets the 429 any turn does, and not a 409 of its own;
+  - a duplicate in flight that may not run again gets the 503 any such turn does, and not a 409 of its own;
   - the fingerprint hashes a copy of the method, target and kept body (6 MiB at most) with `store::hash`, rather than
     streaming them into a hasher;
   - a `Location` that is not visible ASCII is not recorded;
@@ -1107,17 +1123,24 @@ sockets and where API Gateway WebSocket does, on AWS. A probe on AWS, behind Clo
   as pairs sees the same in both.
 - **The client's address comes from `CloudFront-Viewer-Address`,** as on HTTP, and never from `X-Forwarded-For`:
   CloudFront appends to what a client sends there, so its first element can be forged.
-- **An event is a turn.** A `5xx`, a busy name's `429`, an answer that is not well-formed events, or one that is late
-  (the engine's 10 s) ends the socket. The app is told `CLOSE`, with the client's code if it gave one, of a socket
-  the client closed, and `DISCONNECT` of one that ended any other way but its own `CLOSE`.
+- **An event is a turn.** A `5xx`, an answer that is not well-formed events, or one that is late (the engine's 10 s)
+  ends the socket. The app is told `CLOSE`, with the client's code if it gave one, of a socket the client closed, and
+  `DISCONNECT` of one that ended any other way but its own `CLOSE`.
 - **A socket's messages run concurrently, and arrive unordered,** as API Gateway invokes them; `tric dev` runs 16 of
   one socket's at once. An app that needs order puts a sequence number in its messages. Ordering them would mean a
   lock or a queue tric would have to invent. `DISCONNECT` can arrive while earlier messages still run: it deletes the
   record, and an event after it finds no socket and is dropped, with a log line.
 - **GRIP is a channel and a publish, and no more.** A channel is a name, of the app. A publish is a `POST` to
   `/publish/` at the app's own origin with `Prefer: respond-async`: held, as every background request is, and taken
-  after the turn's other held requests, at most once, if the turn commits. Without that header, it is a call to the
-  app like any other. Messages are text: `content-bin`, other formats and `action` drop the publish, with a log line.
+  after the turn's other held requests, if the turn commits, and taken again if its event is delivered again. Without
+  that header, it is a call to the app like any other. Messages are text: `content-bin`, other formats and `action`
+  drop the publish, with a log line.
+- **A publish may be sent twice.** It was sent at most once, as serve took the commit out of the head's `pending`
+  before it handed the publish to the router, so an event delivered again was dropped. The record that lets an event
+  through now stays in the name's tree for two days or more, so a delivery that the router takes for failed after
+  serve answered (the delete of the waiting object fails, or serve's answer is lost) and that is tried again publishes
+  again, as a background request is sent again. Sending once would take a write for each delivery, which is what the
+  records saved. An app whose sockets must not see a message twice puts an id in its messages.
 - **The subprotocol is echoed.** The app's `OPEN` answer sets `Sec-WebSocket-Protocol`, and tric copies it to the
   handshake's answer; a browser fails the handshake without it.
 - **Every handshake header is sent on every event,** less the upgrade's own but for the subprotocols offered, as
