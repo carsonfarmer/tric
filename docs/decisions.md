@@ -330,7 +330,8 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   B-trees go wrong, so the model test (below) is built for it: it uses nodes of about a kilobyte, so that branches
   as well as leaves split and merge, and four levels grow and collapse in a few hundred rounds. It is not done at each
   delete, which would merge a node that the next write fills again, and only nodes the turn changed are looked at, so
-  a commit reads nothing it hadn't.
+  a commit reads nothing it hadn't. A spill that uploads nodes merges first, as the commit does (see "A spill of nodes
+  merges first" under the tree crate).
 - **A branch's first key is not looked at.** A child's key is the least key that can be in it, and the first child
   has nothing to its left to be least of, so a lookup searches only the keys after it. A merge keeps this true by
   giving the first child of the right-hand branch its parent's separator when the two join, since there it is
@@ -370,10 +371,10 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
 - **Past its memory budget a turn spills, as LMDB does a dirty page.** The copies, and the blocks and large values held
   for upload, count against one budget of 8 MiB (`Config::budget`), checked after each write. Past it, the held values
   and blocks upload first, up to 16 at once while the writer waits, and each becomes a link; if the copies are still
-  over the budget, the changed nodes upload bottom-up and become links too, which dirties their parents in turn. Nothing
-  refers to an uploaded object until the commit, so a discard changes nothing that a head names. What the turn uploaded,
-  and what it uploaded and then replaced, is left for the sweep. The turn holds about its budget and one write however
-  much it writes.
+  over the budget, what is thin merges, as at the commit, and the changed nodes upload bottom-up and become links too,
+  which dirties their parents in turn. Nothing refers to an uploaded object until the commit, so a discard changes
+  nothing that a head names. What the turn uploaded, and what it uploaded and then replaced, is left for the sweep. The
+  turn holds about its budget and one write however much it writes.
 - **A key's value over 4 KiB is held like a block,** uploaded when the budget spills it or the commit does, and
   counted against the same budget. This reads "upload eagerly, as blocks do" as "dirty against the shared budget and
   spilled by the same rule": a value is not uploaded at the write, since a value written twice in a turn would then
@@ -1154,6 +1155,11 @@ The tree is the crate `tric-tree`, in `crates/tree`, and the root is a workspace
   is the copy that outlives a turn, so a snapshot type would only repeat the reads. The mark does not share the
   scans' walk: it reads level by level, unordered and up to `Config::in_flight` at once, and keeps nothing in the
   cache, where a scan reads in key order, to a limit, through the cache.
+- **A spill of nodes merges first, as the commit does.** Both are one `flush`: what is thin merges and what is empty
+  is dropped (`fix`), a root of one child gives way to it, and then the nodes upload. A spill used to upload the nodes
+  as they were, so its upload dropped the empty ones itself and put right a root it had emptied: a second path for
+  what `fix` does. A merge at a spill may be filled again by a later write, as one at each delete would be, and may
+  read a neighbour, but a spill is past the budget and rare, and most of its merges are ones the commit would make.
 - **The tests moved with the tree,** the model test against a `BTreeMap` among them, and its counting store is
   `tric_tree::testing`, behind the `testing` feature, which tric's dev-dependency turns on; tric's tests take it as a
   `Store` from `tree::counting`. Of the tree's 21 tests, 19 are the crate's as they were, and one is renamed for the

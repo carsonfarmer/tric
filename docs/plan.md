@@ -208,23 +208,23 @@ i/<day>/<key>        the record of an `Idempotency-Key`: the request's fingerpri
 
 **Editing.** A turn edits the tree itself, as LMDB and bbolt do in a write transaction. There is no overlay:
 - A write descends from the root. Each node on the path is loaded (a GET if it is not cached, unless it is already in
-  memory), copied, and changed; its object goes on `dead`. Nodes it did not touch stay links.
+  memory), copied, and changed. Nodes it did not touch stay links.
 - Reads, `readdir` and `list-keys` use the same tree, so they see the turn's own writes and nothing more. A blind write
   descends at the write, so a GET per uncached level is paid there, not at the commit.
 - An overfull node splits in halves by size, up to the root, which grows the tree by a level.
-- At the commit, a changed node under a quarter full merges with a neighbour (and the two are split again if they do not
-  fit in one), and an emptied node is dropped, as bbolt does. A root with one child is replaced by it. So the tree
-  shrinks as it is emptied, and a name that is mostly deleted does not stay sparse.
+- At the commit, and when a spill uploads nodes, a changed node under a quarter full merges with a neighbour (and the
+  two are split again if they do not fit in one), and an emptied node is dropped, as bbolt does. A root with one child
+  is replaced by it. So the tree shrinks as it is emptied, and a name that is mostly deleted does not stay sparse.
 
 **Spilling.** The copies in memory, and file data and large values held for upload, count against one budget of 8 MiB
 (`Config::budget`), checked after each write. Past it, as LMDB spills dirty pages:
 1. The held blocks and values upload, up to 16 at once, and the writer waits. Each item becomes a link.
-2. If the copies still pass the budget, the changed nodes upload bottom-up and become links, so each parent is changed,
-   and in memory, in its turn.
+2. If the copies still pass the budget, what is thin merges and what is empty is dropped, as at the commit, and the
+   changed nodes upload bottom-up and become links, so each parent is changed, and in memory, in its turn.
 
-Whatever a turn made and then replaced is on `made`, and, as it was replaced, on `dead` too. So a turn's memory stays
-about its budget plus one write, however much it writes. A key's value over 4 KiB is held like a block, and uploaded
-when the budget spills it or the commit does.
+What a turn uploaded and then replaced stays in the store, for the sweep. So a turn's memory stays about its budget
+plus one write, however much it writes. A key's value over 4 KiB is held like a block, and uploaded when the budget
+spills it or the commit does.
 
 **The commit,** at the answer:
 1. Merge what is thin, and drop what is empty, from the leaves up.

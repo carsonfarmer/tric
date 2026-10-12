@@ -1023,7 +1023,7 @@ impl<'a> Flush<'a> {
     }
 
     /// Uploads the values held in `node`, and, if `nodes`, the nodes below it that are in memory, so each is a link.
-    /// Those left empty are dropped. The node itself is for the caller to upload.
+    /// None of them is empty, as [`fix`] dropped those. The node itself is for the caller to upload.
     fn node(&'a self, node: &'a mut Node) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             match &mut node.body {
@@ -1040,9 +1040,6 @@ impl<'a> Flush<'a> {
                 }
                 Body::Branch(kids) => {
                     try_join_all(kids.iter_mut().map(|kid| self.child(kid))).await?;
-                    if self.nodes {
-                        kids.retain(|k| !matches!(&k.at, At::Dirty(n) if n.is_empty()));
-                    }
                 }
             }
             node.measure();
@@ -1053,7 +1050,7 @@ impl<'a> Flush<'a> {
     async fn child(&self, kid: &mut Child) -> Result<()> {
         let At::Dirty(node) = &mut kid.at else { return Ok(()) };
         self.node(node).await?;
-        if !self.nodes || node.is_empty() {
+        if !self.nodes {
             return Ok(());
         }
         let (json, max) = (node.json(), self.reader.config.node);
@@ -1258,12 +1255,26 @@ impl Tree {
         Ok(())
     }
 
+    /// Uploads the values the tree holds, and, if `nodes`, the nodes it changed too, after it merges what is thin and
+    /// drops what is empty, as at the commit, and gives up the levels of the root that have one child.
     async fn flush(&mut self, nodes: bool) -> Result<()> {
-        Flush::new(&self.reader, nodes).node(&mut self.root).await?;
-        if matches!(&self.root.body, Body::Branch(kids) if kids.is_empty()) {
-            self.root = Node::leaf();
+        let r = &*self.reader;
+        if nodes {
+            fix(r, &mut self.root).await?;
+            while let Body::Branch(kids) = &mut self.root.body {
+                match kids.len() {
+                    0 => self.root = Node::leaf(),
+                    1 => {
+                        let Some(Child { mut at, .. }) = kids.pop() else { break };
+                        let only = dirty(r, &mut at).await?;
+                        self.root = std::mem::replace(only, Node::leaf());
+                        r.stats.collapses.fetch_add(1, Relaxed);
+                    }
+                    _ => break,
+                }
+            }
         }
-        Ok(())
+        Flush::new(r, nodes).node(&mut self.root).await
     }
 
     /// Merges what is thin, uploads what changed, and gives the new root, for the caller to keep. The tree is then as
@@ -1279,23 +1290,10 @@ impl Tree {
     }
 
     async fn seal(&mut self) -> Result<Root> {
-        let r = &*self.reader;
-        fix(r, &mut self.root).await?;
-        while let Body::Branch(kids) = &mut self.root.body {
-            match kids.len() {
-                0 => self.root = Node::leaf(),
-                1 => {
-                    let Some(Child { mut at, .. }) = kids.pop() else { break };
-                    let only = dirty(r, &mut at).await?;
-                    self.root = std::mem::replace(only, Node::leaf());
-                    r.stats.collapses.fetch_add(1, Relaxed);
-                }
-                _ => break,
-            }
-        }
-        Flush::new(r, true).node(&mut self.root).await?;
-        if self.root.size > r.config.node {
-            return Err(Error::TooLarge(format!("the root is over {} bytes", r.config.node)));
+        self.flush(true).await?;
+        let max = self.reader.config.node;
+        if self.root.size > max {
+            return Err(Error::TooLarge(format!("the root is over {max} bytes")));
         }
         let Work { bytes, entries, seq } = self.work;
         Ok(Root { root: self.root.body.clone(), bytes, entries, seq })
