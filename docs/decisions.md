@@ -85,9 +85,10 @@ reason.
 - **The retries have a Scheduler group and a role of their own.** The retry role may invoke `events:retry` only, and
   the cron role `events:cron` only. The router may create a schedule in the retry group only, and pass only the retry
   role to Scheduler, so it can't make a schedule that runs as `cron`. serve may invoke `outbox` only, so it can make
-  none. The retry role's trust names the account and the group's ARN, as Scheduler's documentation asks, so no other
-  schedule can assume it. The router's two functions share its role, so `route` holds these grants as well; it takes
-  no event, and the grants are narrow.
+  none. Each role's trust names the account and its own group's ARN, as Scheduler's documentation asks, so no other
+  schedule can assume it. The module makes the two alike, a group and a role for each alias, named `tric-cron` and
+  `tric-retry`. The router's two functions share its role, so `route` holds these grants as well; it takes no event,
+  and the grants are narrow.
 - **`PENDING_TTL` is the window and an hour.** serve drops an event whose commit isn't pending, so an entry must
   outlast the last try. The hour covers Scheduler's minute, Lambda's own two retries of a try, and an event that
   Lambda was late to hand over. A hand-over later than that loses the tail of the window, not the first tries.
@@ -123,6 +124,9 @@ reason.
 - **The package is arm64 only,** and `docker compose run --rm package` refuses to build it anywhere else. Graviton
   costs less, and no cross-compiling means no toolchain to keep. The toolchain image is Amazon Linux 2023, the
   runtime's own OS, so the binary links the glibc that Lambda has.
+- **The install's names begin with `tric`, and no variable changes that.** IAM's role names and CloudFront's function
+  names are the account's, in every region, so an account holds one install, and a second install is a second
+  account. The bucket's name, which S3 shares among all accounts, is `tric-` and a suffix that OpenTofu makes up.
 - **The router invokes serve with `InvokeWithResponseStream`.** It sends a function-URL event (payload format 2.0)
   carrying the tenant id. The answer is a JSON prelude, then 8 NULs, then the body. Failures come from
   `InvokeComplete`'s error code.

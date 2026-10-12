@@ -17,12 +17,6 @@ variable "region" {
   default = "us-west-2"
 }
 
-variable "name" {
-  description = "The prefix of every resource's name"
-  type        = string
-  default     = "tric"
-}
-
 variable "package" {
   description = "The Lambda package: tric, for arm64, and bootstrap"
   type        = string
@@ -75,14 +69,14 @@ variable "sweep_every" {
 
 provider "aws" {
   region = var.region
-  default_tags { tags = { app = var.name } }
+  default_tags { tags = { app = local.name } }
 }
 
 # CloudFront takes its certificates from us-east-1 only.
 provider "aws" {
   alias  = "us_east_1"
   region = "us-east-1"
-  default_tags { tags = { app = var.name } }
+  default_tags { tags = { app = local.name } }
 }
 
 data "aws_caller_identity" "current" {}
@@ -93,11 +87,12 @@ data "aws_route53_zone" "domain" {
 }
 
 locals {
+  # The prefix of every resource's name, which is fixed, so an account holds one install.
+  name = "tric"
   # The functions' ARNs, spelt out so that the functions can name each other.
-  function = "arn:aws:lambda:${var.region}:${data.aws_caller_identity.current.account_id}:function:${var.name}"
+  function = "arn:aws:lambda:${var.region}:${data.aws_caller_identity.current.account_id}:function:${local.name}"
   serve    = "${local.function}-serve"
   outbox   = "${local.function}-events:outbox"
-  cron     = "${local.function}-events:cron"
   retry    = "${local.function}-events:retry"
   bucket   = aws_s3_bucket.store.arn
   # API Gateway's, for sockets: its stage `ws`, which CloudFront sends upgrades to, and `@connections`'.
@@ -106,14 +101,14 @@ locals {
   # The Lambda Web Adapter, which turns invocations into HTTP requests to tric.
   adapter = "arn:aws:lambda:${var.region}:753240598075:layer:LambdaAdapterLayerArm64:30"
   # The retries' schedule group, and its schedules, whose names the router makes up.
-  retries   = "${var.name}-retry"
+  retries   = aws_scheduler_schedule_group.scheduler["retry"].name
   schedules = "arn:aws:scheduler:${var.region}:${data.aws_caller_identity.current.account_id}:schedule/${local.retries}"
 }
 
 # The bucket: apps/ and native/; and ws/, sockets' records, and outbox/, the deliveries that wait to be tried again,
 # which only the router reads and writes.
 resource "aws_s3_bucket" "store" {
-  bucket_prefix = "${var.name}-"
+  bucket_prefix = "${local.name}-"
   force_destroy = true
 }
 
@@ -174,7 +169,7 @@ locals {
 
 # The router's: the trusted core, which mints the apps' credentials.
 resource "aws_iam_role" "route" {
-  name               = "${var.name}-route"
+  name               = "${local.name}-route"
   assume_role_policy = local.lambda
 }
 
@@ -218,7 +213,7 @@ resource "aws_iam_role_policy" "route" {
       {
         Effect    = "Allow"
         Action    = "iam:PassRole"
-        Resource  = aws_iam_role.retry.arn
+        Resource  = aws_iam_role.scheduler["retry"].arn
         Condition = { StringEquals = { "iam:PassedToService" = "scheduler.amazonaws.com" } }
       },
     ]
@@ -227,7 +222,7 @@ resource "aws_iam_role_policy" "route" {
 
 # The apps': the router's sessions narrow it to one app.
 resource "aws_iam_role" "app" {
-  name = "${var.name}-app"
+  name = "${local.name}-app"
   assume_role_policy = jsonencode({
     Version   = "2012-10-17"
     Statement = [{ Effect = "Allow", Principal = { AWS = aws_iam_role.route.arn }, Action = "sts:AssumeRole" }]
@@ -269,7 +264,7 @@ resource "aws_iam_role_policy" "app" {
 
 # serve's: its logs and the outbox, and no storage at all.
 resource "aws_iam_role" "serve" {
-  name               = "${var.name}-serve"
+  name               = "${local.name}-serve"
   assume_role_policy = local.lambda
 }
 
@@ -284,9 +279,18 @@ resource "aws_iam_role_policy" "serve" {
   })
 }
 
-# Scheduler's, for the apps' cron: the events function's `cron` alias, and no other.
+# Scheduler's, a group and a role for each alias of the events function that it invokes: `cron`, for the apps' cron and
+# sweeps, and `retry`, for the deliveries' retries. A role invokes its own alias and no other, and only its own group's
+# schedules may assume it. The retries' group is apart, so that the router, which makes their schedules, can make none
+# that run as `cron`.
+resource "aws_scheduler_schedule_group" "scheduler" {
+  for_each = toset(["cron", "retry"])
+  name     = "${local.name}-${each.key}"
+}
+
 resource "aws_iam_role" "scheduler" {
-  name = "${var.name}-scheduler"
+  for_each = aws_scheduler_schedule_group.scheduler
+  name     = "${local.name}-${each.key}"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -296,7 +300,7 @@ resource "aws_iam_role" "scheduler" {
       Condition = {
         StringEquals = {
           "aws:SourceAccount" = data.aws_caller_identity.current.account_id
-          "aws:SourceArn"     = aws_scheduler_schedule_group.cron.arn
+          "aws:SourceArn"     = each.value.arn
         }
       }
     }]
@@ -304,47 +308,16 @@ resource "aws_iam_role" "scheduler" {
 }
 
 resource "aws_iam_role_policy" "scheduler" {
-  role = aws_iam_role.scheduler.id
+  for_each = aws_scheduler_schedule_group.scheduler
+  role     = aws_iam_role.scheduler[each.key].id
   policy = jsonencode({
-    Version   = "2012-10-17"
-    Statement = [{ Effect = "Allow", Action = "lambda:InvokeFunction", Resource = local.cron }]
-  })
-}
-
-resource "aws_scheduler_schedule_group" "cron" {
-  name = var.name
-}
-
-# Scheduler's, for the deliveries' retries: the events function's `retry` alias, and no other. Its group is its own, so
-# that the router, which makes these schedules, can make none that run as `cron`.
-resource "aws_iam_role" "retry" {
-  name = "${var.name}-retry"
-  assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "scheduler.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-      Condition = {
-        StringEquals = {
-          "aws:SourceAccount" = data.aws_caller_identity.current.account_id
-          "aws:SourceArn"     = aws_scheduler_schedule_group.retry.arn
-        }
-      }
+      Effect   = "Allow"
+      Action   = "lambda:InvokeFunction"
+      Resource = "${local.function}-events:${each.key}"
     }]
   })
-}
-
-resource "aws_iam_role_policy" "retry" {
-  role = aws_iam_role.retry.id
-  policy = jsonencode({
-    Version   = "2012-10-17"
-    Statement = [{ Effect = "Allow", Action = "lambda:InvokeFunction", Resource = local.retry }]
-  })
-}
-
-resource "aws_scheduler_schedule_group" "retry" {
-  name = local.retries
 }
 
 # The functions, from one package: bootstrap runs `tric <handler>`, behind the adapter, on port 3000.
@@ -364,7 +337,7 @@ locals {
     # Where a delivery that fails waits for its next try: the group the router schedules in, and what it schedules.
     TRIC_RETRIES    = local.retries
     TRIC_RETRY      = local.retry
-    TRIC_RETRY_ROLE = aws_iam_role.retry.arn
+    TRIC_RETRY_ROLE = aws_iam_role.scheduler["retry"].arn
   }
   functions = {
     # Clients' requests, which only CloudFront's secret lets in.
@@ -401,13 +374,13 @@ locals {
 
 resource "aws_cloudwatch_log_group" "function" {
   for_each          = local.functions
-  name              = "/aws/lambda/${var.name}-${each.key}"
+  name              = "/aws/lambda/${local.name}-${each.key}"
   retention_in_days = 3
 }
 
 resource "aws_lambda_function" "function" {
   for_each         = local.functions
-  function_name    = "${var.name}-${each.key}"
+  function_name    = "${local.name}-${each.key}"
   role             = each.value.role
   runtime          = "provided.al2023"
   architectures    = ["arm64"]
@@ -464,7 +437,7 @@ resource "aws_lambda_permission" "ws" {
 # route response; every message to a client goes through `@connections`. Its own URL refuses an opening without the
 # origin secret, as the function URL does a request.
 resource "aws_apigatewayv2_api" "ws" {
-  name                       = "${var.name}-ws"
+  name                       = "${local.name}-ws"
   protocol_type              = "WEBSOCKET"
   route_selection_expression = "$request.body.action"
 }
@@ -533,7 +506,7 @@ resource "aws_acm_certificate_validation" "apps" {
 # function can't see `Upgrade`, so a request with `Sec-WebSocket-Key` is taken as a socket's opening, and goes to API
 # Gateway's stage, with its path as X-Forwarded-Path; its query goes as it is.
 resource "aws_cloudfront_function" "host" {
-  name    = "${var.name}-host"
+  name    = "${local.name}-host"
   runtime = "cloudfront-js-2.0"
   publish = true
   code    = <<-EOT
@@ -618,7 +591,7 @@ output "TRIC_BUCKET" {
 }
 
 output "TRIC_SCHEDULES" {
-  value = aws_scheduler_schedule_group.cron.name
+  value = aws_scheduler_schedule_group.scheduler["cron"].name
 }
 
 output "TRIC_EVENTS" {
@@ -626,7 +599,7 @@ output "TRIC_EVENTS" {
 }
 
 output "TRIC_SCHEDULER_ROLE" {
-  value = aws_iam_role.scheduler.arn
+  value = aws_iam_role.scheduler["cron"].arn
 }
 
 output "TRIC_SWEEP_EVERY" {

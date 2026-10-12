@@ -586,7 +586,7 @@ done
 for t in "lambda:InvokeFunction $FN:tric-events" "lambda:InvokeFunction $FN:tric-events:outbox" \
   "s3:GetObject $B3/apps/alpha/names/x" "s3:PutObject $B3/apps/alpha/names/x" "s3:PutObject $B3/x" \
   "s3:ListBucket $B3" "s3:DeleteObject $B3/apps/alpha/current" "scheduler:CreateSchedule $SCHED/$TRIC_SCHEDULES/x" \
-  "iam:PassRole arn:aws:iam::$ACCOUNT:role/tric-scheduler"; do
+  "iam:PassRole arn:aws:iam::$ACCOUNT:role/tric-cron"; do
   is "the router's role is denied $t" "$(psim tric-route $t)" implicitDeny
 done
 is "serve may invoke the outbox alias" "$(psim tric-serve lambda:InvokeFunction "$FN:tric-events:outbox")" allowed
@@ -601,7 +601,7 @@ for p in apps/alpha/values/ apps/alpha/names/ ws/channels/; do
   is "and listing the versions under it" "$(psim tric-serve s3:ListBucketVersions "$B3" $p)" implicitDeny
 done
 # Each Scheduler role invokes its own alias of the events function, and nothing else.
-for r in "tric-scheduler cron" "tric-retry retry"; do
+for r in "tric-cron cron" "tric-retry retry"; do
   set -- $r
   is "$1 may invoke the $2 alias" "$(psim $1 lambda:InvokeFunction "$FN:tric-events:$2")" allowed
   for t in events events:outbox events:cron events:retry serve; do
@@ -886,14 +886,9 @@ if [ -n "$commit" ]; then
 fi
 # serve's 503 to each try, in the router's log: the first try, and two that Scheduler made.
 tries="{ \$.fields.app = \"alpha\" && \$.fields.message = \"outbox: serve answered 503 Service Unavailable\" }"
-end=$((SECONDS + 360)) n=0
-while [ $SECONDS -lt $end ]; do
-  n=$(nlogs events "$failed" "$tries")
-  [[ $n =~ ^[0-9]+$ ]] && [ "$n" -ge 3 ] && break
-  sleep 15
-done
-if [[ $n =~ ^[0-9]+$ ]] && [ "$n" -ge 3 ]; then pass "Scheduler tries a failed delivery again, and again"
-else fail "Scheduler tries a failed delivery again, and again" "$n tries in 6 minutes, want 3"; fi
+if awaitpat events "$failed" "$tries" 360 3; then pass "Scheduler tries a failed delivery again, and again"
+else fail "Scheduler tries a failed delivery again, and again" \
+  "$(nlogs events "$failed" "$tries") tries in 6 minutes, want 3"; fi
 note "the tries' times: $(aws logs filter-log-events --log-group-name /aws/lambda/tric-events --start-time "$failed" \
   --filter-pattern "$tries" --query 'events[].timestamp' --output text | tr '\t' '\n' |
   awk 'NR == 1 { t = $1 } { printf "+%ds ", ($1 - t) / 1000 }')"

@@ -13,7 +13,7 @@ mock_provider "aws" {
     defaults = { arn = "arn:aws:logs:us-west-2:123456789012:log-group:x" }
   }
   mock_resource "aws_scheduler_schedule_group" {
-    defaults = { arn = "arn:aws:scheduler:us-west-2:123456789012:schedule-group/tric" }
+    defaults = { arn = "arn:aws:scheduler:us-west-2:123456789012:schedule-group/tric-cron" }
   }
   mock_resource "aws_cloudfront_function" {
     defaults = { arn = "arn:aws:cloudfront::123456789012:function/tric-host" }
@@ -36,12 +36,12 @@ override_resource {
 }
 
 override_resource {
-  target = aws_iam_role.retry
+  target = aws_iam_role.scheduler["retry"]
   values = { arn = "arn:aws:iam::123456789012:role/tric-retry" }
 }
 
 override_resource {
-  target = aws_scheduler_schedule_group.retry
+  target = aws_scheduler_schedule_group.scheduler["retry"]
   values = { arn = "arn:aws:scheduler:us-west-2:123456789012:schedule-group/tric-retry" }
 }
 
@@ -188,19 +188,19 @@ run "module" {
   }
   assert {
     condition = (
-      jsondecode(aws_iam_role_policy.scheduler.policy).Statement[0].Resource
+      jsondecode(aws_iam_role_policy.scheduler["cron"].policy).Statement[0].Resource
       == "arn:aws:lambda:us-west-2:123456789012:function:tric-events:cron"
     )
     error_message = "Scheduler invokes the events function as cron, never as outbox or ws"
   }
   assert {
     condition = (
-      jsondecode(aws_iam_role_policy.retry.policy).Statement == [{
+      jsondecode(aws_iam_role_policy.scheduler["retry"].policy).Statement == [{
         Effect   = "Allow"
         Action   = "lambda:InvokeFunction"
         Resource = "arn:aws:lambda:us-west-2:123456789012:function:tric-events:retry"
       }]
-      && jsondecode(aws_iam_role.retry.assume_role_policy).Statement == [{
+      && jsondecode(aws_iam_role.scheduler["retry"].assume_role_policy).Statement == [{
         Effect    = "Allow"
         Principal = { Service = "scheduler.amazonaws.com" }
         Action    = "sts:AssumeRole"
@@ -215,8 +215,8 @@ run "module" {
   assert {
     condition = (
       [for p in [aws_iam_role_policy.route, aws_iam_role_policy.app, aws_iam_role_policy.serve,
-        aws_iam_role_policy.scheduler, aws_iam_role_policy.retry] : p.policy
-      if strcontains(p.policy, "function:tric-events:retry")] == [aws_iam_role_policy.retry.policy]
+        aws_iam_role_policy.scheduler["cron"], aws_iam_role_policy.scheduler["retry"]] : p.policy
+      if strcontains(p.policy, "function:tric-events:retry")] == [aws_iam_role_policy.scheduler["retry"].policy]
     )
     error_message = "only the retry role invokes the retry alias: not serve, the router, the apps or cron's Scheduler"
   }
@@ -249,7 +249,7 @@ run "module" {
       aws_lambda_function.function[f].environment[0].variables.TRIC_RETRIES == "tric-retry"
       && aws_lambda_function.function[f].environment[0].variables.TRIC_RETRY
       == "arn:aws:lambda:us-west-2:123456789012:function:tric-events:retry"
-      && aws_lambda_function.function[f].environment[0].variables.TRIC_RETRY_ROLE == aws_iam_role.retry.arn
+      && aws_lambda_function.function[f].environment[0].variables.TRIC_RETRY_ROLE == aws_iam_role.scheduler["retry"].arn
     )]) && !strcontains(jsonencode(aws_lambda_function.function["serve"].environment), "TRIC_RETRY")
     error_message = "the router knows where retries go, and serve does not"
   }
