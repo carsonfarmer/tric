@@ -288,8 +288,9 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   production linker. Without `TRIC_CONFORMANCE`, the directory of the built tests, the test is skipped, so a build
   outside the image is not broken by it. The host needs an `App` to be a `Tric`, so it takes the built fixture.
 - **The conformance run is Wasmtime's own configuration:** the directory as `/`, no environment beyond the test's and
-  no skip-list. All 21 pass, and `FAILS`, the list of those that do not, is empty and has a rule: a listed test that
-  passes fails the run, so a reason cannot outlive its cause. `TESTS` pins the count, so a change of commit is noticed.
+  no skip-list. All 21 pass, and one that fails fails the run. A list of tests allowed to fail, with a rule that a
+  listed test that passes fails the run, was kept empty, and went: a test that fails is fixed, not listed. `TESTS`
+  pins the count, so a change of commit is noticed.
   The harness was shown to be able to fail: with `get-flags` made to report `mutate-directory` for any descriptor
   opened to read, `rust/filesystem-flags-and-type` failed, at its check that `open(".")` with no flags reads `READ`.
 - **Wasmtime's own 0.3 file system programs are not a second suite.** Wasmtime 49.0.2 has 8, in its `test-programs`

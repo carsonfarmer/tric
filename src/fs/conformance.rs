@@ -8,7 +8,7 @@
 //! engine and the host, which an integration test cannot reach.
 //!
 //! Wasmtime's own runner expects every one of these to pass on Linux, with the directory as `/`, and no environment
-//! beyond the test's: so does this, and [`FAILS`] lists those that do not, and why.
+//! beyond the test's: so does this, and one that fails fails the run.
 use super::{At, Handle, Mode};
 use crate::engine::{App, Engine};
 use crate::name::{Committed, Turn};
@@ -21,10 +21,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
-
-/// The tests that fail, by `label/name` (`c/` or `rust/` and the test's name), and why. A test that is here and passes
-/// fails the run, so the list does not outlive its reasons.
-const FAILS: &[(&str, &str)] = &[];
 
 /// The suites: the label tests are listed under, and where they are.
 const SUITES: &[(&str, &str)] = &[("c", "c"), ("rust", "rust")];
@@ -134,7 +130,7 @@ async fn the_wasi_testsuite_passes() {
         std::fs::read(&fixture).unwrap_or_else(|e| panic!("{}: {e}: build the fixtures first", fixture.display()));
     let app = Arc::new(engine.load(&engine.compile(&wasm).unwrap(), vec![]).unwrap());
 
-    let (mut passed, mut unexpected, mut ran) = (0, vec![], vec![]);
+    let (mut failed, mut ran) = (vec![], 0);
     for &(label, suite) in SUITES {
         let suite = dir.join(suite);
         let mut tests: Vec<PathBuf> = std::fs::read_dir(&suite).unwrap().map(|e| e.unwrap().path()).collect();
@@ -150,20 +146,13 @@ async fn the_wasi_testsuite_passes() {
             let started = Instant::now();
             let result = run(&engine, &app, &wasm, &config).await;
             eprintln!("{id}: {} in {:?}", if result.is_ok() { "ok" } else { "FAILED" }, started.elapsed());
-            let known = FAILS.iter().find(|(name, _)| *name == id);
-            match (result, known) {
-                (Ok(()), None) => passed += 1,
-                (Ok(()), Some((_, why))) => unexpected.push(format!("{id} passes, though it is listed to fail: {why}")),
-                (Err(_), Some(_)) => {}
-                (Err(why), None) => unexpected.push(format!("{id}: {why}")),
+            if let Err(why) = result {
+                failed.push(format!("{id}: {why}"));
             }
-            ran.push(id);
+            ran += 1;
         }
     }
-    eprintln!("{passed} of {} passed, {} listed to fail", ran.len(), FAILS.len());
-    for (name, _) in FAILS {
-        assert!(ran.iter().any(|id| id == name), "{name} is listed to fail, but is not a test");
-    }
-    assert!(unexpected.is_empty(), "the WASI conformance tests:\n{}", unexpected.join("\n"));
-    assert_eq!(ran.len(), TESTS, "the suite is pinned to a commit with {TESTS} tests that need a directory");
+    eprintln!("{} of {ran} passed", ran - failed.len());
+    assert!(failed.is_empty(), "the WASI conformance tests:\n{}", failed.join("\n"));
+    assert_eq!(ran, TESTS, "the suite is pinned to a commit with {TESTS} tests that need a directory");
 }

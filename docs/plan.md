@@ -407,9 +407,8 @@ any file exists. The 0.2 binding was removed later, when tric came to serve WASI
   toolchain. All 21 pass.
 - **The harness** is a `#[cfg(test)]` module in the binary (`src/fs/conformance.rs`), using the production linker, host
   and limits, and a turn over the memory store, which holds the test's own `fs-tests.dir`; the turn is committed
-  after the test. Wasmtime's runner expects every one of these to pass on Linux, and so does the harness: a `FAILS`
-  list names each that does not, and why, and a test that is listed and passes fails the run. It is skipped without
-  `TRIC_CONFORMANCE`, the directory of the fetched files.
+  after the test. Wasmtime's runner expects every one of these to pass on Linux, and so does the harness: one that
+  fails fails the run. It is skipped without `TRIC_CONFORMANCE`, the directory of the fetched files.
 - **Our own tests:** the tree against a `BTreeMap`, over random operations with tiny nodes so that it splits, merges and
   collapses, and grows to four levels, with what is in the store checked against what the tree names after every round;
   request counts with a counting `ObjectStore`, to show that a write puts only what it changed, and that a failed
