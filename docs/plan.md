@@ -177,7 +177,7 @@ o/<day>/<digest>     the record of a delivery event, which is empty
 - `<ino>` and `<dir>` are decimal and `<block>` is 16 hex digits, so the blocks of a file sort as numbers. (Nothing
   depends on the order of inode numbers: a prefix ends in its `/`.) Inode 1 is the root directory, empty until written.
   New inodes count up from the head's `seq` and are never reused, so a number names one file for the life of the name,
-  which `is-same-object` and a stale descriptor both rely on. A name emptied by deletes keeps its `seq`, so its head
+  which `is-same-object` and a stale descriptor both rely on. A name emptied by deletes keeps its `seq`, so its tree
   is `{"seq": N}`, not empty.
 - `<day>` is the Unix day a record was made, six decimal digits, `<key>` the key's SHA-256 in hex, and `<digest>` the
   SHA-256 of the event's JSON, whose `day` is the record's. A lookup of a key reads yesterday's, today's and tomorrow's,

@@ -874,8 +874,8 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
 - **After a discard, a descriptor on an inode that is gone gets `io`.** A directory can be an orphan, as on Linux, and
   making a name inside a directory with no links is `no-entry`. A full descriptor table is `insufficient-memory`, and
   `get-directories` on a full table traps, as its WIT type has no error to say it with.
-- **A name emptied by deletes keeps its `seq`,** so its head is `{"seq": N}` and not an empty tree. An inode number is
-  never given twice (above), and an empty head would start the count again.
+- **A name emptied by deletes keeps its `seq`,** so its tree is `{"seq": N}` and not empty. An inode number is
+  never given twice (above), and an empty tree would start the count again.
 - **A request with no name has no preopens,** and the preopen of a request that has one is the turn's own name
   (`Ctx::mount()`), which for a safe method reuses the snapshot that was read, so a GET that touches a file costs no
   second read of the head.
