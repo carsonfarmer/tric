@@ -289,7 +289,7 @@ mod tests {
             sink: Arc::new(|_| Box::pin(async { Ok(()) })),
         });
         let turn =
-            Turn::open(&tric.store, "a", "n", false, &Default::default(), None, Instant::now()).await.unwrap().unwrap();
+            Turn::open(&tric.store, "a", "n", &Default::default(), None).await.unwrap().unwrap();
         let mut store = store(&engine.engine, WasiCtx::builder().build(), Ctx::of_command(tric, turn, "n"));
         let guest = app.pre.instantiate_async(&mut store).await.unwrap();
 

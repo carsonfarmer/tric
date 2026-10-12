@@ -478,7 +478,7 @@ async fn turns_on_one_name_serialize(kind: Kind) {
         let res = task.await.unwrap();
         match res.status {
             200 => ok += 1,
-            429 => assert_eq!(res.header("retry-after"), Some("1")),
+            503 => assert_eq!(res.header("retry-after"), Some("1")),
             s => panic!("{s}: {}", res.body),
         }
     }
@@ -487,16 +487,21 @@ async fn turns_on_one_name_serialize(kind: Kind) {
     let n = tric.post("/@counter/kv?op=incr&key=n&delta=0").await.json()["ok"].as_i64().unwrap();
     assert_eq!(n, ok, "every turn that answered 200 counted once, and no other");
 
-    // A turn that has run long enough claims its name: one that comes while it runs waits, and then is turned away.
+    // A turn that has sent an unsafe request may not run again: if another commits first, it answers 503, and what it
+    // sent stays sent, but nothing it wrote lands, so its key is free for the client's retry.
+    let me = format!("http://{}", tric.host);
+    let sends = format!("/@held/fetch?method=POST&sleep=3000&url={me}/@sent/echo");
     let slow = tokio::spawn({
-        let tric = tric.clone();
-        async move { tric.post("/@held/kv?op=set&key=k&value=1&sleep=8000").await }
+        let (tric, sends) = (tric.clone(), sends.clone());
+        async move { tric.send("POST", &sends, &[("idempotency-key", "k")]).await }
     });
-    sleep(Duration::from_millis(1500)).await; // past CLAIM_AFTER
-    let busy = tric.post("/@held/kv?op=set&key=k&value=2").await;
-    assert_eq!((busy.status, busy.header("retry-after")), (429, Some("1")));
-    assert_eq!(slow.await.unwrap().status, 200);
-    assert_eq!(tric.value("held", "k").await, "1");
+    sleep(Duration::from_millis(1000)).await;
+    assert_eq!(tric.post("/@held/kv?op=set&key=k&value=1").await.status, 200);
+    let lost = slow.await.unwrap();
+    assert_eq!((lost.status, lost.header("retry-after")), (503, Some("1")));
+    assert!(tric.value("sent", "echo").await.as_str().is_some(), "sent");
+    let again = tric.send("POST", &sends, &[("idempotency-key", "k")]).await;
+    assert_eq!((again.status, again.header("idempotent-replayed")), (200, None));
 }
 
 async fn turns_with_an_idempotency_key_apply_once(kind: Kind) {
@@ -557,7 +562,7 @@ async fn turns_with_an_idempotency_key_apply_once(kind: Kind) {
         match (res.status, res.header("idempotent-replayed")) {
             (200, None) => ran += 1,
             (200, Some("true")) => assert_eq!(res.body, ""),
-            (429, None) => assert_eq!(res.header("retry-after"), Some("1")),
+            (503, None) => assert_eq!(res.header("retry-after"), Some("1")),
             (s, r) => panic!("{s} {r:?}: {}", res.body),
         }
     }
@@ -765,7 +770,7 @@ async fn files_race(kind: Kind, fs: Fs) {
         let res = task.await.unwrap();
         match res.status {
             200 => ok += 1,
-            429 => assert_eq!(res.header("retry-after"), Some("1")),
+            503 => assert_eq!(res.header("retry-after"), Some("1")),
             s => panic!("{s}: {}", res.body),
         }
     }

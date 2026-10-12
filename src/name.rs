@@ -1,5 +1,4 @@
 //! Names: each name's state is one object, its head, which a turn changes with a compare-and-swap when it commits.
-use crate::engine::ANSWER;
 use crate::fs;
 use crate::kv::{Error, KeyResponse, other};
 use crate::outbox::{Event, Held, Sink, WINDOW};
@@ -21,10 +20,6 @@ const VALUE_MAX: usize = 1 << 20;
 pub const HEAD_MAX: usize = 1 << 20;
 const HELD_MAX: usize = 1_000_000; // bytes of held requests, as JSON, so an event is within Lambda's 1 MB
 const PAGE: usize = 1000; // keys per `list-keys`
-/// How long a turn waits for others' claims, and reruns, before it gives up with a 429.
-pub const BUSY: Duration = Duration::from_secs(5);
-/// A claim outlives the deadline of the turn that took it, by the time a commit may take.
-const CLAIM_TTL: Duration = ANSWER.saturating_add(Duration::from_secs(5));
 /// How long a commit stays pending: the window its delivery is tried in, and an hour more, for an event that Lambda
 /// was late to hand over.
 const PENDING_TTL: Duration = WINDOW.saturating_add(Duration::from_secs(3600));
@@ -32,8 +27,9 @@ const PENDING_TTL: Duration = WINDOW.saturating_add(Duration::from_secs(3600));
 /// are refused, so the head stays far under `HEAD_MAX`, and no pending commit is dropped before its time.
 const PENDING_MAX: usize = 1000;
 /// How long a commit's put may take, with learning whether it landed when its answer is lost; past that, the commit
-/// fails with [`Failed::Unsettled`]. The guest's `ANSWER`, the claims it waits for and this fit in CloudFront's 60 s
-/// for an answer from the origin, so the client hears the 500, and not a 504 that it might try again.
+/// fails with [`Failed::Unsettled`]. A turn's runs, which begin before its deadline (`tric::DEADLINE`), the guest's
+/// `ANSWER` and this fit in CloudFront's 60 s for an answer from the origin, so the client hears the 500, and not a 504
+/// that it might try again.
 pub const SETTLE: Duration = Duration::from_secs(30);
 /// The header that makes a turn apply once, however often it is sent: see [`Idempotency`].
 pub const IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("idempotency-key");
@@ -54,8 +50,8 @@ pub fn of(path: &str) -> Option<&str> {
     path.strip_prefix("/@").map(|rest| rest.split('/').next().unwrap_or_default())
 }
 
-/// A name's state: its tree, with the root in the head, the commits pending, the claim, the commit that wrote it and
-/// the version it was written over.
+/// A name's state: its tree, with the root in the head, the commits pending, the commit that wrote it and the version
+/// it was written over.
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Head {
@@ -64,9 +60,7 @@ pub struct Head {
     /// The commits whose background requests are not yet delivered.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pending: BTreeMap<String, Pending>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    claim: Option<Claim>,
-    /// The random id of the last commit, which a claim, its release and `settle` keep; none before the first.
+    /// The random id of the last commit, which `settle` keeps; none before the first.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     commit: String,
     /// The version id of the head this one was written over, which `put` sets; none for the first head, or where the
@@ -78,8 +72,8 @@ pub struct Head {
 impl Head {
     /// Adds to `seen` the ids of the objects the head's tree is made of, with the name's own `app` and `name`, and
     /// gives how many nodes it read, or `None` if that would be over `max`: see [`Tree::mark`]. The tree is all a head
-    /// names of its name's objects: its `pending` holds digests of events, its claim a lease, `commit` the id of a
-    /// commit and `over` a version of the head itself, and none of them names an object.
+    /// names of its name's objects: its `pending` holds digests of events, `commit` the id of a commit and `over` a
+    /// version of the head itself, and none of them names an object.
     pub async fn mark(
         &self,
         store: &Store,
@@ -103,20 +97,6 @@ pub struct Pending {
 impl Pending {
     fn live(&self, now: u64) -> bool {
         now.saturating_sub(self.at) < PENDING_TTL.as_millis() as u64
-    }
-}
-
-/// A turn's lease on a name, until a Unix millisecond.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Claim {
-    id: String,
-    until: u64,
-}
-
-impl Claim {
-    fn live(&self) -> bool {
-        self.until > now()
     }
 }
 
@@ -273,11 +253,10 @@ pub enum Answer {
 /// What a turn changes, under its lock.
 #[derive(Default)]
 struct State {
-    head: Head,                  // as read, or as this turn's claim wrote it
+    head: Head,                  // as read
     base: Option<UpdateVersion>, // the head's version, if there is a head
     answered: bool,
-    claimed: bool, // once this turn's claim is taken
-    doomed: bool,  // a claim failed, so the commit will
+    sent: bool, // once the turn has sent an unsafe request before it answered, so it may not run again
     held: Vec<Held>,
     held_size: usize,
 }
@@ -285,8 +264,8 @@ struct State {
 /// A request that may write one name: its writes are in its tree, which is committed or discarded once it answers. A
 /// snapshot is a turn that has answered: it reads the name as it was, and writes nothing.
 ///
-/// The locks are taken in the order `claiming`, the file system's gate (which a commit takes and lets go of at once),
-/// `tree`, `state`; `state` is never held across an await.
+/// The locks are taken in the order the file system's gate (which a commit takes and lets go of at once), `tree`,
+/// `state`; `state` is never held across an await.
 pub struct Turn {
     store: Store,
     app: String,
@@ -296,7 +275,6 @@ pub struct Turn {
     tree: RwLock<Tree>,
     /// What the file system keeps: the descriptors open on it, and the gate its changes pass.
     pub fs: fs::State,
-    claiming: tokio::sync::Mutex<()>,
     settled: watch::Sender<Option<bool>>, // whether it committed, once it is known
     once: Option<Idempotency>,
 }
@@ -364,7 +342,7 @@ async fn fate(
     let over = base.and_then(|b| b.version.as_deref());
     if now.commit == commit {
         // A commit's own head is the one its answer would describe: one written over it has others' changes.
-        let own = now.over.as_deref() == over && now.claim.is_none();
+        let own = now.over.as_deref() == over;
         return Ok(Some(Committed::Done(if own { etag(&version) } else { None })));
     }
     if version.version.is_none() || base.is_some_and(|b| b.version.is_none()) {
@@ -389,10 +367,9 @@ fn same(a: &UpdateVersion, b: &UpdateVersion) -> bool {
     }
 }
 
-/// Why a commit failed, where that decides how the turn answers: only an unclaimed turn's commit that failed before
-/// its put ([`Failed::Unsent`]) answers 503, so a client may try again, as nothing landed; any other failure answers
-/// 500, as it may have landed, or did what the turn claimed the name for, which running again would do again. An error
-/// carries at most one.
+/// Why a commit failed, where that decides how the turn answers: only a commit that failed before its put
+/// ([`Failed::Unsent`]) answers 503, so a client may try again, as nothing landed; any other failure answers 500, as it
+/// may have landed. An error carries at most one.
 #[derive(Debug, PartialEq)]
 pub enum Failed {
     /// The name would be over its limits: its head over `HEAD_MAX`, or its tree too full for the record of an
@@ -400,14 +377,11 @@ pub enum Failed {
     /// `PENDING_MAX` of them, so that is a backstop. Running again would fail again, as for a trap, so it is never
     /// `Unsent`.
     TooLarge,
-    /// An unclaimed turn's commit failed before its head was put, so nothing landed.
+    /// The commit failed before its head was put, so nothing landed.
     Unsent,
     /// The put had no sure answer, and the head did not say within `SETTLE` whether it landed. It may have, so a
     /// client that tried again could run the turn twice.
     Unsettled,
-    /// A claimed turn's claim ran out, and another write landed on its base first. The turn did what it claimed the
-    /// name for, which cannot be undone, so it does not run again.
-    Lapsed,
 }
 
 impl std::fmt::Display for Failed {
@@ -418,7 +392,6 @@ impl std::fmt::Display for Failed {
             Failed::Unsettled => {
                 write!(f, "the commit may have landed, and the name did not say within {SETTLE:?} whether it did")
             }
-            Failed::Lapsed => write!(f, "the turn's claim ran out, and another write landed on the name first"),
         }
     }
 }
@@ -467,50 +440,37 @@ impl Turn {
         let tree = RwLock::new(tree::open(store, app, name, &head.tree, tree::config())?);
         let state = Mutex::new(State { head, base, answered, ..Default::default() });
         let (app, name, path, settled) = (app.into(), name.into(), path(app, name), watch::Sender::new(None));
-        let (claiming, fs) = (Default::default(), Default::default());
-        Ok(Arc::new(Self { store: store.clone(), app, name, path, state, tree, fs, claiming, settled, once }))
+        Ok(Arc::new(Self { store: store.clone(), app, name, path, state, tree, fs: Default::default(), settled, once }))
     }
 
-    /// A snapshot of `name`: as it is now, without waiting for anyone's claim.
+    /// A snapshot of `name`: as it is now.
     pub async fn snap(store: &Store, app: &str, name: &str) -> Result<Arc<Self>> {
         Self::new(store, app, name, read(store, &path(app, name)).await?, true, None)
     }
 
-    /// Opens a turn on `name`, once no one else's claim is live, if `conditions` hold, and claimed if `claim`; or
-    /// answers without one. A turn whose `Idempotency-Key` `once` committed is answered as it was, at once, or with 422
-    /// if its request was another; else the turn is refused with 412 if the conditions do not hold, or with 429 if
-    /// others still hold the name, or keep changing it, at `until`.
+    /// Opens a turn on `name`, if `conditions` hold; or answers without one. A turn whose `Idempotency-Key` `once`
+    /// committed is answered as it was, at once, or with 422 if its request was another; else the turn is refused with
+    /// 412 if the conditions do not hold.
     pub async fn open(
         store: &Store,
         app: &str,
         name: &str,
-        claim: bool,
         conditions: &Conditions,
         once: Option<&Idempotency>,
-        until: Instant,
     ) -> Result<Result<Arc<Self>, Answer>> {
-        loop {
-            let turn = Self::new(store, app, name, read(store, &path(app, name)).await?, false, once.cloned())?;
-            if let Some(once) = once
-                && let Some(record) = recorded(&*turn.tree.read().await, &once.key, now() / DAY).await?
-            {
-                return Ok(Err(match record.fingerprint == once.fingerprint {
-                    true => Answer::Replay(record),
-                    false => Answer::Refused(StatusCode::UNPROCESSABLE_ENTITY),
-                }));
-            }
-            let free = !turn.state().head.claim.as_ref().is_some_and(Claim::live);
-            if free && !conditions.hold(turn.etag().as_deref()) {
-                return Ok(Err(Answer::Refused(StatusCode::PRECONDITION_FAILED)));
-            }
-            if free && (!claim || turn.claim().await) {
-                return Ok(Ok(turn));
-            }
-            if Instant::now() >= until {
-                return Ok(Err(Answer::Refused(StatusCode::TOO_MANY_REQUESTS)));
-            }
-            sleep(Duration::from_millis(rand::random_range(25..=50))).await;
+        let turn = Self::new(store, app, name, read(store, &path(app, name)).await?, false, once.cloned())?;
+        if let Some(once) = once
+            && let Some(record) = recorded(&*turn.tree.read().await, &once.key, now() / DAY).await?
+        {
+            return Ok(Err(match record.fingerprint == once.fingerprint {
+                true => Answer::Replay(record),
+                false => Answer::Refused(StatusCode::UNPROCESSABLE_ENTITY),
+            }));
         }
+        if !conditions.hold(turn.etag().as_deref()) {
+            return Ok(Err(Answer::Refused(StatusCode::PRECONDITION_FAILED)));
+        }
+        Ok(Ok(turn))
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -522,55 +482,15 @@ impl Turn {
         self.state().base.as_ref().and_then(etag)
     }
 
-    /// Claims the name, so that no other turn commits before this one, and returns whether it holds the claim. One that
-    /// fails dooms the turn: something else changed the name, so its commit will fail. Once the turn has answered there
-    /// is nothing left to claim for. The claim is a task of its own, so a caller that goes away leaves no claim the
-    /// turn does not know of.
-    pub async fn claim(self: &Arc<Self>) -> bool {
-        let turn = self.clone();
-        let claim = async move {
-            let _one = turn.claiming.lock().await;
-            let (mut head, base) = {
-                let s = turn.state();
-                if s.claimed || s.doomed || s.answered {
-                    return s.claimed;
-                }
-                (s.head.clone(), s.base.clone())
-            };
-            let id = store::random();
-            head.claim = Some(Claim { id: id.clone(), until: now() + CLAIM_TTL.as_millis() as u64 });
-            let landed = match put(&turn.store, &turn.path, &mut head, base).await {
-                Ok(landed) => landed,
-                // It may have landed all the same: the claim is the turn's if the head holds it, and only the turn
-                // changes a head that holds its live claim.
-                Err(_) => match read(&turn.store, &turn.path).await {
-                    Ok(Some((now, version))) if now.claim.as_ref().is_some_and(|c| c.id == id) => Some(version),
-                    _ => None,
-                },
-            };
-            let mut s = turn.state();
-            match landed {
-                Some(version) => {
-                    (s.head.claim, s.base, s.claimed) = (head.claim, Some(version), true);
-                    true
-                }
-                None => {
-                    s.doomed = true;
-                    false
-                }
+    /// Readies an unsafe outbound request: before the answer, by marking the turn as one that may not run again, as
+    /// what it sends stays sent; after it, by waiting for the commit.
+    pub async fn before_unsafe(&self) -> Result<(), &'static str> {
+        {
+            let mut s = self.state();
+            if !s.answered {
+                s.sent = true;
+                return Ok(());
             }
-        };
-        tokio::spawn(claim).await.unwrap_or(false)
-    }
-
-    /// Readies an unsafe outbound request: before the answer, by claiming the name; after it, by waiting for the
-    /// commit.
-    pub async fn before_unsafe(self: &Arc<Self>) -> Result<(), &'static str> {
-        if self.claim().await {
-            return Ok(());
-        }
-        if !self.state().answered {
-            return Err("another request changed the name first, so this one will run again");
         }
         match self.settled.subscribe().wait_for(Option::is_some).await.map(|v| *v) {
             Ok(Some(true)) => Ok(()),
@@ -578,9 +498,9 @@ impl Turn {
         }
     }
 
-    /// Whether a claim failed, so the turn's commit will.
-    pub fn doomed(&self) -> bool {
-        self.state().doomed
+    /// Whether the turn may run again: it has sent no unsafe request before it answered.
+    pub fn repeatable(&self) -> bool {
+        !self.state().sent
     }
 
     /// Marks the turn answered: no more writes or held requests.
@@ -716,20 +636,14 @@ impl Turn {
         status: StatusCode,
         location: Option<&HeaderValue>,
     ) -> Result<Committed> {
-        let _one = self.claiming.lock().await; // so a claim in flight lands first
-        let (mut head, base, held, claimed, doomed) = {
+        let (mut head, base, held) = {
             let s = &mut *self.state();
             s.answered = true;
-            let held = std::mem::take(&mut s.held);
-            (s.head.clone(), s.base.clone(), held, s.claimed, s.doomed)
+            (s.head.clone(), s.base.clone(), std::mem::take(&mut s.held))
         };
         self.fs.drain().await; // so the file system's changes that were admitted land first
         let mut tree = self.tree.write().await; // after the writes that were in flight
-        if doomed {
-            tree.reset();
-            return Ok(Committed::Conflict);
-        }
-        if !tree.edited() && held.is_empty() && !claimed && self.once.is_none() {
+        if !tree.edited() && held.is_empty() && self.once.is_none() {
             return Ok(Committed::Done(base.as_ref().and_then(etag)));
         }
         let commit = store::random();
@@ -754,7 +668,6 @@ impl Turn {
                 head.tree = tree.finish().await?;
             }
             head.pending.retain(|_, p| p.live(now));
-            head.claim = None;
             head.commit = commit.clone();
             if !held.is_empty() {
                 let event = Event {
@@ -775,19 +688,14 @@ impl Turn {
         };
         let kept = match ready.await {
             Ok(kept) => kept,
-            // Nothing landed, so an unclaimed turn may run again, unless it would fail again; a claimed one did what it
-            // claimed the name for.
+            // Nothing landed, so the client may try again, unless it would fail again.
             Err(e) => {
                 tree.reset();
-                let again = !claimed && e.downcast_ref::<Failed>().is_none(); // so not `TooLarge`
+                let again = e.downcast_ref::<Failed>().is_none(); // so not `TooLarge`
                 return Err(if again { e.context(Failed::Unsent) } else { e });
             }
         };
-        let landed = match self.land(&mut head, base, &commit).await {
-            // A claimed turn sent what it claimed the name for, so it runs once at most, whatever became of its claim.
-            Ok(Committed::Conflict) if claimed => Err(wasmtime::Error::msg(Failed::Lapsed)),
-            landed => landed,
-        };
+        let landed = self.land(&mut head, base, &commit).await;
         match &landed {
             Ok(Committed::Done(_)) => {
                 if let Some(kept) = kept {
@@ -818,32 +726,26 @@ impl Turn {
         fate.context(Failed::Unsettled)
     }
 
-    /// Discards the turn, and its claim if it took one.
+    /// Discards the turn.
     pub async fn discard(&self) {
-        let _one = self.claiming.lock().await;
-        let (mut head, base, claimed) = {
+        {
             let s = &mut *self.state();
-            s.answered = true; // so the claim timer takes no claim after
+            s.answered = true;
             s.held.clear();
-            (s.head.clone(), s.base.clone(), std::mem::take(&mut s.claimed))
-        };
+        }
         self.fs.drain().await;
         self.tree.write().await.reset();
         self.settled.send_replace(Some(false));
-        if claimed {
-            head.claim = None;
-            _ = put(&self.store, &self.path, &mut head, base).await; // if it fails, the claim expires
-        }
     }
 }
 
-/// Takes `commit` off the pending ones of `name`, as far as it can in a few tries. Never while the name is claimed, as
-/// that would break the claim: the commit then stays until a later commit drops it, after `PENDING_TTL`.
+/// Takes `commit` off the pending ones of `name`, as far as it can in a few tries: one it cannot stays until a later
+/// commit drops it, after `PENDING_TTL`.
 pub async fn settle(store: &Store, app: &str, name: &str, commit: &str) {
     let path = path(app, name);
     for _ in 0..3 {
         let Ok(Some((mut head, version))) = read(store, &path).await else { return };
-        if head.pending.remove(commit).is_none() || head.claim.as_ref().is_some_and(Claim::live) {
+        if head.pending.remove(commit).is_none() {
             return;
         }
         if let Ok(Some(_)) = put(store, &path, &mut head, Some(version)).await {
@@ -906,7 +808,7 @@ mod tests {
             }
             assert!(serde_json::to_vec(&head).unwrap().len() < HEAD_MAX / 4, "the head stays far under its limit");
             put(&store, &path("a", "n"), &mut head, None).await.unwrap().unwrap();
-            let turn = Turn::open(&store, "a", "n", false, &Default::default(), None, Instant::now()).await;
+            let turn = Turn::open(&store, "a", "n", &Default::default(), None).await;
             assert_eq!(turn.unwrap().ok().unwrap().backlogged(), backlogged, "{live} live");
         }
     }
@@ -945,10 +847,8 @@ mod tests {
     /// What lands on a head after a planned put.
     #[derive(Clone, Copy, Debug)]
     enum Then {
-        Commit,  // another turn's commit
-        Claim,   // another turn's claim, which keeps the head's commit
-        Release, // the claim let go, which keeps the head as it was but for the claim
-        Expire,  // not a write: every version but the latest expires
+        Commit, // another turn's commit
+        Expire, // not a write: every version but the latest expires
     }
 
     impl Lossy {
@@ -985,9 +885,7 @@ mod tests {
                 head.over = Some(id.clone());
             }
             match then {
-                Then::Commit => (head.claim, head.commit) = (None, store::random()),
-                Then::Claim => head.claim = Some(Claim { id: store::random(), until: now() + 60_000 }),
-                Then::Release => head.claim = None,
+                Then::Commit => head.commit = store::random(),
                 Then::Expire => {
                     versions.drain(..versions.len().saturating_sub(1));
                     return;
@@ -1103,15 +1001,15 @@ mod tests {
     /// A versioned store through a `Lossy`, whose name `n` has one commit, of a value at `s`: the base of the turns.
     async fn based() -> (Store, Arc<Lossy>) {
         let (store, lossy) = fresh();
-        let turn = writes(&store, false, "s").await.unwrap();
+        let turn = writes(&store, "s").await.unwrap();
         assert!(matches!(commit(&turn).await.unwrap(), Committed::Done(Some(_))));
         lossy.tries.store(0, SeqCst);
         (store, lossy)
     }
 
-    /// A turn on `n`, claimed if `claim`, that writes at `key` a value too large to be inline, so it is an object.
-    async fn writes(store: &Store, claim: bool, key: &str) -> Result<Arc<Turn>, Answer> {
-        let turn = Turn::open(store, "a", "n", claim, &Default::default(), None, Instant::now()).await.unwrap()?;
+    /// A turn on `n` that writes at `key` a value too large to be inline, so it is an object.
+    async fn writes(store: &Store, key: &str) -> Result<Arc<Turn>, Answer> {
+        let turn = Turn::open(store, "a", "n", &Default::default(), None).await.unwrap()?;
         turn.write(vec![(key.into(), Some(Bytes::from(vec![7; 5000])))]).await.unwrap();
         Ok(turn)
     }
@@ -1141,7 +1039,7 @@ mod tests {
     async fn a_commit_that_landed_but_lost_its_answer_is_done_and_keeps_what_it_made() {
         let (store, lossy) = based().await;
         lossy.plan(Put::Lands, &[]);
-        let turn = writes(&store, false, "k").await.unwrap();
+        let turn = writes(&store, "k").await.unwrap();
         let done = commit(&turn).await.unwrap();
         assert_eq!(lossy.tries.load(SeqCst), 2, "tried again, and refused as it had landed");
         assert_eq!(done, Committed::Done(etag_now(&store).await), "not a conflict, so the turn does not run again");
@@ -1150,11 +1048,11 @@ mod tests {
 
         // Others wrote on it before the head was read, so the head is not its own: done, with no ETag. The head's
         // versions say so, however far back the commit's is.
-        let others: [&'static [Then]; 3] = [&[Then::Commit], &[Then::Claim], &[Then::Claim, Then::Commit]];
+        let others: [&'static [Then]; 2] = [&[Then::Commit], &[Then::Commit, Then::Commit]];
         for then in others {
             let (store, lossy) = based().await;
             lossy.plan(Put::Lands, then);
-            let turn = writes(&store, false, "k").await.unwrap();
+            let turn = writes(&store, "k").await.unwrap();
             assert_eq!(commit(&turn).await.unwrap(), Committed::Done(None), "{then:?}");
             assert_eq!(value(&store, "k").await, Some(Bytes::from(vec![7; 5000])), "{then:?}");
             assert_eq!(objects(&store).await, 2, "{then:?}");
@@ -1168,7 +1066,7 @@ mod tests {
         for _ in 0..store::TRIES {
             lossy.plan(Put::Fails, &[]);
         }
-        let turn = writes(&store, false, "k").await.unwrap();
+        let turn = writes(&store, "k").await.unwrap();
         assert_eq!(commit(&turn).await.unwrap(), Committed::Done(etag_now(&store).await));
         assert_eq!((lossy.tries.load(SeqCst), objects(&store).await), (store::TRIES as usize + 1, 2));
 
@@ -1178,28 +1076,25 @@ mod tests {
             lossy.plan(Put::Fails, &[]);
         }
         lossy.plan(Put::Late, &[]);
-        let turn = writes(&store, false, "k").await.unwrap();
+        let turn = writes(&store, "k").await.unwrap();
         assert_eq!(commit(&turn).await.unwrap(), Committed::Done(etag_now(&store).await));
         assert_eq!(lossy.tries.load(SeqCst), store::TRIES as usize + 1);
         assert_eq!(value(&store, "k").await, Some(Bytes::from(vec![7; 5000])));
 
-        // Another write landed on its base instead, so it never will: a conflict, and what it made is left for the
-        // sweep. A claim taken and let go is such a write, though the name is as it was.
-        let others: [&'static [Then]; 3] = [&[Then::Commit], &[Then::Claim], &[Then::Claim, Then::Release]];
-        for then in others {
-            let (store, lossy) = based().await;
-            lossy.plan(Put::Fails, then);
-            let turn = writes(&store, false, "k").await.unwrap();
-            assert_eq!(commit(&turn).await.unwrap(), Committed::Conflict, "{then:?}");
-            assert_eq!((value(&store, "k").await, objects(&store).await), (None, 2), "{then:?}");
-        }
+        // Another commit landed on its base instead, so it never will: a conflict, and what it made is left for the
+        // sweep.
+        let (store, lossy) = based().await;
+        lossy.plan(Put::Fails, &[Then::Commit]);
+        let turn = writes(&store, "k").await.unwrap();
+        assert_eq!(commit(&turn).await.unwrap(), Committed::Conflict);
+        assert_eq!((value(&store, "k").await, objects(&store).await), (None, 2));
     }
 
     #[tokio::test]
     async fn the_first_commit_on_a_name_learns_whether_it_landed() {
         let (store, lossy) = fresh();
         lossy.plan(Put::Lands, &[]);
-        let turn = writes(&store, false, "k").await.unwrap();
+        let turn = writes(&store, "k").await.unwrap();
         assert_eq!(commit(&turn).await.unwrap(), Committed::Done(etag_now(&store).await));
         assert_eq!(lossy.tries.load(SeqCst), 2);
 
@@ -1207,13 +1102,13 @@ mod tests {
         for _ in 0..store::TRIES {
             lossy.plan(Put::Fails, &[]);
         }
-        let turn = writes(&store, false, "k").await.unwrap();
+        let turn = writes(&store, "k").await.unwrap();
         assert_eq!(commit(&turn).await.unwrap(), Committed::Done(etag_now(&store).await));
         assert_eq!(lossy.tries.load(SeqCst), store::TRIES as usize + 1);
 
         let (store, lossy) = fresh();
         lossy.plan(Put::Fails, &[Then::Commit]);
-        let turn = writes(&store, false, "k").await.unwrap();
+        let turn = writes(&store, "k").await.unwrap();
         assert_eq!(commit(&turn).await.unwrap(), Committed::Conflict, "another's first commit landed instead");
     }
 
@@ -1222,7 +1117,7 @@ mod tests {
         // It landed, and another commit on it, and the version it wrote has expired.
         let (store, lossy) = based().await;
         lossy.plan(Put::Lands, &[Then::Commit, Then::Expire]);
-        let turn = writes(&store, false, "k").await.unwrap();
+        let turn = writes(&store, "k").await.unwrap();
         let e = commit(&turn).await.unwrap_err();
         assert_eq!(e.downcast_ref(), Some(&Failed::Unsettled), "{e:#}");
         assert_eq!(value(&store, "k").await, Some(Bytes::from(vec![7; 5000])), "so it may not run again");
@@ -1231,7 +1126,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_commit_that_cannot_reach_the_bucket_is_unsettled_and_not_tried_again() {
         let (store, lossy) = based().await;
-        let turn = writes(&store, false, "k").await.unwrap();
+        let turn = writes(&store, "k").await.unwrap();
         lossy.down.store(true, SeqCst);
         let start = tokio::time::Instant::now();
         let e = commit(&turn).await.unwrap_err();
@@ -1245,7 +1140,7 @@ mod tests {
     #[tokio::test]
     async fn a_commit_that_conflicts_keeps_what_it_made_for_the_sweep() {
         let (store, lossy) = based().await;
-        let (first, second) = (writes(&store, false, "k").await.unwrap(), writes(&store, false, "l").await.unwrap());
+        let (first, second) = (writes(&store, "k").await.unwrap(), writes(&store, "l").await.unwrap());
         assert!(matches!(commit(&first).await.unwrap(), Committed::Done(Some(_))));
         lossy.tries.store(0, SeqCst);
         assert_eq!(commit(&second).await.unwrap(), Committed::Conflict);
@@ -1255,47 +1150,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_claimed_turn_whose_claim_ran_out_does_not_run_again() {
-        // Its put has no answer, and another commit lands on its claim, as it would once the claim had run out.
-        let (store, lossy) = based().await;
-        let turn = writes(&store, true, "k").await.unwrap();
-        lossy.plan(Put::Fails, &[Then::Commit]);
-        let e = commit(&turn).await.unwrap_err();
-        assert_eq!(e.downcast_ref(), Some(&Failed::Lapsed), "{e:#}");
+    async fn a_commit_that_failed_before_its_put_may_be_tried_again() {
+        // Its event is not handed over, so nothing lands.
+        let (store, _) = based().await;
+        let turn = writes(&store, "k").await.unwrap();
+        let req = http::Request::builder().method("POST").uri("https://h/x").body(Default::default()).unwrap();
+        turn.hold(Held::of(req).await.unwrap()).unwrap();
+        let sink: Sink = Arc::new(|_| Box::pin(async { wasmtime::bail!("the sink failed") }));
+        let e = turn.commit("h", &sink, StatusCode::OK, None).await.unwrap_err();
+        assert_eq!(e.downcast_ref(), Some(&Failed::Unsent), "{e:#}");
         assert_eq!(value(&store, "k").await, None, "it did not land");
         let res = crate::tric::failed(&e);
-        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(res.headers().get(http::header::RETRY_AFTER).is_none(), "so the client does not try again");
-
-        // Another commit landed on its claim before its put, which is refused at once.
-        let (store, _) = based().await;
-        let turn = writes(&store, true, "k").await.unwrap();
-        let (mut other, version) = read(&store, &path("a", "n")).await.unwrap().unwrap();
-        (other.claim, other.commit) = (None, store::random());
-        put(&store, &path("a", "n"), &mut other, Some(version)).await.unwrap().unwrap();
-        let e = commit(&turn).await.unwrap_err();
-        assert_eq!(e.downcast_ref(), Some(&Failed::Lapsed), "{e:#}");
+        assert_eq!(
+            (res.status(), res.headers().get(http::header::RETRY_AFTER).is_some()),
+            (StatusCode::SERVICE_UNAVAILABLE, true)
+        );
     }
 
     #[tokio::test]
-    async fn a_claimed_turn_whose_commit_failed_before_its_put_does_not_run_again() {
-        // Its event is not handed over, so nothing lands: an unclaimed turn may run again, and a claimed one may not.
-        for claim in [false, true] {
-            let (store, _) = based().await;
-            let turn = writes(&store, claim, "k").await.unwrap();
-            let req = http::Request::builder().method("POST").uri("https://h/x").body(Default::default()).unwrap();
-            turn.hold(Held::of(req).await.unwrap()).unwrap();
-            let sink: Sink = Arc::new(|_| Box::pin(async { wasmtime::bail!("the sink failed") }));
-            let e = turn.commit("h", &sink, StatusCode::OK, None).await.unwrap_err();
-            assert_eq!(e.downcast_ref() == Some(&Failed::Unsent), !claim, "{e:#}");
-            assert_eq!(value(&store, "k").await, None, "it did not land");
-            let res = crate::tric::failed(&e);
-            let answer = (res.status(), res.headers().get(http::header::RETRY_AFTER).is_some());
-            match claim {
-                false => assert_eq!(answer, (StatusCode::SERVICE_UNAVAILABLE, true)),
-                true => assert_eq!(answer, (StatusCode::INTERNAL_SERVER_ERROR, false), "so it does not run again"),
+    async fn a_turn_that_sent_an_unsafe_request_may_not_run_again() {
+        // Before it answers, the request goes at once, and the turn may not run again, as it would send it again.
+        let (store, _) = based().await;
+        let turn = writes(&store, "k").await.unwrap();
+        assert!(turn.repeatable());
+        assert_eq!(turn.before_unsafe().await, Ok(()));
+        assert!(!turn.repeatable());
+        assert!(matches!(commit(&writes(&store, "l").await.unwrap()).await.unwrap(), Committed::Done(Some(_))));
+        assert_eq!(commit(&turn).await.unwrap(), Committed::Conflict, "so it answers 503, and what it wrote is gone");
+        assert_eq!(value(&store, "k").await, None);
+
+        // After it answers, the request waits for the commit, and goes only if that is done.
+        for (done, sent) in [(true, Ok(())), (false, Err("the request's changes were discarded"))] {
+            let turn = writes(&store, "m").await.unwrap();
+            turn.answer();
+            let unsafe_ = tokio::spawn({
+                let turn = turn.clone();
+                async move { turn.before_unsafe().await }
+            });
+            match done {
+                true => assert!(matches!(commit(&turn).await.unwrap(), Committed::Done(Some(_)))),
+                false => turn.discard().await,
             }
-            assert!(read(&store, &path("a", "n")).await.unwrap().unwrap().0.claim.is_none(), "and its claim is let go");
+            assert_eq!(unsafe_.await.unwrap(), sent);
+            assert!(turn.repeatable(), "it sent nothing before it answered");
         }
     }
 
@@ -1308,7 +1205,7 @@ mod tests {
             let size = serde_json::to_vec(&head).unwrap().len();
             head.pending.get_mut("p").unwrap().digest = "0".repeat(HEAD_MAX - size - 10);
             put(&store, &path("a", "n"), &mut head, None).await.unwrap().unwrap();
-            let turn = writes(&store, false, "k").await.unwrap();
+            let turn = writes(&store, "k").await.unwrap();
             if event {
                 let req = http::Request::builder().method("POST").uri("https://h/x").body(Default::default()).unwrap();
                 turn.hold(Held::of(req).await.unwrap()).unwrap();
@@ -1323,34 +1220,6 @@ mod tests {
             );
             assert!(res.headers().get(http::header::RETRY_AFTER).is_none());
         }
-    }
-
-    #[tokio::test]
-    async fn a_claim_that_landed_but_lost_its_answer_is_held() {
-        let (store, lossy) = based().await;
-        lossy.plan(Put::Lands, &[]);
-        let turn = writes(&store, true, "k").await.expect("the claim is the turn's, not another's");
-        assert!(turn.state().claimed && !turn.doomed());
-        assert_eq!(commit(&turn).await.unwrap(), Committed::Done(etag_now(&store).await));
-        assert!(read(&store, &path("a", "n")).await.unwrap().unwrap().0.claim.is_none());
-    }
-
-    #[tokio::test]
-    async fn a_claim_let_go_leaves_a_head_unlike_the_one_it_was_taken_on() {
-        let (store, _) = based().await;
-        let at = path("a", "n");
-        let (before, base) = store.get(&at, HEAD_MAX as u64).await.unwrap().unwrap();
-        let turn = writes(&store, true, "k").await.unwrap();
-        assert!(turn.state().claimed);
-        turn.discard().await;
-        let (after, version) = store.get(&at, HEAD_MAX as u64).await.unwrap().unwrap();
-        let (was, is): (Head, Head) =
-            (serde_json::from_slice(&before).unwrap(), serde_json::from_slice(&after).unwrap());
-        assert!(is.claim.is_none() && is.commit == was.commit, "the name is as it was");
-        assert_ne!(after, before, "but not its bytes");
-        assert_ne!(version.e_tag, base.e_tag, "nor its ETag");
-        let put = put(&store, &at, &mut Head::default(), Some(base)).await.unwrap();
-        assert!(put.is_none(), "so a put on the head it was taken on, as of a commit put again, is refused");
     }
 
     #[test]
@@ -1392,9 +1261,9 @@ mod tests {
         Idempotency::of(store::hash(b"k"), &Method::POST, &Uri::from_static("/@n"), body.as_bytes())
     }
 
-    /// A turn on `n`, claimed if `claim`, with `once`, if one is opened at once.
-    async fn keyed(store: &Store, claim: bool, once: &Idempotency) -> Result<Arc<Turn>, Answer> {
-        Turn::open(store, "a", "n", claim, &Default::default(), Some(once), Instant::now()).await.unwrap()
+    /// A turn on `n` with `once`, if one is opened.
+    async fn keyed(store: &Store, once: &Idempotency) -> Result<Arc<Turn>, Answer> {
+        Turn::open(store, "a", "n", &Default::default(), Some(once)).await.unwrap()
     }
 
     /// Commits `turn`, as answered with `status` and `location`.
@@ -1407,20 +1276,18 @@ mod tests {
     #[tokio::test]
     async fn a_turn_whose_key_committed_is_answered_as_it_was_without_running() {
         let store = Store::memory();
-        let turn = keyed(&store, false, &once("1")).await.unwrap();
+        let turn = keyed(&store, &once("1")).await.unwrap();
         turn.increment("c", 1).await.unwrap();
         assert!(matches!(answered(&turn, 201, Some("/@n/1")).await, Committed::Done(Some(_))));
         let record = Record { fingerprint: once("1").fingerprint, status: 201, location: Some("/@n/1".into()) };
-        assert_eq!(keyed(&store, false, &once("1")).await.err(), Some(Answer::Replay(record)));
+        assert_eq!(keyed(&store, &once("1")).await.err(), Some(Answer::Replay(record)));
         let other = Answer::Refused(StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(keyed(&store, false, &once("2")).await.err(), Some(other), "the key, with another request");
+        assert_eq!(keyed(&store, &once("2")).await.err(), Some(other), "the key, with another request");
 
-        // Before anyone's claim, and the conditions, so a replay never waits, and is never refused for what changed.
-        let claimed = writes(&store, true, "k").await.unwrap();
+        // Before the conditions, so a replay is never refused for what changed.
         let conditions = Conditions { if_match: Some("\"other\"".into()), if_none_match: None };
-        let replay = Turn::open(&store, "a", "n", false, &conditions, Some(&once("1")), Instant::now()).await.unwrap();
+        let replay = Turn::open(&store, "a", "n", &conditions, Some(&once("1"))).await.unwrap();
         assert!(matches!(replay, Err(Answer::Replay(_))));
-        claimed.discard().await;
         assert_eq!(value(&store, "c").await, Some(Bytes::copy_from_slice(&1i64.to_le_bytes())), "it ran once");
     }
 
@@ -1428,9 +1295,9 @@ mod tests {
     async fn a_turn_with_a_key_records_it_whatever_it_changed() {
         // So a retry is answered as the first was, even if what the first found has changed since; a 4xx as it is.
         let store = Store::memory();
-        let turn = keyed(&store, false, &once("1")).await.unwrap();
+        let turn = keyed(&store, &once("1")).await.unwrap();
         assert!(matches!(answered(&turn, 409, None).await, Committed::Done(Some(_))), "a head, to hold the record");
-        let replay = keyed(&store, false, &once("1")).await.err();
+        let replay = keyed(&store, &once("1")).await.err();
         assert!(matches!(replay, Some(Answer::Replay(Record { status: 409, location: None, .. }))), "{replay:?}");
     }
 
@@ -1438,10 +1305,10 @@ mod tests {
     async fn a_discarded_turn_records_nothing() {
         // As for a 5xx, or a trap.
         let store = Store::memory();
-        let turn = keyed(&store, false, &once("1")).await.unwrap();
+        let turn = keyed(&store, &once("1")).await.unwrap();
         turn.increment("c", 1).await.unwrap();
         turn.discard().await;
-        keyed(&store, false, &once("1")).await.expect("so it runs again");
+        keyed(&store, &once("1")).await.expect("so it runs again");
     }
 
     #[tokio::test]
@@ -1481,7 +1348,7 @@ mod tests {
         tree.write(records.into()).await.unwrap();
         let mut head = Head { tree: tree.finish().await.unwrap(), ..Default::default() };
         put(&store, &path("a", "n"), &mut head, None).await.unwrap().unwrap();
-        commit(&writes(&store, false, "k").await.unwrap()).await.unwrap();
+        commit(&writes(&store, "k").await.unwrap()).await.unwrap();
         let snap = Turn::snap(&store, "a", "n").await.unwrap();
         assert_eq!(snap.tree().read().await.scan("i/", None, 10).await.unwrap(), [record_key(today - 1, "k")]);
     }
