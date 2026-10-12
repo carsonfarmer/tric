@@ -87,6 +87,9 @@ const NODES: usize = 16 << 20;
 /// The bytes of values that a default cache keeps.
 const VALUES: usize = 32 << 20;
 
+/// How many uploads a tree has under way at once, and how many nodes a mark reads at once.
+pub const IN_FLIGHT: usize = 16;
+
 /// What bounds a tree, and how it uses the store. A tree is read with a `node` and a `blob` no smaller than those it
 /// was written with.
 #[derive(Clone, Copy, Debug)]
@@ -104,21 +107,11 @@ pub struct Config {
     pub data: u64,
     /// The most a value is: 1 MiB by default.
     pub blob: u64,
-    /// How many uploads a tree has under way at once, and how many nodes a mark reads at once: 16 by default.
-    pub in_flight: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            node: 64 << 10,
-            inline: 4 << 10,
-            budget: 8 << 20,
-            entries: u64::MAX,
-            data: u64::MAX,
-            blob: 1 << 20,
-            in_flight: 16,
-        }
+        Self { node: 64 << 10, inline: 4 << 10, budget: 8 << 20, entries: u64::MAX, data: u64::MAX, blob: 1 << 20 }
     }
 }
 
@@ -148,21 +141,11 @@ pub enum Full {
     Data(u64),
 }
 
-impl fmt::Display for Full {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Entries(n) => write!(f, "a tree holds {n} keys or fewer"),
-            Self::Data(n) => write!(f, "a tree holds {n} bytes of values or fewer"),
-        }
-    }
-}
-
-impl std::error::Error for Full {}
-
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Full(full) => full.fmt(f),
+            Self::Full(Full::Entries(n)) => write!(f, "a tree holds {n} keys or fewer"),
+            Self::Full(Full::Data(n)) => write!(f, "a tree holds {n} bytes of values or fewer"),
             Self::TooLarge(why) | Self::Corrupt(why) => f.write_str(why),
             Self::Store(e) => e.fmt(f),
             Self::Poisoned => f.write_str("an earlier change to the tree failed"),
@@ -1006,7 +989,7 @@ struct Flush<'a> {
 
 impl<'a> Flush<'a> {
     fn new(reader: &'a Reader, nodes: bool) -> Self {
-        Self { reader, permits: Semaphore::new(reader.config.in_flight.max(1)), nodes }
+        Self { reader, permits: Semaphore::new(IN_FLIGHT), nodes }
     }
 
     /// Uploads an object at a new id, and returns the link.
@@ -1023,7 +1006,7 @@ impl<'a> Flush<'a> {
     }
 
     /// Uploads the values held in `node`, and, if `nodes`, the nodes below it that are in memory, so each is a link.
-    /// Those left empty are dropped. The node itself is for the caller to upload.
+    /// None of them is empty, as [`fix`] dropped those. The node itself is for the caller to upload.
     fn node(&'a self, node: &'a mut Node) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             match &mut node.body {
@@ -1040,9 +1023,6 @@ impl<'a> Flush<'a> {
                 }
                 Body::Branch(kids) => {
                     try_join_all(kids.iter_mut().map(|kid| self.child(kid))).await?;
-                    if self.nodes {
-                        kids.retain(|k| !matches!(&k.at, At::Dirty(n) if n.is_empty()));
-                    }
                 }
             }
             node.measure();
@@ -1053,7 +1033,7 @@ impl<'a> Flush<'a> {
     async fn child(&self, kid: &mut Child) -> Result<()> {
         let At::Dirty(node) = &mut kid.at else { return Ok(()) };
         self.node(node).await?;
-        if !self.nodes || node.is_empty() {
+        if !self.nodes {
             return Ok(());
         }
         let (json, max) = (node.json(), self.reader.config.node);
@@ -1258,12 +1238,26 @@ impl Tree {
         Ok(())
     }
 
+    /// Uploads the values the tree holds, and, if `nodes`, the nodes it changed too, after it merges what is thin and
+    /// drops what is empty, as at the commit, and gives up the levels of the root that have one child.
     async fn flush(&mut self, nodes: bool) -> Result<()> {
-        Flush::new(&self.reader, nodes).node(&mut self.root).await?;
-        if matches!(&self.root.body, Body::Branch(kids) if kids.is_empty()) {
-            self.root = Node::leaf();
+        let r = &*self.reader;
+        if nodes {
+            fix(r, &mut self.root).await?;
+            while let Body::Branch(kids) = &mut self.root.body {
+                match kids.len() {
+                    0 => self.root = Node::leaf(),
+                    1 => {
+                        let Some(Child { mut at, .. }) = kids.pop() else { break };
+                        let only = dirty(r, &mut at).await?;
+                        self.root = std::mem::replace(only, Node::leaf());
+                        r.stats.collapses.fetch_add(1, Relaxed);
+                    }
+                    _ => break,
+                }
+            }
         }
-        Ok(())
+        Flush::new(r, nodes).node(&mut self.root).await
     }
 
     /// Merges what is thin, uploads what changed, and gives the new root, for the caller to keep. The tree is then as
@@ -1279,23 +1273,10 @@ impl Tree {
     }
 
     async fn seal(&mut self) -> Result<Root> {
-        let r = &*self.reader;
-        fix(r, &mut self.root).await?;
-        while let Body::Branch(kids) = &mut self.root.body {
-            match kids.len() {
-                0 => self.root = Node::leaf(),
-                1 => {
-                    let Some(Child { mut at, .. }) = kids.pop() else { break };
-                    let only = dirty(r, &mut at).await?;
-                    self.root = std::mem::replace(only, Node::leaf());
-                    r.stats.collapses.fetch_add(1, Relaxed);
-                }
-                _ => break,
-            }
-        }
-        Flush::new(r, true).node(&mut self.root).await?;
-        if self.root.size > r.config.node {
-            return Err(Error::TooLarge(format!("the root is over {} bytes", r.config.node)));
+        self.flush(true).await?;
+        let max = self.reader.config.node;
+        if self.root.size > max {
+            return Err(Error::TooLarge(format!("the root is over {max} bytes")));
         }
         let Work { bytes, entries, seq } = self.work;
         Ok(Root { root: self.root.body.clone(), bytes, entries, seq })
@@ -1312,11 +1293,11 @@ impl Tree {
     /// Adds to `seen` the ids of the objects the tree reaches below its root, as [`number`] gives them, its nodes and
     /// its values that are objects alike, and gives how many nodes it read, or `None` if that would be over `max`.
     ///
-    /// The nodes are read level by level, [`Config::in_flight`] at once, each checked as any read is, and none is kept
-    /// in the cache. An id already in `seen` is passed over with all below it, as what is below an object never
-    /// changes, so one set passed to the marks of several roots has each object read once. A node that is missing or
-    /// not what its link says is an error, so what is marked is of a tree that was whole. After `None` or an error,
-    /// `seen` holds part of the tree, and is not to be used.
+    /// The nodes are read level by level, [`IN_FLIGHT`] at once, each checked as any read is, and none is kept in the
+    /// cache. An id already in `seen` is passed over with all below it, as what is below an object never changes, so
+    /// one set passed to the marks of several roots has each object read once. A node that is missing or not what its
+    /// link says is an error, so what is marked is of a tree that was whole. After `None` or an error, `seen` holds
+    /// part of the tree, and is not to be used.
     pub async fn mark(&self, seen: &mut HashSet<u128>, max: usize) -> Result<Option<usize>> {
         let (mut next, mut nodes) = (vec![], 0);
         refs(&self.root, seen, &mut next)?;
@@ -1327,19 +1308,12 @@ impl Tree {
             }
             let (r, links) = (&*self.reader, std::mem::take(&mut next));
             let reads = stream::iter(links).map(|link| async move { r.load(&link, false).await });
-            let mut reads = reads.buffer_unordered(r.config.in_flight.max(1));
+            let mut reads = reads.buffer_unordered(IN_FLIGHT);
             while let Some(node) = reads.try_next().await? {
                 refs(&node, seen, &mut next)?;
             }
         }
         Ok(Some(nodes))
-    }
-
-    /// The ids of the objects the tree reaches below its root: [`Tree::mark`] from none, or `None` if it would read
-    /// over `max` nodes.
-    pub async fn reachable(&self, max: usize) -> Result<Option<HashSet<u128>>> {
-        let mut seen = HashSet::new();
-        Ok(self.mark(&mut seen, max).await?.map(|_| seen))
     }
 
     /// How often the tree split, merged and gave up a level of its root.
@@ -1394,7 +1368,7 @@ mod tests {
     /// A config that makes a few keys a deep tree: a branch holds a few nodes, and a leaf as many values that are
     /// objects.
     fn tiny() -> Config {
-        Config { node: 1400, inline: 8, budget: 2048, entries: 1000, data: 100_000, blob: 100, in_flight: 16 }
+        Config { node: 1400, inline: 8, budget: 2048, entries: 1000, data: 100_000, blob: 100 }
     }
 
     fn open(store: &Store, root: &Root, config: Config) -> Tree {
@@ -1426,6 +1400,13 @@ mod tests {
             let n = if self.below(10) < 6 { self.below(9) } else { 9 + self.below(92) };
             (0..n).map(|_| self.below(256) as u8).collect()
         }
+    }
+
+    /// The ids of the objects `tree` reaches below its root: a mark from none, or `None` if it would read over `max`
+    /// nodes.
+    async fn reachable(tree: &Tree, max: usize) -> Result<Option<HashSet<u128>>> {
+        let mut seen = HashSet::new();
+        Ok(tree.mark(&mut seen, max).await?.map(|_| seen))
     }
 
     async fn set(tree: &mut Tree, key: &str, value: &[u8]) {
@@ -1625,7 +1606,7 @@ mod tests {
                 assert_eq!(text(&fresh, k).await, v.as_slice(), "{k}");
             }
             assert_eq!(fresh.scan("k/", None, usize::MAX).await.unwrap(), model.keys().cloned().collect::<Vec<_>>());
-            assert_eq!(fresh.reachable(usize::MAX).await.unwrap(), Some(numbers(&audit)), "round {round}");
+            assert_eq!(reachable(&fresh, usize::MAX).await.unwrap(), Some(numbers(&audit)), "round {round}");
             // Nothing was deleted, so nothing the root reaches is lost; what it does not reach is for a collector.
             let stored = stored(&store).await;
             let lost: Vec<_> = audit.ids.difference(&stored).collect();
@@ -1682,24 +1663,24 @@ mod tests {
         store.cache = Arc::default();
         let tree = at(&store, &root);
 
-        // Every node below the root is read once, a few at once and no more than `in_flight`, and none is kept.
+        // Every node below the root is read once, a few at once and no more than `IN_FLIGHT`, and none is kept.
         counts.gets.store(0, SeqCst);
         counts.delay.store(5, SeqCst);
-        assert_eq!(tree.reachable(usize::MAX).await.unwrap(), Some(all.clone()));
+        assert_eq!(reachable(&tree, usize::MAX).await.unwrap(), Some(all.clone()));
         assert_eq!(counts.gets.load(SeqCst), all.len());
         let peak = counts.peak.load(SeqCst);
-        assert!((2..=tiny().in_flight).contains(&peak), "{peak} at once");
+        assert!((2..=IN_FLIGHT).contains(&peak), "{peak} at once");
         counts.delay.store(0, SeqCst);
         counts.gets.store(0, SeqCst);
         assert!(tree.get("k/077").await.unwrap().is_some());
         assert_eq!(counts.gets.load(SeqCst), audit.depth - 1, "the walk left nothing in the cache");
 
         // Over `max` nodes it is not read at all past the level that went over, and says so.
-        assert_eq!(tree.reachable(all.len()).await.unwrap(), Some(all.clone()));
+        assert_eq!(reachable(&tree, all.len()).await.unwrap(), Some(all.clone()));
         counts.gets.store(0, SeqCst);
-        assert_eq!(tree.reachable(all.len() - 1).await.unwrap(), None);
+        assert_eq!(reachable(&tree, all.len() - 1).await.unwrap(), None);
         assert!(counts.gets.load(SeqCst) < all.len());
-        assert_eq!(tree.reachable(0).await.unwrap(), None);
+        assert_eq!(reachable(&tree, 0).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -1717,7 +1698,7 @@ mod tests {
                 _ => drop(store.inner.put(&path, Bytes::new().into()).await.unwrap()),
             }
             store.cache = Arc::default(); // a node in the cache was whole when it was put there
-            let err = at(&store, &root).reachable(usize::MAX).await.unwrap_err();
+            let err = reachable(&at(&store, &root), usize::MAX).await.unwrap_err();
             assert!(matches!(err, Error::Corrupt(_)), "a {damage} node is no tree: {err}");
         }
     }
@@ -1731,7 +1712,7 @@ mod tests {
         let root = commit(&mut tree).await;
         let audit = audit(&store, &root).await;
         assert_eq!(audit.ids.len(), 1, "a root of two keys has no node below it, and one value is an object");
-        assert_eq!(at(&store, &root).reachable(usize::MAX).await.unwrap(), Some(numbers(&audit)));
+        assert_eq!(reachable(&at(&store, &root), usize::MAX).await.unwrap(), Some(numbers(&audit)));
         assert_eq!(stored(&store).await, audit.ids, "the object is all there is");
     }
 

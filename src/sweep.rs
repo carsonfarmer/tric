@@ -452,7 +452,7 @@ mod tests {
 
     /// A config that makes a few keys a tree of several nodes, and a value of more than 8 bytes an object of its own.
     fn tiny() -> Config {
-        Config { node: 1400, inline: 8, budget: 2048, entries: 1000, data: 100_000, blob: 100, ..tree::config() }
+        Config { node: 1400, inline: 8, budget: 2048, entries: 1000, data: 100_000, blob: 100 }
     }
 
     /// A key's versions, the newest first: an id, and the head, or nothing for a delete marker.
