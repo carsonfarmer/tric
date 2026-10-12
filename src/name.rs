@@ -1,18 +1,18 @@
 //! Names: each name's state is one object, its head, which a turn changes with a compare-and-swap when it commits.
 use crate::fs;
 use crate::kv::{Error, KeyResponse, other};
-use crate::outbox::{Event, Held, Sink, WINDOW};
+use crate::outbox::{Event, Held, Sink};
 use crate::store::{self, Store};
 use crate::tree::{self, Full, Root, Tree};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use object_store::{PutMode, UpdateVersion, path::Path};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::{sync::RwLock, sync::watch, time::sleep, time::timeout_at};
-use wasmtime::{Result, ensure, error::Context};
+use wasmtime::{Result, error::Context};
 
 const NAME_MAX: usize = 128;
 const KEY_MAX: usize = 256; // bytes
@@ -20,12 +20,6 @@ const VALUE_MAX: usize = 1 << 20;
 pub const HEAD_MAX: usize = 1 << 20;
 const HELD_MAX: usize = 1_000_000; // bytes of held requests, as JSON, so an event is within Lambda's 1 MB
 const PAGE: usize = 1000; // keys per `list-keys`
-/// How long a commit stays pending: the window its delivery is tried in, and an hour more, for an event that Lambda
-/// was late to hand over.
-const PENDING_TTL: Duration = WINDOW.saturating_add(Duration::from_secs(3600));
-/// The most commits a name may have pending, at some 130 bytes each in its head. At that, a turn's background requests
-/// are refused, so the head stays far under `HEAD_MAX`, and no pending commit is dropped before its time.
-const PENDING_MAX: usize = 1000;
 /// How long a commit's put may take, with learning whether it landed when its answer is lost; past that, the commit
 /// fails with [`Failed::Unsettled`]. A turn's runs, which begin before its deadline (`tric::DEADLINE`), the guest's
 /// `ANSWER` and this fit in CloudFront's 60 s for an answer from the origin, so the client hears the 500, and not a 504
@@ -34,9 +28,10 @@ pub const SETTLE: Duration = Duration::from_secs(30);
 /// The header that makes a turn apply once, however often it is sent: see [`Idempotency`].
 pub const IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("idempotency-key");
 const IDEMPOTENCY_KEY_MAX: usize = 255; // bytes
-/// A day, in milliseconds: the records of `Idempotency-Key`s are kept by the Unix day they were made on.
+/// A day, in milliseconds: the records a commit keeps in the tree, of its `Idempotency-Key` and of its delivery event,
+/// are kept by the Unix day they were made on.
 const DAY: u64 = 24 * 3600 * 1000;
-/// The most expired records of `Idempotency-Key`s one commit deletes.
+/// The most expired records of each kind one commit deletes.
 const PRUNE_MAX: usize = 1000;
 
 /// Whether `s` is a name: 1 to 128 of `A-Za-z0-9._~:-`, starting with a letter or digit.
@@ -50,17 +45,13 @@ pub fn of(path: &str) -> Option<&str> {
     path.strip_prefix("/@").map(|rest| rest.split('/').next().unwrap_or_default())
 }
 
-/// A name's state: its tree, with the root in the head, the commits pending, the commit that wrote it and the version
-/// it was written over.
+/// A name's state: its tree, with the root in the head, the commit that wrote it and the version it was written over.
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Head {
     #[serde(default, skip_serializing_if = "Root::is_empty")]
     tree: Root,
-    /// The commits whose background requests are not yet delivered.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub pending: BTreeMap<String, Pending>,
-    /// The random id of the last commit, which `settle` keeps; none before the first.
+    /// The random id of the commit that wrote it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     commit: String,
     /// The version id of the head this one was written over, which `put` sets; none for the first head, or where the
@@ -72,8 +63,8 @@ pub struct Head {
 impl Head {
     /// Adds to `seen` the ids of the objects the head's tree is made of, with the name's own `app` and `name`, and
     /// gives how many nodes it read, or `None` if that would be over `max`: see [`Tree::mark`]. The tree is all a head
-    /// names of its name's objects: its `pending` holds digests of events, `commit` the id of a commit and `over` a
-    /// version of the head itself, and none of them names an object.
+    /// names of its name's objects: its `commit` is the id of a commit and `over` a version of the head itself, and
+    /// neither names an object.
     pub async fn mark(
         &self,
         store: &Store,
@@ -83,20 +74,6 @@ impl Head {
         max: usize,
     ) -> Result<Option<usize>> {
         Ok(tree::open(store, app, name, &self.tree, tree::config())?.mark(seen, max).await?)
-    }
-}
-
-/// A commit's delivery event, by its SHA-256, and when the commit landed, in Unix milliseconds.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Pending {
-    pub digest: String,
-    at: u64,
-}
-
-impl Pending {
-    fn live(&self, now: u64) -> bool {
-        now.saturating_sub(self.at) < PENDING_TTL.as_millis() as u64
     }
 }
 
@@ -119,8 +96,8 @@ pub async fn read(store: &Store, path: &Path) -> Result<Option<(Head, UpdateVers
 }
 
 /// Writes `head` over the version `base`, or where there is none, if that is still the head, with `over` set to
-/// `base`'s version id: its new version, or `None` if another write landed first and this one did not. An error other
-/// than [`Failed::TooLarge`] may have landed, or may yet: see [`Store::put`].
+/// `base`'s version id: its new version, or `None` if another write landed first and this one did not. An error may
+/// have landed, or may yet: see [`Store::put`].
 async fn put(
     store: &Store,
     path: &Path,
@@ -129,7 +106,6 @@ async fn put(
 ) -> Result<Option<UpdateVersion>> {
     head.over = base.as_ref().and_then(|v| v.version.clone());
     let json = serde_json::to_vec(head)?;
-    ensure!(json.len() <= HEAD_MAX, Failed::TooLarge);
     let (start, bytes, over) = (Instant::now(), json.len(), base.as_ref().and_then(|v| v.e_tag.clone()));
     let put = store.put(path, json.into(), base.map_or(PutMode::Create, PutMode::Update)).await;
     let etag = put.as_ref().ok().and_then(Option::as_ref).and_then(|v| v.e_tag.as_deref());
@@ -234,13 +210,27 @@ async fn recorded(tree: &Tree, key: &str, today: u64) -> Result<Option<Record>> 
     Ok(None)
 }
 
-/// The first `PRUNE_MAX` records of `Idempotency-Key`s, up to the first made yesterday or after, which no lookup reads.
-async fn expired(tree: &Tree, today: u64) -> Result<Vec<String>> {
-    let old = |k: &String| k.split('/').nth(1).and_then(|d| d.parse::<u64>().ok()).is_some_and(|d| d + 1 < today);
-    if !tree.scan("i/", None, 1).await?.first().is_some_and(old) {
+/// The key in the tree of the record of a delivery event, by its SHA-256 `digest`, made on the Unix day `day`.
+fn event_key(day: u64, digest: &str) -> String {
+    format!("o/{day:06}/{digest}")
+}
+
+/// The first `PRUNE_MAX` records under `prefix`, `i/` or `o/`, up to the first made on the day `kept` or after.
+async fn expired(tree: &Tree, prefix: &str, kept: u64) -> Result<Vec<String>> {
+    let old = |k: &String| k.split('/').nth(1).and_then(|d| d.parse::<u64>().ok()).is_some_and(|d| d < kept);
+    if !tree.scan(prefix, None, 1).await?.first().is_some_and(old) {
         return Ok(vec![]); // as there mostly are none, at the cost of one key
     }
-    Ok(tree.scan("i/", None, PRUNE_MAX).await?.into_iter().take_while(old).collect())
+    Ok(tree.scan(prefix, None, PRUNE_MAX).await?.into_iter().take_while(old).collect())
+}
+
+/// Whether the head of `name` holds the record of the delivery event with the SHA-256 `digest` made on the Unix day
+/// `day`, which its commit writes, and the commits after it keep until two days after `day`; and the head's `ETag`, as
+/// the store gives it, if there is a head.
+pub async fn holds(store: &Store, app: &str, name: &str, day: u64, digest: &str) -> Result<(bool, Option<String>)> {
+    let Some((head, version)) = read(store, &path(app, name)).await? else { return Ok((false, None)) };
+    let tree = tree::open(store, app, name, &head.tree, tree::config())?;
+    Ok((tree.get(&event_key(day, digest)).await?.is_some(), version.e_tag))
 }
 
 /// What a turn that does not run answers.
@@ -372,10 +362,8 @@ fn same(a: &UpdateVersion, b: &UpdateVersion) -> bool {
 /// may have landed. An error carries at most one.
 #[derive(Debug, PartialEq)]
 pub enum Failed {
-    /// The name would be over its limits: its head over `HEAD_MAX`, or its tree too full for the record of an
-    /// `Idempotency-Key`. The head is the root of the tree, at most `NODE_MAX`, and the pending commits, at most
-    /// `PENDING_MAX` of them, so that is a backstop. Running again would fail again, as for a trap, so it is never
-    /// `Unsent`.
+    /// The name's tree would be over its limits with the commit's records, of its `Idempotency-Key` and its delivery
+    /// event. Running again would fail again, as for a trap, so it is never `Unsent`.
     TooLarge,
     /// The commit failed before its head was put, so nothing landed.
     Unsent,
@@ -517,13 +505,6 @@ impl Turn {
         &self.tree
     }
 
-    /// Whether the name has `PENDING_MAX` commits pending, so that the turn's commit would be one too many for its
-    /// background requests.
-    pub fn backlogged(&self) -> bool {
-        let now = now();
-        self.state().head.pending.values().filter(|p| p.live(now)).count() >= PENDING_MAX
-    }
-
     /// Holds `held` for the outbox, unless the turn is answered or holds too much.
     pub fn hold(&self, held: Held) -> Result<(), String> {
         let n = serde_json::to_vec(&held).map_err(|e| e.to_string())?.len();
@@ -610,10 +591,10 @@ impl Turn {
     }
 
     /// Commits the turn, asked at `host` and answered with `status` and `location`: its tree is uploaded, its held
-    /// requests go to `sink` as a delivery event whose digest the head keeps in `pending`, and its head goes over the
-    /// version it read, if that is still the head. A commit that puts a head deletes expired records of
-    /// `Idempotency-Key`s, and a turn with a key always puts one, to record it, whatever it changed. The `ETag` it
-    /// returns is the new head's, or the old one's when there was nothing to write. A commit that fails is discarded.
+    /// requests go to `sink` as a delivery event whose digest the tree records, and its head goes over the version it
+    /// read, if that is still the head. A commit that puts a head deletes expired records, and a turn with a key always
+    /// puts one, to record it, whatever it changed. The `ETag` it returns is the new head's, or the old one's when there
+    /// was nothing to write. A commit that fails is discarded.
     pub async fn commit(
         &self,
         host: &str,
@@ -652,37 +633,43 @@ impl Turn {
             if tree.edited() {
                 kept = self.fs.settle(&mut tree).await?;
             }
-            let now = now();
-            let mut edits: Vec<_> = expired(&tree, now / DAY).await?.into_iter().map(|k| (k, None)).collect();
+            // An `Idempotency-Key`'s record is read until the day after its own; a delivery event's until two days
+            // after, past the window its delivery is tried in.
+            let today = now() / DAY;
+            let mut edits = expired(&tree, "i/", today.saturating_sub(1)).await?;
+            edits.extend(expired(&tree, "o/", today.saturating_sub(2)).await?);
+            let mut edits: Vec<_> = edits.into_iter().map(|k| (k, None)).collect();
             if let Some(once) = &self.once {
                 let location = location.and_then(|l| l.to_str().ok()).map(Into::into);
                 let record = Record { fingerprint: once.fingerprint.clone(), status: status.as_u16(), location };
-                edits.push((record_key(now / DAY, &once.key), Some(serde_json::to_vec(&record)?.into())));
+                edits.push((record_key(today, &once.key), Some(serde_json::to_vec(&record)?.into())));
+            }
+            let mut event = None;
+            if !held.is_empty() {
+                let e = Event {
+                    app: self.app.clone(),
+                    host: host.into(),
+                    name: self.name.clone(),
+                    day: today,
+                    base: base.as_ref().and_then(|v| v.e_tag.clone()),
+                    commit: commit.clone(),
+                    requests: held,
+                };
+                let bytes = Bytes::from(serde_json::to_vec(&e)?);
+                edits.push((event_key(today, &store::hash(&bytes)), Some(Bytes::new())));
+                event = Some(bytes);
             }
             tree.write(edits).await.map_err(|e| match e {
-                // A name too full for the record stays so until something is deleted: it is not tried again.
+                // A name too full for the records stays so until something is deleted: it is not tried again.
                 tree::Error::Full(_) | tree::Error::TooLarge(_) => wasmtime::Error::from(e).context(Failed::TooLarge),
                 e => e.into(),
             })?;
             if tree.edited() {
                 head.tree = tree.finish().await?;
             }
-            head.pending.retain(|_, p| p.live(now));
             head.commit = commit.clone();
-            if !held.is_empty() {
-                let event = Event {
-                    app: self.app.clone(),
-                    host: host.into(),
-                    name: self.name.clone(),
-                    base: base.as_ref().and_then(|v| v.e_tag.clone()),
-                    commit: commit.clone(),
-                    requests: held,
-                };
-                let bytes = Bytes::from(serde_json::to_vec(&event)?);
-                head.pending.insert(commit.clone(), Pending { digest: store::hash(&bytes), at: now });
-                // Before the event is handed over, or it would be sent in vain.
-                ensure!(serde_json::to_vec(&head)?.len() <= HEAD_MAX, Failed::TooLarge);
-                sink(bytes).await?;
+            if let Some(event) = event {
+                sink(event).await?; // before the head is put, so a commit that lands has handed it over
             }
             Ok::<_, wasmtime::Error>(kept)
         };
@@ -716,7 +703,6 @@ impl Turn {
         let lost = match timeout_at(until, put(&self.store, &self.path, head, base.clone())).await {
             Ok(Ok(Some(version))) => return Ok(Committed::Done(etag(&version))),
             Ok(Ok(None)) => return Ok(Committed::Conflict),
-            Ok(Err(e)) if e.downcast_ref() == Some(&Failed::TooLarge) => return Err(e), // so it did not go
             Ok(Err(e)) => format!("{e:#}"),
             Err(_) => format!("no answer within {SETTLE:?}"),
         };
@@ -736,21 +722,6 @@ impl Turn {
         self.fs.drain().await;
         self.tree.write().await.reset();
         self.settled.send_replace(Some(false));
-    }
-}
-
-/// Takes `commit` off the pending ones of `name`, as far as it can in a few tries: one it cannot stays until a later
-/// commit drops it, after `PENDING_TTL`.
-pub async fn settle(store: &Store, app: &str, name: &str, commit: &str) {
-    let path = path(app, name);
-    for _ in 0..3 {
-        let Ok(Some((mut head, version))) = read(store, &path).await else { return };
-        if head.pending.remove(commit).is_none() {
-            return;
-        }
-        if let Ok(Some(_)) = put(store, &path, &mut head, Some(version)).await {
-            return;
-        }
     }
 }
 
@@ -796,32 +767,6 @@ mod tests {
         assert!(!c(None, Some("W/\"abc\"")).hold(e), "If-None-Match compares weakly");
         assert!(c(None, Some("\"x\"")).hold(e));
         assert!(c(None, None).hold(None));
-    }
-
-    #[tokio::test]
-    async fn a_name_with_too_many_commits_pending_is_backlogged() {
-        for (live, backlogged) in [(PENDING_MAX, true), (PENDING_MAX - 1, false)] {
-            let (store, mut head) = (Store::memory(), Head::default());
-            for i in 0..=PENDING_MAX {
-                let at = if i < live { now() } else { 0 }; // the rest have expired, and do not count
-                head.pending.insert(store::random(), Pending { digest: store::hash(&[]), at });
-            }
-            assert!(serde_json::to_vec(&head).unwrap().len() < HEAD_MAX / 4, "the head stays far under its limit");
-            put(&store, &path("a", "n"), &mut head, None).await.unwrap().unwrap();
-            let turn = Turn::open(&store, "a", "n", &Default::default(), None).await;
-            assert_eq!(turn.unwrap().ok().unwrap().backlogged(), backlogged, "{live} live");
-        }
-    }
-
-    #[tokio::test]
-    async fn too_large() {
-        let (store, mut head) = (Store::memory(), Head::default());
-        for _ in 0..10_000 {
-            head.pending.insert(store::random(), Pending { digest: store::hash(&[]), at: now() });
-        }
-        let put = put(&store, &path("a", "n"), &mut head, None).await;
-        assert_eq!(put.err().unwrap().downcast_ref(), Some(&Failed::TooLarge));
-        assert!(read(&store, &path("a", "n")).await.unwrap().is_none());
     }
 
     /// A versioned bucket, which keeps every version of a head, as S3 does, each with an `ETag` that is the SHA-256 of
@@ -1196,19 +1141,55 @@ mod tests {
         }
     }
 
+    /// A request held for the outbox.
+    async fn held() -> Held {
+        Held::of(http::Request::builder().method("POST").uri("https://h/x").body(Default::default()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_commit_records_its_event_by_its_digest_and_hands_it_over_before_its_put() {
+        let (store, _) = based().await;
+        let events = Arc::new(Mutex::new(vec![]));
+        let sink: Sink = Arc::new({
+            let events = events.clone();
+            move |bytes| {
+                events.lock().unwrap().push(bytes);
+                Box::pin(async { Ok(()) })
+            }
+        });
+        let base = etag_now(&store).await;
+        let (first, second) = (writes(&store, "k").await.unwrap(), writes(&store, "l").await.unwrap());
+        for turn in [&first, &second] {
+            turn.hold(held().await).unwrap();
+        }
+        assert!(matches!(first.commit("h", &sink, StatusCode::OK, None).await.unwrap(), Committed::Done(Some(_))));
+        assert_eq!(second.commit("h", &sink, StatusCode::OK, None).await.unwrap(), Committed::Conflict);
+        let events = events.lock().unwrap().clone();
+        let day = serde_json::from_slice::<Event>(&events[0]).unwrap().day;
+        let holds = async |bytes: &[u8]| holds(&store, "a", "n", day, &store::hash(bytes)).await.unwrap();
+        let head = etag_now(&store).await.map(|e| e.trim_matches('"').to_owned());
+        assert_eq!(holds(&events[0]).await, (true, head.clone()), "the commit that landed");
+        assert_eq!(holds(&events[1]).await, (false, head.clone()), "the one that did not, which never will");
+        assert_eq!(holds(b"other").await, (false, head), "another event");
+        let event = serde_json::from_slice::<Event>(&events[1]).unwrap();
+        assert_eq!(event.base.map(|b| format!("\"{b}\"")), base, "the version both wrote over");
+    }
+
     #[tokio::test]
     async fn a_commit_that_would_put_the_name_over_its_limits_does_not_run_again() {
-        // Its head is over `HEAD_MAX` once it is the commit's: as it is put, or, with an event, before that is sent.
+        // Its tree is full, so it has no room for the commit's records: of its key, or of its event.
         for event in [false, true] {
-            let (store, mut head) = (Store::memory(), Head::default());
-            head.pending.insert("p".into(), Pending { digest: String::new(), at: now() });
-            let size = serde_json::to_vec(&head).unwrap().len();
-            head.pending.get_mut("p").unwrap().digest = "0".repeat(HEAD_MAX - size - 10);
-            put(&store, &path("a", "n"), &mut head, None).await.unwrap().unwrap();
-            let turn = writes(&store, "k").await.unwrap();
+            let store = Store::memory();
+            let full = serde_json::json!({ "tree": { "entries": tree::ENTRIES_MAX } });
+            put(&store, &path("a", "n"), &mut serde_json::from_value(full).unwrap(), None).await.unwrap().unwrap();
+            let turn = match event {
+                false => keyed(&store, &once("1")).await.unwrap(),
+                true => Turn::open(&store, "a", "n", &Default::default(), None).await.unwrap().unwrap(),
+            };
             if event {
-                let req = http::Request::builder().method("POST").uri("https://h/x").body(Default::default()).unwrap();
-                turn.hold(Held::of(req).await.unwrap()).unwrap();
+                turn.hold(held().await).unwrap();
             }
             let e = commit(&turn).await.unwrap_err();
             assert_eq!(e.downcast_ref(), Some(&Failed::TooLarge), "{e:#}");
@@ -1330,26 +1311,32 @@ mod tests {
         let days = [(40, 600), (50, 600), (98, 5), (99, 5), (100, 5)];
         let record = |(day, i)| (record_key(day, &format!("{i:064x}")), Some(Bytes::from_static(b"{}")));
         tree.write(days.iter().flat_map(|&(day, n)| (0..n).map(move |i| record((day, i)))).collect()).await.unwrap();
+        tree.write(vec![(event_key(10, "e"), Some(Bytes::new()))]).await.unwrap();
         for n in [PRUNE_MAX, 205, 0] {
-            let expired = expired(&tree, 100).await.unwrap();
+            let expired = expired(&tree, "i/", 99).await.unwrap();
             assert_eq!(expired.len(), n);
-            assert!(expired.iter().all(|k| k.as_str() < record_key(99, "").as_str()), "none from yesterday on");
+            assert!(expired.iter().all(|k| k.as_str() < record_key(99, "").as_str()), "none from day 99 on");
             tree.write(expired.into_iter().map(|k| (k, None)).collect()).await.unwrap();
         }
-        assert_eq!(tree.scan("i/", None, 100).await.unwrap().len(), 10, "yesterday's and today's are kept");
+        assert_eq!(tree.scan("i/", None, 100).await.unwrap().len(), 10, "day 99's and day 100's are kept");
+        assert_eq!(expired(&tree, "o/", 99).await.unwrap(), [event_key(10, "e")], "and the records of another kind");
     }
 
     #[tokio::test]
-    async fn a_commit_that_puts_a_head_deletes_the_records_made_before_yesterday() {
+    async fn a_commit_that_puts_a_head_deletes_the_expired_records() {
+        // A key's record is kept to yesterday, and an event's to the day before.
         let store = Store::memory();
         let today = now() / DAY;
         let mut tree = tree::open(&store, "a", "n", &Root::default(), tree::config()).unwrap();
-        let records = [today - 2, today - 1].map(|day| (record_key(day, "k"), Some(Bytes::from_static(b"{}"))));
-        tree.write(records.into()).await.unwrap();
+        let mut records: Vec<_> = [today - 2, today - 1].map(|day| (record_key(day, "k"), Some(Bytes::new()))).into();
+        records.extend([today - 3, today - 2].map(|day| (event_key(day, "e"), Some(Bytes::new()))));
+        tree.write(records).await.unwrap();
         let mut head = Head { tree: tree.finish().await.unwrap(), ..Default::default() };
         put(&store, &path("a", "n"), &mut head, None).await.unwrap().unwrap();
         commit(&writes(&store, "k").await.unwrap()).await.unwrap();
         let snap = Turn::snap(&store, "a", "n").await.unwrap();
-        assert_eq!(snap.tree().read().await.scan("i/", None, 10).await.unwrap(), [record_key(today - 1, "k")]);
+        let tree = snap.tree().read().await;
+        assert_eq!(tree.scan("i/", None, 10).await.unwrap(), [record_key(today - 1, "k")]);
+        assert_eq!(tree.scan("o/", None, 10).await.unwrap(), [event_key(today - 2, "e")]);
     }
 }

@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
@@ -1045,8 +1045,8 @@ async fn isolates_apps() {
     assert_eq!(listed(&b).try_collect::<Vec<_>>().await.unwrap(), [format!("native/{b}/x/y")]);
 }
 
-/// An event that names an app, but whose commit is not pending in that app's head with the event's digest, is dropped:
-/// so neither an app, nor anyone who learns a commit id, can send requests as another. Acceptance criterion 5.
+/// An event that names an app, but whose digest no commit recorded in that app's name, is dropped: so neither an app,
+/// nor anyone who learns a commit id, can send requests as another. Acceptance criterion 5.
 #[tokio::test]
 async fn drops_forged_events() {
     let tric = Tric::app(Kind { stack: true, app: "app" }).await;
@@ -1061,6 +1061,7 @@ async fn drops_forged_events() {
         "app": tric.apps[0],
         "host": tric.host,
         "name": "f",
+        "day": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() / 86_400,
         "base": "\"forged\"",
         "commit": commit,
         "requests": [{ "method": "POST", "uri": format!("{me}/@h/echo"), "headers": [], "body": "" }],
@@ -1069,7 +1070,7 @@ async fn drops_forged_events() {
     let outbox =
         [("x-amzn-lambda-context", r#"{"invoked_function_arn":"arn:aws:lambda:local:0:function:events:outbox"}"#)];
     assert_eq!(exchange(&tric.outbox, &tric.outbox, "POST", "/", &outbox, body).await.status, 202);
-    let line = "outbox: dropped an event, as its commit is not pending";
+    let line = "outbox: dropped an event, as no commit recorded it";
     assert!(tric.logged(line, Duration::from_secs(30)).await, "dropped");
     assert_eq!(tric.value("h", "echo").await, Value::Null);
 
