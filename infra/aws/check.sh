@@ -125,17 +125,19 @@ invoke() {
 }
 status() { grep -aoE '"statusCode": ?[0-9]+' | head -1 | grep -oE '[0-9]+$'; }
 now() { echo $(($(date +%s) * 1000)); }
+# The items of a list that the AWS CLI printed as text, one to a line: none for an empty list, which it prints as None.
+listed() { tr '\t' '\n' | grep -v '^None$' | grep .; }
 # The number of events in function $1's log since $2 (ms) that match $3.
 nlogs() {
   aws logs filter-log-events --log-group-name "/aws/lambda/tric-$1" --start-time "$2" --filter-pattern "$3" \
     --query 'length(events)' --output text
 }
-# Waits up to $4 seconds for function $1's log since $2 to have a line that matches the filter pattern $3.
+# Waits up to $4 seconds for function $1's log since $2 to have $5 lines (one, by default) that match filter pattern $3.
 awaitpat() {
   local end=$((SECONDS + $4)) n
   while [ $SECONDS -lt $end ]; do
     n=$(nlogs "$1" "$2" "$3")
-    [[ $n =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && return 0
+    [[ $n =~ ^[0-9]+$ ]] && [ "$n" -ge "${5:-1}" ] && return 0
     sleep 5
   done
   return 1
@@ -149,15 +151,7 @@ reports() {
   echo "${n:-?}"
 }
 # Waits up to $4 seconds for function $1 to have $3 invocations or more end since $2 (ms).
-awaitreports() {
-  local end=$((SECONDS + $4)) n
-  while [ $SECONDS -lt $end ]; do
-    n=$(reports "$1" "$2")
-    [[ $n =~ ^[0-9]+$ ]] && [ "$n" -ge "$3" ] && return 0
-    sleep 5
-  done
-  return 1
-}
+awaitreports() { awaitpat "$1" "$2" REPORT "$4" "$3"; }
 # The number of lines of function $1's log since $2 (ms) that are of a sweep: the router's "sweep", serve's "swept", and
 # any warning that begins "sweep:" (and not serve's "sweep: reclaimed" for a name it deleted from, which is no warning).
 sweeplines() {
@@ -202,7 +196,7 @@ sweepexpr() {
 # The names of app $1's schedules in the cron group, which all begin with the hash of its name (src/deploy.rs).
 schedules() {
   aws scheduler list-schedules --group-name "$TRIC_SCHEDULES" --name-prefix "$(sha "$1" 24)-" \
-    --query 'Schedules[].Name' --output text | tr '\t' '\n' | grep -v '^None$' | grep .
+    --query 'Schedules[].Name' --output text | listed
 }
 # Schedule $1 of the cron group, as JSON.
 schedule() { aws scheduler get-schedule --group-name "$TRIC_SCHEDULES" --name "$1" --output json; }
@@ -215,13 +209,22 @@ sweepsof() {
 }
 # The keys under prefix $1 of the bucket, one to a line, in order.
 under() {
-  aws s3api list-objects-v2 --bucket "$TRIC_BUCKET" --prefix "$1" --query 'Contents[].Key' --output text |
-    tr '\t' '\n' | grep -v '^None$' | grep . | sort
+  aws s3api list-objects-v2 --bucket "$TRIC_BUCKET" --prefix "$1" --query 'Contents[].Key' --output text | listed | sort
 }
 # The number of versions (not delete markers) of the head of alpha's name $1.
 headversions() {
   aws s3api list-object-versions --bucket "$TRIC_BUCKET" --prefix "apps/alpha/names/$1" \
     --query "length(Versions[?Key == 'apps/alpha/names/$1'])" --output text
+}
+# Asks for alpha's sweep as Scheduler does, by the cron alias with {app, sweep}, and checks that the ask was taken.
+asksweep() {
+  local o
+  o=$(mktemp)
+  is "the cron alias takes the ask, and its function does not fail" "$(aws lambda invoke --function-name tric-events \
+    --qualifier cron --cli-binary-format raw-in-base64-out --cli-read-timeout 330 \
+    --payload '{"app":"alpha","sweep":true}' --query '[StatusCode, FunctionError]' --output text "$o" |
+    tr '\t' ' ')" "200 None"
+  rm -f "$o"
 }
 
 if [ "${1:-}" = late ]; then
@@ -251,12 +254,7 @@ if [ "${1:-}" = late ]; then
   is "hist-$run has its trees and the stray, as the run left them" "$(under apps/alpha/values/hist-$run/ | xargs)" \
     "$(printf '%s\n' $hist $aged | sort | xargs)"
   since=$(now)
-  o=$(mktemp)
-  is "the cron alias takes the ask, and its function does not fail" "$(aws lambda invoke --function-name tric-events \
-    --qualifier cron --cli-binary-format raw-in-base64-out --cli-read-timeout 330 \
-    --payload '{"app":"alpha","sweep":true}' --query '[StatusCode, FunctionError]' --output text "$o" |
-    tr '\t' ' ')" "200 None"
-  rm -f "$o"
+  asksweep
   if awaitpat serve "$since" '{ $.fields.message = "swept" && $.fields.app = "alpha" }' 90; then
     report=$(sweepreport alpha "$since")
     is "none was skipped, none failed, and it was done" "$(jq -r '[.skipped, .failed, .done] | join(" ")' \
@@ -313,7 +311,7 @@ unschedule() {
   done
   if [ -n "${prefix:-}" ]; then
     for n in $(aws scheduler list-schedules --group-name tric-retry --name-prefix "$prefix" \
-      --query 'Schedules[].Name' --output text | tr '\t' '\n' | grep -v '^None$'); do
+      --query 'Schedules[].Name' --output text | listed); do
       aws scheduler delete-schedule --group-name tric-retry --name "$n" >/dev/null || fail "delete a retry"
     done
     is "no retry of the run's delivery is left" "$(aws scheduler list-schedules --group-name tric-retry \
@@ -489,15 +487,17 @@ is "tric-app has one inline policy and none attached" "$(aws iam list-role-polic
   --query 'length(AttachedPolicies)' --output text)" 1/0
 role=$(aws iam get-role-policy --role-name tric-app --policy-name "$(aws iam list-role-policies --role-name tric-app \
   --query 'PolicyNames[0]' --output text)" --query PolicyDocument --output json)
-# What alpha's credentials may do with action $1 on resource $2 of the bucket (the bucket itself, if $2 is empty): the
-# role's policy, narrowed by the session policy. A listing's condition is on its prefix, $3, which the simulator has to
-# be told (and a listing without one is simulated without the key, as a bare listing is).
-s3sim() {
-  aws iam simulate-custom-policy --policy-input-list "$role" --permissions-boundary-policy-input-list \
-    "$(session alpha)" --action-names "$1" --resource-arns "$B3${2:+/$2}" \
+# What the role's policy allows of action $1 on resource $2 of the bucket (the bucket itself, if $2 is empty), narrowed
+# by the session policy $4 if one is given. A listing's condition is on its prefix, $3, which the simulator has to be
+# told (and a listing without one is simulated without the key, as a bare listing is).
+rolesim() {
+  aws iam simulate-custom-policy --policy-input-list "$role" ${4:+--permissions-boundary-policy-input-list "$4"} \
+    --action-names "$1" --resource-arns "$B3${2:+/$2}" \
     ${3:+--context-entries "ContextKeyName=s3:prefix,ContextKeyType=string,ContextKeyValues=$3"} \
     --query 'EvaluationResults[0].EvalDecision' --output text
 }
+# The same for alpha's credentials: the role's policy, narrowed by alpha's session policy.
+s3sim() { rolesim "$1" "${2:-}" "${3:-}" "$(session alpha)"; }
 # The same for a listing of the bucket under the prefix $1, and a listing of its versions.
 s3list() { s3sim s3:ListBucket "" "$1"; }
 s3vers() { s3sim s3:ListBucketVersions "" "$1"; }
@@ -539,36 +539,29 @@ done
 # The role alone, as if the router gave a session too wide a policy: still no release or component is writable.
 for c in "s3:PutObject apps/alpha/current" "s3:DeleteObject apps/alpha/current" \
   "s3:PutObject apps/alpha/components/x"; do
-  is "tric-app itself denies $c" "$(aws iam simulate-custom-policy --policy-input-list "$role" --action-names ${c% *} \
-    --resource-arns "$B3/${c#* }" --query 'EvaluationResults[0].EvalDecision' --output text)" implicitDeny
+  is "tric-app itself denies $c" "$(rolesim $c)" implicitDeny
 done
 # The role alone lists any app's values, and the versions of any app's names, which is why the session narrows it to
 # one app's; and nothing else.
-rolelist() {
-  aws iam simulate-custom-policy --policy-input-list "$role" --action-names "${2:-s3:ListBucket}" \
-    --resource-arns "$B3" \
-    ${1:+--context-entries "ContextKeyName=s3:prefix,ContextKeyType=string,ContextKeyValues=$1"} \
-    --query 'EvaluationResults[0].EvalDecision' --output text
-}
 for p in apps/alpha/values/ apps/beta/values/; do
-  is "tric-app itself allows listing $p, which the session narrows to one app's" "$(rolelist $p)" allowed
+  is "tric-app itself allows listing $p, which the session narrows to one app's" "$(rolesim s3:ListBucket "" $p)" \
+    allowed
 done
 for p in apps/alpha/names/ apps/beta/names/; do
   is "tric-app itself allows listing the versions under $p, which the session narrows to one app's" \
-    "$(rolelist $p s3:ListBucketVersions)" allowed
+    "$(rolesim s3:ListBucketVersions "" $p)" allowed
 done
 for p in apps/alpha/names/ apps/alpha/ apps/alpha/components/ native/alpha/ outbox/alpha/ ws/channels/; do
-  is "tric-app itself denies listing $p" "$(rolelist $p)" implicitDeny
+  is "tric-app itself denies listing $p" "$(rolesim s3:ListBucket "" $p)" implicitDeny
 done
 for p in apps/alpha/values/ apps/alpha/ native/alpha/ outbox/alpha/; do
-  is "tric-app itself denies listing the versions under $p" "$(rolelist $p s3:ListBucketVersions)" implicitDeny
+  is "tric-app itself denies listing the versions under $p" "$(rolesim s3:ListBucketVersions "" $p)" implicitDeny
 done
-is "tric-app itself denies listing with no prefix" "$(rolelist "")" implicitDeny
-is "tric-app itself denies listing versions with no prefix" "$(rolelist "" s3:ListBucketVersions)" implicitDeny
+is "tric-app itself denies listing with no prefix" "$(rolesim s3:ListBucket)" implicitDeny
+is "tric-app itself denies listing versions with no prefix" "$(rolesim s3:ListBucketVersions)" implicitDeny
 for k in names values; do
-  is "tric-app itself denies deleting a version of apps/alpha/$k/x" "$(aws iam simulate-custom-policy \
-    --policy-input-list "$role" --action-names s3:DeleteObjectVersion --resource-arns "$B3/apps/alpha/$k/x" \
-    --query 'EvaluationResults[0].EvalDecision' --output text)" implicitDeny
+  is "tric-app itself denies deleting a version of apps/alpha/$k/x" \
+    "$(rolesim s3:DeleteObjectVersion apps/alpha/$k/x)" implicitDeny
 done
 # What role $1 may do with action $2 on resource $3 (and for a listing, under the prefix $4).
 psim() {
@@ -881,13 +874,13 @@ echo "== retries"
 # router writes, and a one-time schedule in tric-retry, named for the commit, tries it again.
 commit=''
 for k in $(aws s3api list-objects-v2 --bucket "$TRIC_BUCKET" --prefix outbox/alpha/ --query 'Contents[].Key' \
-  --output text 2>/dev/null | tr '\t' '\n' | grep -v '^None$'); do
+  --output text 2>/dev/null | listed); do
   if aws s3 cp "s3://$TRIC_BUCKET/$k" - 2>/dev/null | grep -qa "e-$run"; then commit=${k##*/}; break; fi
 done
 if [ -n "$commit" ]; then pass "a delivery that fails waits in outbox/alpha/"
 else fail "a delivery that fails waits in outbox/alpha/" "no object there names e-$run"; fi
 if [ -n "$commit" ]; then
-  prefix=$(printf 'alpha/%s' "$commit" | openssl dgst -sha256 -r | cut -c1-32)
+  prefix=$(sha "alpha/$commit" 32)
   is "and a schedule in tric-retry is for it" "$(aws scheduler list-schedules --group-name tric-retry \
     --name-prefix "$prefix" --query 'length(Schedules)' --output text)" 1
 fi
@@ -1008,12 +1001,9 @@ echo "== sweep (the objects that no name refers to)"
 # The names alpha has values under, one to a line; the keys of apps/alpha/ that name this run; the cursor's, if any.
 valuenames() {
   aws s3api list-objects-v2 --bucket "$TRIC_BUCKET" --prefix apps/alpha/values/ --delimiter / \
-    --query 'CommonPrefixes[].Prefix' --output text | tr '\t' '\n' | grep -v '^None$' | grep .
+    --query 'CommonPrefixes[].Prefix' --output text | listed
 }
-mine() {
-  aws s3api list-objects-v2 --bucket "$TRIC_BUCKET" --prefix apps/alpha/ --query 'Contents[].Key' --output text |
-    tr '\t' '\n' | grep -v '^None$' | grep -F -- "-$run" | sort
-}
+mine() { under apps/alpha/ | grep -F -- "-$run"; }
 cursors() {
   aws s3api list-objects-v2 --bucket "$TRIC_BUCKET" --prefix apps/alpha/values/.sweep --query KeyCount --output text
 }
@@ -1047,12 +1037,7 @@ before=$(mine)
 is "the strays are in the bucket" "$(for k in $s1 $s2; do awscode aws s3api head-object --bucket "$TRIC_BUCKET" \
   --key $k; done | xargs)" "OK OK"
 since=$(now) swept_from=$since
-o=$(mktemp)
-is "the cron alias takes the ask, and its function does not fail" "$(aws lambda invoke --function-name tric-events \
-  --qualifier cron --cli-binary-format raw-in-base64-out --cli-read-timeout 330 \
-  --payload '{"app":"alpha","sweep":true}' --query '[StatusCode, FunctionError]' --output text "$o" |
-  tr '\t' ' ')" "200 None"
-rm -f "$o"
+asksweep
 swept_to=$(now)
 # The router says the sweep was answered 204 only when serve had done it and logged it.
 if awaitpat events "$since" '{ $.fields.message = "sweep" && $.fields.app = "alpha" && $.fields.status = 204 }' 90 &&
@@ -1121,9 +1106,10 @@ is "and nothing of this run's is changed" "$(mine)" "$before"
 
 echo "== trees (what the turns of the run asked of the bucket)"
 # Serve's debug log has a "tree" line for each turn and name, by the tree's prefix, when the last of the turn's trees is
-# gone (crates/tree's Reader): the objects it fetched (`gets`: nodes and blobs, which the line doesn't tell apart, and `read` is their
-# bytes), those the process's cache gave instead (`hits`), and those it uploaded (`puts`, nodes and blobs, so a commit's
-# bucket writes). The sweep's report is its "swept" line. Kept in tree-$run.json, with the sweep's own walks apart.
+# gone (crates/tree's Reader): the objects it fetched (`gets`: nodes and blobs, which the line doesn't tell apart, and
+# `read` is their bytes), those the process's cache gave instead (`hits`), and those it uploaded (`puts`, nodes and
+# blobs, so a commit's bucket writes). The sweep's report is its "swept" line. Kept in tree-$run.json, with the sweep's
+# own walks apart.
 if [ $debug != yes ]; then
   note "no numbers for the trees: serve does not log at debug (apply with -var log=warn,tric=debug)"
 else
