@@ -330,8 +330,8 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   B-trees go wrong, so the model test (below) is built for it: it uses nodes of about a kilobyte, so that branches
   as well as leaves split and merge, and four levels grow and collapse in a few hundred rounds. It is not done at each
   delete, which would merge a node that the next write fills again, and only nodes the turn changed are looked at, so
-  a commit reads nothing it hadn't. A spill that uploads nodes merges first, as the commit does (see "A spill of nodes
-  merges first" under the tree crate).
+  a commit reads no more than the neighbours that thin ones join. A spill that uploads nodes merges first, as the
+  commit does (see "A spill of nodes merges first" under the tree crate).
 - **A branch's first key is not looked at.** A child's key is the least key that can be in it, and the first child
   has nothing to its left to be least of, so a lookup searches only the keys after it. A merge keeps this true by
   giving the first child of the right-hand branch its parent's separator when the two join, since there it is
