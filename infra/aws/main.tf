@@ -96,7 +96,6 @@ locals {
   # The functions' ARNs, spelt out so that the functions can name each other.
   function = "arn:aws:lambda:${var.region}:${data.aws_caller_identity.current.account_id}:function:${var.name}"
   serve    = "${local.function}-serve"
-  events   = "${local.function}-events"
   outbox   = "${local.function}-events:outbox"
   cron     = "${local.function}-events:cron"
   retry    = "${local.function}-events:retry"
