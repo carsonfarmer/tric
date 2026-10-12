@@ -187,30 +187,23 @@ run "module" {
     error_message = "the router sends to, and closes, its own API's sockets only"
   }
   assert {
-    condition = (
-      jsondecode(aws_iam_role_policy.scheduler["cron"].policy).Statement[0].Resource
-      == "arn:aws:lambda:us-west-2:123456789012:function:tric-events:cron"
-    )
-    error_message = "Scheduler invokes the events function as cron, never as outbox or ws"
-  }
-  assert {
-    condition = (
-      jsondecode(aws_iam_role_policy.scheduler["retry"].policy).Statement == [{
+    condition = alltrue([for k in ["cron", "retry"] : (
+      jsondecode(aws_iam_role_policy.scheduler[k].policy).Statement == [{
         Effect   = "Allow"
         Action   = "lambda:InvokeFunction"
-        Resource = "arn:aws:lambda:us-west-2:123456789012:function:tric-events:retry"
+        Resource = "arn:aws:lambda:us-west-2:123456789012:function:tric-events:${k}"
       }]
-      && jsondecode(aws_iam_role.scheduler["retry"].assume_role_policy).Statement == [{
+      && jsondecode(aws_iam_role.scheduler[k].assume_role_policy).Statement == [{
         Effect    = "Allow"
         Principal = { Service = "scheduler.amazonaws.com" }
         Action    = "sts:AssumeRole"
         Condition = { StringEquals = {
           "aws:SourceAccount" = "123456789012"
-          "aws:SourceArn"     = "arn:aws:scheduler:us-west-2:123456789012:schedule-group/tric-retry"
+          "aws:SourceArn"     = "arn:aws:scheduler:us-west-2:123456789012:schedule-group/tric-${k}"
         } }
       }]
-    )
-    error_message = "Scheduler invokes the events function as retry, for the retry group's schedules only"
+    )])
+    error_message = "Scheduler invokes each alias, cron or retry, for its own group's schedules only"
   }
   assert {
     condition = (
