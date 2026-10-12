@@ -548,7 +548,7 @@ overlay applied at the commit.
     invoke serve, send to and close its own API's sockets, and create schedules in the retry group only, passing only
     the retry role;
   - serve's role, with its logs and `events:outbox` only;
-  - the Scheduler role, which can invoke `events:cron` only;
+  - the cron role, which can invoke `events:cron` only;
   - the retry role, which can invoke `events:retry` only.
 - **The bucket:** versioning, the lifecycle rules (noncurrent versions, delete markers, `outbox/`, `ws/`), and short
   log retention.

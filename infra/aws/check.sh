@@ -586,7 +586,7 @@ done
 for t in "lambda:InvokeFunction $FN:tric-events" "lambda:InvokeFunction $FN:tric-events:outbox" \
   "s3:GetObject $B3/apps/alpha/names/x" "s3:PutObject $B3/apps/alpha/names/x" "s3:PutObject $B3/x" \
   "s3:ListBucket $B3" "s3:DeleteObject $B3/apps/alpha/current" "scheduler:CreateSchedule $SCHED/$TRIC_SCHEDULES/x" \
-  "iam:PassRole arn:aws:iam::$ACCOUNT:role/tric-scheduler"; do
+  "iam:PassRole arn:aws:iam::$ACCOUNT:role/tric-cron"; do
   is "the router's role is denied $t" "$(psim tric-route $t)" implicitDeny
 done
 is "serve may invoke the outbox alias" "$(psim tric-serve lambda:InvokeFunction "$FN:tric-events:outbox")" allowed
@@ -601,7 +601,7 @@ for p in apps/alpha/values/ apps/alpha/names/ ws/channels/; do
   is "and listing the versions under it" "$(psim tric-serve s3:ListBucketVersions "$B3" $p)" implicitDeny
 done
 # Each Scheduler role invokes its own alias of the events function, and nothing else.
-for r in "tric-scheduler cron" "tric-retry retry"; do
+for r in "tric-cron cron" "tric-retry retry"; do
   set -- $r
   is "$1 may invoke the $2 alias" "$(psim $1 lambda:InvokeFunction "$FN:tric-events:$2")" allowed
   for t in events events:outbox events:cron events:retry serve; do

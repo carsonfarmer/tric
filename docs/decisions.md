@@ -85,9 +85,10 @@ reason.
 - **The retries have a Scheduler group and a role of their own.** The retry role may invoke `events:retry` only, and
   the cron role `events:cron` only. The router may create a schedule in the retry group only, and pass only the retry
   role to Scheduler, so it can't make a schedule that runs as `cron`. serve may invoke `outbox` only, so it can make
-  none. The retry role's trust names the account and the group's ARN, as Scheduler's documentation asks, so no other
-  schedule can assume it. The router's two functions share its role, so `route` holds these grants as well; it takes
-  no event, and the grants are narrow.
+  none. Each role's trust names the account and its own group's ARN, as Scheduler's documentation asks, so no other
+  schedule can assume it. The module makes the two alike, a group and a role for each alias, named `tric-cron` and
+  `tric-retry`. The router's two functions share its role, so `route` holds these grants as well; it takes no event,
+  and the grants are narrow.
 - **`PENDING_TTL` is the window and an hour.** serve drops an event whose commit isn't pending, so an entry must
   outlast the last try. The hour covers Scheduler's minute, Lambda's own two retries of a try, and an event that
   Lambda was late to hand over. A hand-over later than that loses the tail of the window, not the first tries.
