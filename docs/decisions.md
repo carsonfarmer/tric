@@ -86,8 +86,8 @@ reason.
   the cron role `events:cron` only. The router may create a schedule in the retry group only, and pass only the retry
   role to Scheduler, so it can't make a schedule that runs as `cron`. serve may invoke `outbox` only, so it can make
   none. Each role's trust names the account and its own group's ARN, as Scheduler's documentation asks, so no other
-  schedule can assume it. The module makes the two alike, a group and a role for each alias, named `tric-cron` and
-  `tric-retry`. The router's two functions share its role, so `route` holds these grants as well; it takes no event,
+  schedule can assume it. The module makes the two alike, a group and a role for each alias, named `<name>-cron` and
+  `<name>-retry`. The router's two functions share its role, so `route` holds these grants as well; it takes no event,
   and the grants are narrow.
 - **`PENDING_TTL` is the window and an hour.** serve drops an event whose commit isn't pending, so an entry must
   outlast the last try. The hour covers Scheduler's minute, Lambda's own two retries of a try, and an event that
@@ -124,9 +124,11 @@ reason.
 - **The package is arm64 only,** and `docker compose run --rm package` refuses to build it anywhere else. Graviton
   costs less, and no cross-compiling means no toolchain to keep. The toolchain image is Amazon Linux 2023, the
   runtime's own OS, so the binary links the glibc that Lambda has.
-- **The install's names begin with `tric`, and no variable changes that.** IAM's role names and CloudFront's function
-  names are the account's, in every region, so an account holds one install, and a second install is a second
-  account. The bucket's name, which S3 shares among all accounts, is `tric-` and a suffix that OpenTofu makes up.
+- **Every name the install makes begins with `name`,** `tric` unless it is set. IAM's role names and CloudFront's
+  function names are the account's, in every region, so two installs in one account need two names, and two domains.
+  The bucket's name, which S3 shares among all accounts, is the name, `-`, and a suffix that OpenTofu makes up, so a
+  name is what S3 takes: lowercase letters, digits and hyphens, from a letter, at most 32. `check.sh` reads it from
+  the output `name`.
 - **The router invokes serve with `InvokeWithResponseStream`.** It sends a function-URL event (payload format 2.0)
   carrying the tenant id. The answer is a JSON prelude, then 8 NULs, then the body. Failures come from
   `InvokeComplete`'s error code.

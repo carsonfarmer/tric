@@ -307,3 +307,32 @@ run "an_interval_that_does_not_divide_a_day" {
   variables { sweep_every = "5h" }
   expect_failures = [var.sweep_every]
 }
+
+# Every name the install makes begins with `name`, so that two installs can share an account.
+run "another_name" {
+  command = plan
+  variables { name = "acme" }
+  assert {
+    condition = alltrue([
+      for n in concat(
+        [aws_iam_role.route.name, aws_iam_role.app.name, aws_iam_role.serve.name, aws_apigatewayv2_api.ws.name],
+        [aws_cloudfront_function.host.name, aws_s3_bucket.store.bucket_prefix],
+        [for r in aws_iam_role.scheduler : r.name],
+        [for g in aws_scheduler_schedule_group.scheduler : g.name],
+        [for f in aws_lambda_function.function : f.function_name],
+        [for g in aws_cloudwatch_log_group.function : trimprefix(g.name, "/aws/lambda/")],
+      ) : startswith(n, "acme-")
+    ])
+    error_message = "every name the install makes begins with `name`"
+  }
+  assert {
+    condition     = output.name == "acme"
+    error_message = "the checks read the name from the output `name`"
+  }
+}
+
+run "a_name_that_s3_refuses" {
+  command = plan
+  variables { name = "Tric" }
+  expect_failures = [var.name]
+}

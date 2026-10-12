@@ -44,6 +44,8 @@ for k in TRIC_BUCKET TRIC_SCHEDULES TRIC_EVENTS TRIC_SCHEDULER_ROLE TRIC_SWEEP_E
   v=$(out $k) && [ -n "$v" ] || die "tofu output $k is empty: is the install applied, and TF_VAR_domain set?"
   export "$k=$v"
 done
+# The prefix of every name the install made, `tric` unless it was applied with another.
+NAME=$(out name) && [ -n "$NAME" ] || die "tofu output name is empty: is the install applied?"
 DOMAIN=${TF_VAR_domain:?set TF_VAR_domain}
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text) || die "no AWS credentials in the environment"
 FN="arn:aws:lambda:$AWS_REGION:$ACCOUNT:function"
@@ -77,12 +79,12 @@ note "run $run; the account's Lambda concurrency is \
 $(aws lambda get-account-settings --query AccountLimit.ConcurrentExecutions --output text)"
 # Whether serve logs at debug, which the tree's and the heads' numbers need: RUST_LOG's value is never printed.
 debug=no
-case $(aws lambda get-function-configuration --function-name tric-serve \
+case $(aws lambda get-function-configuration --function-name $NAME-serve \
   --query Environment.Variables.RUST_LOG --output text) in *tric=debug*) debug=yes ;; esac
 want=$(openssl dgst -sha256 -binary dist/tric.zip | base64)
 for f in route events serve; do
-  is "tric-$f runs dist/tric.zip" \
-    "$(aws lambda get-function-configuration --function-name tric-$f --query CodeSha256 --output text)" "$want"
+  is "$NAME-$f runs dist/tric.zip" \
+    "$(aws lambda get-function-configuration --function-name $NAME-$f --query CodeSha256 --output text)" "$want"
 done
 mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"; }
 code="src wit Cargo.toml Cargo.lock docker/bootstrap docker/build.Dockerfile" # what goes into dist/tric.zip
@@ -129,7 +131,7 @@ now() { echo $(($(date +%s) * 1000)); }
 listed() { tr '\t' '\n' | grep -v '^None$' | grep .; }
 # The number of events in function $1's log since $2 (ms) that match $3.
 nlogs() {
-  aws logs filter-log-events --log-group-name "/aws/lambda/tric-$1" --start-time "$2" --filter-pattern "$3" \
+  aws logs filter-log-events --log-group-name "/aws/lambda/$NAME-$1" --start-time "$2" --filter-pattern "$3" \
     --query 'length(events)' --output text
 }
 # Waits up to $4 seconds for function $1's log since $2 to have $5 lines (one, by default) that match filter pattern $3.
@@ -160,7 +162,7 @@ sweeplines() {
 }
 # The fields of the last "swept" line of app $1 in serve's log since $2 (ms), as compact JSON; nothing if there is none.
 sweepreport() {
-  aws logs filter-log-events --log-group-name /aws/lambda/tric-serve --start-time "$2" \
+  aws logs filter-log-events --log-group-name /aws/lambda/$NAME-serve --start-time "$2" \
     --filter-pattern "{ \$.fields.message = \"swept\" && \$.fields.app = \"$1\" }" --query 'events[].message' \
     --output json | jq -c '[.[] | fromjson | .fields] | last // empty'
 }
@@ -220,7 +222,7 @@ headversions() {
 asksweep() {
   local o
   o=$(mktemp)
-  is "the cron alias takes the ask, and its function does not fail" "$(aws lambda invoke --function-name tric-events \
+  is "the cron alias takes the ask, and its function does not fail" "$(aws lambda invoke --function-name $NAME-events \
     --qualifier cron --cli-binary-format raw-in-base64-out --cli-read-timeout 330 \
     --payload '{"app":"alpha","sweep":true}' --query '[StatusCode, FunctionError]' --output text "$o" |
     tr '\t' ' ')" "200 None"
@@ -310,11 +312,11 @@ unschedule() {
     is "no schedule of $a is left" "$(schedules $a | grep -c .)" 0
   done
   if [ -n "${prefix:-}" ]; then
-    for n in $(aws scheduler list-schedules --group-name tric-retry --name-prefix "$prefix" \
+    for n in $(aws scheduler list-schedules --group-name $NAME-retry --name-prefix "$prefix" \
       --query 'Schedules[].Name' --output text | listed); do
-      aws scheduler delete-schedule --group-name tric-retry --name "$n" >/dev/null || fail "delete a retry"
+      aws scheduler delete-schedule --group-name $NAME-retry --name "$n" >/dev/null || fail "delete a retry"
     done
-    is "no retry of the run's delivery is left" "$(aws scheduler list-schedules --group-name tric-retry \
+    is "no retry of the run's delivery is left" "$(aws scheduler list-schedules --group-name $NAME-retry \
       --name-prefix "$prefix" --query 'length(Schedules)' --output text)" 0
   fi
 }
@@ -407,8 +409,8 @@ is "a keyed write sent again is answered as it was, and marked" \
 is "a keyed write sent twice writes once" "$(post "$A/@idem-$run/kv?op=incr&key=n&delta=0" | jq -c .ok)" 1
 
 echo "== around CloudFront"
-url=$(aws lambda get-function-url-config --function-name tric-route --query FunctionUrl --output text)
-[[ $url == https://* ]] || die "tric-route has no URL"
+url=$(aws lambda get-function-url-config --function-name $NAME-route --query FunctionUrl --output text)
+[[ $url == https://* ]] || die "$NAME-route has no URL"
 is "the router's URL without the secret is 403" "$(code "${url}echo" -H "X-Forwarded-Host: alpha.$DOMAIN")" 403
 is "the router's URL with a guessed secret is 403" "$(code "${url}echo" -H "X-Forwarded-Host: alpha.$DOMAIN" \
   -H 'X-Tric-Origin: guess' -H 'CloudFront-Viewer-Address: 9.9.9.9:1')" 403
@@ -416,22 +418,22 @@ is "the router's URL with an empty secret is 403" "$(code "${url}echo" -H "X-For
   -H 'X-Tric-Origin;' -H 'CloudFront-Viewer-Address: 9.9.9.9:1')" 403
 # Lambda's own 403 has a body ({"Message":"Forbidden"}); the router's has none.
 is "the 403 is the router's" "$(get "${url}echo" -H "X-Forwarded-Host: alpha.$DOMAIN" | wc -c | tr -d ' ')" 0
-for f in tric-route tric-serve tric-events; do
+for f in $NAME-route $NAME-serve $NAME-events; do
   is "$f exists" "$(awscode aws lambda get-function --function-name $f)" OK
 done
-for f in tric-serve tric-events "tric-events --qualifier outbox"; do
+for f in $NAME-serve $NAME-events "$NAME-events --qualifier outbox"; do
   is "$f has no URL" "$(awscode aws lambda get-function-url-config --function-name $f)" ResourceNotFoundException
   is "$f has no resource policy, so only roles granted it may invoke it" \
     "$(awscode aws lambda get-policy --function-name $f)" ResourceNotFoundException
 done
-is "the router's resource policy invokes only through its URL" "$(aws lambda get-policy --function-name tric-route \
+is "the router's resource policy invokes only through its URL" "$(aws lambda get-policy --function-name $NAME-route \
   --query Policy --output text | jq -c '[.Statement[] | select(.Action == "lambda:InvokeFunction")
   | .Condition.Bool["lambda:InvokedViaFunctionUrl"]] | (length > 0) and all(. == "true")')" true
 # A cron job sent straight to the router, as this admin: its effect is checked under "forged events".
-invoke tric-route "{\"app\":\"beta\",\"path\":\"/@forged-$run/echo\"}" >/dev/null
+invoke $NAME-route "{\"app\":\"beta\",\"path\":\"/@forged-$run/echo\"}" >/dev/null
 
 echo "== tenants"
-is "serve is per tenant" "$(aws lambda get-function-configuration --function-name tric-serve \
+is "serve is per tenant" "$(aws lambda get-function-configuration --function-name $NAME-serve \
   --query TenancyConfig.TenantIsolationMode --output text)" PER_TENANT
 # A function-URL event, as the router sends serve: Host $1, tenant header $2, and $3 as more headers.
 event() {
@@ -445,7 +447,7 @@ event() {
 fake=$(jq -cn '{"x-tric-credentials": ({Version: 1, AccessKeyId: "ASIAXXXXXXXXXXXXXXXX", SecretAccessKey: "x",
   SessionToken: "x", Expiration: "2030-01-01T00:00:00Z"} | tojson)}')
 # serve's status for Host $1, tenant header $2, more headers $3, in Lambda tenant $4.
-st() { invoke tric-serve "$(event "$1" "$2" "$3")" --tenant-id "$4" | status; }
+st() { invoke $NAME-serve "$(event "$1" "$2" "$3")" --tenant-id "$4" | status; }
 s=$(st "alpha.$DOMAIN" alpha "$fake" alpha)
 if [ -n "$s" ] && [ "$s" != 403 ]; then pass "made-up credentials in alpha's own tenant get past serve's gate ($s)"
 else fail "made-up credentials in alpha's own tenant get past serve's gate" "status [$s]"; fi
@@ -453,7 +455,7 @@ is "serve refuses another app's Host in alpha's tenant" "$(st "beta.$DOMAIN" alp
 is "serve refuses a tenant header that isn't the Host's app" "$(st "alpha.$DOMAIN" beta "$fake" alpha)" 403
 is "serve refuses alpha's request in beta's tenant" "$(st "alpha.$DOMAIN" alpha "$fake" beta)" 403
 is "serve refuses a request without credentials" "$(st "alpha.$DOMAIN" alpha "" alpha)" 403
-e=$(aws lambda invoke --function-name tric-serve --cli-binary-format raw-in-base64-out \
+e=$(aws lambda invoke --function-name $NAME-serve --cli-binary-format raw-in-base64-out \
   --payload "$(event "alpha.$DOMAIN" alpha)" /dev/null 2>&1 >/dev/null)
 if grep -qi tenant <<<"$e"; then pass "serve can't be invoked without a tenant"
 else fail "serve can't be invoked without a tenant" "$(head -c 160 <<<"${e:-it ran}")"; fi
@@ -470,7 +472,7 @@ if grep -qx alpha <<<"$apps" && grep -qx beta <<<"$apps"; then pass "native code
 else fail "native code is under each app's own prefix" "got [$(xargs <<<"$apps")]"; fi
 # Distinct log streams of serve with a "probe-stdout" line since $1.
 streams() {
-  aws logs filter-log-events --log-group-name /aws/lambda/tric-serve --start-time "$1" \
+  aws logs filter-log-events --log-group-name /aws/lambda/$NAME-serve --start-time "$1" \
     --filter-pattern '"probe-stdout"' --query 'events[].logStreamName' --output text | tr '\t' '\n' | grep . | sort -u
 }
 t=$(now); get "$A/print" >/dev/null; sleep 20; sa=$(streams "$t")
@@ -482,10 +484,10 @@ else
 fi
 
 echo "== credentials (IAM's policy simulator)"
-is "tric-app has one inline policy and none attached" "$(aws iam list-role-policies --role-name tric-app \
-  --query 'length(PolicyNames)' --output text)/$(aws iam list-attached-role-policies --role-name tric-app \
+is "$NAME-app has one inline policy and none attached" "$(aws iam list-role-policies --role-name $NAME-app \
+  --query 'length(PolicyNames)' --output text)/$(aws iam list-attached-role-policies --role-name $NAME-app \
   --query 'length(AttachedPolicies)' --output text)" 1/0
-role=$(aws iam get-role-policy --role-name tric-app --policy-name "$(aws iam list-role-policies --role-name tric-app \
+role=$(aws iam get-role-policy --role-name $NAME-app --policy-name "$(aws iam list-role-policies --role-name $NAME-app \
   --query 'PolicyNames[0]' --output text)" --query PolicyDocument --output json)
 # What the role's policy allows of action $1 on resource $2 of the bucket (the bucket itself, if $2 is empty), narrowed
 # by the session policy $4 if one is given. A listing's condition is on its prefix, $3, which the simulator has to be
@@ -506,7 +508,7 @@ for c in "s3:GetObject apps/alpha/names/x" "s3:PutObject apps/alpha/names/x" "s3
   "s3:PutObject native/alpha/c/x"; do
   is "alpha's credentials allow $c" "$(s3sim $c)" allowed
 done
-# The sweep's listings (src/route.rs's `policy`, infra/aws/main.tf's tric-app): alpha's values, and the versions of its
+# The sweep's listings (src/route.rs's `policy`, infra/aws/main.tf's app role): alpha's values, and the versions of its
 # names, its heads' history; and no other prefix, not the app's whole prefix, not a prefix that only begins like one,
 # not the other listing's, and not a bare listing.
 for p in apps/alpha/values/ apps/alpha/values/n-1/; do
@@ -539,28 +541,28 @@ done
 # The role alone, as if the router gave a session too wide a policy: still no release or component is writable.
 for c in "s3:PutObject apps/alpha/current" "s3:DeleteObject apps/alpha/current" \
   "s3:PutObject apps/alpha/components/x"; do
-  is "tric-app itself denies $c" "$(rolesim $c)" implicitDeny
+  is "$NAME-app itself denies $c" "$(rolesim $c)" implicitDeny
 done
 # The role alone lists any app's values, and the versions of any app's names, which is why the session narrows it to
 # one app's; and nothing else.
 for p in apps/alpha/values/ apps/beta/values/; do
-  is "tric-app itself allows listing $p, which the session narrows to one app's" "$(rolesim s3:ListBucket "" $p)" \
+  is "$NAME-app itself allows listing $p, which the session narrows to one app's" "$(rolesim s3:ListBucket "" $p)" \
     allowed
 done
 for p in apps/alpha/names/ apps/beta/names/; do
-  is "tric-app itself allows listing the versions under $p, which the session narrows to one app's" \
+  is "$NAME-app itself allows listing the versions under $p, which the session narrows to one app's" \
     "$(rolesim s3:ListBucketVersions "" $p)" allowed
 done
 for p in apps/alpha/names/ apps/alpha/ apps/alpha/components/ native/alpha/ outbox/alpha/ ws/channels/; do
-  is "tric-app itself denies listing $p" "$(rolesim s3:ListBucket "" $p)" implicitDeny
+  is "$NAME-app itself denies listing $p" "$(rolesim s3:ListBucket "" $p)" implicitDeny
 done
 for p in apps/alpha/values/ apps/alpha/ native/alpha/ outbox/alpha/; do
-  is "tric-app itself denies listing the versions under $p" "$(rolesim s3:ListBucketVersions "" $p)" implicitDeny
+  is "$NAME-app itself denies listing the versions under $p" "$(rolesim s3:ListBucketVersions "" $p)" implicitDeny
 done
-is "tric-app itself denies listing with no prefix" "$(rolesim s3:ListBucket)" implicitDeny
-is "tric-app itself denies listing versions with no prefix" "$(rolesim s3:ListBucketVersions)" implicitDeny
+is "$NAME-app itself denies listing with no prefix" "$(rolesim s3:ListBucket)" implicitDeny
+is "$NAME-app itself denies listing versions with no prefix" "$(rolesim s3:ListBucketVersions)" implicitDeny
 for k in names values; do
-  is "tric-app itself denies deleting a version of apps/alpha/$k/x" \
+  is "$NAME-app itself denies deleting a version of apps/alpha/$k/x" \
     "$(rolesim s3:DeleteObjectVersion apps/alpha/$k/x)" implicitDeny
 done
 # What role $1 may do with action $2 on resource $3 (and for a listing, under the prefix $4).
@@ -569,57 +571,57 @@ psim() {
     --resource-arns "$3" ${4:+--context-entries "ContextKeyName=s3:prefix,ContextKeyType=string,ContextKeyValues=$4"} \
     --query 'EvaluationResults[0].EvalDecision' --output text
 }
-is "the router may assume tric-app" "$(psim tric-route sts:AssumeRole "arn:aws:iam::$ACCOUNT:role/tric-app")" allowed
-is "the router may invoke serve" "$(psim tric-route lambda:InvokeFunction "$FN:tric-serve")" allowed
+is "the router may assume $NAME-app" "$(psim $NAME-route sts:AssumeRole "arn:aws:iam::$ACCOUNT:role/$NAME-app")" allowed
+is "the router may invoke serve" "$(psim $NAME-route lambda:InvokeFunction "$FN:$NAME-serve")" allowed
 SCHED="arn:aws:scheduler:$AWS_REGION:$ACCOUNT:schedule"
 for t in "s3:PutObject $B3/outbox/alpha/x" "s3:DeleteObject $B3/outbox/alpha/x" \
-  "scheduler:CreateSchedule $SCHED/tric-retry/x"; do
-  is "the router's role may $t" "$(psim tric-route $t)" allowed
+  "scheduler:CreateSchedule $SCHED/$NAME-retry/x"; do
+  is "the router's role may $t" "$(psim $NAME-route $t)" allowed
 done
 # The listing of ws/channels/ needs its prefix, which a simulation without one lacks: so a bare listing is denied, and
 # a listing under that prefix is allowed, and under an app's values (the sweep's) is not: that is the apps' alone.
-is "the router's role may list ws/channels/" "$(psim tric-route s3:ListBucket "$B3" ws/channels/)" allowed
+is "the router's role may list ws/channels/" "$(psim $NAME-route s3:ListBucket "$B3" ws/channels/)" allowed
 for p in apps/alpha/values/ apps/alpha/names/ apps/alpha/ outbox/; do
-  is "the router's role is denied listing $p" "$(psim tric-route s3:ListBucket "$B3" $p)" implicitDeny
-  is "and listing the versions under it" "$(psim tric-route s3:ListBucketVersions "$B3" $p)" implicitDeny
+  is "the router's role is denied listing $p" "$(psim $NAME-route s3:ListBucket "$B3" $p)" implicitDeny
+  is "and listing the versions under it" "$(psim $NAME-route s3:ListBucketVersions "$B3" $p)" implicitDeny
 done
-for t in "lambda:InvokeFunction $FN:tric-events" "lambda:InvokeFunction $FN:tric-events:outbox" \
+for t in "lambda:InvokeFunction $FN:$NAME-events" "lambda:InvokeFunction $FN:$NAME-events:outbox" \
   "s3:GetObject $B3/apps/alpha/names/x" "s3:PutObject $B3/apps/alpha/names/x" "s3:PutObject $B3/x" \
   "s3:ListBucket $B3" "s3:DeleteObject $B3/apps/alpha/current" "scheduler:CreateSchedule $SCHED/$TRIC_SCHEDULES/x" \
-  "iam:PassRole arn:aws:iam::$ACCOUNT:role/tric-cron"; do
-  is "the router's role is denied $t" "$(psim tric-route $t)" implicitDeny
+  "iam:PassRole arn:aws:iam::$ACCOUNT:role/$NAME-cron"; do
+  is "the router's role is denied $t" "$(psim $NAME-route $t)" implicitDeny
 done
-is "serve may invoke the outbox alias" "$(psim tric-serve lambda:InvokeFunction "$FN:tric-events:outbox")" allowed
-for t in "lambda:InvokeFunction $FN:tric-events" "lambda:InvokeFunction $FN:tric-serve" \
-  "lambda:InvokeFunction $FN:tric-route" "s3:GetObject $B3/apps/alpha/current" "s3:PutObject $B3/apps/alpha/names/x" \
-  "s3:GetObject $B3/native/alpha/x" "s3:ListBucket $B3" "sts:AssumeRole arn:aws:iam::$ACCOUNT:role/tric-app" \
-  "lambda:InvokeFunction $FN:tric-events:retry" "scheduler:CreateSchedule $SCHED/tric-retry/x"; do
-  is "serve's role is denied $t" "$(psim tric-serve $t)" implicitDeny
+is "serve may invoke the outbox alias" "$(psim $NAME-serve lambda:InvokeFunction "$FN:$NAME-events:outbox")" allowed
+for t in "lambda:InvokeFunction $FN:$NAME-events" "lambda:InvokeFunction $FN:$NAME-serve" \
+  "lambda:InvokeFunction $FN:$NAME-route" "s3:GetObject $B3/apps/alpha/current" "s3:PutObject $B3/apps/alpha/names/x" \
+  "s3:GetObject $B3/native/alpha/x" "s3:ListBucket $B3" "sts:AssumeRole arn:aws:iam::$ACCOUNT:role/$NAME-app" \
+  "lambda:InvokeFunction $FN:$NAME-events:retry" "scheduler:CreateSchedule $SCHED/$NAME-retry/x"; do
+  is "serve's role is denied $t" "$(psim $NAME-serve $t)" implicitDeny
 done
 for p in apps/alpha/values/ apps/alpha/names/ ws/channels/; do
-  is "serve's role is denied listing $p" "$(psim tric-serve s3:ListBucket "$B3" $p)" implicitDeny
-  is "and listing the versions under it" "$(psim tric-serve s3:ListBucketVersions "$B3" $p)" implicitDeny
+  is "serve's role is denied listing $p" "$(psim $NAME-serve s3:ListBucket "$B3" $p)" implicitDeny
+  is "and listing the versions under it" "$(psim $NAME-serve s3:ListBucketVersions "$B3" $p)" implicitDeny
 done
 # Each Scheduler role invokes its own alias of the events function, and nothing else.
-for r in "tric-cron cron" "tric-retry retry"; do
+for r in "$NAME-cron cron" "$NAME-retry retry"; do
   set -- $r
-  is "$1 may invoke the $2 alias" "$(psim $1 lambda:InvokeFunction "$FN:tric-events:$2")" allowed
+  is "$1 may invoke the $2 alias" "$(psim $1 lambda:InvokeFunction "$FN:$NAME-events:$2")" allowed
   for t in events events:outbox events:cron events:retry serve; do
     [ "$t" = "events:$2" ] ||
-      is "$1 may not invoke tric-$t" "$(psim $1 lambda:InvokeFunction "$FN:tric-$t")" implicitDeny
+      is "$1 may not invoke $NAME-$t" "$(psim $1 lambda:InvokeFunction "$FN:$NAME-$t")" implicitDeny
   done
 done
 
 echo "== infrastructure"
-is "the app role trusts only the router's role" "$(aws iam get-role --role-name tric-app \
+is "the app role trusts only the router's role" "$(aws iam get-role --role-name $NAME-app \
   --query 'Role.AssumeRolePolicyDocument.Statement[].Principal.AWS' --output text)" \
-  "arn:aws:iam::$ACCOUNT:role/tric-route"
-is "tric-serve has one inline policy and none attached" "$(aws iam list-role-policies --role-name tric-serve \
-  --query 'length(PolicyNames)' --output text)/$(aws iam list-attached-role-policies --role-name tric-serve \
+  "arn:aws:iam::$ACCOUNT:role/$NAME-route"
+is "$NAME-serve has one inline policy and none attached" "$(aws iam list-role-policies --role-name $NAME-serve \
+  --query 'length(PolicyNames)' --output text)/$(aws iam list-attached-role-policies --role-name $NAME-serve \
   --query 'length(AttachedPolicies)' --output text)" 1/0
 for q in outbox retry; do
   is "the $q alias retries twice, keeps an event 6 h, and has no destination" \
-    "$(aws lambda get-function-event-invoke-config --function-name tric-events --qualifier $q \
+    "$(aws lambda get-function-event-invoke-config --function-name $NAME-events --qualifier $q \
     --query '[MaximumRetryAttempts, MaximumEventAgeInSeconds, DestinationConfig.OnFailure.Destination]' \
     --output text | tr '\t' ' ')" "2 21600 None"
 done
@@ -648,21 +650,21 @@ is "ws/ expires in 1 day, and the rule is on" "$(jq -r '.Rules[] | select(.ID ==
   | [.Status, (.Filter.Prefix // ""), .Expiration.Days] | join(" ")' <<<"$lifecycle")" "Enabled ws/ 1"
 is "only outbox/ and ws/ expire current objects, and so no key of apps/ does" "$(jq -r '[.Rules[]
   | select(.Expiration.Days != null) | (.Filter.Prefix // "")] | sort | join(" ")' <<<"$lifecycle")" "outbox/ ws/"
-is "only tric-route reserves concurrency, 200" "$(for f in route events serve; do
-  printf '%s=%s ' "$f" "$(aws lambda get-function-concurrency --function-name "tric-$f" \
+is "only $NAME-route reserves concurrency, 200" "$(for f in route events serve; do
+  printf '%s=%s ' "$f" "$(aws lambda get-function-concurrency --function-name "$NAME-$f" \
     --query ReservedConcurrentExecutions --output text)"
 done)" "route=200 events=None serve=None "
 is "the bucket has no policy" "$(awscode aws s3api get-bucket-policy --bucket "$TRIC_BUCKET")" NoSuchBucketPolicy
 # The names of a function's environment variables, never their values.
 envs() {
-  aws lambda get-function-configuration --function-name "tric-$1" --query 'Environment.Variables | keys(@)' \
+  aws lambda get-function-configuration --function-name "$NAME-$1" --query 'Environment.Variables | keys(@)' \
     --output text | tr '\t' '\n'
 }
-is "only tric-route holds the origin secret" \
+is "only $NAME-route holds the origin secret" \
   "$(for f in route events serve; do envs $f | grep -qx TRIC_ORIGIN && echo $f; done)" route
 for f in route events serve; do
-  is "tric-$f has no provisioned concurrency" "$(aws lambda list-provisioned-concurrency-configs \
-    --function-name tric-$f --query 'length(ProvisionedConcurrencyConfigs)' --output text)" 0
+  is "$NAME-$f has no provisioned concurrency" "$(aws lambda list-provisioned-concurrency-configs \
+    --function-name $NAME-$f --query 'length(ProvisionedConcurrencyConfigs)' --output text)" 0
 done
 
 echo "== outbound and the guest"
@@ -834,26 +836,26 @@ since=$(now)
 post "$B/@j-$run/kv?op=set&key=x&value=1" >/dev/null # j has a head, and no pending commit
 forged=$(jq -cn --arg h "beta.$DOMAIN" --arg n "j-$run" '{app: "beta", host: $h, name: $n, commit: "forged",
   requests: [{method: "POST", uri: "https://\($h)/@\($n)/echo", headers: [], body: ""}]}')
-invoke tric-events "$forged" --qualifier outbox >/dev/null || fail "invoke the outbox alias"
+invoke $NAME-events "$forged" --qualifier outbox >/dev/null || fail "invoke the outbox alias"
 if awaitlog serve "$since" "its commit is not pending" 60; then pass "a forged delivery is dropped for its digest"
 else fail "a forged delivery is dropped for its digest" "no 'its commit is not pending' in serve's log"; fi
 is "and stores nothing" "$(value "$B" j-$run echo)" null
 since=$(now)
-invoke tric-events "$(jq -cn --arg n "ghost-$run" '{app: $n, host: "x", name: "g", commit: "c", requests: []}')" \
+invoke $NAME-events "$(jq -cn --arg n "ghost-$run" '{app: $n, host: "x", name: "g", commit: "c", requests: []}')" \
   --qualifier outbox >/dev/null
 if awaitlog events "$since" "has no release" 60; then pass "a delivery for an app with no release is dropped"
 else fail "a delivery for an app with no release is dropped"; fi
 since=$(now)
-invoke tric-events "$(jq -cn --arg h "beta.$DOMAIN" --arg n "nohead-$run" '{app: "beta", host: $h, name: $n,
+invoke $NAME-events "$(jq -cn --arg h "beta.$DOMAIN" --arg n "nohead-$run" '{app: "beta", host: $h, name: $n,
   commit: "forged", requests: []}')" --qualifier outbox >/dev/null
 if awaitlog serve "$since" "its commit never landed" 20; then pass "a delivery whose commit never lands is dropped"
 else fail "a delivery whose commit never lands is dropped"; fi
-invoke tric-events "{\"app\":\"beta\",\"path\":\"/@forged-$run/echo\"}" --qualifier outbox >/dev/null
+invoke $NAME-events "{\"app\":\"beta\",\"path\":\"/@forged-$run/echo\"}" --qualifier outbox >/dev/null
 evt=$(jq -cn --arg h "alpha.$DOMAIN" --arg n "x-$run" '{app: "alpha", host: $h, name: $n, commit: "forged",
   requests: [{method: "POST", uri: "https://\($h)/@\($n)/echo", headers: [], body: ""}]}')
 is "a delivery over HTTP is a plain POST to the app" "$(post "$A/" -H 'Forwarded: for=_tric' --data "$evt")" hello
 for q in "" "--qualifier outbox"; do
-  is "tric-events refuses an HTTP event ${q:-unqualified}" "$(invoke tric-events "$(event "alpha.$DOMAIN" alpha)" $q |
+  is "$NAME-events refuses an HTTP event ${q:-unqualified}" "$(invoke $NAME-events "$(event "alpha.$DOMAIN" alpha)" $q |
     status)" 403
 done
 sleep 10
@@ -871,7 +873,7 @@ is "alpha has no cron job now, and still its sweep" "$(schedules alpha | grep -c
 
 echo "== retries"
 # The delivery to e-$run fails (its turn answers 503), so its event waits as outbox/alpha/<commit>, which only the
-# router writes, and a one-time schedule in tric-retry, named for the commit, tries it again.
+# router writes, and a one-time schedule in the retry group, named for the commit, tries it again.
 commit=''
 for k in $(aws s3api list-objects-v2 --bucket "$TRIC_BUCKET" --prefix outbox/alpha/ --query 'Contents[].Key' \
   --output text 2>/dev/null | listed); do
@@ -881,7 +883,7 @@ if [ -n "$commit" ]; then pass "a delivery that fails waits in outbox/alpha/"
 else fail "a delivery that fails waits in outbox/alpha/" "no object there names e-$run"; fi
 if [ -n "$commit" ]; then
   prefix=$(sha "alpha/$commit" 32)
-  is "and a schedule in tric-retry is for it" "$(aws scheduler list-schedules --group-name tric-retry \
+  is "and a schedule in $NAME-retry is for it" "$(aws scheduler list-schedules --group-name $NAME-retry \
     --name-prefix "$prefix" --query 'length(Schedules)' --output text)" 1
 fi
 # serve's 503 to each try, in the router's log: the first try, and two that Scheduler made.
@@ -889,7 +891,7 @@ tries="{ \$.fields.app = \"alpha\" && \$.fields.message = \"outbox: serve answer
 if awaitpat events "$failed" "$tries" 360 3; then pass "Scheduler tries a failed delivery again, and again"
 else fail "Scheduler tries a failed delivery again, and again" \
   "$(nlogs events "$failed" "$tries") tries in 6 minutes, want 3"; fi
-note "the tries' times: $(aws logs filter-log-events --log-group-name /aws/lambda/tric-events --start-time "$failed" \
+note "the tries' times: $(aws logs filter-log-events --log-group-name /aws/lambda/$NAME-events --start-time "$failed" \
   --filter-pattern "$tries" --query 'events[].timestamp' --output text | tr '\t' '\n' |
   awk 'NR == 1 { t = $1 } { printf "+%ds ", ($1 - t) / 1000 }')"
 is "the failed delivery committed nothing" "$(value "$A" e-$run echo)" null
@@ -897,7 +899,7 @@ if [ -n "$commit" ]; then
   # As if its window were over: this try fails too, and the next would be past the deadline, so the event is lost.
   since=$(now)
   # The adapter gives back an event's body alone, so what this does is the check, not its status.
-  invoke tric-events "$(jq -cn --arg c "$commit" --argjson d "$(date +%s)" \
+  invoke $NAME-events "$(jq -cn --arg c "$commit" --argjson d "$(date +%s)" \
     '{app: "alpha", commit: $c, tries: 9, deadline: $d}')" --qualifier retry >/dev/null || fail "invoke the retry alias"
   if awaitlog events "$since" "failed every try" 30; then pass "a delivery past its window is lost, with a warning"
   else fail "a delivery past its window is lost, with a warning"; fi
@@ -930,9 +932,9 @@ else
   is "the increments that answered 200 are the ones that landed" \
     "$(for w in 1 2 3 4; do value "$A" $h w$w; done | jq -s 'map(tonumber? // 0) | add')" "$ok"
   sleep 30
-  aws logs filter-log-events --log-group-name /aws/lambda/tric-serve --start-time "$t" --filter-pattern "\"$h\"" \
+  aws logs filter-log-events --log-group-name /aws/lambda/$NAME-serve --start-time "$t" --filter-pattern "\"$h\"" \
     --output json >"$live/heads-$run.json"
-  aws logs filter-log-events --log-group-name /aws/lambda/tric-route --start-time "$t" \
+  aws logs filter-log-events --log-group-name /aws/lambda/$NAME-route --start-time "$t" \
     --filter-pattern '{ $.fields.message = "route" && $.fields.app = "alpha" }' --output json >"$live/routes-$run.json"
   if python3 -I - "$live/heads-$run.json" "$live/routes-$run.json" <<'PY'
 import json, sys
@@ -1077,13 +1079,13 @@ since=$(now)
 is "a GET that says Forwarded: for=_sweep is a request like any other" "$(get "$A/" -H 'Forwarded: for=_sweep')" hello
 is "so is a POST" "$(post "$A/" -H 'Forwarded: for=_sweep')" hello
 ask='{"app":"alpha","sweep":true}'
-invoke tric-route "$ask" >/dev/null || fail "invoke the router"
+invoke $NAME-route "$ask" >/dev/null || fail "invoke the router"
 for q in "" "--qualifier outbox" "--qualifier retry"; do
-  invoke tric-events "$ask" $q >/dev/null || fail "invoke events ${q:-unqualified}"
+  invoke $NAME-events "$ask" $q >/dev/null || fail "invoke events ${q:-unqualified}"
 done
 for body in '{"app":"alpha"}' '{"app":"alpha","sweep":false}' '{"app":"A/b","sweep":true}' \
   '{"app":"alpha","sweep":true,"path":"/"}' "{\"app\":\"ghost-$run\",\"sweep\":true}"; do
-  invoke tric-events "$body" --qualifier cron >/dev/null || fail "invoke the cron alias with $body"
+  invoke $NAME-events "$body" --qualifier cron >/dev/null || fail "invoke the cron alias with $body"
 done
 # 8 invocations of events, and 3 of the router (the two requests above, and its function invoked on its own), each
 # ending in a REPORT: so that a sweep among them would have been logged by now.
@@ -1094,7 +1096,7 @@ else
 $(reports route "$since") of 3"
 fi
 for f in route events serve; do
-  is "the forged asks made no sweep (tric-$f's log)" "$(sweeplines $f "$since")" 0
+  is "the forged asks made no sweep ($NAME-$f's log)" "$(sweeplines $f "$since")" 0
 done
 is "and they left no cursor" "$(cursors)" 0
 is "and nothing of this run's is changed" "$(mine)" "$before"
@@ -1110,9 +1112,9 @@ if [ $debug != yes ]; then
 else
   sleep 15
   raw=$(mktemp) swp=$(mktemp)
-  aws logs filter-log-events --log-group-name /aws/lambda/tric-serve --start-time "$t_files" \
+  aws logs filter-log-events --log-group-name /aws/lambda/$NAME-serve --start-time "$t_files" \
     --filter-pattern '{ $.fields.message = "tree" }' --output json >"$raw"
-  aws logs filter-log-events --log-group-name /aws/lambda/tric-serve --start-time "$t_files" \
+  aws logs filter-log-events --log-group-name /aws/lambda/$NAME-serve --start-time "$t_files" \
     --filter-pattern '{ $.fields.message = "swept" && $.fields.app = "alpha" }' --output json >"$swp"
   if python3 -I - "$raw" "$swp" "$live/tree-$run.json" $run $swept_from $((swept_to + 2000)) <<'PY'
 import json, sys
@@ -1173,7 +1175,7 @@ fi
 echo "== quiet (nothing else is running)"
 sleep 30
 t=$(now)
-invoke tric-events "{\"app\":\"ghost-$run\",\"path\":\"/@x/echo\"}" --qualifier cron >/dev/null ||
+invoke $NAME-events "{\"app\":\"ghost-$run\",\"path\":\"/@x/echo\"}" --qualifier cron >/dev/null ||
   fail "invoke the cron alias"
 code "https://nobody-$run.$DOMAIN/" >/dev/null
 sleep 60
@@ -1182,7 +1184,7 @@ is "an unknown host runs the router once" "$(reports route "$t")" 1
 is "and neither runs serve" "$(reports serve "$t")" 0
 t=$(now)
 sleep 180
-for f in route events serve; do is "tric-$f didn't run in 3 idle minutes" "$(reports $f "$t")" 0; done
+for f in route events serve; do is "$NAME-$f didn't run in 3 idle minutes" "$(reports $f "$t")" 0; done
 
 echo "== cleanup (the strays, and the schedules of the run's apps, if any are left)"
 teardown

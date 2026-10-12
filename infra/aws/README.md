@@ -75,8 +75,8 @@ There are three things to know:
 ## Install
 
 You need:
-- an AWS account with no other install of tric, as every name begins with `tric`;
-- a domain whose hosted zone is in Route 53;
+- an AWS account;
+- a domain whose hosted zone is in Route 53, for this install alone;
 - Docker;
 - an arm64 host (such as Apple silicon) to build the package, which runs on Graviton.
 
@@ -102,8 +102,10 @@ All commands run from the repository's root.
    docker compose run --rm tofu apply
    ```
 
-   The region is `us-west-2` unless you add `-var region=<region>`. The first apply waits a few minutes for the
-   certificate and the distribution. The functions log as `-var log=<RUST_LOG>` says, `warn,tric=info` by default.
+   The region is `us-west-2` unless you add `-var region=<region>`. Every name the install makes begins with `tric`,
+   unless you add `-var name=<name>`; a second install in the same account needs a name of its own. The first apply
+   waits a few minutes for the certificate and the distribution. The functions log as `-var log=<RUST_LOG>` says,
+   `warn,tric=info` by default.
 
 After a new package, run `apply` again: it updates the three functions. The package is built with WebSockets.
 

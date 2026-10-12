@@ -17,6 +17,17 @@ variable "region" {
   default = "us-west-2"
 }
 
+variable "name" {
+  description = "The prefix of every name the install makes, so that two installs can share an account"
+  type        = string
+  default     = "tric"
+  validation {
+    # The bucket's name is the name, `-`, and a suffix, and S3 takes lowercase letters, digits and hyphens only.
+    condition     = can(regex("^[a-z][a-z0-9-]{0,31}$", var.name))
+    error_message = "name is a lowercase letter, then at most 31 lowercase letters, digits and hyphens"
+  }
+}
+
 variable "package" {
   description = "The Lambda package: tric, for arm64, and bootstrap"
   type        = string
@@ -69,14 +80,14 @@ variable "sweep_every" {
 
 provider "aws" {
   region = var.region
-  default_tags { tags = { app = local.name } }
+  default_tags { tags = { app = var.name } }
 }
 
 # CloudFront takes its certificates from us-east-1 only.
 provider "aws" {
   alias  = "us_east_1"
   region = "us-east-1"
-  default_tags { tags = { app = local.name } }
+  default_tags { tags = { app = var.name } }
 }
 
 data "aws_caller_identity" "current" {}
@@ -87,10 +98,8 @@ data "aws_route53_zone" "domain" {
 }
 
 locals {
-  # The prefix of every resource's name, which is fixed, so an account holds one install.
-  name = "tric"
   # The functions' ARNs, spelt out so that the functions can name each other.
-  function = "arn:aws:lambda:${var.region}:${data.aws_caller_identity.current.account_id}:function:${local.name}"
+  function = "arn:aws:lambda:${var.region}:${data.aws_caller_identity.current.account_id}:function:${var.name}"
   serve    = "${local.function}-serve"
   outbox   = "${local.function}-events:outbox"
   retry    = "${local.function}-events:retry"
@@ -108,7 +117,7 @@ locals {
 # The bucket: apps/ and native/; and ws/, sockets' records, and outbox/, the deliveries that wait to be tried again,
 # which only the router reads and writes.
 resource "aws_s3_bucket" "store" {
-  bucket_prefix = "${local.name}-"
+  bucket_prefix = "${var.name}-"
   force_destroy = true
 }
 
@@ -169,7 +178,7 @@ locals {
 
 # The router's: the trusted core, which mints the apps' credentials.
 resource "aws_iam_role" "route" {
-  name               = "${local.name}-route"
+  name               = "${var.name}-route"
   assume_role_policy = local.lambda
 }
 
@@ -222,7 +231,7 @@ resource "aws_iam_role_policy" "route" {
 
 # The apps': the router's sessions narrow it to one app.
 resource "aws_iam_role" "app" {
-  name = "${local.name}-app"
+  name = "${var.name}-app"
   assume_role_policy = jsonencode({
     Version   = "2012-10-17"
     Statement = [{ Effect = "Allow", Principal = { AWS = aws_iam_role.route.arn }, Action = "sts:AssumeRole" }]
@@ -264,7 +273,7 @@ resource "aws_iam_role_policy" "app" {
 
 # serve's: its logs and the outbox, and no storage at all.
 resource "aws_iam_role" "serve" {
-  name               = "${local.name}-serve"
+  name               = "${var.name}-serve"
   assume_role_policy = local.lambda
 }
 
@@ -285,12 +294,12 @@ resource "aws_iam_role_policy" "serve" {
 # that run as `cron`.
 resource "aws_scheduler_schedule_group" "scheduler" {
   for_each = toset(["cron", "retry"])
-  name     = "${local.name}-${each.key}"
+  name     = "${var.name}-${each.key}"
 }
 
 resource "aws_iam_role" "scheduler" {
   for_each = aws_scheduler_schedule_group.scheduler
-  name     = "${local.name}-${each.key}"
+  name     = "${var.name}-${each.key}"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -374,13 +383,13 @@ locals {
 
 resource "aws_cloudwatch_log_group" "function" {
   for_each          = local.functions
-  name              = "/aws/lambda/${local.name}-${each.key}"
+  name              = "/aws/lambda/${var.name}-${each.key}"
   retention_in_days = 3
 }
 
 resource "aws_lambda_function" "function" {
   for_each         = local.functions
-  function_name    = "${local.name}-${each.key}"
+  function_name    = "${var.name}-${each.key}"
   role             = each.value.role
   runtime          = "provided.al2023"
   architectures    = ["arm64"]
@@ -437,7 +446,7 @@ resource "aws_lambda_permission" "ws" {
 # route response; every message to a client goes through `@connections`. Its own URL refuses an opening without the
 # origin secret, as the function URL does a request.
 resource "aws_apigatewayv2_api" "ws" {
-  name                       = "${local.name}-ws"
+  name                       = "${var.name}-ws"
   protocol_type              = "WEBSOCKET"
   route_selection_expression = "$request.body.action"
 }
@@ -506,7 +515,7 @@ resource "aws_acm_certificate_validation" "apps" {
 # function can't see `Upgrade`, so a request with `Sec-WebSocket-Key` is taken as a socket's opening, and goes to API
 # Gateway's stage, with its path as X-Forwarded-Path; its query goes as it is.
 resource "aws_cloudfront_function" "host" {
-  name    = "${local.name}-host"
+  name    = "${var.name}-host"
   runtime = "cloudfront-js-2.0"
   publish = true
   code    = <<-EOT
@@ -608,4 +617,9 @@ output "TRIC_SWEEP_EVERY" {
 
 output "AWS_REGION" {
   value = var.region
+}
+
+# The checks' (check.sh): the prefix of every name.
+output "name" {
+  value = var.name
 }
