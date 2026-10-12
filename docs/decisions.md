@@ -1128,10 +1128,12 @@ The tree is the crate `tric-tree`, in `crates/tree`, and the root is a workspace
   limit), `TooLarge`, `Corrupt`, `Store` (an `object_store` error) and `Poisoned`; it is a `std::error::Error`, so
   `?` makes it a `wasmtime::Error` in tric. tric's two `fail`s, of keys and of files, match `Full` where they used to
   downcast, and tell the guest the name's limit in the words they used before.
-- **The limits are one `Config`, with defaults.** The node (64 KiB), inline (4 KiB), budget (8 MiB), blob (1 MiB) and
-  in-flight (16) defaults are the old constants. Entries and data are unbounded by default, as they are policy:
-  tric's `tree::config()` sets 4 Mi and 16 GiB (`ENTRIES_MAX`, `DATA_MAX`), and `DATA_MAX` and the file system's
-  other limits stay in tric.
+- **The limits are one `Config`, with defaults.** The node (64 KiB), inline (4 KiB), budget (8 MiB) and blob (1 MiB)
+  defaults are the old constants. Entries and data are unbounded by default, as they are policy: tric's `tree::config()`
+  sets 4 Mi and 16 GiB (`ENTRIES_MAX`, `DATA_MAX`), and `DATA_MAX` and the file system's other limits stay in tric. How
+  much is under way at once is not a limit, and is the crate's constant `IN_FLIGHT` (16), the uploads of a flush and the
+  reads of a mark: it was a field of the config, which only ever held 16 and had to be guarded against 0. tric reads its
+  blocks and heads that many at a time too, and takes the number from the crate.
 - **A path is the caller's prefix and an id.** `tric_tree::object(prefix, id)` is where an object is, directly under
   the prefix, and `tric_tree::number` reads an id back, for a collector that lists the prefix. tric's `tree::prefix`
   is `apps/<app>/values/<name>`, as before.
@@ -1153,8 +1155,8 @@ The tree is the crate `tric-tree`, in `crates/tree`, and the root is a workspace
   each object once. `Tree::reachable` is a mark from an empty set.
 - **One tree type, and a walk of its own for the mark.** A snapshot is a tree that is not written, and `Tree::fork`
   is the copy that outlives a turn, so a snapshot type would only repeat the reads. The mark does not share the
-  scans' walk: it reads level by level, unordered and up to `Config::in_flight` at once, and keeps nothing in the
-  cache, where a scan reads in key order, to a limit, through the cache.
+  scans' walk: it reads level by level, unordered and up to `IN_FLIGHT` at once, and keeps nothing in the cache,
+  where a scan reads in key order, to a limit, through the cache.
 - **A spill of nodes merges first, as the commit does.** Both are one `flush`: what is thin merges and what is empty
   is dropped (`fix`), a root of one child gives way to it, and then the nodes upload. A spill used to upload the nodes
   as they were, so its upload dropped the empty ones itself and put right a root it had emptied: a second path for

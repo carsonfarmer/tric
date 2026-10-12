@@ -87,6 +87,9 @@ const NODES: usize = 16 << 20;
 /// The bytes of values that a default cache keeps.
 const VALUES: usize = 32 << 20;
 
+/// How many uploads a tree has under way at once, and how many nodes a mark reads at once.
+pub const IN_FLIGHT: usize = 16;
+
 /// What bounds a tree, and how it uses the store. A tree is read with a `node` and a `blob` no smaller than those it
 /// was written with.
 #[derive(Clone, Copy, Debug)]
@@ -104,21 +107,11 @@ pub struct Config {
     pub data: u64,
     /// The most a value is: 1 MiB by default.
     pub blob: u64,
-    /// How many uploads a tree has under way at once, and how many nodes a mark reads at once: 16 by default.
-    pub in_flight: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            node: 64 << 10,
-            inline: 4 << 10,
-            budget: 8 << 20,
-            entries: u64::MAX,
-            data: u64::MAX,
-            blob: 1 << 20,
-            in_flight: 16,
-        }
+        Self { node: 64 << 10, inline: 4 << 10, budget: 8 << 20, entries: u64::MAX, data: u64::MAX, blob: 1 << 20 }
     }
 }
 
@@ -1006,7 +999,7 @@ struct Flush<'a> {
 
 impl<'a> Flush<'a> {
     fn new(reader: &'a Reader, nodes: bool) -> Self {
-        Self { reader, permits: Semaphore::new(reader.config.in_flight.max(1)), nodes }
+        Self { reader, permits: Semaphore::new(IN_FLIGHT), nodes }
     }
 
     /// Uploads an object at a new id, and returns the link.
@@ -1310,7 +1303,7 @@ impl Tree {
     /// Adds to `seen` the ids of the objects the tree reaches below its root, as [`number`] gives them, its nodes and
     /// its values that are objects alike, and gives how many nodes it read, or `None` if that would be over `max`.
     ///
-    /// The nodes are read level by level, [`Config::in_flight`] at once, each checked as any read is, and none is kept
+    /// The nodes are read level by level, [`IN_FLIGHT`] at once, each checked as any read is, and none is kept
     /// in the cache. An id already in `seen` is passed over with all below it, as what is below an object never
     /// changes, so one set passed to the marks of several roots has each object read once. A node that is missing or
     /// not what its link says is an error, so what is marked is of a tree that was whole. After `None` or an error,
@@ -1325,7 +1318,7 @@ impl Tree {
             }
             let (r, links) = (&*self.reader, std::mem::take(&mut next));
             let reads = stream::iter(links).map(|link| async move { r.load(&link, false).await });
-            let mut reads = reads.buffer_unordered(r.config.in_flight.max(1));
+            let mut reads = reads.buffer_unordered(IN_FLIGHT);
             while let Some(node) = reads.try_next().await? {
                 refs(&node, seen, &mut next)?;
             }
@@ -1392,7 +1385,7 @@ mod tests {
     /// A config that makes a few keys a deep tree: a branch holds a few nodes, and a leaf as many values that are
     /// objects.
     fn tiny() -> Config {
-        Config { node: 1400, inline: 8, budget: 2048, entries: 1000, data: 100_000, blob: 100, in_flight: 16 }
+        Config { node: 1400, inline: 8, budget: 2048, entries: 1000, data: 100_000, blob: 100 }
     }
 
     fn open(store: &Store, root: &Root, config: Config) -> Tree {
@@ -1680,13 +1673,13 @@ mod tests {
         store.cache = Arc::default();
         let tree = at(&store, &root);
 
-        // Every node below the root is read once, a few at once and no more than `in_flight`, and none is kept.
+        // Every node below the root is read once, a few at once and no more than `IN_FLIGHT`, and none is kept.
         counts.gets.store(0, SeqCst);
         counts.delay.store(5, SeqCst);
         assert_eq!(tree.reachable(usize::MAX).await.unwrap(), Some(all.clone()));
         assert_eq!(counts.gets.load(SeqCst), all.len());
         let peak = counts.peak.load(SeqCst);
-        assert!((2..=tiny().in_flight).contains(&peak), "{peak} at once");
+        assert!((2..=IN_FLIGHT).contains(&peak), "{peak} at once");
         counts.delay.store(0, SeqCst);
         counts.gets.store(0, SeqCst);
         assert!(tree.get("k/077").await.unwrap().is_some());
