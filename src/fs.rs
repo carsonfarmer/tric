@@ -76,12 +76,6 @@ impl From<ResourceTableError> for Fault {
     }
 }
 
-impl From<wasmtime::Error> for Fault {
-    fn from(e: wasmtime::Error) -> Self {
-        Self::Trap(e)
-    }
-}
-
 impl Host {
     /// The descriptor, which is cloned out of the table so that nothing of the table is held across an await.
     fn fd(&self, fd: &Resource<Handle>) -> Result<Handle, Fault> {
@@ -470,7 +464,8 @@ impl Handle {
         let Found::Existing(ino, kind) = resolved(ops::locate(&tree, self.ino(), path, m.follow).await?, &m)? else {
             return Err(Errno::NoEntry);
         };
-        if m.write && !self.mutable() {
+        // To write, or to change a directory's entries, is a right that a turn that has answered does not give.
+        if (m.write || m.mutate) && !self.mutable() {
             return Err(Errno::ReadOnly);
         }
         Ok(self.child(ino, kind, &m))
@@ -486,22 +481,6 @@ impl Handle {
         let tree = self.pin.view().await;
         let (ino, _) = ops::lookup(&tree, self.ino(), path, follow).await?;
         ops::stat(&tree, ino).await
-    }
-
-    /// Opens `path` as `open-at` asks, with `mode` holding the flags of the descriptor as the guest gave them. `mutate`
-    /// of it is the right to change the directory entries, which a turn that has answered does not give, and `sync` is
-    /// that a write be durable when it returns, which only a commit makes it.
-    pub async fn open_as(&self, path: &str, mut mode: Mode, sync: bool) -> Res<Self> {
-        if sync {
-            return Err(Errno::Unsupported);
-        }
-        if mode.mutate && !self.mutable() {
-            return Err(Errno::ReadOnly);
-        }
-        // A descriptor that is not asked to write reads, and one that makes a file or empties it writes.
-        mode.read |= !mode.write;
-        mode.write |= mode.create || mode.truncate;
-        self.open(path, mode).await
     }
 
     /// Sets the size of the file.
@@ -591,56 +570,28 @@ impl Handle {
     pub async fn mkdir_at(&self, path: &str) -> Res<()> {
         self.dir()?;
         let mut tree = edit(self.turn()).await?;
-        let (parent, name, at, _) = ops::entry(&tree, self.ino(), path, Errno::Exist).await?;
-        if at.is_some() {
-            return Err(Errno::Exist);
-        }
-        ops::create(&mut tree, parent, &name, Kind::Dir, None).await?;
-        Ok(())
+        ops::mkdir(&mut tree, self.ino(), path).await
     }
 
     /// Makes `path` a symlink to `target`.
     pub async fn symlink_at(&self, path: &str, target: &str) -> Res<()> {
         self.dir()?;
         let mut tree = edit(self.turn()).await?;
-        let (parent, name, at, slash) = ops::entry(&tree, self.ino(), path, Errno::Exist).await?;
-        if at.is_some() {
-            return Err(Errno::Exist);
-        }
-        if slash {
-            return Err(Errno::NoEntry);
-        }
-        ops::symlink(&mut tree, parent, &name, target).await?;
-        Ok(())
+        ops::symlink(&mut tree, self.ino(), path, target).await
     }
 
     pub async fn readlink_at(&self, path: &str) -> Res<String> {
         self.dir()?;
         let tree = self.pin.view().await;
-        match ops::locate(&tree, self.ino(), path, false).await? {
-            Loc::Dir(_) => Err(Errno::Invalid),
-            Loc::Entry { at: None, .. } => Err(Errno::NoEntry),
-            Loc::Entry { at: Some(d), .. } if d.kind() == Kind::Link => ops::readlink(&tree, d.ino()).await,
-            Loc::Entry { .. } => Err(Errno::Invalid),
-        }
+        ops::readlink(&tree, self.ino(), path).await
     }
 
-    pub async fn unlink_at(&self, path: &str) -> Res<()> {
+    /// Removes `path`: an empty directory if `dir` is set, as `remove-directory-at` does, and else a file or a symlink,
+    /// as `unlink-file-at` does.
+    pub async fn remove_at(&self, path: &str, dir: bool) -> Res<()> {
         self.dir()?;
         let mut tree = edit(self.turn()).await?;
-        let (parent, name, at, slash) = ops::entry(&tree, self.ino(), path, Errno::IsDirectory).await?;
-        if slash && at.is_some_and(|d| d.kind() != Kind::Dir) {
-            return Err(Errno::NotDirectory);
-        }
-        let gone = ops::unlink(&mut tree, parent, &name).await?;
-        reclaim(self.turn(), &mut tree, gone).await
-    }
-
-    pub async fn rmdir_at(&self, path: &str) -> Res<()> {
-        self.dir()?;
-        let mut tree = edit(self.turn()).await?;
-        let (parent, name, _, _) = ops::entry(&tree, self.ino(), path, Errno::Invalid).await?;
-        let gone = ops::rmdir(&mut tree, parent, &name).await?;
+        let gone = ops::remove(&mut tree, self.ino(), path, dir).await?;
         reclaim(self.turn(), &mut tree, gone).await
     }
 
@@ -652,9 +603,7 @@ impl Handle {
             return Err(Errno::Invalid);
         }
         let mut tree = edit(self.turn()).await?;
-        let (from_dir, from, _, from_slash) = ops::entry(&tree, self.ino(), from, Errno::Busy).await?;
-        let (to_dir, to, _, to_slash) = ops::entry(&tree, to_dir.ino(), to, Errno::Busy).await?;
-        let gone = ops::rename(&mut tree, (from_dir, &from), (to_dir, &to), (from_slash, to_slash)).await?;
+        let gone = ops::rename(&mut tree, (self.ino(), from), (to_dir.ino(), to)).await?;
         reclaim(self.turn(), &mut tree, gone).await
     }
 
@@ -667,12 +616,7 @@ impl Handle {
             return Err(Errno::Invalid);
         }
         let mut tree = edit(self.turn()).await?;
-        let (ino, _) = ops::lookup(&tree, self.ino(), path, false).await?;
-        let (parent, name, _, slash) = ops::entry(&tree, to_dir.ino(), to, Errno::Exist).await?;
-        if slash {
-            return Err(Errno::NoEntry);
-        }
-        ops::link(&mut tree, ino, parent, &name).await
+        ops::link(&mut tree, (self.ino(), path), (to_dir.ino(), to)).await
     }
 
     /// Whether `other` is the same file or directory.
@@ -681,14 +625,14 @@ impl Handle {
     }
 
     /// Something that tells one file from another and is the same for one file: its inode.
-    pub fn hash(&self) -> (u64, u64) {
-        (self.ino(), 0)
+    pub fn hash(&self) -> u64 {
+        self.ino()
     }
 
-    pub async fn hash_at(&self, path: &str, follow: bool) -> Res<(u64, u64)> {
+    pub async fn hash_at(&self, path: &str, follow: bool) -> Res<u64> {
         self.dir()?;
         let tree = self.pin.view().await;
-        Ok((ops::lookup(&tree, self.ino(), path, follow).await?.0, 0))
+        Ok(ops::lookup(&tree, self.ino(), path, follow).await?.0)
     }
 }
 
@@ -742,9 +686,9 @@ impl Entries {
 
 /// A task that is aborted when it is dropped: a read, which holds nothing of the turn's but the tree, shared, while it
 /// plans, and which closing the stream it is for cancels.
-struct Task<T>(JoinHandle<T>);
+struct Task(JoinHandle<()>);
 
-impl<T> Drop for Task<T> {
+impl Drop for Task {
     fn drop(&mut self) {
         self.0.abort();
     }
@@ -761,7 +705,7 @@ pub struct Ahead {
     end: Option<u64>,
     /// Where the blocks that were asked for end.
     asked: u64,
-    task: Option<Task<()>>,
+    task: Option<Task>,
 }
 
 impl Ahead {
@@ -865,8 +809,8 @@ mod tests {
         assert_eq!(h.readlink_at(path).await.err(), no, "readlink {path}");
         assert_eq!(h.mkdir_at(path).await.err(), no, "mkdir {path}");
         assert_eq!(h.symlink_at(path, "x").await.err(), no, "symlink {path}");
-        assert_eq!(h.unlink_at(path).await.err(), no, "unlink {path}");
-        assert_eq!(h.rmdir_at(path).await.err(), no, "rmdir {path}");
+        assert_eq!(h.remove_at(path, false).await.err(), no, "unlink {path}");
+        assert_eq!(h.remove_at(path, true).await.err(), no, "rmdir {path}");
         assert_eq!(h.rename_at(path, h, "moved").await.err(), no, "rename from {path}");
         assert_eq!(h.rename_at(own, h, path).await.err(), no, "rename to {path}");
         assert_eq!(h.link_at(path, h, "linked").await.err(), no, "link from {path}");
@@ -983,8 +927,8 @@ mod tests {
         // A turn that has answered changes nothing, and the descriptors say so.
         turn.answer();
         assert!(!root.mutates() && !e.mutates());
-        assert_eq!(root.open_as("d", Mode { mutate: true, ..self::dir() }, false).await.err(), Some(Errno::ReadOnly));
-        assert!(root.open_as("d", plain, false).await.is_ok());
+        assert_eq!(root.open("d", changing).await.err(), Some(Errno::ReadOnly));
+        assert!(root.open("d", plain).await.is_ok());
     }
 
     #[tokio::test]
@@ -994,7 +938,7 @@ mod tests {
         let root = Handle::root(&turn);
         let file = put(&root, "f", b"abc").await;
         let (ino, twin) = (file.ino(), root.open("f", read()).await.unwrap());
-        root.unlink_at("f").await.unwrap();
+        root.remove_at("f", false).await.unwrap();
 
         assert_eq!(root.stat_at("f", false).await.err(), Some(Errno::NoEntry));
         assert_eq!(file.stat().await.unwrap().links, 0);
@@ -1020,7 +964,7 @@ mod tests {
         let root = Handle::root(&turn);
         root.mkdir_at("d").await.unwrap();
         let d = root.open("d", dir()).await.unwrap();
-        root.rmdir_at("d").await.unwrap();
+        root.remove_at("d", true).await.unwrap();
         assert_eq!(d.stat().await.unwrap().links, 0);
         assert_eq!(d.mkdir_at("x").await, Err(Errno::NoEntry), "nothing is made in a directory that is gone");
         assert_eq!(d.open("x", make()).await.err(), Some(Errno::NoEntry));
@@ -1048,8 +992,8 @@ mod tests {
         let (kept, file, shut) =
             (put(&root, "kept", b"kept").await, put(&root, "file", &big).await, put(&root, "shut", b"shut").await);
         let (ino, shut_ino) = (file.ino(), shut.ino());
-        root.unlink_at("file").await.unwrap();
-        root.unlink_at("shut").await.unwrap();
+        root.remove_at("file", false).await.unwrap();
+        root.remove_at("shut", false).await.unwrap();
         drop(shut);
         commit(&first).await;
 
@@ -1104,8 +1048,8 @@ mod tests {
             root.set_times_at("f", true, Time::Now, Time::Now).await,
             root.mkdir_at("e").await,
             root.symlink_at("l", "f").await,
-            root.unlink_at("f").await,
-            root.rmdir_at("d").await,
+            root.remove_at("f", false).await,
+            root.remove_at("d", true).await,
             root.rename_at("f", &root, "g").await,
             root.link_at("f", &root, "g").await,
             root.open("new", make()).await.map(drop),
@@ -1146,7 +1090,7 @@ mod tests {
         assert_eq!(root.mkdir_at("e").await, Err(Errno::ReadOnly));
         assert_eq!(root.open("g", make()).await.err(), Some(Errno::ReadOnly));
         assert_eq!(root.open("f", write_only()).await.err(), Some(Errno::ReadOnly));
-        assert_eq!(root.unlink_at("f").await, Err(Errno::ReadOnly));
+        assert_eq!(root.remove_at("f", false).await, Err(Errno::ReadOnly));
     }
 
     #[tokio::test]

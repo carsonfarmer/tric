@@ -376,9 +376,9 @@ system: `cli`, `clocks`, `random` and `sockets` `add_to_linker`.
 |---|---|---|
 | `crates/tree` (was `src/tree.rs`) | nodes, links, edits, spill, merge, scans, the cache, the mark | 1,080 (built) |
 | `src/name.rs`, `src/tric.rs`, `src/store.rs` | the turn over the tree; reading the head back | +70 (built) |
-| `src/fs.rs` | the core: descriptors, the gate, orphans, read-ahead, and the paths over the operations | 790 (built) |
-| `src/fs/ops.rs` | inodes, blocks, directories, rename, errors, on the tree | 850 (built) |
-| `src/fs/p3.rs` | 0.3: the descriptor's methods, preopens, `stream` and `future` | 650 (built) |
+| `src/fs.rs` | the core: descriptors, the gate, orphans, read-ahead, and the paths over the operations | 730 (built) |
+| `src/fs/ops.rs` | inodes, blocks, directories, rename, errors, on the tree | 820 (built) |
+| `src/fs/p3.rs` | 0.3: the descriptor's methods, preopens, `stream` and `future` | 630 (built) |
 | `src/sweep.rs`, and the trigger | versions, mark, listing, delete, cursor; schedule, router, serve | 480 (built) |
 
 The tree came to 1,080 lines, against an estimate of 800, because spilling, merging, the cache and the log are in it.
@@ -407,9 +407,8 @@ any file exists. The 0.2 binding was removed later, when tric came to serve WASI
   toolchain. All 21 pass.
 - **The harness** is a `#[cfg(test)]` module in the binary (`src/fs/conformance.rs`), using the production linker, host
   and limits, and a turn over the memory store, which holds the test's own `fs-tests.dir`; the turn is committed
-  after the test. Wasmtime's runner expects every one of these to pass on Linux, and so does the harness: a `FAILS`
-  list names each that does not, and why, and a test that is listed and passes fails the run. It is skipped without
-  `TRIC_CONFORMANCE`, the directory of the fetched files.
+  after the test. Wasmtime's runner expects every one of these to pass on Linux, and so does the harness: one that
+  fails fails the run. It is skipped without `TRIC_CONFORMANCE`, the directory of the fetched files.
 - **Our own tests:** the tree against a `BTreeMap`, over random operations with tiny nodes so that it splits, merges and
   collapses, and grows to four levels, with what is in the store checked against what the tree names after every round;
   request counts with a counting `ObjectStore`, to show that a write puts only what it changed, and that a failed

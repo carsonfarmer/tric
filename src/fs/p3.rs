@@ -142,22 +142,14 @@ impl types::HostDescriptor for Host {
     }
 }
 
-/// The descriptors a call names, cloned out of the table so that nothing of the table is held across an await.
+/// A descriptor a call names, cloned out of the table so that nothing of the table is held across an await.
 trait Descriptors {
     fn fd(&self, fd: &Resource<Handle>) -> Result<Handle, Fault>;
-    fn fds(&self, a: &Resource<Handle>, b: &Resource<Handle>) -> Result<(Handle, Handle), Fault>;
 }
 
 impl<U> Descriptors for Accessor<U, HasSelf<Host>> {
     fn fd(&self, fd: &Resource<Handle>) -> Result<Handle, Fault> {
         self.with(|mut store| store.get().fd(fd))
-    }
-
-    fn fds(&self, a: &Resource<Handle>, b: &Resource<Handle>) -> Result<(Handle, Handle), Fault> {
-        self.with(|mut store| {
-            let host = store.get();
-            Ok((host.fd(a)?, host.fd(b)?))
-        })
     }
 }
 
@@ -323,7 +315,7 @@ impl<U> types::HostDescriptorWithStore<U> for HasSelf<Host> {
         new_fd: Resource<Handle>,
         new_path: String,
     ) -> Result<(), Fault> {
-        let (old_dir, new_dir) = store.fds(&fd, &new_fd)?;
+        let (old_dir, new_dir) = (store.fd(&fd)?, store.fd(&new_fd)?);
         if old_path_flags.contains(PathFlags::SYMLINK_FOLLOW) {
             return Err(Errno::Invalid.into()); // a link to what a symlink points to is not made
         }
@@ -342,17 +334,24 @@ impl<U> types::HostDescriptorWithStore<U> for HasSelf<Host> {
         let sync = DescriptorFlags::FILE_INTEGRITY_SYNC
             | DescriptorFlags::DATA_INTEGRITY_SYNC
             | DescriptorFlags::REQUESTED_WRITE_SYNC;
+        // That a write be durable when it returns is not a thing to promise: only a commit makes it so.
+        if flags.intersects(sync) {
+            return Err(Errno::Unsupported.into());
+        }
+        let (create, truncate) = (open_flags.contains(OpenFlags::CREATE), open_flags.contains(OpenFlags::TRUNCATE));
+        let write = flags.contains(DescriptorFlags::WRITE);
+        // A descriptor that is not asked to write reads, and one that makes a file or empties it writes.
         let mode = Mode {
             follow: path_flags.contains(PathFlags::SYMLINK_FOLLOW),
-            create: open_flags.contains(OpenFlags::CREATE),
+            create,
             directory: open_flags.contains(OpenFlags::DIRECTORY),
             exclusive: open_flags.contains(OpenFlags::EXCLUSIVE),
-            truncate: open_flags.contains(OpenFlags::TRUNCATE),
-            read: flags.contains(DescriptorFlags::READ),
-            write: flags.contains(DescriptorFlags::WRITE),
+            truncate,
+            read: flags.contains(DescriptorFlags::READ) || !write,
+            write: write || create || truncate,
             mutate: flags.contains(DescriptorFlags::MUTATE_DIRECTORY),
         };
-        let file = dir.open_as(&path, mode, flags.intersects(sync)).await?;
+        let file = dir.open(&path, mode).await?;
         store.with(|mut store| store.get().add(file))
     }
 
@@ -361,7 +360,7 @@ impl<U> types::HostDescriptorWithStore<U> for HasSelf<Host> {
     }
 
     async fn remove_directory_at(store: &Accessor<U, Self>, fd: Resource<Handle>, path: String) -> Result<(), Fault> {
-        Ok(store.fd(&fd)?.rmdir_at(&path).await?)
+        Ok(store.fd(&fd)?.remove_at(&path, true).await?)
     }
 
     async fn rename_at(
@@ -371,7 +370,7 @@ impl<U> types::HostDescriptorWithStore<U> for HasSelf<Host> {
         new_fd: Resource<Handle>,
         new_path: String,
     ) -> Result<(), Fault> {
-        let (old_dir, new_dir) = store.fds(&fd, &new_fd)?;
+        let (old_dir, new_dir) = (store.fd(&fd)?, store.fd(&new_fd)?);
         Ok(old_dir.rename_at(&old_path, &new_dir, &new_path).await?)
     }
 
@@ -385,7 +384,7 @@ impl<U> types::HostDescriptorWithStore<U> for HasSelf<Host> {
     }
 
     async fn unlink_file_at(store: &Accessor<U, Self>, fd: Resource<Handle>, path: String) -> Result<(), Fault> {
-        Ok(store.fd(&fd)?.unlink_at(&path).await?)
+        Ok(store.fd(&fd)?.remove_at(&path, false).await?)
     }
 
     async fn is_same_object(
@@ -400,8 +399,7 @@ impl<U> types::HostDescriptorWithStore<U> for HasSelf<Host> {
     }
 
     async fn metadata_hash(store: &Accessor<U, Self>, fd: Resource<Handle>) -> Result<MetadataHashValue, Fault> {
-        let (lower, upper) = store.fd(&fd)?.hash();
-        Ok(MetadataHashValue { lower, upper })
+        Ok(MetadataHashValue { lower: store.fd(&fd)?.hash(), upper: 0 })
     }
 
     async fn metadata_hash_at(
@@ -411,8 +409,7 @@ impl<U> types::HostDescriptorWithStore<U> for HasSelf<Host> {
         path: String,
     ) -> Result<MetadataHashValue, Fault> {
         let follow = path_flags.contains(PathFlags::SYMLINK_FOLLOW);
-        let (lower, upper) = store.fd(&fd)?.hash_at(&path, follow).await?;
-        Ok(MetadataHashValue { lower, upper })
+        Ok(MetadataHashValue { lower: store.fd(&fd)?.hash_at(&path, follow).await?, upper: 0 })
     }
 }
 
@@ -769,7 +766,7 @@ mod tests {
         let root = Handle::root(&first);
         let big = pattern(300_000);
         let file = put(&root, "f", &big).await;
-        root.unlink_at("f").await.unwrap();
+        root.remove_at("f", false).await.unwrap();
         commit(&first).await;
         assert!(first.fs.kept(file.ino()).is_some());
         assert_eq!(drain(&file, 0).await, (big, Ok(())));
