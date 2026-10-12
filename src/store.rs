@@ -144,10 +144,9 @@ impl Store {
         Ok(self.inner.list_with_delimiter(Some(prefix)).await?)
     }
 
-    /// The object at `path`, at `version` if one is given, if there is one; it must be `max` bytes or less.
-    pub async fn get(&self, path: &Path, version: Option<String>, max: u64) -> Result<Option<(Bytes, UpdateVersion)>> {
-        let got = self.inner.get_opts(path, GetOptions { version, ..Default::default() }).await;
-        let Some(got) = found(got)? else { return Ok(None) };
+    /// The object at `path`, if there is one; it must be `max` bytes or less.
+    pub async fn get(&self, path: &Path, max: u64) -> Result<Option<(Bytes, UpdateVersion)>> {
+        let Some(got) = found(self.inner.get(path).await)? else { return Ok(None) };
         ensure!(got.meta.size <= max, "{path} is over {max} bytes");
         let version = UpdateVersion { e_tag: got.meta.e_tag.clone(), version: got.meta.version.clone() };
         Ok(Some((got.bytes().await?, version)))
@@ -168,7 +167,7 @@ impl Store {
     }
 
     pub async fn json<T: DeserializeOwned>(&self, path: &Path, max: u64) -> Result<Option<(T, UpdateVersion)>> {
-        let Some((bytes, version)) = self.get(path, None, max).await? else { return Ok(None) };
+        let Some((bytes, version)) = self.get(path, max).await? else { return Ok(None) };
         Ok(Some((serde_json::from_slice(&bytes).with_context(|| format!("{path}"))?, version)))
     }
 

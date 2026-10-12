@@ -1339,11 +1339,11 @@ mod tests {
     async fn a_claim_let_go_leaves_a_head_unlike_the_one_it_was_taken_on() {
         let (store, _) = based().await;
         let at = path("a", "n");
-        let (before, base) = store.get(&at, None, HEAD_MAX as u64).await.unwrap().unwrap();
+        let (before, base) = store.get(&at, HEAD_MAX as u64).await.unwrap().unwrap();
         let turn = writes(&store, true, "k").await.unwrap();
         assert!(turn.state().claimed);
         turn.discard().await;
-        let (after, version) = store.get(&at, None, HEAD_MAX as u64).await.unwrap().unwrap();
+        let (after, version) = store.get(&at, HEAD_MAX as u64).await.unwrap().unwrap();
         let (was, is): (Head, Head) =
             (serde_json::from_slice(&before).unwrap(), serde_json::from_slice(&after).unwrap());
         assert!(is.claim.is_none() && is.commit == was.commit, "the name is as it was");
