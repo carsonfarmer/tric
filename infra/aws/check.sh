@@ -701,15 +701,15 @@ fjson() {
   r=$(cat)
   jq -c . <<<"$r" 2>/dev/null || echo "[not JSON: $(head -c 80 <<<"$r")]"
 }
-# The fixture's route for wasi:filesystem $1, and how it says the errors that are checked. Through 0.2 it is /files
-# (tests/components/rust/src/files.rs), by std::fs, and an error is the io::ErrorKind that std makes of it; through 0.3
-# it is /files-p3 (files_p3.rs), the same ops through the binding's streams, and an error is the Debug of the
-# error-code. The names of a binding's checks begin with $X, and $I is its place in a list.
-binding() {
+# The fixture's route to its files by $1, and how it says the errors that are checked. By std it is /std-files
+# (tests/components/rust/src/std_files.rs), std::fs over wasi-libc, and an error is the io::ErrorKind that std makes of
+# it; by the binding it is /files (files.rs), the same ops through wasi:filesystem's own streams, and an error is the
+# Debug of the error-code. The names of a route's checks begin with $X, and $I is its place in a list.
+by() {
   V=$1
   case $1 in
-    0.2) R=files X='' I=0 NOENT=NotFound RO=ReadOnlyFilesystem PERM=PermissionDenied ;;
-    0.3) R=files-p3 X=p3- I=1 NOENT=ErrorCode::NoEntry RO=ErrorCode::ReadOnly PERM=ErrorCode::NotPermitted ;;
+    std) R=std-files X='' I=0 NOENT=NotFound RO=ReadOnlyFilesystem PERM=PermissionDenied ;;
+    binding) R=files X=p3- I=1 NOENT=ErrorCode::NoEntry RO=ErrorCode::ReadOnly PERM=ErrorCode::NotPermitted ;;
   esac
 }
 # What the route answers to ?$3 of name $2 of app $1: {"ok": v} or {"err": "<kind>: <message>"}, or {"err": "<kind>"}.
@@ -741,8 +741,8 @@ print(json.dumps({"fnv": str(h), "len": len(b)}, sort_keys=True, separators=(","
 }
 
 raced=()
-for V in 0.2 0.3; do
-  binding $V
+for V in std binding; do
+  by $V
   # A turn's files commit with its keys, whole or not at all (a 5xx discards the turn; any other status commits it).
   f=${X}files-$run
   w="op=write&path=/hello.txt&key=k"
@@ -811,15 +811,15 @@ for V in 0.2 0.3; do
   raced[I]=$ok # read back after the sweep
 done
 
-# The two bindings are one filesystem: what a turn writes through one, the other reads, in place.
-binding 0.3
-is "0.3 writes a file of three blocks" "$(fpost "$A" one-$run 'op=big&path=/big&n=600000')" '{"ok":600000}'
-binding 0.2
-is "0.2 sums it as the pattern has it" "$(fsum "$A" one-$run /big)" "$(patsum 600000)"
-is "0.2 writes 4 bytes across the end of its first block" \
+# The two routes are one filesystem: what a turn writes through one, the other reads, in place.
+by binding
+is "binding writes a file of three blocks" "$(fpost "$A" one-$run 'op=big&path=/big&n=600000')" '{"ok":600000}'
+by std
+is "std sums it as the pattern has it" "$(fsum "$A" one-$run /big)" "$(patsum 600000)"
+is "std writes 4 bytes across the end of its first block" \
   "$(fpost "$A" one-$run 'op=patch&path=/big&at=262142&data=XYZW')" '{"ok":null}'
-binding 0.3
-is "0.3 sums it with them" "$(fsum "$A" one-$run /big)" "$(patsum 600000 262142 XYZW)"
+by binding
+is "binding sums it with them" "$(fsum "$A" one-$run /big)" "$(patsum 600000 262142 XYZW)"
 
 echo "== outbox"
 # One to fail: it waits in outbox/ and is tried again by Scheduler, a minute on and then two. Checked at the end.
@@ -1076,15 +1076,15 @@ for k in $s1 $s2; do
   is "the stray $k is kept, being younger than the hour's grace" "$(awscode aws s3api head-object \
     --bucket "$TRIC_BUCKET" --key $k)" OK
 done
-for V in 0.2 0.3; do
-  binding $V
+for V in std binding; do
+  by $V
   is "$V: a key is read as it was" "$(value "$A" ${X}files-$run k)" '"kept"'
   is "$V: a file is read as it was" "$(fget "$A" ${X}files-$run 'op=read&path=/hello.txt')" '{"ok":"kept"}'
   is "$V: the file of blocks is as it was" "$(fsum "$A" ${X}big-$run /big)" "$(patsum 1000000 262142 XYZW 300000)"
   is "$V: and the count of the racing turns" "$(fget "$A" ${X}race-$run 'op=read&path=/n' | jq -r '.ok // "ERR"')" \
     "${raced[I]}"
 done
-is "the file both bindings wrote is as it was" "$(fsum "$A" one-$run /big)" "$(patsum 600000 262142 XYZW)"
+is "the file both routes wrote is as it was" "$(fsum "$A" one-$run /big)" "$(patsum 600000 262142 XYZW)"
 
 # Nothing else may ask for a sweep. Serve takes the router's `Forwarded: for=_sweep` for the ask, and only the cron
 # alias's {app, sweep: true}, which only Scheduler may invoke, makes the router write it (src/route.rs's `job`,
@@ -1120,8 +1120,8 @@ is "and they left no cursor" "$(cursors)" 0
 is "and nothing of this run's is changed" "$(mine)" "$before"
 
 echo "== trees (what the turns of the run asked of the bucket)"
-# Serve's debug log has a "tree" line for each turn and name, when the last of the turn's trees is gone (src/tree.rs's
-# Reader): the objects it fetched (`gets`: nodes and blobs, which the line doesn't tell apart, and `read` is their
+# Serve's debug log has a "tree" line for each turn and name, by the tree's prefix, when the last of the turn's trees is
+# gone (crates/tree's Reader): the objects it fetched (`gets`: nodes and blobs, which the line doesn't tell apart, and `read` is their
 # bytes), those the process's cache gave instead (`hits`), and those it uploaded (`puts`, nodes and blobs, so a commit's
 # bucket writes). The sweep's report is its "swept" line. Kept in tree-$run.json, with the sweep's own walks apart.
 if [ $debug != yes ]; then
@@ -1130,7 +1130,7 @@ else
   sleep 15
   raw=$(mktemp) swp=$(mktemp)
   aws logs filter-log-events --log-group-name /aws/lambda/tric-serve --start-time "$t_files" \
-    --filter-pattern '{ $.fields.message = "tree" && $.fields.app = "alpha" }' --output json >"$raw"
+    --filter-pattern '{ $.fields.message = "tree" }' --output json >"$raw"
   aws logs filter-log-events --log-group-name /aws/lambda/tric-serve --start-time "$t_files" \
     --filter-pattern '{ $.fields.message = "swept" && $.fields.app = "alpha" }' --output json >"$swp"
   if python3 -I - "$raw" "$swp" "$live/tree-$run.json" $run $swept_from $((swept_to + 2000)) <<'PY'
@@ -1146,9 +1146,11 @@ def lines(path):
             continue
 turns, walks = [], []
 for e, f in lines(tree):
-    if not str(f.get("name", "")).endswith("-" + run):
+    # The line names the tree by its prefix (src/tree.rs's `prefix`): alpha's names' are apps/alpha/values/<name>.
+    under, _, name = str(f.get("prefix", "")).rpartition("/")
+    if under != "apps/alpha/values" or not name.endswith("-" + run):
         continue
-    row = {"at": e["timestamp"], "stream": e["logStreamName"], "name": f["name"]}
+    row = {"at": e["timestamp"], "stream": e["logStreamName"], "name": name}
     row.update({k: f.get(k, 0) for k in KEYS})
     (walks if t0 <= row["at"] <= t1 else turns).append(row)
 turns.sort(key=lambda r: r["at"])
@@ -1181,8 +1183,8 @@ for prefix in ("", "p3-"):
     ok = ok and bool(big) and most["puts"] >= 4
 sys.exit(0 if ok else 1)
 PY
-  then pass "a commit of the file of four blocks uploads four objects at least, through each binding"
-  else fail "a commit of the file of four blocks uploads four objects at least, through each binding" \
+  then pass "a commit of the file of four blocks uploads four objects at least, through each route"
+  else fail "a commit of the file of four blocks uploads four objects at least, through each route" \
     "see $live/tree-$run.json"; fi
   rm -f "$raw" "$swp"
 fi
