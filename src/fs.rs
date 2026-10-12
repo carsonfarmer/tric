@@ -39,8 +39,8 @@ use crate::name::Turn;
 use crate::tree::Tree;
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
-pub use ops::{At, Errno, Kind, Res, Stat, Time};
-use ops::{Loc, PAGE, ROOT};
+pub use ops::{At, Errno, Kind, Mode, Res, Stat, Time};
+use ops::{PAGE, ROOT};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -349,46 +349,6 @@ impl Drop for Pin {
     }
 }
 
-/// How a path is opened.
-#[derive(Clone, Copy, Default)]
-pub struct Mode {
-    pub follow: bool,
-    pub create: bool,
-    pub directory: bool,
-    pub exclusive: bool,
-    pub truncate: bool,
-    pub read: bool,
-    pub write: bool,
-    /// For a directory: that it be opened to change its entries, which `get-flags` reports back.
-    pub mutate: bool,
-}
-
-/// What `open` found.
-enum Found {
-    Existing(u64, Kind),
-    Missing { parent: u64, name: String },
-}
-
-fn resolved(loc: Loc, m: &Mode) -> Res<Found> {
-    let changes = m.create || m.truncate || m.write;
-    match loc {
-        Loc::Dir(_) if m.create && m.exclusive => Err(Errno::Exist),
-        Loc::Dir(_) if changes => Err(Errno::IsDirectory),
-        Loc::Dir(ino) => Ok(Found::Existing(ino, Kind::Dir)),
-        Loc::Entry { at: None, .. } if !m.create => Err(Errno::NoEntry),
-        Loc::Entry { at: None, slash: true, .. } => Err(Errno::IsDirectory),
-        Loc::Entry { parent, name, at: None, .. } => Ok(Found::Missing { parent, name }),
-        Loc::Entry { at: Some(_), .. } if m.create && m.exclusive => Err(Errno::Exist),
-        Loc::Entry { at: Some(d), slash, .. } => match d.kind() {
-            Kind::Link => Err(if m.directory { Errno::NotDirectory } else { Errno::Loop }),
-            Kind::Dir if changes => Err(Errno::IsDirectory),
-            Kind::Dir => Ok(Found::Existing(d.ino(), Kind::Dir)),
-            Kind::File if m.directory || slash => Err(Errno::NotDirectory),
-            Kind::File => Ok(Found::Existing(d.ino(), Kind::File)),
-        },
-    }
-}
-
 /// A descriptor: an open file or directory, with the rights it was opened with. The paths it takes lead down from it,
 /// and never up: the preopened root is the top of what the guest can name.
 #[derive(Clone)]
@@ -447,23 +407,11 @@ impl Handle {
         }
         if m.create || m.truncate {
             let mut tree = edit(self.turn()).await?;
-            let (ino, kind) = match resolved(ops::locate(&tree, self.ino(), path, m.follow).await?, &m)? {
-                Found::Existing(ino, kind) => {
-                    if m.truncate && kind == Kind::File {
-                        ops::set_size(&mut tree, ino, 0).await?;
-                    }
-                    (ino, kind)
-                }
-                Found::Missing { parent, name } => {
-                    (ops::create(&mut tree, parent, &name, Kind::File, None).await?, Kind::File)
-                }
-            };
+            let (ino, kind) = ops::open_mut(&mut tree, self.ino(), path, &m).await?;
             return Ok(self.child(ino, kind, &m));
         }
         let tree = self.pin.view().await;
-        let Found::Existing(ino, kind) = resolved(ops::locate(&tree, self.ino(), path, m.follow).await?, &m)? else {
-            return Err(Errno::NoEntry);
-        };
+        let (ino, kind) = ops::open(&tree, self.ino(), path, &m).await?;
         // To write, or to change a directory's entries, is a right that a turn that has answered does not give.
         if (m.write || m.mutate) && !self.mutable() {
             return Err(Errno::ReadOnly);
@@ -540,13 +488,11 @@ impl Handle {
         ops::plan(&tree, self.ino(), offset, len).await
     }
 
-    /// Writes `data`, and returns how much of it: fewer than all if the name filled. A stream writes with
-    /// [`Handle::write_task`].
+    /// Writes `data` as a stream does, with [`Handle::write_task`], and returns how much of it: fewer than all if the
+    /// name filled.
     #[cfg(test)]
     pub async fn write(&self, at: At, data: &[u8]) -> Res<usize> {
-        self.writing()?;
-        let mut tree = edit(self.turn()).await?;
-        ops::write_at(&mut tree, self.ino(), at, data).await
+        self.write_task(at, Bytes::copy_from_slice(data))?.await.expect("the write finished")
     }
 
     /// Starts a write for a stream, which is admitted now and runs as a task of its own, which nothing cancels. It
@@ -842,7 +788,7 @@ mod tests {
         // Inserted as a damaged tree could hold it, to see that following one still leads nowhere.
         let sub = root.open("sub", dir()).await.unwrap();
         let mut tree = turn.tree().write().await;
-        ops::create(&mut tree, sub.ino(), "abs", Kind::Link, Some("/secret")).await.unwrap();
+        ops::tests::damaged_link(&mut tree, sub.ino(), "abs", "/secret").await;
         drop(tree);
         let before = contents(&turn, &root).await;
 
