@@ -351,7 +351,8 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
 - **A file's access time is set when it is made, and by `set-times`: never by a read.** Updating an access time on
   every read would turn a read into a write, and a snapshot can't write. An inode has a creation, a modification and
   a change time, in Unix nanoseconds, and a time that does not fit one is `overflow`. **`sync`, `sync-data` and
-  `advise` do nothing,** as durability is the commit's.
+  `advise` do nothing,** as durability is the commit's. For the same reason `open-at` with a `*-sync` flag is
+  `unsupported`: that a write be durable when it returns is a promise only a commit keeps.
 - **A file unlinked while open is as on Linux.** Its inode stays in the tree at a link count of 0, and is read and
   written through the descriptors that hold it, as Linux does. The last close in the turn removes it. The commit leaves
   out an inode still at 0, so it and its blocks are garbage, for the sweep. A descriptor that outlives the answer (a
@@ -776,7 +777,8 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   opened to change its entries, and a directory opened by `open-at` reports the flag if it was asked for, and only
   while the turn can still change anything. The turn decides what is allowed, not the descriptor: a change fails when
   the turn is a snapshot or has answered (`read-only`), and not otherwise, and asking for the flag from a turn that
-  has answered is `read-only` too. Enforcing it per descriptor would break wasi-libc, which asks for it only with
+  has answered is `read-only` too, as asking for `write` is, once the path is found: a path that is not there is
+  `no-entry` first. Enforcing it per descriptor would break wasi-libc, which asks for it only with
   `O_WRONLY`, which no directory is opened with, and still changes the entries of the directories it opens, and
   Wasmtime's own host reports it from the open mode without enforcing it. The `wasi-testsuite` checks the report
   (`open(".")` with no flags reads `READ`, not `READ | MUTATE_DIRECTORY`), which is how this was found. The descriptor

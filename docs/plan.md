@@ -376,9 +376,9 @@ system: `cli`, `clocks`, `random` and `sockets` `add_to_linker`.
 |---|---|---|
 | `crates/tree` (was `src/tree.rs`) | nodes, links, edits, spill, merge, scans, the cache, the mark | 1,080 (built) |
 | `src/name.rs`, `src/tric.rs`, `src/store.rs` | the turn over the tree; reading the head back | +70 (built) |
-| `src/fs.rs` | the core: descriptors, the gate, orphans, read-ahead, and the paths over the operations | 790 (built) |
-| `src/fs/ops.rs` | inodes, blocks, directories, rename, errors, on the tree | 850 (built) |
-| `src/fs/p3.rs` | 0.3: the descriptor's methods, preopens, `stream` and `future` | 650 (built) |
+| `src/fs.rs` | the core: descriptors, the gate, orphans, read-ahead, and the paths over the operations | 730 (built) |
+| `src/fs/ops.rs` | inodes, blocks, directories, rename, errors, on the tree | 820 (built) |
+| `src/fs/p3.rs` | 0.3: the descriptor's methods, preopens, `stream` and `future` | 630 (built) |
 | `src/sweep.rs`, and the trigger | versions, mark, listing, delete, cursor; schedule, router, serve | 480 (built) |
 
 The tree came to 1,080 lines, against an estimate of 800, because spilling, merging, the cache and the log are in it.
