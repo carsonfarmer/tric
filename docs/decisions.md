@@ -1125,9 +1125,10 @@ The tree is the crate `tric-tree`, in `crates/tree`, and the root is a workspace
   the head, as before. A `Root` is the old `Shape`, field for field and as JSON, and the node format is unchanged, so
   every head and node already written reads as it did.
 - **Errors are the crate's `Error`, which a caller matches.** `Full` (with `Full::Entries` or `Full::Data` and the
-  limit), `TooLarge`, `Corrupt`, `Store` (an `object_store` error) and `Poisoned`; it is a `std::error::Error`, so
-  `?` makes it a `wasmtime::Error` in tric. tric's two `fail`s, of keys and of files, match `Full` where they used to
-  downcast, and tell the guest the name's limit in the words they used before.
+  limit), `TooLarge`, `Corrupt`, `Store` (an `object_store` error) and `Poisoned`; it is a `std::error::Error`, so `?`
+  makes it a `wasmtime::Error` in tric. `Full` is only what a write would have gone over, and not an error of its own:
+  the `Error` that holds it says so. tric's two `fail`s, of keys and of files, match `Full` where they used to downcast,
+  and tell the guest the name's limit in the words they used before.
 - **The limits are one `Config`, with defaults.** The node (64 KiB), inline (4 KiB), budget (8 MiB) and blob (1 MiB)
   defaults are the old constants. Entries and data are unbounded by default, as they are policy: tric's `tree::config()`
   sets 4 Mi and 16 GiB (`ENTRIES_MAX`, `DATA_MAX`), and `DATA_MAX` and the file system's other limits stay in tric. How

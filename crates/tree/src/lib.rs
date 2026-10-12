@@ -141,21 +141,11 @@ pub enum Full {
     Data(u64),
 }
 
-impl fmt::Display for Full {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Entries(n) => write!(f, "a tree holds {n} keys or fewer"),
-            Self::Data(n) => write!(f, "a tree holds {n} bytes of values or fewer"),
-        }
-    }
-}
-
-impl std::error::Error for Full {}
-
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Full(full) => full.fmt(f),
+            Self::Full(Full::Entries(n)) => write!(f, "a tree holds {n} keys or fewer"),
+            Self::Full(Full::Data(n)) => write!(f, "a tree holds {n} bytes of values or fewer"),
             Self::TooLarge(why) | Self::Corrupt(why) => f.write_str(why),
             Self::Store(e) => e.fmt(f),
             Self::Poisoned => f.write_str("an earlier change to the tree failed"),
@@ -1303,11 +1293,11 @@ impl Tree {
     /// Adds to `seen` the ids of the objects the tree reaches below its root, as [`number`] gives them, its nodes and
     /// its values that are objects alike, and gives how many nodes it read, or `None` if that would be over `max`.
     ///
-    /// The nodes are read level by level, [`IN_FLIGHT`] at once, each checked as any read is, and none is kept
-    /// in the cache. An id already in `seen` is passed over with all below it, as what is below an object never
-    /// changes, so one set passed to the marks of several roots has each object read once. A node that is missing or
-    /// not what its link says is an error, so what is marked is of a tree that was whole. After `None` or an error,
-    /// `seen` holds part of the tree, and is not to be used.
+    /// The nodes are read level by level, [`IN_FLIGHT`] at once, each checked as any read is, and none is kept in the
+    /// cache. An id already in `seen` is passed over with all below it, as what is below an object never changes, so
+    /// one set passed to the marks of several roots has each object read once. A node that is missing or not what its
+    /// link says is an error, so what is marked is of a tree that was whole. After `None` or an error, `seen` holds
+    /// part of the tree, and is not to be used.
     pub async fn mark(&self, seen: &mut HashSet<u128>, max: usize) -> Result<Option<usize>> {
         let (mut next, mut nodes) = (vec![], 0);
         refs(&self.root, seen, &mut next)?;
