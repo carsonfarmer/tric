@@ -276,8 +276,8 @@ struct State {
     head: Head,                  // as read, or as this turn's claim wrote it
     base: Option<UpdateVersion>, // the head's version, if there is a head
     answered: bool,
-    claim: Option<String>, // this turn's, once taken
-    doomed: bool,          // a claim failed, so the commit will
+    claimed: bool, // once this turn's claim is taken
+    doomed: bool,  // a claim failed, so the commit will
     held: Vec<Held>,
     held_size: usize,
 }
@@ -532,8 +532,8 @@ impl Turn {
             let _one = turn.claiming.lock().await;
             let (mut head, base) = {
                 let s = turn.state();
-                if s.claim.is_some() || s.doomed || s.answered {
-                    return s.claim.is_some();
+                if s.claimed || s.doomed || s.answered {
+                    return s.claimed;
                 }
                 (s.head.clone(), s.base.clone())
             };
@@ -551,7 +551,7 @@ impl Turn {
             let mut s = turn.state();
             match landed {
                 Some(version) => {
-                    (s.head.claim, s.base, s.claim) = (head.claim, Some(version), Some(id));
+                    (s.head.claim, s.base, s.claimed) = (head.claim, Some(version), true);
                     true
                 }
                 None => {
@@ -721,7 +721,7 @@ impl Turn {
             let s = &mut *self.state();
             s.answered = true;
             let held = std::mem::take(&mut s.held);
-            (s.head.clone(), s.base.clone(), held, s.claim.is_some(), s.doomed)
+            (s.head.clone(), s.base.clone(), held, s.claimed, s.doomed)
         };
         self.fs.drain().await; // so the file system's changes that were admitted land first
         let mut tree = self.tree.write().await; // after the writes that were in flight
@@ -767,7 +767,8 @@ impl Turn {
                 };
                 let bytes = Bytes::from(serde_json::to_vec(&event)?);
                 head.pending.insert(commit.clone(), Pending { digest: store::hash(&bytes), at: now });
-                ensure!(serde_json::to_vec(&head)?.len() <= HEAD_MAX, Failed::TooLarge); // or the event would be sent in vain
+                // Before the event is handed over, or it would be sent in vain.
+                ensure!(serde_json::to_vec(&head)?.len() <= HEAD_MAX, Failed::TooLarge);
                 sink(bytes).await?;
             }
             Ok::<_, wasmtime::Error>(kept)
@@ -824,12 +825,12 @@ impl Turn {
             let s = &mut *self.state();
             s.answered = true; // so the claim timer takes no claim after
             s.held.clear();
-            (s.head.clone(), s.base.clone(), s.claim.take())
+            (s.head.clone(), s.base.clone(), std::mem::take(&mut s.claimed))
         };
         self.fs.drain().await;
         self.tree.write().await.reset();
         self.settled.send_replace(Some(false));
-        if claimed.is_some() {
+        if claimed {
             head.claim = None;
             _ = put(&self.store, &self.path, &mut head, base).await; // if it fails, the claim expires
         }
@@ -1329,7 +1330,7 @@ mod tests {
         let (store, lossy) = based().await;
         lossy.plan(Put::Lands, &[]);
         let turn = writes(&store, true, "k").await.expect("the claim is the turn's, not another's");
-        assert!(turn.state().claim.is_some() && !turn.doomed());
+        assert!(turn.state().claimed && !turn.doomed());
         assert_eq!(commit(&turn).await.unwrap(), Committed::Done(etag_now(&store).await));
         assert!(read(&store, &path("a", "n")).await.unwrap().unwrap().0.claim.is_none());
     }
@@ -1340,7 +1341,7 @@ mod tests {
         let at = path("a", "n");
         let (before, base) = store.get(&at, None, HEAD_MAX as u64).await.unwrap().unwrap();
         let turn = writes(&store, true, "k").await.unwrap();
-        assert!(turn.state().claim.is_some());
+        assert!(turn.state().claimed);
         turn.discard().await;
         let (after, version) = store.get(&at, None, HEAD_MAX as u64).await.unwrap().unwrap();
         let (was, is): (Head, Head) =
