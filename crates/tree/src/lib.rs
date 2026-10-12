@@ -1326,13 +1326,6 @@ impl Tree {
         Ok(Some(nodes))
     }
 
-    /// The ids of the objects the tree reaches below its root: [`Tree::mark`] from none, or `None` if it would read
-    /// over `max` nodes.
-    pub async fn reachable(&self, max: usize) -> Result<Option<HashSet<u128>>> {
-        let mut seen = HashSet::new();
-        Ok(self.mark(&mut seen, max).await?.map(|_| seen))
-    }
-
     /// How often the tree split, merged and gave up a level of its root.
     #[cfg(test)]
     fn rebalanced(&self) -> (u64, u64, u64) {
@@ -1417,6 +1410,13 @@ mod tests {
             let n = if self.below(10) < 6 { self.below(9) } else { 9 + self.below(92) };
             (0..n).map(|_| self.below(256) as u8).collect()
         }
+    }
+
+    /// The ids of the objects `tree` reaches below its root: a mark from none, or `None` if it would read over `max`
+    /// nodes.
+    async fn reachable(tree: &Tree, max: usize) -> Result<Option<HashSet<u128>>> {
+        let mut seen = HashSet::new();
+        Ok(tree.mark(&mut seen, max).await?.map(|_| seen))
     }
 
     async fn set(tree: &mut Tree, key: &str, value: &[u8]) {
@@ -1616,7 +1616,7 @@ mod tests {
                 assert_eq!(text(&fresh, k).await, v.as_slice(), "{k}");
             }
             assert_eq!(fresh.scan("k/", None, usize::MAX).await.unwrap(), model.keys().cloned().collect::<Vec<_>>());
-            assert_eq!(fresh.reachable(usize::MAX).await.unwrap(), Some(numbers(&audit)), "round {round}");
+            assert_eq!(reachable(&fresh, usize::MAX).await.unwrap(), Some(numbers(&audit)), "round {round}");
             // Nothing was deleted, so nothing the root reaches is lost; what it does not reach is for a collector.
             let stored = stored(&store).await;
             let lost: Vec<_> = audit.ids.difference(&stored).collect();
@@ -1676,7 +1676,7 @@ mod tests {
         // Every node below the root is read once, a few at once and no more than `IN_FLIGHT`, and none is kept.
         counts.gets.store(0, SeqCst);
         counts.delay.store(5, SeqCst);
-        assert_eq!(tree.reachable(usize::MAX).await.unwrap(), Some(all.clone()));
+        assert_eq!(reachable(&tree, usize::MAX).await.unwrap(), Some(all.clone()));
         assert_eq!(counts.gets.load(SeqCst), all.len());
         let peak = counts.peak.load(SeqCst);
         assert!((2..=IN_FLIGHT).contains(&peak), "{peak} at once");
@@ -1686,11 +1686,11 @@ mod tests {
         assert_eq!(counts.gets.load(SeqCst), audit.depth - 1, "the walk left nothing in the cache");
 
         // Over `max` nodes it is not read at all past the level that went over, and says so.
-        assert_eq!(tree.reachable(all.len()).await.unwrap(), Some(all.clone()));
+        assert_eq!(reachable(&tree, all.len()).await.unwrap(), Some(all.clone()));
         counts.gets.store(0, SeqCst);
-        assert_eq!(tree.reachable(all.len() - 1).await.unwrap(), None);
+        assert_eq!(reachable(&tree, all.len() - 1).await.unwrap(), None);
         assert!(counts.gets.load(SeqCst) < all.len());
-        assert_eq!(tree.reachable(0).await.unwrap(), None);
+        assert_eq!(reachable(&tree, 0).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -1708,7 +1708,7 @@ mod tests {
                 _ => drop(store.inner.put(&path, Bytes::new().into()).await.unwrap()),
             }
             store.cache = Arc::default(); // a node in the cache was whole when it was put there
-            let err = at(&store, &root).reachable(usize::MAX).await.unwrap_err();
+            let err = reachable(&at(&store, &root), usize::MAX).await.unwrap_err();
             assert!(matches!(err, Error::Corrupt(_)), "a {damage} node is no tree: {err}");
         }
     }
@@ -1722,7 +1722,7 @@ mod tests {
         let root = commit(&mut tree).await;
         let audit = audit(&store, &root).await;
         assert_eq!(audit.ids.len(), 1, "a root of two keys has no node below it, and one value is an object");
-        assert_eq!(at(&store, &root).reachable(usize::MAX).await.unwrap(), Some(numbers(&audit)));
+        assert_eq!(reachable(&at(&store, &root), usize::MAX).await.unwrap(), Some(numbers(&audit)));
         assert_eq!(stored(&store).await, audit.ids, "the object is all there is");
     }
 

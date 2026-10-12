@@ -1152,7 +1152,8 @@ The tree is the crate `tric-tree`, in `crates/tree`, and the root is a workspace
   the only collector: its survey, its grace and its deletes stay in tric. `Tree::mark` walks every object a root
   reaches, its nodes and the values that are objects, each node checked as any read is, and at most `max` nodes; it
   adds to a set it is given, and passes over what the set holds, so the marks of several roots share one set and read
-  each object once. `Tree::reachable` is a mark from an empty set.
+  each object once. A mark from an empty set, `Tree::reachable`, was public too, and only the crate's tests called it,
+  so it is one of their helpers now.
 - **One tree type, and a walk of its own for the mark.** A snapshot is a tree that is not written, and `Tree::fork`
   is the copy that outlives a turn, so a snapshot type would only repeat the reads. The mark does not share the
   scans' walk: it reads level by level, unordered and up to `IN_FLIGHT` at once, and keeps nothing in the cache,
