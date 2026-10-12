@@ -22,7 +22,7 @@ pub const ROOT: u64 = 1;
 /// The bytes of a file one key holds, at most.
 pub const BLOCK: u64 = 256 << 10;
 /// The most bytes a file is: all a name may hold.
-pub const FILE_MAX: u64 = DATA_MAX;
+const FILE_MAX: u64 = DATA_MAX;
 const NAME_MAX: usize = 255;
 const PATH_MAX: usize = 4096;
 const TARGET_MAX: usize = 1024;
@@ -70,7 +70,7 @@ pub type Res<T> = Result<T, Errno>;
 
 /// What the guest is told of a tree error: that the name is full, which it can act on, and else only that the i/o
 /// failed, as the rest is the host's to know.
-pub fn fail(e: tree::Error) -> Errno {
+fn fail(e: tree::Error) -> Errno {
     if let tree::Error::Full(_) = e {
         return Errno::InsufficientSpace;
     }
@@ -104,7 +104,7 @@ fn is_zero(n: &u64) -> bool {
 /// An inode. Times are Unix nanoseconds; `atime` is set, never by a read.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Inode {
+struct Inode {
     k: Kind,
     /// The links to it: the entries that name it, which for a directory is 1. A file that is open and unlinked is at 0
     /// until it is closed.
@@ -214,25 +214,28 @@ fn dir_prefix(dir: u64) -> String {
 
 /// The JSON at `key`, if there is any.
 async fn load<T: DeserializeOwned>(tree: &Tree, key: &str) -> Res<Option<T>> {
-    let Some(item) = tree.get(key).await.map_err(fail)? else { return Ok(None) };
-    let bytes = tree.value(&item).await.map_err(fail)?;
-    serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+    match tree.get(key).await.map_err(fail)? {
+        Some(item) => decode(tree, key, &item).await.map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The JSON of `item`, the value at `key`. One that does not decode is a damaged tree, for the host to explain.
+async fn decode<T: DeserializeOwned>(tree: &Tree, key: &str, item: &Item) -> Res<T> {
+    let bytes = tree.value(item).await.map_err(fail)?;
+    serde_json::from_slice(&bytes).map_err(|e| {
         tracing::warn!("name: {key}: {e}");
         Errno::Io
     })
 }
 
-fn encode<T: Serialize>(value: &T) -> Res<Bytes> {
-    let json = serde_json::to_vec(value).map_err(|e| {
-        tracing::warn!("name: {e}");
-        Errno::Io
-    })?;
-    Ok(json.into())
+fn encode<T: Serialize>(value: &T) -> Bytes {
+    serde_json::to_vec(value).expect("an inode or an entry is JSON").into()
 }
 
 /// The inode `ino`. One that a name or a descriptor leads to and that is not there is the host's to explain: the
 /// turn was discarded, or the tree is damaged.
-pub async fn fetch(tree: &Tree, ino: u64) -> Res<Inode> {
+async fn fetch(tree: &Tree, ino: u64) -> Res<Inode> {
     match load(tree, &inode_key(ino)).await? {
         Some(inode) => Ok(inode),
         None if ino == ROOT => Ok(Inode::root()),
@@ -410,10 +413,8 @@ impl<'a> Tx<'a> {
         self.edits.insert(key, Some(value));
     }
 
-    fn put_dirent(&mut self, dir: u64, name: &str, at: Dirent) -> Res<()> {
-        let value = encode(&at)?;
-        self.put(dirent_key(dir, name), value);
-        Ok(())
+    fn put_dirent(&mut self, dir: u64, name: &str, at: Dirent) {
+        self.put(dirent_key(dir, name), encode(&at));
     }
 
     fn remove_dirent(&mut self, dir: u64, name: &str) {
@@ -424,7 +425,7 @@ impl<'a> Tx<'a> {
     async fn finish(self) -> Res<()> {
         let Self { tree, inodes, mut edits, .. } = self;
         for (ino, slot) in inodes.into_iter().filter(|(_, s)| s.dirty) {
-            edits.insert(inode_key(ino), Some(encode(&slot.inode)?));
+            edits.insert(inode_key(ino), Some(encode(&slot.inode)));
         }
         if edits.is_empty() {
             return Ok(());
@@ -477,7 +478,7 @@ pub async fn create(tree: &mut Tree, parent: u64, name: &str, kind: Kind, target
         _ => {}
     }
     tx.add(ino, inode);
-    tx.put_dirent(parent, name, Dirent { i: ino, k: kind })?;
+    tx.put_dirent(parent, name, Dirent { i: ino, k: kind });
     tx.touch(parent).await?;
     tx.finish().await?;
     Ok(ino)
@@ -753,7 +754,7 @@ pub async fn rename(tree: &mut Tree, from: (u64, &str), to: (u64, &str)) -> Res<
     }
     let mut tx = Tx::new(tree);
     tx.remove_dirent(from_dir, &from);
-    tx.put_dirent(to_dir, &to, src)?;
+    tx.put_dirent(to_dir, &to, src);
     let gone = match dst {
         Some(d) => tx.unlink(d.i).await?,
         None => None,
@@ -784,7 +785,7 @@ pub async fn link(tree: &mut Tree, from: (u64, &str), to: (u64, &str)) -> Res<()
     let inode = tx.edit(ino).await?;
     inode.n = inode.n.checked_add(1).ok_or(Errno::TooManyLinks)?;
     inode.c = now;
-    tx.put_dirent(parent, &name, Dirent { i: ino, k: kind })?;
+    tx.put_dirent(parent, &name, Dirent { i: ino, k: kind });
     tx.touch(parent).await?;
     tx.finish().await
 }
@@ -809,11 +810,7 @@ pub async fn readdir(tree: &Tree, dir: u64, after: Option<&str>, limit: usize) -
     let after = after.map(|n| format!("{prefix}{n}"));
     let mut out = vec![];
     for (key, item) in tree.entries(&prefix, after.as_deref(), limit).await.map_err(fail)? {
-        let bytes = tree.value(&item).await.map_err(fail)?;
-        let at: Dirent = serde_json::from_slice(&bytes).map_err(|e| {
-            tracing::warn!("name: {key}: {e}");
-            Errno::Io
-        })?;
+        let at: Dirent = decode(tree, &key, &item).await?;
         out.push((key[prefix.len()..].to_owned(), at.k));
     }
     Ok(out)
