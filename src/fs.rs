@@ -76,12 +76,6 @@ impl From<ResourceTableError> for Fault {
     }
 }
 
-impl From<wasmtime::Error> for Fault {
-    fn from(e: wasmtime::Error) -> Self {
-        Self::Trap(e)
-    }
-}
-
 impl Host {
     /// The descriptor, which is cloned out of the table so that nothing of the table is held across an await.
     fn fd(&self, fd: &Resource<Handle>) -> Result<Handle, Fault> {
@@ -692,9 +686,9 @@ impl Entries {
 
 /// A task that is aborted when it is dropped: a read, which holds nothing of the turn's but the tree, shared, while it
 /// plans, and which closing the stream it is for cancels.
-struct Task<T>(JoinHandle<T>);
+struct Task(JoinHandle<()>);
 
-impl<T> Drop for Task<T> {
+impl Drop for Task {
     fn drop(&mut self) {
         self.0.abort();
     }
@@ -711,7 +705,7 @@ pub struct Ahead {
     end: Option<u64>,
     /// Where the blocks that were asked for end.
     asked: u64,
-    task: Option<Task<()>>,
+    task: Option<Task>,
 }
 
 impl Ahead {
