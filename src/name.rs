@@ -1097,7 +1097,7 @@ mod tests {
     /// A versioned store through a new `Lossy`.
     fn fresh() -> (Store, Arc<Lossy>) {
         let lossy = Arc::new(Lossy::default());
-        (Store { inner: lossy.clone(), versioned: true, cache: Arc::default() }, lossy)
+        (Store { inner: lossy.clone(), once: None, versioned: true, cache: Arc::default() }, lossy)
     }
 
     /// A versioned store through a `Lossy`, whose name `n` has one commit, of a value at `s`: the base of the turns.

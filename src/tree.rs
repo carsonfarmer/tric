@@ -40,6 +40,6 @@ pub(crate) mod counting {
     /// A versioned store in memory that counts what is asked of it, as [`tric_tree::testing::counting`] does.
     pub fn counting() -> (Store, Arc<Counts>) {
         let (inner, counts) = tric_tree::testing::counting();
-        (Store { inner, versioned: true, cache: Arc::default() }, counts)
+        (Store { inner, once: None, versioned: true, cache: Arc::default() }, counts)
     }
 }
