@@ -123,6 +123,9 @@ reason.
 - **The package is arm64 only,** and `docker compose run --rm package` refuses to build it anywhere else. Graviton
   costs less, and no cross-compiling means no toolchain to keep. The toolchain image is Amazon Linux 2023, the
   runtime's own OS, so the binary links the glibc that Lambda has.
+- **The install's names begin with `tric`, and no variable changes that.** IAM's role names and CloudFront's function
+  names are the account's, in every region, so an account holds one install, and a second install is a second
+  account. The bucket's name, which S3 shares among all accounts, is `tric-` and a suffix that OpenTofu makes up.
 - **The router invokes serve with `InvokeWithResponseStream`.** It sends a function-URL event (payload format 2.0)
   carrying the tenant id. The answer is a JSON prelude, then 8 NULs, then the body. Failures come from
   `InvokeComplete`'s error code.

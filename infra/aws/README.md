@@ -75,7 +75,7 @@ There are three things to know:
 ## Install
 
 You need:
-- an AWS account;
+- an AWS account with no other install of tric, as every name begins with `tric`;
 - a domain whose hosted zone is in Route 53;
 - Docker;
 - an arm64 host (such as Apple silicon) to build the package, which runs on Graviton.
