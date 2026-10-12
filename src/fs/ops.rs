@@ -339,7 +339,7 @@ pub async fn lookup(tree: &Tree, start: u64, path: &str, follow: bool) -> Res<(u
 
 /// An entry that a path leads to, or may lead to, as `locate` finds it without `follow`; `dir` is the error for a path
 /// that ends in a directory itself.
-pub async fn entry(tree: &Tree, start: u64, path: &str, dir: Errno) -> Res<(u64, String, Option<Dirent>, bool)> {
+async fn entry(tree: &Tree, start: u64, path: &str, dir: Errno) -> Res<(u64, String, Option<Dirent>, bool)> {
     match locate(tree, start, path, false).await? {
         Loc::Dir(_) => Err(dir),
         Loc::Entry { parent, name, at, slash } => Ok((parent, name, at, slash)),
@@ -433,15 +433,6 @@ impl<'a> Tx<'a> {
     }
 }
 
-fn check_name(name: &str) -> Res<()> {
-    match name {
-        "" | "." | ".." => Err(Errno::Invalid),
-        n if n.len() > NAME_MAX => Err(Errno::NameTooLong),
-        n if n.contains(['/', '\0']) => Err(Errno::Invalid),
-        _ => Ok(()),
-    }
-}
-
 /// A new inode number: the one after the last given out, which the tree keeps with its root, and after the root's.
 fn alloc(tree: &mut Tree) -> u64 {
     let ino = tree.sequence().max(ROOT) + 1;
@@ -449,20 +440,33 @@ fn alloc(tree: &mut Tree) -> u64 {
     ino
 }
 
-/// A new file, directory or symlink (with its `target`) named `name` in the directory `parent`, which must not have
-/// one. Returns its inode.
+/// Whether the directory `dir` has no entries.
+async fn empty(tree: &Tree, dir: u64) -> Res<bool> {
+    Ok(tree.scan(&dir_prefix(dir), None, 1).await.map_err(fail)?.is_empty())
+}
+
+/// That the directory `dir` can take a new entry: one that is open can be removed, and nothing is made in it then.
+async fn live(tree: &Tree, dir: u64) -> Res<()> {
+    match fetch(tree, dir).await?.n {
+        0 => Err(Errno::NoEntry),
+        _ => Ok(()),
+    }
+}
+
+/// Where a new entry at `path` goes: a directory, and a name in it that is free. Only a new directory's path may end
+/// in a slash, as Linux has it: any other that does names a directory that is not there.
+async fn vacant(tree: &Tree, start: u64, path: &str, dir: bool) -> Res<(u64, String)> {
+    match locate(tree, start, path, false).await? {
+        Loc::Entry { at: None, slash: true, .. } if !dir => Err(Errno::NoEntry),
+        Loc::Entry { parent, name, at: None, .. } => Ok((parent, name)),
+        _ => Err(Errno::Exist),
+    }
+}
+
+/// A new file, directory or symlink (with its `target`) named `name` in the directory `parent`. The name is one that
+/// `locate` gave, and found free, with the tree held as it is now. Returns its inode.
 pub async fn create(tree: &mut Tree, parent: u64, name: &str, kind: Kind, target: Option<&str>) -> Res<u64> {
-    check_name(name)?;
-    let dir = fetch(tree, parent).await?;
-    if dir.k != Kind::Dir {
-        return Err(Errno::NotDirectory);
-    }
-    if dir.n == 0 {
-        return Err(Errno::NoEntry); // it was removed while open
-    }
-    if dirent(tree, parent, name).await?.is_some() {
-        return Err(Errno::Exist);
-    }
+    live(tree, parent).await?;
     let ino = alloc(tree);
     let mut tx = Tx::new(tree);
     let now = tx.now;
@@ -479,9 +483,17 @@ pub async fn create(tree: &mut Tree, parent: u64, name: &str, kind: Kind, target
     Ok(ino)
 }
 
-/// A symlink to `target`, named `name` in `parent`. The target is relative, as an absolute path leads out of the
-/// directory the guest was given (the WIT says `not-permitted`): `locate` refuses one it finds all the same.
-pub async fn symlink(tree: &mut Tree, parent: u64, name: &str, target: &str) -> Res<u64> {
+/// A new directory at `path`.
+pub async fn mkdir(tree: &mut Tree, start: u64, path: &str) -> Res<()> {
+    let (parent, name) = vacant(tree, start, path, true).await?;
+    create(tree, parent, &name, Kind::Dir, None).await?;
+    Ok(())
+}
+
+/// A symlink to `target` at `path`. The target is relative, as an absolute path leads out of the directory the guest
+/// was given (the WIT says `not-permitted`): `locate` refuses one it finds all the same.
+pub async fn symlink(tree: &mut Tree, start: u64, path: &str, target: &str) -> Res<()> {
+    let (parent, name) = vacant(tree, start, path, false).await?;
     if target.len() > TARGET_MAX {
         return Err(Errno::NameTooLong);
     }
@@ -491,13 +503,14 @@ pub async fn symlink(tree: &mut Tree, parent: u64, name: &str, target: &str) -> 
     if target.starts_with('/') {
         return Err(Errno::NotPermitted);
     }
-    create(tree, parent, name, Kind::Link, Some(target)).await
+    create(tree, parent, &name, Kind::Link, Some(target)).await?;
+    Ok(())
 }
 
-pub async fn readlink(tree: &Tree, ino: u64) -> Res<String> {
-    let i = fetch(tree, ino).await?;
-    match i.k {
-        Kind::Link => Ok(i.t.unwrap_or_default()),
+/// What the symlink at `path` says.
+pub async fn readlink(tree: &Tree, start: u64, path: &str) -> Res<String> {
+    match lookup(tree, start, path, false).await? {
+        (ino, Kind::Link) => Ok(fetch(tree, ino).await?.t.unwrap_or_default()),
         _ => Err(Errno::Invalid),
     }
 }
@@ -681,55 +694,40 @@ pub async fn purge(tree: &mut Tree, ino: u64) -> Res<()> {
     tree.write(vec![(inode_key(ino), None)]).await.map_err(fail)
 }
 
-/// Removes the file or symlink named `name` in `parent`. Returns its inode if that was its last link.
-pub async fn unlink(tree: &mut Tree, parent: u64, name: &str) -> Res<Option<u64>> {
-    let at = dirent(tree, parent, name).await?.ok_or(Errno::NoEntry)?;
-    if at.k == Kind::Dir {
-        return Err(Errno::IsDirectory);
+/// Removes the entry at `path`: an empty directory if `dir` is set, and a file or symlink if it is not. Returns its
+/// inode if that was its last link, which for a directory it always is.
+pub async fn remove(tree: &mut Tree, start: u64, path: &str, dir: bool) -> Res<Option<u64>> {
+    let itself = if dir { Errno::Invalid } else { Errno::IsDirectory };
+    let (parent, name, at, slash) = entry(tree, start, path, itself).await?;
+    let at = at.ok_or(Errno::NoEntry)?;
+    match at.k {
+        Kind::Dir if !dir => return Err(Errno::IsDirectory),
+        Kind::Dir => {
+            if !empty(tree, at.i).await? {
+                return Err(Errno::NotEmpty);
+            }
+        }
+        _ if dir || slash => return Err(Errno::NotDirectory),
+        _ => {}
     }
     let mut tx = Tx::new(tree);
-    tx.remove_dirent(parent, name);
+    tx.remove_dirent(parent, &name);
     let gone = tx.unlink(at.i).await?;
     tx.touch(parent).await?;
     tx.finish().await?;
     Ok(gone)
 }
 
-/// Removes the empty directory named `name` in `parent`. Returns its inode, which has no links now.
-pub async fn rmdir(tree: &mut Tree, parent: u64, name: &str) -> Res<Option<u64>> {
-    let at = dirent(tree, parent, name).await?.ok_or(Errno::NoEntry)?;
-    if at.k != Kind::Dir {
+/// Moves the entry at `from` to `to`, each a path from a directory, over what is there if it can be. A trailing slash
+/// on either asks for a directory. Returns the inode that it replaced, if that had no more links.
+pub async fn rename(tree: &mut Tree, from: (u64, &str), to: (u64, &str)) -> Res<Option<u64>> {
+    let (from_dir, from, src, from_slash) = entry(tree, from.0, from.1, Errno::Busy).await?;
+    let (to_dir, to, dst, to_slash) = entry(tree, to.0, to.1, Errno::Busy).await?;
+    let src = src.ok_or(Errno::NoEntry)?;
+    if src.k != Kind::Dir && (from_slash || to_slash) {
         return Err(Errno::NotDirectory);
     }
-    if !tree.scan(&dir_prefix(at.i), None, 1).await.map_err(fail)?.is_empty() {
-        return Err(Errno::NotEmpty);
-    }
-    let mut tx = Tx::new(tree);
-    tx.remove_dirent(parent, name);
-    let gone = tx.unlink(at.i).await?;
-    tx.touch(parent).await?;
-    tx.finish().await?;
-    Ok(gone)
-}
-
-/// Moves `from` in `from_dir` to `to` in `to_dir`, over what is there if it can be. A trailing slash on either asks
-/// for a directory. Returns the inode that it replaced, if that had no more links.
-pub async fn rename(
-    tree: &mut Tree,
-    (from_dir, from): (u64, &str),
-    (to_dir, to): (u64, &str),
-    slashes: (bool, bool),
-) -> Res<Option<u64>> {
-    check_name(to)?;
-    let src = dirent(tree, from_dir, from).await?.ok_or(Errno::NoEntry)?;
-    let dst = dirent(tree, to_dir, to).await?;
-    if src.k != Kind::Dir && (slashes.0 || slashes.1) {
-        return Err(Errno::NotDirectory);
-    }
-    let target = fetch(tree, to_dir).await?;
-    if target.n == 0 {
-        return Err(Errno::NoEntry); // the directory was removed while open
-    }
+    live(tree, to_dir).await?;
     if dst.is_some_and(|d| d.i == src.i) {
         return Ok(None); // the same file under two names: nothing to do
     }
@@ -745,7 +743,7 @@ pub async fn rename(
     }
     match (src.k, dst) {
         (Kind::Dir, Some(Dirent { k: Kind::Dir, i })) => {
-            if !tree.scan(&dir_prefix(i), None, 1).await.map_err(fail)?.is_empty() {
+            if !empty(tree, i).await? {
                 return Err(Errno::NotEmpty);
             }
         }
@@ -754,8 +752,8 @@ pub async fn rename(
         _ => {}
     }
     let mut tx = Tx::new(tree);
-    tx.remove_dirent(from_dir, from);
-    tx.put_dirent(to_dir, to, src)?;
+    tx.remove_dirent(from_dir, &from);
+    tx.put_dirent(to_dir, &to, src)?;
     let gone = match dst {
         Some(d) => tx.unlink(d.i).await?,
         None => None,
@@ -772,26 +770,21 @@ pub async fn rename(
     Ok(gone)
 }
 
-/// Another name, `name` in `parent`, for the file or symlink `ino`.
-pub async fn link(tree: &mut Tree, ino: u64, parent: u64, name: &str) -> Res<()> {
-    check_name(name)?;
-    let target = fetch(tree, parent).await?;
-    if target.n == 0 {
-        return Err(Errno::NoEntry);
-    }
-    if dirent(tree, parent, name).await?.is_some() {
-        return Err(Errno::Exist);
+/// Makes `to` another name for the file or symlink at `from`, which is not followed if it is a symlink: each a path
+/// from a directory.
+pub async fn link(tree: &mut Tree, from: (u64, &str), to: (u64, &str)) -> Res<()> {
+    let (ino, kind) = lookup(tree, from.0, from.1, false).await?;
+    let (parent, name) = vacant(tree, to.0, to.1, false).await?;
+    live(tree, parent).await?;
+    if kind == Kind::Dir {
+        return Err(Errno::NotPermitted);
     }
     let mut tx = Tx::new(tree);
     let now = tx.now;
     let inode = tx.edit(ino).await?;
-    if inode.k == Kind::Dir {
-        return Err(Errno::NotPermitted);
-    }
     inode.n = inode.n.checked_add(1).ok_or(Errno::TooManyLinks)?;
     inode.c = now;
-    let kind = inode.k;
-    tx.put_dirent(parent, name, Dirent { i: ino, k: kind })?;
+    tx.put_dirent(parent, &name, Dirent { i: ino, k: kind })?;
     tx.touch(parent).await?;
     tx.finish().await
 }
@@ -910,6 +903,7 @@ mod tests {
         create(&mut t, ROOT, "out", Kind::File, None).await.unwrap();
         symlink(&mut t, sub, "up", "../out").await.unwrap();
         assert_eq!(symlink(&mut t, sub, "abs", "/out").await, Err(Errno::NotPermitted), "refused when made");
+        assert_eq!(readlink(&t, sub, "up").await.as_deref(), Ok("../out"));
         // Inserted as a damaged tree could hold it, to see that following one still leads nowhere.
         create(&mut t, sub, "abs", Kind::Link, Some("/out")).await.unwrap();
         symlink(&mut t, sub, "high", "../../out").await.unwrap();
@@ -954,29 +948,38 @@ mod tests {
     #[tokio::test]
     async fn directories_and_names() {
         let mut t = tree(tree::config());
-        let a = create(&mut t, ROOT, "a", Kind::Dir, None).await.unwrap();
-        let b = create(&mut t, a, "b", Kind::Dir, None).await.unwrap();
+        mkdir(&mut t, ROOT, "a").await.unwrap();
+        mkdir(&mut t, ROOT, "a/b/").await.unwrap();
+        let (a, b) = (lookup(&t, ROOT, "a", false).await.unwrap().0, lookup(&t, ROOT, "a/b", false).await.unwrap().0);
         let f = create(&mut t, b, "f", Kind::File, None).await.unwrap();
-        assert_eq!(create(&mut t, a, "b", Kind::File, None).await, Err(Errno::Exist));
-        assert_eq!(rmdir(&mut t, ROOT, "a").await, Err(Errno::NotEmpty));
-        assert_eq!(rename(&mut t, (ROOT, "a"), (b, "a"), (false, false)).await, Err(Errno::Invalid), "into itself");
-        assert_eq!(rename(&mut t, (ROOT, "a"), (a, "x"), (false, false)).await, Err(Errno::Invalid));
-        assert_eq!(rename(&mut t, (b, "f"), (a, "b"), (false, false)).await, Err(Errno::IsDirectory));
-        assert_eq!(rename(&mut t, (a, "b"), (b, "f"), (false, false)).await, Err(Errno::Invalid));
-        rename(&mut t, (b, "f"), (ROOT, "g"), (false, false)).await.unwrap();
+        assert_eq!(mkdir(&mut t, a, "b").await, Err(Errno::Exist));
+        assert_eq!(symlink(&mut t, a, "b/f", "x").await, Err(Errno::Exist));
+        assert_eq!(symlink(&mut t, a, "c/", "x").await, Err(Errno::NoEntry), "only a directory's name ends in a slash");
+        assert_eq!(remove(&mut t, ROOT, "a", true).await, Err(Errno::NotEmpty));
+        assert_eq!(rename(&mut t, (ROOT, "a"), (b, "a")).await, Err(Errno::Invalid), "into itself");
+        assert_eq!(rename(&mut t, (ROOT, "a"), (a, "x")).await, Err(Errno::Invalid));
+        assert_eq!(rename(&mut t, (b, "f"), (a, "b")).await, Err(Errno::IsDirectory));
+        assert_eq!(rename(&mut t, (a, "b"), (b, "f")).await, Err(Errno::Invalid));
+        assert_eq!(rename(&mut t, (b, "f"), (ROOT, "g/")).await, Err(Errno::NotDirectory));
+        assert_eq!(rename(&mut t, (b, "."), (ROOT, "g")).await, Err(Errno::Busy));
+        rename(&mut t, (b, "f"), (ROOT, "g")).await.unwrap();
         assert_eq!(lookup(&t, ROOT, "g", true).await.unwrap(), (f, Kind::File));
         assert_eq!(lookup(&t, ROOT, "a/b/f", true).await.map(|_| ()), Err(Errno::NoEntry));
         assert_eq!(lookup(&t, ROOT, "g/", true).await.map(|_| ()), Err(Errno::NotDirectory));
-        assert_eq!(unlink(&mut t, ROOT, "a").await, Err(Errno::IsDirectory));
-        assert_eq!(rmdir(&mut t, a, "b").await, Ok(Some(b)));
+        assert_eq!(readlink(&t, ROOT, "g").await, Err(Errno::Invalid));
+        assert_eq!(remove(&mut t, ROOT, "a", false).await, Err(Errno::IsDirectory));
+        assert_eq!(remove(&mut t, ROOT, "g", true).await, Err(Errno::NotDirectory));
+        assert_eq!(remove(&mut t, ROOT, "g/", false).await, Err(Errno::NotDirectory));
+        assert_eq!(remove(&mut t, a, ".", true).await, Err(Errno::Invalid));
+        assert_eq!(remove(&mut t, a, "b", true).await, Ok(Some(b)));
         assert_eq!(stat(&t, b).await.unwrap().links, 0, "until it is purged");
         assert_eq!(create(&mut t, b, "x", Kind::File, None).await, Err(Errno::NoEntry), "a removed directory is empty");
         purge(&mut t, b).await.unwrap();
         let names = readdir(&t, ROOT, None, 100).await.unwrap().into_iter().map(|(n, _)| n).collect::<Vec<_>>();
         assert_eq!(names, ["a", "g"]);
         // Past the limits of a name.
-        assert_eq!(create(&mut t, ROOT, &"x".repeat(256), Kind::File, None).await, Err(Errno::NameTooLong));
-        assert_eq!(create(&mut t, ROOT, "a/b", Kind::File, None).await, Err(Errno::Invalid));
+        assert_eq!(mkdir(&mut t, ROOT, &"x".repeat(256)).await, Err(Errno::NameTooLong));
+        assert_eq!(mkdir(&mut t, ROOT, "a\0b").await, Err(Errno::Invalid));
     }
 
     #[tokio::test]
@@ -1005,23 +1008,25 @@ mod tests {
         let mut t = tree(tree::config());
         let f = create(&mut t, ROOT, "f", Kind::File, None).await.unwrap();
         write_at(&mut t, f, At::Offset(0), &vec![1u8; BLOCK as usize + 1]).await.unwrap();
-        link(&mut t, f, ROOT, "g").await.unwrap();
-        assert_eq!(link(&mut t, f, ROOT, "g").await, Err(Errno::Exist));
-        let d = create(&mut t, ROOT, "d", Kind::Dir, None).await.unwrap();
-        assert_eq!(link(&mut t, d, ROOT, "e").await, Err(Errno::NotPermitted));
+        link(&mut t, (ROOT, "f"), (ROOT, "g")).await.unwrap();
+        assert_eq!(link(&mut t, (ROOT, "f"), (ROOT, "g")).await, Err(Errno::Exist));
+        assert_eq!(link(&mut t, (ROOT, "f"), (ROOT, "g/")).await, Err(Errno::Exist), "as Linux has it");
+        assert_eq!(link(&mut t, (ROOT, "f"), (ROOT, "h/")).await, Err(Errno::NoEntry));
+        create(&mut t, ROOT, "d", Kind::Dir, None).await.unwrap();
+        assert_eq!(link(&mut t, (ROOT, "d"), (ROOT, "e")).await, Err(Errno::NotPermitted));
         assert_eq!(stat(&t, f).await.unwrap().links, 2);
-        assert_eq!(unlink(&mut t, ROOT, "f").await, Ok(None));
-        assert_eq!(unlink(&mut t, ROOT, "f").await, Err(Errno::NoEntry));
+        assert_eq!(remove(&mut t, ROOT, "f", false).await, Ok(None));
+        assert_eq!(remove(&mut t, ROOT, "f", false).await, Err(Errno::NoEntry));
         assert_eq!(read_at(&t, f, 0, 1).await.unwrap(), &[1u8][..]);
-        assert_eq!(unlink(&mut t, ROOT, "g").await, Ok(Some(f)));
+        assert_eq!(remove(&mut t, ROOT, "g", false).await, Ok(Some(f)));
         purge(&mut t, f).await.unwrap();
         assert!(t.scan(&format!("f/{f}"), None, 10).await.unwrap().is_empty(), "no inode and no blocks remain");
         // Renaming over a file takes its last link too.
         let x = create(&mut t, ROOT, "x", Kind::File, None).await.unwrap();
         let y = create(&mut t, ROOT, "y", Kind::File, None).await.unwrap();
-        assert_eq!(rename(&mut t, (ROOT, "x"), (ROOT, "y"), (false, false)).await, Ok(Some(y)));
+        assert_eq!(rename(&mut t, (ROOT, "x"), (ROOT, "y")).await, Ok(Some(y)));
         assert_eq!(lookup(&t, ROOT, "y", true).await.unwrap().0, x);
-        assert_eq!(rename(&mut t, (ROOT, "y"), (ROOT, "y"), (false, false)).await, Ok(None));
+        assert_eq!(rename(&mut t, (ROOT, "y"), (ROOT, "y")).await, Ok(None));
     }
 
     #[tokio::test]
@@ -1054,7 +1059,7 @@ mod tests {
         assert_eq!(write_at(&mut t, ino, At::Offset(0), &[1; 20_000]).await, Err(Errno::Io));
         counts.allow.store(usize::MAX, SeqCst);
         assert_eq!(create(&mut t, ROOT, "g", Kind::File, None).await, Err(Errno::Io), "the tree takes no more");
-        assert_eq!(unlink(&mut t, ROOT, "f").await, Err(Errno::Io));
+        assert_eq!(remove(&mut t, ROOT, "f", false).await, Err(Errno::Io));
         assert!(t.finish().await.is_err(), "and it is not committed");
     }
 

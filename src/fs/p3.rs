@@ -361,7 +361,7 @@ impl<U> types::HostDescriptorWithStore<U> for HasSelf<Host> {
     }
 
     async fn remove_directory_at(store: &Accessor<U, Self>, fd: Resource<Handle>, path: String) -> Result<(), Fault> {
-        Ok(store.fd(&fd)?.rmdir_at(&path).await?)
+        Ok(store.fd(&fd)?.remove_at(&path, true).await?)
     }
 
     async fn rename_at(
@@ -385,7 +385,7 @@ impl<U> types::HostDescriptorWithStore<U> for HasSelf<Host> {
     }
 
     async fn unlink_file_at(store: &Accessor<U, Self>, fd: Resource<Handle>, path: String) -> Result<(), Fault> {
-        Ok(store.fd(&fd)?.unlink_at(&path).await?)
+        Ok(store.fd(&fd)?.remove_at(&path, false).await?)
     }
 
     async fn is_same_object(
@@ -769,7 +769,7 @@ mod tests {
         let root = Handle::root(&first);
         let big = pattern(300_000);
         let file = put(&root, "f", &big).await;
-        root.unlink_at("f").await.unwrap();
+        root.remove_at("f", false).await.unwrap();
         commit(&first).await;
         assert!(first.fs.kept(file.ino()).is_some());
         assert_eq!(drain(&file, 0).await, (big, Ok(())));

@@ -793,6 +793,15 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   at several depths with symlinks that try to climb out, and was shown to fail when the check was removed.
 - **Hard links join files and symlinks, not directories.** A link made with `symlink-follow` is `invalid`, since a
   link to what a symlink points at would need a second resolution at the link.
+- **A path is resolved once, in `ops`, by the operation that uses it.** `ops::mkdir`, `symlink`, `readlink`, `remove`,
+  `rename` and `link` each take the path and read its entry once, with the tree held, and decide from that entry; the
+  descriptor only checks that it is a directory and takes the tree. An earlier version resolved the path in `src/fs.rs`
+  and then had `ops` read the entry again, and check the name and the parent's kind again, which could not fail:
+  `locate` yields only a name that is not empty, `.` or `..`, at most 255 bytes and without `/` or NUL, and a parent
+  from its own stack of directories. `unlink-file-at` and `remove-directory-at` are one `remove`, told which by a flag.
+  Two answers now follow Linux where they did not: `link-at` to an entry that exists, written with a trailing slash,
+  is `exist`, as `symlink-at` already was, and `readlink-at` of a file written with a trailing slash is
+  `not-directory`, as `readlinkat` has it.
 - **A file is as large as the name: `FILE_MAX = DATA_MAX`** (16 GiB). A smaller cap would be a second limit to explain,
   and the name's own budget, which is exact, already stops a write.
 - **An operation is one atomic batch of tree edits,** so that a failure leaves the tree as it was, with two exceptions:
