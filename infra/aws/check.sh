@@ -886,14 +886,9 @@ if [ -n "$commit" ]; then
 fi
 # serve's 503 to each try, in the router's log: the first try, and two that Scheduler made.
 tries="{ \$.fields.app = \"alpha\" && \$.fields.message = \"outbox: serve answered 503 Service Unavailable\" }"
-end=$((SECONDS + 360)) n=0
-while [ $SECONDS -lt $end ]; do
-  n=$(nlogs events "$failed" "$tries")
-  [[ $n =~ ^[0-9]+$ ]] && [ "$n" -ge 3 ] && break
-  sleep 15
-done
-if [[ $n =~ ^[0-9]+$ ]] && [ "$n" -ge 3 ]; then pass "Scheduler tries a failed delivery again, and again"
-else fail "Scheduler tries a failed delivery again, and again" "$n tries in 6 minutes, want 3"; fi
+if awaitpat events "$failed" "$tries" 360 3; then pass "Scheduler tries a failed delivery again, and again"
+else fail "Scheduler tries a failed delivery again, and again" \
+  "$(nlogs events "$failed" "$tries") tries in 6 minutes, want 3"; fi
 note "the tries' times: $(aws logs filter-log-events --log-group-name /aws/lambda/tric-events --start-time "$failed" \
   --filter-pattern "$tries" --query 'events[].timestamp' --output text | tr '\t' '\n' |
   awk 'NR == 1 { t = $1 } { printf "+%ds ", ($1 - t) / 1000 }')"
