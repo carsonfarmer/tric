@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::{sync::RwLock, sync::watch, time::sleep, time::timeout_at};
-use wasmtime::{Result, bail, ensure};
+use wasmtime::{Result, ensure, error::Context};
 
 const NAME_MAX: usize = 128;
 const KEY_MAX: usize = 256; // bytes
@@ -308,22 +308,19 @@ pub enum Committed {
     Conflict,             // another turn changed the name first
 }
 
-/// What became of a commit whose put had no sure answer.
-#[derive(Debug, PartialEq)]
-enum Fate {
-    Landed(Option<String>), // with the head's `ETag`, if the head is still the one the commit wrote
-    Lost,                   // another write landed on its base, so it never will
-    Unknown,
-}
-
 /// What became of the commit `commit`, whose head `head` was put over `base` with no sure answer: what [`fate`] says,
-/// asked again while it cannot say, after a wait from 100 ms that doubles up to 2 s.
-async fn learn(store: &Store, path: &Path, head: &mut Head, base: Option<&UpdateVersion>, commit: &str) -> Fate {
+/// asked again while it cannot say yet, after a wait from 100 ms that doubles up to 2 s; `None` if it cannot say.
+async fn learn(
+    store: &Store,
+    path: &Path,
+    head: &mut Head,
+    base: Option<&UpdateVersion>,
+    commit: &str,
+) -> Option<Committed> {
     let mut wait = Duration::from_millis(100);
     loop {
         match fate(store, path, head, base, commit).await {
-            Ok(Some(fate)) => return fate,
-            Ok(None) => {}
+            Ok(fate) => return fate,
             Err(e) => tracing::info!(%path, commit, "commit: {e:#}"),
         }
         sleep(wait).await;
@@ -332,14 +329,16 @@ async fn learn(store: &Store, path: &Path, head: &mut Head, base: Option<&Update
 }
 
 /// What became of the commit `commit`, whose head `head` was put over `base` with no sure answer, by the head as it is
-/// now; `None` if the head was still `base`, so `head` was put again, and that was refused.
+/// now: done, with the head's `ETag` if the head is still the one the commit wrote, or a conflict, as another write
+/// landed on its base, so it never will; `None` if the head cannot say, and an error if it cannot say yet.
 ///
 /// Each head names the commit that wrote it, and the version it was written over, so no head's bytes, and so no head's
 /// `ETag`, are ever another's, and a put on `base`'s `ETag` lands on `base` itself or not at all. So a head's versions
 /// are a chain, and only the one written over `base` can be the commit's:
+/// - if the head is still `base`, or there is still none where there was none, nothing has landed on it, and the commit
+///   is put again, as it was, which lands only if the first put has not; if that is refused, something has landed
+///   since, so the head is asked again;
 /// - if the head names the commit, it landed;
-/// - if the head is still `base`, nothing has landed on it, and the commit is put again, as it was, which lands only if
-///   the first put has not;
 /// - else the commit landed if the version written over `base` names it, and never will if that version does not.
 ///
 /// The chain is read back from the head, one version at a time, so with no versions, a head that is gone or a version
@@ -350,31 +349,33 @@ async fn fate(
     head: &mut Head,
     base: Option<&UpdateVersion>,
     commit: &str,
-) -> Result<Option<Fate>> {
-    let Some((mut now, version)) = read(store, path).await? else {
-        return match base {
-            None => Ok(put(store, path, head, None).await?.map(|v| Fate::Landed(etag(&v)))),
-            Some(_) => Ok(Some(Fate::Unknown)),
-        };
+) -> Result<Option<Committed>> {
+    let read = read(store, path).await?;
+    let untouched = match (&read, base) {
+        (None, None) => true,
+        (Some((_, version)), Some(base)) => same(base, version),
+        _ => false,
     };
+    if untouched {
+        let put = put(store, path, head, base.cloned()).await?;
+        return put.map(|v| Some(Committed::Done(etag(&v)))).context("put again, and refused: something landed since");
+    }
+    let Some((mut now, version)) = read else { return Ok(None) };
     let over = base.and_then(|b| b.version.as_deref());
     if now.commit == commit {
         // A commit's own head is the one its answer would describe: one written over it has others' changes.
         let own = now.over.as_deref() == over && now.claim.is_none();
-        return Ok(Some(Fate::Landed(if own { etag(&version) } else { None })));
-    }
-    if let Some(base) = base.filter(|b| same(b, &version)) {
-        return Ok(put(store, path, head, Some(base.clone())).await?.map(|v| Fate::Landed(etag(&v))));
+        return Ok(Some(Committed::Done(if own { etag(&version) } else { None })));
     }
     if version.version.is_none() || base.is_some_and(|b| b.version.is_none()) {
-        return Ok(Some(Fate::Unknown));
+        return Ok(None);
     }
     loop {
         if now.over.as_deref() == over {
-            return Ok(Some(if now.commit == commit { Fate::Landed(None) } else { Fate::Lost }));
+            return Ok(Some(if now.commit == commit { Committed::Done(None) } else { Committed::Conflict }));
         }
-        let Some(before) = now.over.as_deref() else { return Ok(Some(Fate::Unknown)) };
-        let Some(bytes) = store.version(path, before, HEAD_MAX as u64).await? else { return Ok(Some(Fate::Unknown)) };
+        let Some(before) = now.over.as_deref() else { return Ok(None) };
+        let Some(bytes) = store.version(path, before, HEAD_MAX as u64).await? else { return Ok(None) };
         now = serde_json::from_slice(&bytes)?;
     }
 }
@@ -811,13 +812,9 @@ impl Turn {
             Err(_) => format!("no answer within {SETTLE:?}"),
         };
         let fate = timeout_at(until, learn(&self.store, &self.path, head, base.as_ref(), commit)).await;
-        let fate = fate.unwrap_or(Fate::Unknown);
+        let fate = fate.ok().flatten();
         tracing::warn!(path = %self.path, commit, ?fate, "commit: {lost}");
-        match fate {
-            Fate::Landed(etag) => Ok(Committed::Done(etag)),
-            Fate::Lost => Ok(Committed::Conflict),
-            Fate::Unknown => bail!(Failed::Unsettled),
-        }
+        fate.context(Failed::Unsettled)
     }
 
     /// Discards the turn, and its claim if it took one.
