@@ -222,9 +222,8 @@ impl Hub<'_> {
         };
         let (method, body) = m.map_or((Method::DELETE, vec![]), |m| (Method::POST, m.into_bytes()));
         let url = format!("{}/@connections/{}", ws.trim_end_matches('/'), aws::query(id));
-        match route.aws.send("execute-api", method, &url, &[], body).await {
-            Ok(res) if res.status().is_success() => false,
-            Ok(res) => (tracing::info!(id, "ws: @connections answered {}", res.status()), res.status() == 410).1,
+        match route.aws.send("execute-api", method, &url, &[], body, Some(StatusCode::GONE)).await {
+            Ok(res) => res.status() == StatusCode::GONE,
             Err(e) => (tracing::warn!(id, "ws: {e:#}"), false).1,
         }
     }

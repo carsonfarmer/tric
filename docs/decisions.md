@@ -145,6 +145,11 @@ reason.
   a probe of a group of 104 showed. More than 100 fails the deploy, which says to delete them by hand.
 - **A cron expression can't restrict both the day of the month and the day of the week.** POSIX cron runs a job
   when either one matches, and Scheduler can't say that, so tric refuses it everywhere.
+- **An AWS call's status is checked in one place.** `Aws::send` answers an error that says what the service answered,
+  unless the status is a success or the one its caller names as done already: Scheduler's 409 for a schedule that is
+  made, its 404 for one that is gone, and `@connections`' 410 for a socket that is gone. Each caller had a check of its
+  own, and Lambda's `Event` invocation took 202 only, where now it takes any success, which is all Lambda answers it
+  with.
 
 ## Storage and turns
 
