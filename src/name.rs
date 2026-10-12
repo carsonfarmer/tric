@@ -45,26 +45,26 @@ pub fn of(path: &str) -> Option<&str> {
     path.strip_prefix("/@").map(|rest| rest.split('/').next().unwrap_or_default())
 }
 
-/// A name's state: its tree, with the root in the head, the commit that wrote it and the version it was written over.
+/// A name's state: its tree, with the root in the head, and the commit that wrote it.
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Head {
     #[serde(default, skip_serializing_if = "Root::is_empty")]
     tree: Root,
-    /// The random id of the commit that wrote it.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// The random id of the commit that wrote it, new to each: so no head's bytes are ever another's, and a put on a
+    /// head's `ETag` in the store lands on that head itself or not at all.
     commit: String,
-    /// The version id of the head this one was written over, which `put` sets; none for the first head, or where the
-    /// bucket keeps no versions. So a head's versions are a chain, and no head's bytes are ever another's.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    over: Option<String>,
 }
 
 impl Head {
+    /// The head's `ETag`: its commit's id, which changes only when a commit writes the name.
+    fn etag(&self) -> String {
+        format!("\"{}\"", self.commit)
+    }
+
     /// Adds to `seen` the ids of the objects the head's tree is made of, with the name's own `app` and `name`, and
     /// gives how many nodes it read, or `None` if that would be over `max`: see [`Tree::mark`]. The tree is all a head
-    /// names of its name's objects: its `commit` is the id of a commit and `over` a version of the head itself, and
-    /// neither names an object.
+    /// names of its name's objects: its `commit` is the id of a commit, which names none.
     pub async fn mark(
         &self,
         store: &Store,
@@ -85,8 +85,8 @@ pub fn path(app: &str, name: &str) -> Path {
     store::app(app, &["names", name])
 }
 
-/// The head at `path`, with its version. Each read and write of a head logs, at debug, its `ETag` and what it took:
-/// the numbers that say whether a cache of heads in each environment would pay.
+/// The head at `path`, with its version. Each read and write of a head logs, at debug, the bucket's `ETag` of it and
+/// what it took: the numbers that say whether a cache of heads in each environment would pay.
 pub async fn read(store: &Store, path: &Path) -> Result<Option<(Head, UpdateVersion)>> {
     let start = Instant::now();
     let read = store.json(path, HEAD_MAX as u64).await;
@@ -95,27 +95,16 @@ pub async fn read(store: &Store, path: &Path) -> Result<Option<(Head, UpdateVers
     read
 }
 
-/// Writes `head` over the version `base`, or where there is none, if that is still the head, with `over` set to
-/// `base`'s version id: its new version, or `None` if another write landed first and this one did not. An error may
-/// have landed, or may yet: see [`Store::put`].
-async fn put(
-    store: &Store,
-    path: &Path,
-    head: &mut Head,
-    base: Option<UpdateVersion>,
-) -> Result<Option<UpdateVersion>> {
-    head.over = base.as_ref().and_then(|v| v.version.clone());
+/// Writes `head` over the version `base`, or where there is none, if that is still the head: its new version, or
+/// `None` if another write landed first and this one did not. An error may have landed, or may yet: see
+/// [`Store::put`].
+async fn put(store: &Store, path: &Path, head: &Head, base: Option<UpdateVersion>) -> Result<Option<UpdateVersion>> {
     let json = serde_json::to_vec(head)?;
-    let (start, bytes, over) = (Instant::now(), json.len(), base.as_ref().and_then(|v| v.e_tag.clone()));
+    let (start, bytes, was) = (Instant::now(), json.len(), base.as_ref().and_then(|v| v.e_tag.clone()));
     let put = store.put(path, json.into(), base.map_or(PutMode::Create, PutMode::Update)).await;
     let etag = put.as_ref().ok().and_then(Option::as_ref).and_then(|v| v.e_tag.as_deref());
-    tracing::debug!(%path, over, etag, bytes, ms = start.elapsed().as_millis() as u64, "put");
+    tracing::debug!(%path, base = was, etag, bytes, ms = start.elapsed().as_millis() as u64, "put");
     put
-}
-
-/// The `ETag` of a head's version: a strong one, whatever the store says.
-fn etag(version: &UpdateVersion) -> Option<String> {
-    version.e_tag.as_ref().map(|e| format!("\"{}\"", e.trim_matches('"')))
 }
 
 /// `If-Match` and `If-None-Match`, which a turn evaluates against the head's `ETag` before it runs.
@@ -225,12 +214,12 @@ async fn expired(tree: &Tree, prefix: &str, kept: u64) -> Result<Vec<String>> {
 }
 
 /// Whether the head of `name` holds the record of the delivery event with the SHA-256 `digest` made on the Unix day
-/// `day`, which its commit writes, and the commits after it keep until two days after `day`; and the head's `ETag`, as
-/// the store gives it, if there is a head.
+/// `day`, which its commit writes, and the commits after it keep until two days after `day`; and the head's commit, if
+/// there is a head.
 pub async fn holds(store: &Store, app: &str, name: &str, day: u64, digest: &str) -> Result<(bool, Option<String>)> {
-    let Some((head, version)) = read(store, &path(app, name)).await? else { return Ok((false, None)) };
+    let Some((head, _)) = read(store, &path(app, name)).await? else { return Ok((false, None)) };
     let tree = tree::open(store, app, name, &head.tree, tree::config())?;
-    Ok((tree.get(&event_key(day, digest)).await?.is_some(), version.e_tag))
+    Ok((tree.get(&event_key(day, digest)).await?.is_some(), Some(head.commit)))
 }
 
 /// What a turn that does not run answers.
@@ -276,87 +265,6 @@ pub enum Committed {
     Conflict,             // another turn changed the name first
 }
 
-/// What became of the commit `commit`, whose head `head` was put over `base` with no sure answer: what [`fate`] says,
-/// asked again while it cannot say yet, after a wait from 100 ms that doubles up to 2 s; `None` if it cannot say.
-async fn learn(
-    store: &Store,
-    path: &Path,
-    head: &mut Head,
-    base: Option<&UpdateVersion>,
-    commit: &str,
-) -> Option<Committed> {
-    let mut wait = Duration::from_millis(100);
-    loop {
-        match fate(store, path, head, base, commit).await {
-            Ok(fate) => return fate,
-            Err(e) => tracing::info!(%path, commit, "commit: {e:#}"),
-        }
-        sleep(wait).await;
-        wait = (wait * 2).min(Duration::from_secs(2));
-    }
-}
-
-/// What became of the commit `commit`, whose head `head` was put over `base` with no sure answer, by the head as it is
-/// now: done, with the head's `ETag` if the head is still the one the commit wrote, or a conflict, as another write
-/// landed on its base, so it never will; `None` if the head cannot say, and an error if it cannot say yet.
-///
-/// Each head names the commit that wrote it, and the version it was written over, so no head's bytes, and so no head's
-/// `ETag`, are ever another's, and a put on `base`'s `ETag` lands on `base` itself or not at all. So a head's versions
-/// are a chain, and only the one written over `base` can be the commit's:
-/// - if the head is still `base`, or there is still none where there was none, nothing has landed on it, and the commit
-///   is put again, as it was, which lands only if the first put has not; if that is refused, something has landed
-///   since, so the head is asked again;
-/// - if the head names the commit, it landed;
-/// - else the commit landed if the version written over `base` names it, and never will if that version does not.
-///
-/// The chain is read back from the head, one version at a time, so with no versions, a head that is gone or a version
-/// that has expired, whether the commit landed is unknown.
-async fn fate(
-    store: &Store,
-    path: &Path,
-    head: &mut Head,
-    base: Option<&UpdateVersion>,
-    commit: &str,
-) -> Result<Option<Committed>> {
-    let read = read(store, path).await?;
-    let untouched = match (&read, base) {
-        (None, None) => true,
-        (Some((_, version)), Some(base)) => same(base, version),
-        _ => false,
-    };
-    if untouched {
-        let put = put(store, path, head, base.cloned()).await?;
-        return put.map(|v| Some(Committed::Done(etag(&v)))).context("put again, and refused: something landed since");
-    }
-    let Some((mut now, version)) = read else { return Ok(None) };
-    let over = base.and_then(|b| b.version.as_deref());
-    if now.commit == commit {
-        // A commit's own head is the one its answer would describe: one written over it has others' changes.
-        let own = now.over.as_deref() == over;
-        return Ok(Some(Committed::Done(if own { etag(&version) } else { None })));
-    }
-    if version.version.is_none() || base.is_some_and(|b| b.version.is_none()) {
-        return Ok(None);
-    }
-    loop {
-        if now.over.as_deref() == over {
-            return Ok(Some(if now.commit == commit { Committed::Done(None) } else { Committed::Conflict }));
-        }
-        let Some(before) = now.over.as_deref() else { return Ok(None) };
-        let Some(bytes) = store.version(path, before, HEAD_MAX as u64).await? else { return Ok(None) };
-        now = serde_json::from_slice(&bytes)?;
-    }
-}
-
-/// Whether `a` and `b` are the same version of a head: by their version ids, and where the bucket keeps none, by their
-/// `ETag`s.
-fn same(a: &UpdateVersion, b: &UpdateVersion) -> bool {
-    match (&a.version, &b.version) {
-        (None, None) => a.e_tag.is_some() && a.e_tag == b.e_tag,
-        (a, b) => a == b,
-    }
-}
-
 /// Why a commit failed, where that decides how the turn answers: only a commit that failed before its put
 /// ([`Failed::Unsent`]) answers 503, so a client may try again, as nothing landed; any other failure answers 500, as it
 /// may have landed. An error carries at most one.
@@ -367,8 +275,9 @@ pub enum Failed {
     TooLarge,
     /// The commit failed before its head was put, so nothing landed.
     Unsent,
-    /// The put had no sure answer, and the head did not say within `SETTLE` whether it landed. It may have, so a
-    /// client that tried again could run the turn twice.
+    /// The put had no sure answer, and the head did not say that it landed: it was another commit's, which may have
+    /// been written over the turn's, or it could not be read within `SETTLE`. It may have landed, so a client that tried
+    /// again could run the turn twice.
     Unsettled,
 }
 
@@ -378,7 +287,7 @@ impl std::fmt::Display for Failed {
             Failed::TooLarge => write!(f, "the name would be over its limits"),
             Failed::Unsent => write!(f, "the commit failed before its head was put"),
             Failed::Unsettled => {
-                write!(f, "the commit may have landed, and the name did not say within {SETTLE:?} whether it did")
+                write!(f, "the commit may have landed, and the name did not say whether it did")
             }
         }
     }
@@ -467,7 +376,8 @@ impl Turn {
 
     /// The `ETag` of the head as the turn last read or wrote it; none if there is no head.
     pub fn etag(&self) -> Option<String> {
-        self.state().base.as_ref().and_then(etag)
+        let s = self.state();
+        s.base.is_some().then(|| s.head.etag())
     }
 
     /// Readies an unsafe outbound request: before the answer, by marking the turn as one that may not run again, as
@@ -625,9 +535,9 @@ impl Turn {
         self.fs.drain().await; // so the file system's changes that were admitted land first
         let mut tree = self.tree.write().await; // after the writes that were in flight
         if !tree.edited() && held.is_empty() && self.once.is_none() {
-            return Ok(Committed::Done(base.as_ref().and_then(etag)));
+            return Ok(Committed::Done(self.etag()));
         }
-        let commit = store::random();
+        let (commit, was) = (store::random(), base.is_some().then(|| head.commit.clone()));
         let ready = async {
             let mut kept = None;
             if tree.edited() {
@@ -651,7 +561,7 @@ impl Turn {
                     host: host.into(),
                     name: self.name.clone(),
                     day: today,
-                    base: base.as_ref().and_then(|v| v.e_tag.clone()),
+                    base: was.clone(),
                     commit: commit.clone(),
                     requests: held,
                 };
@@ -667,7 +577,7 @@ impl Turn {
             if tree.edited() {
                 head.tree = tree.finish().await?;
             }
-            head.commit = commit.clone();
+            head.commit = commit;
             if let Some(event) = event {
                 sink(event).await?; // before the head is put, so a commit that lands has handed it over
             }
@@ -682,7 +592,7 @@ impl Turn {
                 return Err(if again { e.context(Failed::Unsent) } else { e });
             }
         };
-        let landed = self.land(&mut head, base, &commit).await;
+        let landed = self.land(&head, base, was.as_deref()).await;
         match &landed {
             Ok(Committed::Done(_)) => {
                 if let Some(kept) = kept {
@@ -694,22 +604,42 @@ impl Turn {
         landed
     }
 
-    /// Puts `head`, the commit `commit`'s, over `base`. A put with no sure answer may have landed, or may yet, so the
-    /// head's history says which, as [`learn`] reads it, until `SETTLE` after the put began: a commit that landed is
-    /// done, and one that never will is a conflict; else it fails with [`Failed::Unsettled`], and is neither done nor
-    /// run again.
-    async fn land(&self, head: &mut Head, base: Option<UpdateVersion>, commit: &str) -> Result<Committed> {
+    /// Puts `head` over `base`, the head the turn read, whose commit was `was`. A put with no sure answer may have
+    /// landed, or may yet, so until `SETTLE` after the put began the head is read, and read again after a wait from
+    /// 100 ms that doubles up to 2 s: while it is still the one the turn read, the commit is put again, as it was, which
+    /// lands only if no put of it has; once it is the commit's, the commit is done. Once it is another commit's, which
+    /// may be over the commit's or over `base`, or if it cannot be read in time, the commit fails with
+    /// [`Failed::Unsettled`], and is neither done nor run again.
+    async fn land(&self, head: &Head, base: Option<UpdateVersion>, was: Option<&str>) -> Result<Committed> {
         let until = tokio::time::Instant::now() + SETTLE;
         let lost = match timeout_at(until, put(&self.store, &self.path, head, base.clone())).await {
-            Ok(Ok(Some(version))) => return Ok(Committed::Done(etag(&version))),
+            Ok(Ok(Some(_))) => return Ok(Committed::Done(Some(head.etag()))),
             Ok(Ok(None)) => return Ok(Committed::Conflict),
             Ok(Err(e)) => format!("{e:#}"),
             Err(_) => format!("no answer within {SETTLE:?}"),
         };
-        let fate = timeout_at(until, learn(&self.store, &self.path, head, base.as_ref(), commit)).await;
-        let fate = fate.ok().flatten();
-        tracing::warn!(path = %self.path, commit, ?fate, "commit: {lost}");
-        fate.context(Failed::Unsettled)
+        let (path, commit) = (&self.path, &head.commit);
+        let learn = async {
+            let mut wait = Duration::from_millis(100);
+            loop {
+                match read(&self.store, path).await {
+                    Ok(now) if now.as_ref().map(|(h, _)| h.commit.as_str()) == was => {
+                        match put(&self.store, path, head, base.clone()).await {
+                            Ok(Some(_)) => return true,
+                            Ok(None) => {} // something landed since, which the head says
+                            Err(e) => tracing::info!(%path, commit, "commit: {e:#}"),
+                        }
+                    }
+                    Ok(now) => return now.is_some_and(|(h, _)| h.commit == *commit),
+                    Err(e) => tracing::info!(%path, commit, "commit: {e:#}"),
+                }
+                sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(2));
+            }
+        };
+        let landed = timeout_at(until, learn).await.unwrap_or(false);
+        tracing::warn!(%path, commit, landed, "commit: {lost}");
+        landed.then(|| Committed::Done(Some(head.etag()))).context(Failed::Unsettled)
     }
 
     /// Discards the turn.
@@ -769,16 +699,16 @@ mod tests {
         assert!(c(None, None).hold(None));
     }
 
-    /// A versioned bucket, which keeps every version of a head, as S3 does, each with an `ETag` that is the SHA-256 of
-    /// its bytes, as S3's is their MD5. Its conditional puts are of heads, and go as its plan says, a step each, and as
-    /// asked once the plan is done; the rest goes to `inner`.
+    /// A bucket of heads, each with an `ETag` that is the SHA-256 of its bytes, as S3's is their MD5. Its conditional
+    /// puts are of heads, and go as its plan says, a step each, and as asked once the plan is done; the rest goes to
+    /// `inner`.
     #[derive(Debug, Default)]
     struct Lossy {
         inner: InMemory,
-        heads: Mutex<HashMap<Path, Vec<(String, Bytes)>>>, // each head's versions, with their ids, the latest last
-        plan: Mutex<VecDeque<(Put, &'static [Then])>>,     // how a put goes, and the writes that land on it after
-        tries: AtomicUsize,                                // the conditional puts
-        down: AtomicBool,                                  // so no head can be read or put
+        heads: Mutex<HashMap<Path, Bytes>>,
+        plan: Mutex<VecDeque<(Put, bool)>>, // how a put goes, and whether another turn's commit lands on it after
+        tries: AtomicUsize,                 // the conditional puts
+        down: AtomicBool,                   // so no head can be read or put
     }
 
     /// How a planned put goes.
@@ -789,24 +719,16 @@ mod tests {
         Late,  // the put before it, which had no answer, lands as this one is sent, so this one is refused
     }
 
-    /// What lands on a head after a planned put.
-    #[derive(Clone, Copy, Debug)]
-    enum Then {
-        Commit, // another turn's commit
-        Expire, // not a write: every version but the latest expires
-    }
-
     impl Lossy {
-        /// Plans the next conditional put.
-        fn plan(&self, put: Put, then: &'static [Then]) {
-            self.plan.lock().unwrap().push_back((put, then));
+        /// Plans the next conditional put, after which another turn's commit lands if `other`.
+        fn plan(&self, put: Put, other: bool) {
+            self.plan.lock().unwrap().push_back((put, other));
         }
 
-        /// Puts `bytes` at `at` as a new version, if `mode` allows.
+        /// Puts `bytes` at `at`, if `mode` allows.
         fn write(&self, at: &Path, bytes: Bytes, mode: &PutMode) -> object_store::Result<PutResult> {
             let mut heads = self.heads.lock().unwrap();
-            let versions = heads.entry(at.clone()).or_default();
-            let etag = versions.last().map(|(_, bytes)| store::hash(bytes));
+            let etag = heads.get(at).map(|bytes| store::hash(bytes));
             let holds = match mode {
                 PutMode::Create => etag.is_none(),
                 PutMode::Update(base) => etag.is_some() && etag == base.e_tag,
@@ -815,28 +737,17 @@ mod tests {
             if !holds {
                 return Err(object_store::Error::Precondition { path: at.to_string(), source: "refused".into() });
             }
-            let id = store::random();
-            versions.push((id.clone(), bytes.clone()));
-            Ok(PutResult { e_tag: Some(store::hash(&bytes)), version: Some(id), extensions: Default::default() })
+            let e_tag = Some(store::hash(&bytes));
+            heads.insert(at.clone(), bytes);
+            Ok(PutResult { e_tag, version: None, extensions: Default::default() })
         }
 
-        /// Lands `then` on the head at `at`.
-        fn other(&self, at: &Path, then: Then) {
+        /// Lands another turn's commit on the head at `at`, which changes nothing in its tree.
+        fn other(&self, at: &Path) {
             let mut heads = self.heads.lock().unwrap();
-            let versions = heads.entry(at.clone()).or_default();
-            let mut head = Head::default();
-            if let Some((id, bytes)) = versions.last() {
-                head = serde_json::from_slice(bytes).unwrap();
-                head.over = Some(id.clone());
-            }
-            match then {
-                Then::Commit => head.commit = store::random(),
-                Then::Expire => {
-                    versions.drain(..versions.len().saturating_sub(1));
-                    return;
-                }
-            }
-            versions.push((store::random(), serde_json::to_vec(&head).unwrap().into()));
+            let mut head: Head = heads.get(at).map_or_else(Default::default, |b| serde_json::from_slice(b).unwrap());
+            head.commit = store::random();
+            heads.insert(at.clone(), serde_json::to_vec(&head).unwrap().into());
         }
     }
 
@@ -862,14 +773,14 @@ mod tests {
                 return Err(lost());
             }
             let bytes = Bytes::from(payload);
-            let Some((put, thens)) = self.plan.lock().unwrap().pop_front() else {
+            let Some((put, other)) = self.plan.lock().unwrap().pop_front() else {
                 return self.write(at, bytes, &opts.mode);
             };
             if !matches!(put, Put::Fails) {
                 self.write(at, bytes, &opts.mode)?;
             }
-            for &then in thens {
-                self.other(at, then);
+            if other {
+                self.other(at);
             }
             match put {
                 Put::Late => Err(object_store::Error::Precondition { path: at.to_string(), source: "late".into() }),
@@ -886,19 +797,14 @@ mod tests {
         }
 
         async fn get_opts(&self, at: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
-            let versions = self.heads.lock().unwrap().get(at).cloned();
-            let Some(versions) = versions else { return self.inner.get_opts(at, opts).await };
+            let head = self.heads.lock().unwrap().get(at).cloned();
+            let Some(bytes) = head else { return self.inner.get_opts(at, opts).await };
             if self.down.load(SeqCst) {
                 return Err(lost());
             }
-            // The latest version, or the one asked for.
-            let found = versions.into_iter().rfind(|(id, _)| opts.version.as_ref().is_none_or(|v| v == id));
-            let Some((id, bytes)) = found else {
-                return Err(object_store::Error::NotFound { path: at.to_string(), source: "no such version".into() });
-            };
-            let size = bytes.len() as u64;
-            let (e_tag, version) = (Some(store::hash(&bytes)), Some(id));
-            let meta = ObjectMeta { location: at.clone(), last_modified: Default::default(), size, e_tag, version };
+            let (size, e_tag) = (bytes.len() as u64, Some(store::hash(&bytes)));
+            let meta =
+                ObjectMeta { location: at.clone(), last_modified: Default::default(), size, e_tag, version: None };
             let payload = GetResultPayload::Stream(stream::once(async move { Ok(bytes) }).boxed());
             Ok(GetResult {
                 payload,
@@ -937,13 +843,13 @@ mod tests {
         }
     }
 
-    /// A versioned store through a new `Lossy`.
+    /// A store through a new `Lossy`.
     fn fresh() -> (Store, Arc<Lossy>) {
         let lossy = Arc::new(Lossy::default());
         (Store { inner: lossy.clone(), once: None, versioned: true, cache: Arc::default() }, lossy)
     }
 
-    /// A versioned store through a `Lossy`, whose name `n` has one commit, of a value at `s`: the base of the turns.
+    /// A store through a `Lossy`, whose name `n` has one commit, of a value at `s`: the base of the turns.
     async fn based() -> (Store, Arc<Lossy>) {
         let (store, lossy) = fresh();
         let turn = writes(&store, "s").await.unwrap();
@@ -975,97 +881,83 @@ mod tests {
         Turn::snap(store, "a", "n").await.unwrap().get(key).await.unwrap()
     }
 
-    /// The head's `ETag` now.
-    async fn etag_now(store: &Store) -> Option<String> {
-        etag(&read(store, &path("a", "n")).await.unwrap().unwrap().1)
+    /// The head of `n` now.
+    async fn head_now(store: &Store) -> Head {
+        read(store, &path("a", "n")).await.unwrap().unwrap().0
+    }
+
+    /// What a commit that wrote the head now answers.
+    async fn done_now(store: &Store) -> Committed {
+        Committed::Done(Some(head_now(store).await.etag()))
     }
 
     #[tokio::test]
     async fn a_commit_that_landed_but_lost_its_answer_is_done_and_keeps_what_it_made() {
         let (store, lossy) = based().await;
-        lossy.plan(Put::Lands, &[]);
+        lossy.plan(Put::Lands, false);
         let turn = writes(&store, "k").await.unwrap();
         let done = commit(&turn).await.unwrap();
         assert_eq!(lossy.tries.load(SeqCst), 2, "tried again, and refused as it had landed");
-        assert_eq!(done, Committed::Done(etag_now(&store).await), "not a conflict, so the turn does not run again");
+        assert_eq!(done, done_now(&store).await, "not a conflict, so the turn does not run again");
         assert_eq!(value(&store, "k").await, Some(Bytes::from(vec![7; 5000])));
         assert_eq!(objects(&store).await, 2, "the base's and the turn's");
-
-        // Others wrote on it before the head was read, so the head is not its own: done, with no ETag. The head's
-        // versions say so, however far back the commit's is.
-        let others: [&'static [Then]; 2] = [&[Then::Commit], &[Then::Commit, Then::Commit]];
-        for then in others {
-            let (store, lossy) = based().await;
-            lossy.plan(Put::Lands, then);
-            let turn = writes(&store, "k").await.unwrap();
-            assert_eq!(commit(&turn).await.unwrap(), Committed::Done(None), "{then:?}");
-            assert_eq!(value(&store, "k").await, Some(Bytes::from(vec![7; 5000])), "{then:?}");
-            assert_eq!(objects(&store).await, 2, "{then:?}");
-        }
     }
 
     #[tokio::test]
-    async fn a_commit_that_did_not_land_is_put_again_or_is_a_conflict() {
+    async fn a_commit_that_did_not_land_is_put_again() {
         // Nothing else changed the name, so it is put again, and lands.
         let (store, lossy) = based().await;
         for _ in 0..store::TRIES {
-            lossy.plan(Put::Fails, &[]);
+            lossy.plan(Put::Fails, false);
         }
         let turn = writes(&store, "k").await.unwrap();
-        assert_eq!(commit(&turn).await.unwrap(), Committed::Done(etag_now(&store).await));
+        assert_eq!(commit(&turn).await.unwrap(), done_now(&store).await);
         assert_eq!((lossy.tries.load(SeqCst), objects(&store).await), (store::TRIES as usize + 1, 2));
 
         // A try landed after all, as it was put again, so that was refused: the head says it landed.
         let (store, lossy) = based().await;
         for _ in 0..store::TRIES {
-            lossy.plan(Put::Fails, &[]);
+            lossy.plan(Put::Fails, false);
         }
-        lossy.plan(Put::Late, &[]);
+        lossy.plan(Put::Late, false);
         let turn = writes(&store, "k").await.unwrap();
-        assert_eq!(commit(&turn).await.unwrap(), Committed::Done(etag_now(&store).await));
+        assert_eq!(commit(&turn).await.unwrap(), done_now(&store).await);
         assert_eq!(lossy.tries.load(SeqCst), store::TRIES as usize + 1);
         assert_eq!(value(&store, "k").await, Some(Bytes::from(vec![7; 5000])));
-
-        // Another commit landed on its base instead, so it never will: a conflict, and what it made is left for the
-        // sweep.
-        let (store, lossy) = based().await;
-        lossy.plan(Put::Fails, &[Then::Commit]);
-        let turn = writes(&store, "k").await.unwrap();
-        assert_eq!(commit(&turn).await.unwrap(), Committed::Conflict);
-        assert_eq!((value(&store, "k").await, objects(&store).await), (None, 2));
     }
 
     #[tokio::test]
     async fn the_first_commit_on_a_name_learns_whether_it_landed() {
         let (store, lossy) = fresh();
-        lossy.plan(Put::Lands, &[]);
+        lossy.plan(Put::Lands, false);
         let turn = writes(&store, "k").await.unwrap();
-        assert_eq!(commit(&turn).await.unwrap(), Committed::Done(etag_now(&store).await));
+        assert_eq!(commit(&turn).await.unwrap(), done_now(&store).await);
         assert_eq!(lossy.tries.load(SeqCst), 2);
 
         let (store, lossy) = fresh();
         for _ in 0..store::TRIES {
-            lossy.plan(Put::Fails, &[]);
+            lossy.plan(Put::Fails, false);
         }
         let turn = writes(&store, "k").await.unwrap();
-        assert_eq!(commit(&turn).await.unwrap(), Committed::Done(etag_now(&store).await));
+        assert_eq!(commit(&turn).await.unwrap(), done_now(&store).await);
         assert_eq!(lossy.tries.load(SeqCst), store::TRIES as usize + 1);
-
-        let (store, lossy) = fresh();
-        lossy.plan(Put::Fails, &[Then::Commit]);
-        let turn = writes(&store, "k").await.unwrap();
-        assert_eq!(commit(&turn).await.unwrap(), Committed::Conflict, "another's first commit landed instead");
     }
 
     #[tokio::test]
-    async fn a_commit_whose_head_cannot_say_whether_it_landed_is_unsettled() {
-        // It landed, and another commit on it, and the version it wrote has expired.
-        let (store, lossy) = based().await;
-        lossy.plan(Put::Lands, &[Then::Commit, Then::Expire]);
-        let turn = writes(&store, "k").await.unwrap();
-        let e = commit(&turn).await.unwrap_err();
-        assert_eq!(e.downcast_ref(), Some(&Failed::Unsettled), "{e:#}");
-        assert_eq!(value(&store, "k").await, Some(Bytes::from(vec![7; 5000])), "so it may not run again");
+    async fn a_commit_whose_answer_was_lost_as_another_landed_is_unsettled() {
+        // The head is another commit's, which may be over the turn's or over its base: whether the turn landed is not
+        // known, so it neither answers as done nor runs again.
+        for (put, landed) in [(Put::Lands, true), (Put::Fails, false)] {
+            let (store, lossy) = based().await;
+            lossy.plan(put, true);
+            let e = commit(&writes(&store, "k").await.unwrap()).await.unwrap_err();
+            assert_eq!(e.downcast_ref(), Some(&Failed::Unsettled), "{put:?}: {e:#}");
+            assert_eq!(value(&store, "k").await.is_some(), landed, "{put:?}");
+        }
+        let (store, lossy) = fresh();
+        lossy.plan(Put::Fails, true);
+        let e = commit(&writes(&store, "k").await.unwrap()).await.unwrap_err();
+        assert_eq!(e.downcast_ref(), Some(&Failed::Unsettled), "another's first commit landed: {e:#}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1159,7 +1051,7 @@ mod tests {
                 Box::pin(async { Ok(()) })
             }
         });
-        let base = etag_now(&store).await;
+        let base = head_now(&store).await.commit;
         let (first, second) = (writes(&store, "k").await.unwrap(), writes(&store, "l").await.unwrap());
         for turn in [&first, &second] {
             turn.hold(held().await).unwrap();
@@ -1169,12 +1061,12 @@ mod tests {
         let events = events.lock().unwrap().clone();
         let day = serde_json::from_slice::<Event>(&events[0]).unwrap().day;
         let holds = async |bytes: &[u8]| holds(&store, "a", "n", day, &store::hash(bytes)).await.unwrap();
-        let head = etag_now(&store).await.map(|e| e.trim_matches('"').to_owned());
+        let head = Some(head_now(&store).await.commit);
         assert_eq!(holds(&events[0]).await, (true, head.clone()), "the commit that landed");
         assert_eq!(holds(&events[1]).await, (false, head.clone()), "the one that did not, which never will");
         assert_eq!(holds(b"other").await, (false, head), "another event");
         let event = serde_json::from_slice::<Event>(&events[1]).unwrap();
-        assert_eq!(event.base.map(|b| format!("\"{b}\"")), base, "the version both wrote over");
+        assert_eq!(event.base, Some(base), "the commit both wrote over");
     }
 
     #[tokio::test]
@@ -1182,8 +1074,8 @@ mod tests {
         // Its tree is full, so it has no room for the commit's records: of its key, or of its event.
         for event in [false, true] {
             let store = Store::memory();
-            let full = serde_json::json!({ "tree": { "entries": tree::ENTRIES_MAX } });
-            put(&store, &path("a", "n"), &mut serde_json::from_value(full).unwrap(), None).await.unwrap().unwrap();
+            let full = serde_json::json!({ "tree": { "entries": tree::ENTRIES_MAX }, "commit": "c" });
+            put(&store, &path("a", "n"), &serde_json::from_value(full).unwrap(), None).await.unwrap().unwrap();
             let turn = match event {
                 false => keyed(&store, &once("1")).await.unwrap(),
                 true => Turn::open(&store, "a", "n", &Default::default(), None).await.unwrap().unwrap(),
@@ -1331,8 +1223,8 @@ mod tests {
         let mut records: Vec<_> = [today - 2, today - 1].map(|day| (record_key(day, "k"), Some(Bytes::new()))).into();
         records.extend([today - 3, today - 2].map(|day| (event_key(day, "e"), Some(Bytes::new()))));
         tree.write(records).await.unwrap();
-        let mut head = Head { tree: tree.finish().await.unwrap(), ..Default::default() };
-        put(&store, &path("a", "n"), &mut head, None).await.unwrap().unwrap();
+        let head = Head { tree: tree.finish().await.unwrap(), commit: store::random() };
+        put(&store, &path("a", "n"), &head, None).await.unwrap().unwrap();
         commit(&writes(&store, "k").await.unwrap()).await.unwrap();
         let snap = Turn::snap(&store, "a", "n").await.unwrap();
         let tree = snap.tree().read().await;

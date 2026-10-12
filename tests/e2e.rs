@@ -1133,18 +1133,15 @@ async fn sweeps_the_names() {
     assert_eq!(tric.files(Fs::BINDING, "POST", "s", &format!("op=big&path=/big&n={n}")).await, json!({ "ok": n }));
     assert_eq!(tric.post("/@s/kv?op=set&key=k&value=v").await.status, 200);
     // A name with history, whose head is then deleted: its versions, the newest a delete marker, as S3 lists them, each
-    // of which alone names a value too big to inline, which is an object of its own. Each head names the version it
-    // was written over, none for the first, as RustFS gives a version id on a get, as S3 does.
-    let (head, mut over) = (Key::from(format!("apps/{app}/names/h")), None);
+    // of which alone names a value too big to inline, which is an object of its own. Each head is a commit's, with an
+    // id of its own.
+    let (head, mut commits) = (Key::from(format!("apps/{app}/names/h")), vec![]);
     for c in ["x", "y"] {
         assert_eq!(tric.post(&format!("/@h/kv?op=set&key=k&value={}", c.repeat(5000))).await.status, 200);
-        let got = s3.get(&head).await.unwrap();
-        let version = got.meta.version.clone();
-        assert!(version.is_some(), "a version id on a get");
-        let json: Value = serde_json::from_slice(&got.bytes().await.unwrap()).unwrap();
-        assert_eq!(json.get("over").and_then(Value::as_str), over.as_deref(), "{json}");
-        over = version;
+        let json: Value = serde_json::from_slice(&s3.get(&head).await.unwrap().bytes().await.unwrap()).unwrap();
+        commits.push(json["commit"].as_str().map(str::to_owned));
     }
+    assert!(commits[0].is_some() && commits[0] != commits[1], "{commits:?}");
     s3.delete(&head).await.unwrap();
     let (status, listed) = versions(None, Some(&format!("apps/{app}/names/h"))).await;
     assert_eq!(status, 200, "{listed}");

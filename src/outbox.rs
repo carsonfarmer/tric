@@ -1,9 +1,9 @@
 //! Background requests: those a turn sends with `Prefer: respond-async` (RFC 7240) are held, and go out only if the
 //! turn commits, at least once, in order, each with an `Idempotency-Key`. A commit hands them to a sink as one delivery
 //! event before it writes the head, and records the event's SHA-256 in the name's tree. Delivery goes ahead once the
-//! head holds the record, and drops the event if the head moves past the version the commit wrote over without it, as
-//! then the commit can never land: an event of a turn that did not commit is dropped, as is one forged by someone who
-//! learnt a commit id, which has a digest no commit recorded.
+//! head holds the record, and drops the event if the head moves past the one the commit wrote over without it, as then
+//! the commit can never land: an event of a turn that did not commit is dropped, as is one forged by someone who learnt
+//! a commit id, which has a digest no commit recorded.
 use crate::name;
 use crate::outbound;
 use crate::store;
@@ -50,7 +50,7 @@ pub struct Event {
     pub name: String,
     /// The Unix day the commit was made on, which the record of the event is kept by.
     pub day: u64,
-    /// The head's version, as the store's `ETag`, that the commit writes over; none if there was no head.
+    /// The commit of the head that the commit writes over; none if there was no head.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
     pub commit: String,
@@ -133,10 +133,10 @@ pub type Delivered = Result<Vec<(String, String)>, Option<Duration>>;
 /// each request in order, until one fails, which a response of 5xx or 429 or a failed exchange is. A request to a host
 /// the app may not reach is done. With the feature `ws`, a publish is taken, not sent, after all else.
 ///
-/// The commit puts its head only over the version it read, `base`, and every head is new bytes, so once the head is
-/// another without the record, the commit can never land; nor can it after `LANDING`. A record stays in every head
-/// after for two days after its own, longer than an event is tried, so a commit that landed is never taken for one that
-/// did not.
+/// The commit puts its head only over the head it read, whose commit is `base`, and each head is a commit's own, so
+/// once the head is another's without the record, the commit can never land; nor can it after `LANDING`. A record
+/// stays in every head after for two days after its own, longer than an event is tried, so a commit that landed is
+/// never taken for one that did not.
 pub async fn deliver(tric: &Arc<Tric>, bytes: &[u8]) -> Delivered {
     let e = match serde_json::from_slice::<Event>(bytes) {
         Ok(e) if e.app == tric.app => e,
