@@ -646,14 +646,14 @@ impl Handle {
     }
 
     /// Something that tells one file from another and is the same for one file: its inode.
-    pub fn hash(&self) -> (u64, u64) {
-        (self.ino(), 0)
+    pub fn hash(&self) -> u64 {
+        self.ino()
     }
 
-    pub async fn hash_at(&self, path: &str, follow: bool) -> Res<(u64, u64)> {
+    pub async fn hash_at(&self, path: &str, follow: bool) -> Res<u64> {
         self.dir()?;
         let tree = self.pin.view().await;
-        Ok((ops::lookup(&tree, self.ino(), path, follow).await?.0, 0))
+        Ok(ops::lookup(&tree, self.ino(), path, follow).await?.0)
     }
 }
 
