@@ -32,7 +32,7 @@ const PENDING_TTL: Duration = WINDOW.saturating_add(Duration::from_secs(3600));
 /// are refused, so the head stays far under `HEAD_MAX`, and no pending commit is dropped before its time.
 const PENDING_MAX: usize = 1000;
 /// How long a commit's put may take, with learning whether it landed when its answer is lost; past that, the commit
-/// fails with [`Unsettled`]. The guest's `ANSWER`, the claims it waits for and this fit in CloudFront's 60 s for an
+/// fails with [`Failed::Unsettled`]. The guest's `ANSWER`, the claims it waits for and this fit in CloudFront's 60 s for an
 /// answer from the origin, so the client hears the 500, and not a 504 that it might try again.
 pub const SETTLE: Duration = Duration::from_secs(30);
 /// The header that makes a turn apply once, however often it is sent: see [`Idempotency`].
@@ -140,7 +140,7 @@ pub async fn read(store: &Store, path: &Path) -> Result<Option<(Head, UpdateVers
 
 /// Writes `head` over the version `base`, or where there is none, if that is still the head, with `over` set to
 /// `base`'s version id: its new version, or `None` if another write landed first and this one did not. An error other
-/// than [`TooLarge`] may have landed, or may yet: see [`Store::put`].
+/// than [`Failed::TooLarge`] may have landed, or may yet: see [`Store::put`].
 async fn put(
     store: &Store,
     path: &Path,
@@ -149,7 +149,7 @@ async fn put(
 ) -> Result<Option<UpdateVersion>> {
     head.over = base.as_ref().and_then(|v| v.version.clone());
     let json = serde_json::to_vec(head)?;
-    ensure!(json.len() <= HEAD_MAX, TooLarge);
+    ensure!(json.len() <= HEAD_MAX, Failed::TooLarge);
     let (start, bytes, over) = (Instant::now(), json.len(), base.as_ref().and_then(|v| v.e_tag.clone()));
     let put = store.put(path, json.into(), base.map_or(PutMode::Create, PutMode::Update)).await;
     let etag = put.as_ref().ok().and_then(Option::as_ref).and_then(|v| v.e_tag.as_deref());
@@ -388,49 +388,37 @@ fn same(a: &UpdateVersion, b: &UpdateVersion) -> bool {
     }
 }
 
-/// Why a commit failed when the name would be over its limits: its head over `HEAD_MAX`, or its tree too full for the
-/// record of an `Idempotency-Key`. The head is the root of the tree, at most `NODE_MAX`, and the pending commits, at
-/// most `PENDING_MAX` of them, so that is a backstop. Running again would fail again, so it answers 500, as for a trap.
-#[derive(Debug)]
-pub struct TooLarge;
-
-impl std::fmt::Display for TooLarge {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "the name would be over its limits")
-    }
+/// Why a commit failed, where that decides how the turn answers: only an unclaimed turn's commit that failed before
+/// its put ([`Failed::Unsent`]) answers 503, so a client may try again, as nothing landed; any other failure answers
+/// 500, as it may have landed, or did what the turn claimed the name for, which running again would do again. An error
+/// carries at most one.
+#[derive(Debug, PartialEq)]
+pub enum Failed {
+    /// The name would be over its limits: its head over `HEAD_MAX`, or its tree too full for the record of an
+    /// `Idempotency-Key`. The head is the root of the tree, at most `NODE_MAX`, and the pending commits, at most
+    /// `PENDING_MAX` of them, so that is a backstop. Running again would fail again, as for a trap, so it is never
+    /// `Unsent`.
+    TooLarge,
+    /// An unclaimed turn's commit failed before its head was put, so nothing landed.
+    Unsent,
+    /// The put had no sure answer, and the head did not say within `SETTLE` whether it landed. It may have, so a
+    /// client that tried again could run the turn twice.
+    Unsettled,
+    /// A claimed turn's claim ran out, and another write landed on its base first. The turn did what it claimed the
+    /// name for, which cannot be undone, so it does not run again.
+    Lapsed,
 }
 
-/// Why a commit failed when its put had no sure answer, and the head did not say within `SETTLE` whether it landed.
-/// It may have, so it answers 500, with no `Retry-After`: a client that tried again could run the turn twice.
-#[derive(Debug)]
-pub struct Unsettled;
-
-impl std::fmt::Display for Unsettled {
+impl std::fmt::Display for Failed {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "the commit may have landed, and the name did not say within {SETTLE:?} whether it did")
-    }
-}
-
-/// Why an unclaimed turn's commit failed before its head was put, so nothing landed, and a client may try again. Only
-/// an error that says so answers 503: any other may have landed, or, for a claimed turn, did what it claimed the name
-/// for, which running again would do again.
-#[derive(Debug)]
-pub struct Unsent;
-
-impl std::fmt::Display for Unsent {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "the commit failed before its head was put")
-    }
-}
-
-/// Why a claimed turn's commit failed when another write landed on its base first, as its claim had run out. The turn
-/// did what it claimed the name for, which cannot be undone, so it does not run again: it answers 500.
-#[derive(Debug)]
-pub struct Lapsed;
-
-impl std::fmt::Display for Lapsed {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "the turn's claim ran out, and another write landed on the name first")
+        match self {
+            Failed::TooLarge => write!(f, "the name would be over its limits"),
+            Failed::Unsent => write!(f, "the commit failed before its head was put"),
+            Failed::Unsettled => {
+                write!(f, "the commit may have landed, and the name did not say within {SETTLE:?} whether it did")
+            }
+            Failed::Lapsed => write!(f, "the turn's claim ran out, and another write landed on the name first"),
+        }
     }
 }
 
@@ -758,7 +746,7 @@ impl Turn {
             }
             tree.write(edits).await.map_err(|e| match e {
                 // A name too full for the record stays so until something is deleted: it is not tried again.
-                tree::Error::Full(_) | tree::Error::TooLarge(_) => wasmtime::Error::from(e).context(TooLarge),
+                tree::Error::Full(_) | tree::Error::TooLarge(_) => wasmtime::Error::from(e).context(Failed::TooLarge),
                 e => e.into(),
             })?;
             if tree.edited() {
@@ -778,22 +766,24 @@ impl Turn {
                 };
                 let bytes = Bytes::from(serde_json::to_vec(&event)?);
                 head.pending.insert(commit.clone(), Pending { digest: store::hash(&bytes), at: now });
-                ensure!(serde_json::to_vec(&head)?.len() <= HEAD_MAX, TooLarge); // or the event would be sent in vain
+                ensure!(serde_json::to_vec(&head)?.len() <= HEAD_MAX, Failed::TooLarge); // or the event would be sent in vain
                 sink(bytes).await?;
             }
             Ok::<_, wasmtime::Error>(kept)
         };
         let kept = match ready.await {
             Ok(kept) => kept,
-            // Nothing landed, so an unclaimed turn may run again; a claimed one did what it claimed the name for.
+            // Nothing landed, so an unclaimed turn may run again, unless it would fail again; a claimed one did what it
+            // claimed the name for.
             Err(e) => {
                 tree.reset();
-                return Err(if claimed { e } else { e.context(Unsent) });
+                let again = !claimed && e.downcast_ref::<Failed>().is_none(); // so not `TooLarge`
+                return Err(if again { e.context(Failed::Unsent) } else { e });
             }
         };
         let landed = match self.land(&mut head, base, &commit).await {
             // A claimed turn sent what it claimed the name for, so it runs once at most, whatever became of its claim.
-            Ok(Committed::Conflict) if claimed => Err(wasmtime::Error::msg(Lapsed)),
+            Ok(Committed::Conflict) if claimed => Err(wasmtime::Error::msg(Failed::Lapsed)),
             landed => landed,
         };
         match &landed {
@@ -809,14 +799,14 @@ impl Turn {
 
     /// Puts `head`, the commit `commit`'s, over `base`. A put with no sure answer may have landed, or may yet, so the
     /// head's history says which, as [`learn`] reads it, until `SETTLE` after the put began: a commit that landed is
-    /// done, and one that never will is a conflict; else it fails with [`Unsettled`], and is neither done nor run
-    /// again.
+    /// done, and one that never will is a conflict; else it fails with [`Failed::Unsettled`], and is neither done nor
+    /// run again.
     async fn land(&self, head: &mut Head, base: Option<UpdateVersion>, commit: &str) -> Result<Committed> {
         let until = tokio::time::Instant::now() + SETTLE;
         let lost = match timeout_at(until, put(&self.store, &self.path, head, base.clone())).await {
             Ok(Ok(Some(version))) => return Ok(Committed::Done(etag(&version))),
             Ok(Ok(None)) => return Ok(Committed::Conflict),
-            Ok(Err(e)) if e.is::<TooLarge>() => return Err(e), // so it did not go
+            Ok(Err(e)) if e.downcast_ref() == Some(&Failed::TooLarge) => return Err(e), // so it did not go
             Ok(Err(e)) => format!("{e:#}"),
             Err(_) => format!("no answer within {SETTLE:?}"),
         };
@@ -826,7 +816,7 @@ impl Turn {
         match fate {
             Fate::Landed(etag) => Ok(Committed::Done(etag)),
             Fate::Lost => Ok(Committed::Conflict),
-            Fate::Unknown => bail!(Unsettled),
+            Fate::Unknown => bail!(Failed::Unsettled),
         }
     }
 
@@ -930,7 +920,7 @@ mod tests {
             head.pending.insert(store::random(), Pending { digest: store::hash(&[]), at: now() });
         }
         let put = put(&store, &path("a", "n"), &mut head, None).await;
-        assert!(put.err().unwrap().is::<TooLarge>());
+        assert_eq!(put.err().unwrap().downcast_ref(), Some(&Failed::TooLarge));
         assert!(read(&store, &path("a", "n")).await.unwrap().is_none());
     }
 
@@ -1236,7 +1226,7 @@ mod tests {
         lossy.plan(Put::Lands, &[Then::Commit, Then::Expire]);
         let turn = writes(&store, false, "k").await.unwrap();
         let e = commit(&turn).await.unwrap_err();
-        assert!(e.is::<Unsettled>(), "{e:#}");
+        assert_eq!(e.downcast_ref(), Some(&Failed::Unsettled), "{e:#}");
         assert_eq!(value(&store, "k").await, Some(Bytes::from(vec![7; 5000])), "so it may not run again");
     }
 
@@ -1247,7 +1237,7 @@ mod tests {
         lossy.down.store(true, SeqCst);
         let start = tokio::time::Instant::now();
         let e = commit(&turn).await.unwrap_err();
-        assert!(e.is::<Unsettled>(), "{e:#}");
+        assert_eq!(e.downcast_ref(), Some(&Failed::Unsettled), "{e:#}");
         assert!(start.elapsed() >= SETTLE, "it asked for as long as it may");
         let res = crate::tric::failed(&e);
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -1273,7 +1263,7 @@ mod tests {
         let turn = writes(&store, true, "k").await.unwrap();
         lossy.plan(Put::Fails, &[Then::Commit]);
         let e = commit(&turn).await.unwrap_err();
-        assert!(e.is::<Lapsed>(), "{e:#}");
+        assert_eq!(e.downcast_ref(), Some(&Failed::Lapsed), "{e:#}");
         assert_eq!(value(&store, "k").await, None, "it did not land");
         let res = crate::tric::failed(&e);
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -1286,7 +1276,7 @@ mod tests {
         (other.claim, other.commit) = (None, store::random());
         put(&store, &path("a", "n"), &mut other, Some(version)).await.unwrap().unwrap();
         let e = commit(&turn).await.unwrap_err();
-        assert!(e.is::<Lapsed>(), "{e:#}");
+        assert_eq!(e.downcast_ref(), Some(&Failed::Lapsed), "{e:#}");
     }
 
     #[tokio::test]
@@ -1299,7 +1289,7 @@ mod tests {
             turn.hold(Held::of(req).await.unwrap()).unwrap();
             let sink: Sink = Arc::new(|_| Box::pin(async { wasmtime::bail!("the sink failed") }));
             let e = turn.commit("h", &sink, StatusCode::OK, None).await.unwrap_err();
-            assert_eq!(e.is::<Unsent>(), !claim, "{e:#}");
+            assert_eq!(e.downcast_ref() == Some(&Failed::Unsent), !claim, "{e:#}");
             assert_eq!(value(&store, "k").await, None, "it did not land");
             let res = crate::tric::failed(&e);
             let answer = (res.status(), res.headers().get(http::header::RETRY_AFTER).is_some());
@@ -1308,6 +1298,32 @@ mod tests {
                 true => assert_eq!(answer, (StatusCode::INTERNAL_SERVER_ERROR, false), "so it does not run again"),
             }
             assert!(read(&store, &path("a", "n")).await.unwrap().unwrap().0.claim.is_none(), "and its claim is let go");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_would_put_the_name_over_its_limits_does_not_run_again() {
+        // Its head is over `HEAD_MAX` once it is the commit's: as it is put, or, with an event, before that is sent.
+        for event in [false, true] {
+            let (store, mut head) = (Store::memory(), Head::default());
+            head.pending.insert("p".into(), Pending { digest: String::new(), at: now() });
+            let size = serde_json::to_vec(&head).unwrap().len();
+            head.pending.get_mut("p").unwrap().digest = "0".repeat(HEAD_MAX - size - 10);
+            put(&store, &path("a", "n"), &mut head, None).await.unwrap().unwrap();
+            let turn = writes(&store, false, "k").await.unwrap();
+            if event {
+                let req = http::Request::builder().method("POST").uri("https://h/x").body(Default::default()).unwrap();
+                turn.hold(Held::of(req).await.unwrap()).unwrap();
+            }
+            let e = commit(&turn).await.unwrap_err();
+            assert_eq!(e.downcast_ref(), Some(&Failed::TooLarge), "{e:#}");
+            let res = crate::tric::failed(&e);
+            assert_eq!(
+                res.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "though nothing landed, as it would fail again"
+            );
+            assert!(res.headers().get(http::header::RETRY_AFTER).is_none());
         }
     }
 
