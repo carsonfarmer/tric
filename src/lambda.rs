@@ -47,11 +47,7 @@ struct Complete {
 pub async fn invoke(aws: &Aws, function: &str, tenant: &str, req: Request) -> Result<Response> {
     let Some(event) = event(req).await? else { return Ok(status(StatusCode::PAYLOAD_TOO_LARGE)) };
     let path = format!("/2021-11-15/functions/{}/response-streaming-invocations", query(function));
-    let res = aws.send("lambda", Method::POST, &path, &[("x-amz-tenant-id", tenant)], event).await?;
-    if !res.status().is_success() {
-        let status = res.status();
-        bail!("Lambda answered {status}: {}", String::from_utf8_lossy(&res.into_body().bytes().await?));
-    }
+    let res = aws.send("lambda", Method::POST, &path, &[("x-amz-tenant-id", tenant)], event, None).await?;
     answer(res.into_body().bytes_stream()).await
 }
 
@@ -110,8 +106,7 @@ async fn event(req: Request) -> Result<Option<Vec<u8>>> {
 /// Hands `event` to the function `function`, which is to run it once Lambda gets to it.
 pub async fn hand(aws: &Aws, function: &str, event: Bytes) -> Result<()> {
     let path = format!("/2015-03-31/functions/{}/invocations", query(function));
-    let res = aws.send("lambda", Method::POST, &path, &[("x-amz-invocation-type", "Event")], event.into()).await?;
-    ensure!(res.status() == StatusCode::ACCEPTED, "Lambda answered {}", res.status());
+    aws.send("lambda", Method::POST, &path, &[("x-amz-invocation-type", "Event")], event.into(), None).await?;
     Ok(())
 }
 

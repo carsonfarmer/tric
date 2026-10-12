@@ -392,15 +392,15 @@ fn candidate(app: &str, name: &str, path: &Path) -> Option<u128> {
 /// The names that have objects, in order, as the engine could have made them.
 async fn names(store: &Store, app: &str) -> Result<BTreeSet<String>> {
     let listed = store.list(&store::app(app, &["values"])).await?;
-    Ok(listed.common_prefixes.iter().filter_map(|p| named(app, "values", p)).collect())
+    Ok(listed.common_prefixes.iter().filter_map(|p| named(app, p)).collect())
 }
 
-/// The name that `listed` is under `dir`, if it is one the engine could have made: a name, whose path, built as every
+/// The name that `listed` is in `values/`, if it is one the engine could have made: a name, whose path, built as every
 /// path is, is the one that was listed. So a key of any other spelling, of a name that is no name, or of an odd shape,
 /// is no name's, and is not touched.
-fn named(app: &str, dir: &str, listed: &Path) -> Option<String> {
+fn named(app: &str, listed: &Path) -> Option<String> {
     let name = percent_decode_str(listed.filename()?).decode_utf8().ok()?;
-    (is_name(&name) && *listed == store::app(app, &[dir, &name])).then(|| name.into_owned())
+    (is_name(&name) && *listed == store::app(app, &["values", &name])).then(|| name.into_owned())
 }
 
 fn cursor_path(app: &str) -> Path {
@@ -694,18 +694,18 @@ mod tests {
         let at = |dir: &str, name: &str| store::app("a", &[dir, name]);
         assert!(!is_name(CURSOR), "the cursor is no name's");
         for name in ["n", "a.b", "x~y", "Z:1", "a-b_c", "9", &"n".repeat(128)] {
-            assert_eq!(named("a", "values", &at("values", name)).as_deref(), Some(name), "{name}");
+            assert_eq!(named("a", &at("values", name)).as_deref(), Some(name), "{name}");
         }
         let long = "n".repeat(129);
         for name in [CURSOR, ".hidden", "_x", "-x", "~x", "a b", "a/b", "a\\b", "é", "a\u{0}b", &long] {
-            assert_eq!(named("a", "values", &at("values", name)), None, "{name:?}");
+            assert_eq!(named("a", &at("values", name)), None, "{name:?}");
         }
         let parse = |s: &str| Path::parse(s).unwrap();
-        assert_eq!(named("a", "values", &parse("apps/a/values/x%7ey")), None, "an escape in the wrong case");
-        assert_eq!(named("a", "values", &at("names", "n")), None, "a name of another kind");
-        assert_eq!(named("a", "values", &store::app("b", &["values", "n"])), None, "another app's");
-        assert_eq!(named("a", "values", &store::app("a", &["values", "n", "m"])), None, "deeper than a name");
-        assert_eq!(named("a", "values", &store::app("a", &["values"])), None, "no name at all");
+        assert_eq!(named("a", &parse("apps/a/values/x%7ey")), None, "an escape in the wrong case");
+        assert_eq!(named("a", &at("names", "n")), None, "a name of another kind");
+        assert_eq!(named("a", &store::app("b", &["values", "n"])), None, "another app's");
+        assert_eq!(named("a", &store::app("a", &["values", "n", "m"])), None, "deeper than a name");
+        assert_eq!(named("a", &store::app("a", &["values"])), None, "no name at all");
     }
 
     #[test]

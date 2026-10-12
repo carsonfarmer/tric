@@ -130,10 +130,8 @@ fn changes<'a>(
 
 /// Calls EventBridge Scheduler, for which `done`, besides a success, means it's done already.
 pub(crate) async fn scheduler(aws: &Aws, method: Method, path: &str, body: Vec<u8>, done: StatusCode) -> Result<Bytes> {
-    let res = aws.send("scheduler", method, path, &[(CONTENT_TYPE.as_str(), "application/json")], body).await?;
-    let (status, body) = (res.status(), res.into_body().bytes().await?);
-    ensure!(status.is_success() || status == done, "Scheduler answered {status}: {}", String::from_utf8_lossy(&body));
-    Ok(body)
+    let json = [(CONTENT_TYPE.as_str(), "application/json")];
+    Ok(aws.send("scheduler", method, path, &json, body, Some(done)).await?.into_body().bytes().await?)
 }
 
 #[cfg(test)]

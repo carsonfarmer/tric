@@ -2,14 +2,14 @@
 //! an app's storage credentials, Lambda, Scheduler, and S3's ListObjectVersions, as object_store lists no versions.
 //! Each service is at `AWS_ENDPOINT_URL_<SERVICE>`, or `AWS_ENDPOINT_URL`, or AWS's own endpoint.
 use crate::store::Shared;
-use http::Method;
 use http::header::CONTENT_TYPE;
+use http::{Method, StatusCode};
 use object_store::ClientOptions;
 use object_store::aws::{AmazonS3, AwsAuthorizer, AwsCredential, AwsCredentialProvider};
 use object_store::client::{HttpClient, HttpConnector, HttpRequest, HttpResponse};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
-use wasmtime::{Result, ensure, error::Context};
+use wasmtime::{Result, bail, error::Context};
 
 /// How long minted credentials last: an hour is the most a role assumed by a role may have.
 pub const LIFETIME: u64 = 3600;
@@ -137,8 +137,9 @@ impl Aws {
     }
 
     /// Sends `service` a signed request at `path`, of its endpoint unless it is a URL, with `headers`, and returns its
-    /// response as it comes. There is no time limit: a response may stream for as long as the function that answers it
-    /// runs.
+    /// response as it comes if it is a success or `done`, a status that the caller takes to mean done already; any
+    /// other is an error that says what the service answered. There is no time limit: a response may stream for as
+    /// long as the function that answers it runs.
     pub async fn send(
         &self,
         service: &str,
@@ -146,6 +147,7 @@ impl Aws {
         path: &str,
         headers: &[(&str, &str)],
         body: Vec<u8>,
+        done: Option<StatusCode>,
     ) -> Result<HttpResponse> {
         let cred = self.creds.get_credential().await?;
         let base = if path.starts_with('/') { self.endpoint(service) } else { String::new() };
@@ -153,7 +155,12 @@ impl Aws {
         let req = headers.iter().fold(http::Request::builder().method(method).uri(uri), |r, (k, v)| r.header(*k, *v));
         let mut req: HttpRequest = req.body(body.into())?;
         AwsAuthorizer::new(&cred, service, &self.region).try_authorize(&mut req, None)?;
-        Ok(self.http.execute(req).await?)
+        let res = self.http.execute(req).await?;
+        let status = res.status();
+        if status.is_success() || Some(status) == done {
+            return Ok(res);
+        }
+        bail!("{service} answered {status}: {}", String::from_utf8_lossy(&res.into_body().bytes().await?))
     }
 
     /// Credentials of the session `session` of `role` (or, where STS has no roles, of the caller), with `policy` as
@@ -168,10 +175,8 @@ impl Aws {
             form += &format!("&RoleArn={}", query(role));
         }
         let headers = [(CONTENT_TYPE.as_str(), "application/x-www-form-urlencoded")];
-        let res = self.send("sts", Method::POST, "/", &headers, form.into_bytes()).await?;
-        let (status, body) = (res.status(), res.into_body().bytes().await?);
-        ensure!(status.is_success(), "AssumeRole answered {status}: {}", String::from_utf8_lossy(&body));
-        let res: AssumeRoleResponse = quick_xml::de::from_reader(&body[..])?;
+        let res = self.send("sts", Method::POST, "/", &headers, form.into_bytes(), None).await?;
+        let res: AssumeRoleResponse = quick_xml::de::from_reader(&res.into_body().bytes().await?[..])?;
         Ok(res.assume_role_result.credentials)
     }
 
@@ -183,10 +188,8 @@ impl Aws {
         if let Some((key, id)) = from {
             path += &format!("&key-marker={}&version-id-marker={}", query(&key), query(&id));
         }
-        let res = self.send("s3", Method::GET, &path, &[], vec![]).await?;
-        let (status, body) = (res.status(), res.into_body().bytes().await?);
-        ensure!(status.is_success(), "ListObjectVersions answered {status}: {}", String::from_utf8_lossy(&body));
-        Versions::parse(&body)
+        let res = self.send("s3", Method::GET, &path, &[], vec![], None).await?;
+        Versions::parse(&res.into_body().bytes().await?)
     }
 }
 
