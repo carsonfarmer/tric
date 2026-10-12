@@ -334,17 +334,24 @@ impl<U> types::HostDescriptorWithStore<U> for HasSelf<Host> {
         let sync = DescriptorFlags::FILE_INTEGRITY_SYNC
             | DescriptorFlags::DATA_INTEGRITY_SYNC
             | DescriptorFlags::REQUESTED_WRITE_SYNC;
+        // That a write be durable when it returns is not a thing to promise: only a commit makes it so.
+        if flags.intersects(sync) {
+            return Err(Errno::Unsupported.into());
+        }
+        let (create, truncate) = (open_flags.contains(OpenFlags::CREATE), open_flags.contains(OpenFlags::TRUNCATE));
+        let write = flags.contains(DescriptorFlags::WRITE);
+        // A descriptor that is not asked to write reads, and one that makes a file or empties it writes.
         let mode = Mode {
             follow: path_flags.contains(PathFlags::SYMLINK_FOLLOW),
-            create: open_flags.contains(OpenFlags::CREATE),
+            create,
             directory: open_flags.contains(OpenFlags::DIRECTORY),
             exclusive: open_flags.contains(OpenFlags::EXCLUSIVE),
-            truncate: open_flags.contains(OpenFlags::TRUNCATE),
-            read: flags.contains(DescriptorFlags::READ),
-            write: flags.contains(DescriptorFlags::WRITE),
+            truncate,
+            read: flags.contains(DescriptorFlags::READ) || !write,
+            write: write || create || truncate,
             mutate: flags.contains(DescriptorFlags::MUTATE_DIRECTORY),
         };
-        let file = dir.open_as(&path, mode, flags.intersects(sync)).await?;
+        let file = dir.open(&path, mode).await?;
         store.with(|mut store| store.get().add(file))
     }
 

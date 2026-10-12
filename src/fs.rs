@@ -470,7 +470,8 @@ impl Handle {
         let Found::Existing(ino, kind) = resolved(ops::locate(&tree, self.ino(), path, m.follow).await?, &m)? else {
             return Err(Errno::NoEntry);
         };
-        if m.write && !self.mutable() {
+        // To write, or to change a directory's entries, is a right that a turn that has answered does not give.
+        if (m.write || m.mutate) && !self.mutable() {
             return Err(Errno::ReadOnly);
         }
         Ok(self.child(ino, kind, &m))
@@ -486,22 +487,6 @@ impl Handle {
         let tree = self.pin.view().await;
         let (ino, _) = ops::lookup(&tree, self.ino(), path, follow).await?;
         ops::stat(&tree, ino).await
-    }
-
-    /// Opens `path` as `open-at` asks, with `mode` holding the flags of the descriptor as the guest gave them. `mutate`
-    /// of it is the right to change the directory entries, which a turn that has answered does not give, and `sync` is
-    /// that a write be durable when it returns, which only a commit makes it.
-    pub async fn open_as(&self, path: &str, mut mode: Mode, sync: bool) -> Res<Self> {
-        if sync {
-            return Err(Errno::Unsupported);
-        }
-        if mode.mutate && !self.mutable() {
-            return Err(Errno::ReadOnly);
-        }
-        // A descriptor that is not asked to write reads, and one that makes a file or empties it writes.
-        mode.read |= !mode.write;
-        mode.write |= mode.create || mode.truncate;
-        self.open(path, mode).await
     }
 
     /// Sets the size of the file.
@@ -948,8 +933,8 @@ mod tests {
         // A turn that has answered changes nothing, and the descriptors say so.
         turn.answer();
         assert!(!root.mutates() && !e.mutates());
-        assert_eq!(root.open_as("d", Mode { mutate: true, ..self::dir() }, false).await.err(), Some(Errno::ReadOnly));
-        assert!(root.open_as("d", plain, false).await.is_ok());
+        assert_eq!(root.open("d", changing).await.err(), Some(Errno::ReadOnly));
+        assert!(root.open("d", plain).await.is_ok());
     }
 
     #[tokio::test]
