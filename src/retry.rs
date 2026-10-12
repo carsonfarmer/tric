@@ -96,7 +96,7 @@ impl Route {
     /// Delivers the waiting event of `w` again. Gives the messages it published.
     async fn again(&self, retries: &Scheduler, mut w: Waiting) -> Result<Vec<(String, String)>> {
         // None: an earlier try of this schedule delivered it, or it was kept past the lifecycle's days.
-        let Some((bytes, _)) = self.store.get(&w.key(), None, EVENT_MAX as u64).await? else { return Ok(vec![]) };
+        let Some((bytes, _)) = self.store.get(&w.key(), EVENT_MAX as u64).await? else { return Ok(vec![]) };
         w.tries += 1;
         match self.deliver(&w.app, bytes).await {
             Ok(published) => {

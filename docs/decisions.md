@@ -424,10 +424,13 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   (<https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-design-patterns.html>).
 - **tric tries a conditional put again itself, so it knows what a refusal follows.** Conditional puts go through a
   client with object_store's retries off (`max_retries: 0`), which shares its credentials and connections with the one
-  for everything else (`store::S3`). An overwrite, which is idempotent, keeps object_store's retries. `Store::put` tries
-  a conditional put again, as it was, after an error that is not a refusal, up to `TRIES` (4) times, from 50 to 100 ms
-  apart and twice as long each time. A refusal at the first try is a conflict, as before, and the turn runs again at
-  once. A refusal after a try that may have landed is an error, for the caller to settle.
+  for everything else. A store on S3 holds both, and `Store::put` sends a conditional put by the one that does not
+  retry (`Store::once`); the memory store, which loses no answer, has the one. It was an `ObjectStore` that wrapped the
+  two and passed every other call on, eight methods and a `Display` for one choice that only `Store::put` makes. An
+  overwrite, which is idempotent, keeps object_store's retries. `Store::put` tries a conditional put again, as it was,
+  after an error that is not a refusal, up to `TRIES` (4) times, from 50 to 100 ms apart and twice as long each time. A
+  refusal at the first try is a conflict, as before, and the turn runs again at once. A refusal after a try that may
+  have landed is an error, for the caller to settle.
 - **A head names the commit that wrote it, and the version it was written over.** A head holds `commit`, the random id
   of the commit that wrote it, which a claim, its release and `settle` keep, and `over`, the version id of the head it
   was written over, which every put of a head sets (`name::put`); the first head has none. So no head's bytes are ever
@@ -480,6 +483,17 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
     origin, and the client hears the 500 and not a 504. A turn that runs again, or uploads slowly, can take longer.
   - object_store's request timeout is 30 s, so a put that waits it out uses all of `SETTLE`, and the turn answers 500.
   - The outbox waits for a commit to land for `SETTLE` and 30 s more, for a put that S3 applies late.
+- **Why a commit failed is one enum, `name::Failed`, and an error carries at most one.** It is `TooLarge`, `Unsent`,
+  `Unsettled` or `Lapsed`, which were four types, so an error could carry both `TooLarge` and `Unsent`, and
+  `tric::failed` had to check for the pair. A failure before the put is marked `Unsent` only if the turn is unclaimed
+  and the error is not a `Failed` already, so `TooLarge` never is, and `tric::failed` answers 503 for `Unsent` and 500
+  for any other. What `name::fate` learns is a `Committed`, done or a conflict, or `None` when the head cannot say,
+  where it was a `Fate` of its own, mapped onto `Committed` after. A turn keeps whether it holds its claim, and not the
+  claim's id, which only the claim's own put reads.
+- **A commit that does not land resets the tree itself, under its write lock.** `discard`, which a failed commit
+  calls, resets the tree too, so the commit's reset looks redundant; but between the two the lock is free, and a
+  descriptor that reads after the answer would see writes that never landed, where the file system promises the tree
+  as the commit left it or as it was.
 - **What a lost answer still costs.**
   - A commit that cannot learn whether it landed answers 500. If the client runs the turn again all the same, and the
     first put did land, the turn has run twice. That takes S3 failing for `SETTLE`, a version expiring during the

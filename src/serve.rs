@@ -154,7 +154,7 @@ impl Serve {
             return Ok(Some(l.tric.clone()));
         }
         let store = Store::s3(store::s3(&self.bucket, Some(creds.clone().into()))?);
-        let Some((release, _)) = store.get(&store::app(app, &["current"]), None, RELEASE_MAX).await? else {
+        let Some((release, _)) = store.get(&store::app(app, &["current"]), RELEASE_MAX).await? else {
             *slot = None;
             return Ok(None);
         };
@@ -176,7 +176,7 @@ impl Serve {
     /// written for next time.
     async fn component(&self, store: &Store, app: &str, sha: &str) -> Result<Component> {
         let native = Path::from_iter(["native", app, &self.engine.compat(), sha]);
-        if let Some((bytes, _)) = store.get(&native, None, NATIVE_MAX).await? {
+        if let Some((bytes, _)) = store.get(&native, NATIVE_MAX).await? {
             // SAFETY: only `app`'s credentials write under `native/<app>/`, so the worst this code can do is what an
             // escape from `app`'s sandbox could, in `app`'s own tenant. A build of another `compat` fails to load.
             match unsafe { self.engine.deserialize(&bytes) } {
@@ -184,7 +184,7 @@ impl Serve {
                 Err(e) => tracing::warn!(app, "native code: {e:#}"),
             }
         }
-        let wasm = store.get(&store::app(app, &["components", sha]), None, COMPONENT_MAX).await?;
+        let wasm = store.get(&store::app(app, &["components", sha]), COMPONENT_MAX).await?;
         let (wasm, _) = wasm.context("the component is missing")?;
         ensure!(store::hash(&wasm) == sha, "the component does not match its digest");
         let component = tokio::task::block_in_place(|| self.engine.compile(&wasm))?;

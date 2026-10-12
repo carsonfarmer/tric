@@ -410,7 +410,7 @@ fn cursor_path(app: &str) -> Path {
 /// The name that the last run got to, if it stopped early. Anything else (none, or not a name) starts over, which
 /// costs a walk again and nothing more.
 async fn cursor(store: &Store, app: &str) -> Option<String> {
-    match store.get(&cursor_path(app), None, 256).await {
+    match store.get(&cursor_path(app), 256).await {
         Ok(Some((bytes, _))) => String::from_utf8(bytes.to_vec()).ok().filter(|name| is_name(name)),
         Ok(None) => None,
         Err(e) => {
@@ -610,7 +610,7 @@ mod tests {
     /// A node among `objects`, as opposed to a value: nodes are JSON, and the values the tests plant are not.
     async fn node(store: &Store, objects: &BTreeSet<Path>) -> Path {
         for path in objects {
-            let (bytes, _) = store.get(path, None, 1 << 20).await.unwrap().unwrap();
+            let (bytes, _) = store.get(path, 1 << 20).await.unwrap().unwrap();
             if bytes.first() == Some(&b'{') {
                 return path.clone();
             }

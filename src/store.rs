@@ -6,8 +6,7 @@ use futures_util::{StreamExt, stream};
 use object_store::aws::{AmazonS3, AmazonS3Builder, AwsCredential};
 use object_store::client::{HttpClient, HttpConnector, ReqwestConnector};
 use object_store::{
-    Certificate, ClientOptions, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, RetryConfig,
+    Certificate, ClientOptions, GetOptions, ListResult, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, RetryConfig,
     StaticCredentialProvider,
 };
 use object_store::{UpdateVersion, memory::InMemory, path::Path};
@@ -23,6 +22,8 @@ use webpki_root_certs::TLS_SERVER_ROOT_CERTS;
 #[derive(Clone)]
 pub struct Store {
     pub(crate) inner: Arc<dyn ObjectStore>,
+    /// The client for conditional puts, where it is not `inner`: on S3, one that sends each once (see [`S3`]).
+    pub(crate) once: Option<AmazonS3>,
     /// Whether the bucket keeps versions, so a value read by its version id outlives its delete. The memory store
     /// keeps none, and never deletes.
     pub versioned: bool,
@@ -58,11 +59,11 @@ pub fn s3(bucket: &str, creds: Option<AwsCredential>) -> Result<S3> {
     S3::new(s3)
 }
 
-/// A bucket on S3 whose conditional puts are sent once each, and the rest as object_store sends them, retries and all.
-/// object_store tries a put again after a 5xx, a 429, a 408 or a connection that failed, and a conditional put that
-/// landed but whose answer was lost then fails its own condition: the 412 would read as another's write. So
-/// [`Store::put`] tries those again itself, and knows which failure came after a try that may have landed.
-#[derive(Debug)]
+/// A bucket on S3, with a second client for its conditional puts, which sends each once; the rest go as object_store
+/// sends them, retries and all. object_store tries a put again after a 5xx, a 429, a 408 or a connection that failed,
+/// and a conditional put that landed but whose answer was lost then fails its own condition: the 412 would read as
+/// another's write. So [`Store::put`] tries those again itself, and knows which failure came after a try that may have
+/// landed.
 pub struct S3 {
     s3: AmazonS3,
     once: AmazonS3, // with no retries, and the same credentials and connections
@@ -84,61 +85,6 @@ impl std::ops::Deref for S3 {
 
     fn deref(&self) -> &AmazonS3 {
         &self.s3
-    }
-}
-
-impl std::fmt::Display for S3 {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        self.s3.fmt(f)
-    }
-}
-
-#[async_trait::async_trait]
-impl ObjectStore for S3 {
-    async fn put_opts(&self, at: &Path, payload: PutPayload, opts: PutOptions) -> object_store::Result<PutResult> {
-        match opts.mode {
-            PutMode::Overwrite => self.s3.put_opts(at, payload, opts).await,
-            PutMode::Create | PutMode::Update(_) => self.once.put_opts(at, payload, opts).await,
-        }
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        at: &Path,
-        opts: PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        self.s3.put_multipart_opts(at, opts).await
-    }
-
-    async fn get_opts(&self, at: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
-        self.s3.get_opts(at, opts).await
-    }
-
-    fn delete_stream(
-        &self,
-        paths: BoxStream<'static, object_store::Result<Path>>,
-    ) -> BoxStream<'static, object_store::Result<Path>> {
-        self.s3.delete_stream(paths)
-    }
-
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.s3.list(prefix)
-    }
-
-    fn list_with_offset(
-        &self,
-        prefix: Option<&Path>,
-        at: &Path,
-    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.s3.list_with_offset(prefix, at)
-    }
-
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
-        self.s3.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> object_store::Result<()> {
-        self.s3.copy_opts(from, to, opts).await
     }
 }
 
@@ -179,13 +125,13 @@ fn found<T>(r: object_store::Result<T>) -> Result<Option<T>> {
 
 impl Store {
     pub fn memory() -> Self {
-        Self { inner: Arc::new(InMemory::new()), versioned: false, cache: Arc::default() }
+        Self { inner: Arc::new(InMemory::new()), once: None, versioned: false, cache: Arc::default() }
     }
 
     /// `s3`, whose bucket must keep versions.
     pub fn s3(s3: S3) -> Self {
         static SHARED: LazyLock<Arc<Cache>> = LazyLock::new(Default::default);
-        Self { inner: Arc::new(s3), versioned: true, cache: SHARED.clone() }
+        Self { inner: Arc::new(s3.s3), once: Some(s3.once), versioned: true, cache: SHARED.clone() }
     }
 
     /// Whether there is an object at `path`.
@@ -198,10 +144,9 @@ impl Store {
         Ok(self.inner.list_with_delimiter(Some(prefix)).await?)
     }
 
-    /// The object at `path`, at `version` if one is given, if there is one; it must be `max` bytes or less.
-    pub async fn get(&self, path: &Path, version: Option<String>, max: u64) -> Result<Option<(Bytes, UpdateVersion)>> {
-        let got = self.inner.get_opts(path, GetOptions { version, ..Default::default() }).await;
-        let Some(got) = found(got)? else { return Ok(None) };
+    /// The object at `path`, if there is one; it must be `max` bytes or less.
+    pub async fn get(&self, path: &Path, max: u64) -> Result<Option<(Bytes, UpdateVersion)>> {
+        let Some(got) = found(self.inner.get(path).await)? else { return Ok(None) };
         ensure!(got.meta.size <= max, "{path} is over {max} bytes");
         let version = UpdateVersion { e_tag: got.meta.e_tag.clone(), version: got.meta.version.clone() };
         Ok(Some((got.bytes().await?, version)))
@@ -222,7 +167,7 @@ impl Store {
     }
 
     pub async fn json<T: DeserializeOwned>(&self, path: &Path, max: u64) -> Result<Option<(T, UpdateVersion)>> {
-        let Some((bytes, version)) = self.get(path, None, max).await? else { return Ok(None) };
+        let Some((bytes, version)) = self.get(path, max).await? else { return Ok(None) };
         Ok(Some((serde_json::from_slice(&bytes).with_context(|| format!("{path}"))?, version)))
     }
 
@@ -232,10 +177,15 @@ impl Store {
     /// landed, a later one that is refused may have been refused for that try's write, so that is an error too, and
     /// what the put did is for the caller to read.
     pub async fn put(&self, path: &Path, bytes: Bytes, mode: PutMode) -> Result<Option<UpdateVersion>> {
-        let (tries, mut tried) = (if matches!(mode, PutMode::Overwrite) { 1 } else { TRIES }, 0);
+        let (client, tries): (&dyn ObjectStore, _) = match (&mode, &self.once) {
+            (PutMode::Overwrite, _) => (&*self.inner, 1),
+            (_, Some(once)) => (once, TRIES),
+            (_, None) => (&*self.inner, TRIES),
+        };
+        let mut tried = 0;
         loop {
             tried += 1;
-            match self.inner.put_opts(path, bytes.clone().into(), mode.clone().into()).await {
+            match client.put_opts(path, bytes.clone().into(), mode.clone().into()).await {
                 Ok(r) => return Ok(Some(UpdateVersion { e_tag: r.e_tag, version: r.version })),
                 Err(
                     e @ (object_store::Error::Precondition { .. }
