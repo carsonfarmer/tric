@@ -1,9 +1,10 @@
-//! Background requests: those a turn sends with `Prefer: respond-async` (RFC 7240) are held, and go out once, and only
-//! if, the turn commits, in order, each with an `Idempotency-Key`. A commit hands them to a sink as one delivery event
-//! before it writes the head, and keeps the event's SHA-256 in the head's `pending`. Delivery waits for the head to move
-//! past the version the commit wrote over, and goes ahead only if the commit is pending there with that digest: an event
-//! of a turn that did not commit is dropped, as is one forged by someone who learnt a commit id.
-use crate::name::{self, Head};
+//! Background requests: those a turn sends with `Prefer: respond-async` (RFC 7240) are held, and go out only if the
+//! turn commits, at least once, in order, each with an `Idempotency-Key`. A commit hands them to a sink as one delivery
+//! event before it writes the head, and records the event's SHA-256 in the name's tree. Delivery goes ahead once the
+//! head holds the record, and drops the event if the head moves past the one the commit wrote over without it, as then
+//! the commit can never land: an event of a turn that did not commit is dropped, as is one forged by someone who learnt
+//! a commit id, which has a digest no commit recorded.
+use crate::name;
 use crate::outbound;
 use crate::store;
 use crate::tric::{Request, Response, Tric, status};
@@ -47,7 +48,9 @@ pub struct Event {
     /// The host the turn was asked at, so a request to it runs in-process.
     pub host: String,
     pub name: String,
-    /// The head's version, as the store's `ETag`, that the commit writes over; none if there was no head.
+    /// The Unix day the commit was made on, which the record of the event is kept by.
+    pub day: u64,
+    /// The commit of the head that the commit writes over; none if there was no head.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
     pub commit: String,
@@ -126,22 +129,27 @@ impl Held {
 /// event is to be tried again, after the `Retry-After` given.
 pub type Delivered = Result<Vec<(String, String)>, Option<Duration>>;
 
-/// Delivers the event `bytes` of `tric`'s app, if its commit landed with its digest: each request in order, until one
-/// fails, which a response of 5xx or 429 or a failed exchange is. A request to a host the app may not reach is done.
-/// With the feature `ws`, a publish is taken, not sent, so it reaches sockets once, if at all, after all else.
+/// Delivers the event `bytes` of `tric`'s app, once the name's head holds the record its commit made of its digest:
+/// each request in order, until one fails, which a response of 5xx or 429 or a failed exchange is. A request to a host
+/// the app may not reach is done. With the feature `ws`, a publish is taken, not sent, after all else.
+///
+/// The commit puts its head only over the head it read, whose commit is `base`, and each head is a commit's own, so
+/// once the head is another's without the record, the commit can never land; nor can it after `LANDING`. A record
+/// stays in every head after for two days after its own, longer than an event is tried, so a commit that landed is
+/// never taken for one that did not.
 pub async fn deliver(tric: &Arc<Tric>, bytes: &[u8]) -> Delivered {
     let e = match serde_json::from_slice::<Event>(bytes) {
         Ok(e) if e.app == tric.app => e,
         _ => return dropped("not an event of this app"),
     };
-    let path = name::path(&e.app, &e.name);
+    let digest = store::hash(bytes);
     let (start, mut wait) = (Instant::now(), Duration::from_millis(50));
-    let head: Option<Head> = loop {
-        match name::read(&tric.store, &path).await {
-            Ok(read) if read.as_ref().and_then(|(_, v)| v.e_tag.as_ref()) != e.base.as_ref() => {
-                break read.map(|(head, _)| head);
+    loop {
+        match name::holds(&tric.store, &e.app, &e.name, e.day, &digest).await {
+            Ok((true, _)) => break,
+            Ok((false, head)) if head != e.base || start.elapsed() > LANDING => {
+                return dropped("no commit recorded it");
             }
-            Ok(_) if start.elapsed() > LANDING => return dropped("its commit never landed"),
             Ok(_) => {}
             Err(err) => {
                 tracing::info!(app = e.app, commit = e.commit, "outbox: {err:#}");
@@ -150,10 +158,6 @@ pub async fn deliver(tric: &Arc<Tric>, bytes: &[u8]) -> Delivered {
         }
         sleep(wait).await;
         wait = (wait * 2).min(Duration::from_secs(1));
-    };
-    let digest = store::hash(bytes);
-    if !head.is_some_and(|h| h.pending.get(&e.commit).is_some_and(|p| p.digest == digest)) {
-        return dropped("its commit is not pending");
     }
     #[cfg_attr(not(feature = "ws"), allow(unused_mut))]
     let mut published = vec![];
@@ -165,7 +169,6 @@ pub async fn deliver(tric: &Arc<Tric>, bytes: &[u8]) -> Delivered {
         }
         send(tric, &e, n).await?;
     }
-    name::settle(&tric.store, &e.app, &e.name, &e.commit).await;
     Ok(published)
 }
 

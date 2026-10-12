@@ -84,7 +84,7 @@ async fn run(engine: &Engine, app: &Arc<App>, wasm: &Path, config: &Config) -> R
         allow: Arc::from([]),
         sink: Arc::new(|_| Box::pin(async { Ok(()) })),
     });
-    let turn = Turn::open(&tric.store, "a", "n", false, &Default::default(), None, Instant::now()).await;
+    let turn = Turn::open(&tric.store, "a", "n", &Default::default(), None).await;
     let turn = turn.map_err(|e| format!("open: {e:#}"))?.ok().ok_or("open: refused")?;
     if let Some(root) = &config.root {
         seed(&Handle::root(&turn), &wasm.with_file_name(root)).await;

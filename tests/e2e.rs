@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
@@ -478,7 +478,7 @@ async fn turns_on_one_name_serialize(kind: Kind) {
         let res = task.await.unwrap();
         match res.status {
             200 => ok += 1,
-            429 => assert_eq!(res.header("retry-after"), Some("1")),
+            503 => assert_eq!(res.header("retry-after"), Some("1")),
             s => panic!("{s}: {}", res.body),
         }
     }
@@ -487,16 +487,21 @@ async fn turns_on_one_name_serialize(kind: Kind) {
     let n = tric.post("/@counter/kv?op=incr&key=n&delta=0").await.json()["ok"].as_i64().unwrap();
     assert_eq!(n, ok, "every turn that answered 200 counted once, and no other");
 
-    // A turn that has run long enough claims its name: one that comes while it runs waits, and then is turned away.
+    // A turn that has sent an unsafe request may not run again: if another commits first, it answers 503, and what it
+    // sent stays sent, but nothing it wrote lands, so its key is free for the client's retry.
+    let me = format!("http://{}", tric.host);
+    let sends = format!("/@held/fetch?method=POST&sleep=3000&url={me}/@sent/echo");
     let slow = tokio::spawn({
-        let tric = tric.clone();
-        async move { tric.post("/@held/kv?op=set&key=k&value=1&sleep=8000").await }
+        let (tric, sends) = (tric.clone(), sends.clone());
+        async move { tric.send("POST", &sends, &[("idempotency-key", "k")]).await }
     });
-    sleep(Duration::from_millis(1500)).await; // past CLAIM_AFTER
-    let busy = tric.post("/@held/kv?op=set&key=k&value=2").await;
-    assert_eq!((busy.status, busy.header("retry-after")), (429, Some("1")));
-    assert_eq!(slow.await.unwrap().status, 200);
-    assert_eq!(tric.value("held", "k").await, "1");
+    sleep(Duration::from_millis(1000)).await;
+    assert_eq!(tric.post("/@held/kv?op=set&key=k&value=1").await.status, 200);
+    let lost = slow.await.unwrap();
+    assert_eq!((lost.status, lost.header("retry-after")), (503, Some("1")));
+    assert!(tric.value("sent", "echo").await.as_str().is_some(), "sent");
+    let again = tric.send("POST", &sends, &[("idempotency-key", "k")]).await;
+    assert_eq!((again.status, again.header("idempotent-replayed")), (200, None));
 }
 
 async fn turns_with_an_idempotency_key_apply_once(kind: Kind) {
@@ -557,7 +562,7 @@ async fn turns_with_an_idempotency_key_apply_once(kind: Kind) {
         match (res.status, res.header("idempotent-replayed")) {
             (200, None) => ran += 1,
             (200, Some("true")) => assert_eq!(res.body, ""),
-            (429, None) => assert_eq!(res.header("retry-after"), Some("1")),
+            (503, None) => assert_eq!(res.header("retry-after"), Some("1")),
             (s, r) => panic!("{s} {r:?}: {}", res.body),
         }
     }
@@ -765,7 +770,7 @@ async fn files_race(kind: Kind, fs: Fs) {
         let res = task.await.unwrap();
         match res.status {
             200 => ok += 1,
-            429 => assert_eq!(res.header("retry-after"), Some("1")),
+            503 => assert_eq!(res.header("retry-after"), Some("1")),
             s => panic!("{s}: {}", res.body),
         }
     }
@@ -1040,8 +1045,8 @@ async fn isolates_apps() {
     assert_eq!(listed(&b).try_collect::<Vec<_>>().await.unwrap(), [format!("native/{b}/x/y")]);
 }
 
-/// An event that names an app, but whose commit is not pending in that app's head with the event's digest, is dropped:
-/// so neither an app, nor anyone who learns a commit id, can send requests as another. Acceptance criterion 5.
+/// An event that names an app, but whose digest no commit recorded in that app's name, is dropped: so neither an app,
+/// nor anyone who learns a commit id, can send requests as another. Acceptance criterion 5.
 #[tokio::test]
 async fn drops_forged_events() {
     let tric = Tric::app(Kind { stack: true, app: "app" }).await;
@@ -1056,6 +1061,7 @@ async fn drops_forged_events() {
         "app": tric.apps[0],
         "host": tric.host,
         "name": "f",
+        "day": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() / 86_400,
         "base": "\"forged\"",
         "commit": commit,
         "requests": [{ "method": "POST", "uri": format!("{me}/@h/echo"), "headers": [], "body": "" }],
@@ -1064,7 +1070,7 @@ async fn drops_forged_events() {
     let outbox =
         [("x-amzn-lambda-context", r#"{"invoked_function_arn":"arn:aws:lambda:local:0:function:events:outbox"}"#)];
     assert_eq!(exchange(&tric.outbox, &tric.outbox, "POST", "/", &outbox, body).await.status, 202);
-    let line = "outbox: dropped an event, as its commit is not pending";
+    let line = "outbox: dropped an event, as no commit recorded it";
     assert!(tric.logged(line, Duration::from_secs(30)).await, "dropped");
     assert_eq!(tric.value("h", "echo").await, Value::Null);
 
@@ -1127,18 +1133,15 @@ async fn sweeps_the_names() {
     assert_eq!(tric.files(Fs::BINDING, "POST", "s", &format!("op=big&path=/big&n={n}")).await, json!({ "ok": n }));
     assert_eq!(tric.post("/@s/kv?op=set&key=k&value=v").await.status, 200);
     // A name with history, whose head is then deleted: its versions, the newest a delete marker, as S3 lists them, each
-    // of which alone names a value too big to inline, which is an object of its own. Each head names the version it
-    // was written over, none for the first, as RustFS gives a version id on a get, as S3 does.
-    let (head, mut over) = (Key::from(format!("apps/{app}/names/h")), None);
+    // of which alone names a value too big to inline, which is an object of its own. Each head is a commit's, with an
+    // id of its own.
+    let (head, mut commits) = (Key::from(format!("apps/{app}/names/h")), vec![]);
     for c in ["x", "y"] {
         assert_eq!(tric.post(&format!("/@h/kv?op=set&key=k&value={}", c.repeat(5000))).await.status, 200);
-        let got = s3.get(&head).await.unwrap();
-        let version = got.meta.version.clone();
-        assert!(version.is_some(), "a version id on a get");
-        let json: Value = serde_json::from_slice(&got.bytes().await.unwrap()).unwrap();
-        assert_eq!(json.get("over").and_then(Value::as_str), over.as_deref(), "{json}");
-        over = version;
+        let json: Value = serde_json::from_slice(&s3.get(&head).await.unwrap().bytes().await.unwrap()).unwrap();
+        commits.push(json["commit"].as_str().map(str::to_owned));
     }
+    assert!(commits[0].is_some() && commits[0] != commits[1], "{commits:?}");
     s3.delete(&head).await.unwrap();
     let (status, listed) = versions(None, Some(&format!("apps/{app}/names/h"))).await;
     assert_eq!(status, 200, "{listed}");

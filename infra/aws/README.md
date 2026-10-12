@@ -19,7 +19,6 @@ while idle: the only standing costs are the domain's Route 53 zone and what the 
     then drops the event. Both aliases are configured so (two retries, a 6 hour maximum event age), with no
     destination: there is no dead-letter record of any kind. A delivery lost that way is lost with hours of its window
     left, and the logs show the router's failures.
-  - A name with 1,000 commits still undelivered refuses a new background request: the app's `fetch` gets a `503`.
 - **serve** runs the apps, with one Lambda tenant per app. It has no URL, and only the router can invoke it.
 - **WebSockets**, an API Gateway WebSocket API. CloudFront sends it a request that opens a socket, at the app's own
   URL. Its stage is throttled to `ws_rate` requests a second, 100 by default, with a burst of `ws_burst`, 200.

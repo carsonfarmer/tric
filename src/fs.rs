@@ -683,10 +683,10 @@ mod tests {
     use crate::store::Store;
     use crate::tree::counting::counting;
     use std::sync::atomic::Ordering::SeqCst;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     pub(super) async fn turn(store: &Store) -> Arc<Turn> {
-        Turn::open(store, "a", "n", false, &Default::default(), None, Instant::now()).await.unwrap().ok().unwrap()
+        Turn::open(store, "a", "n", &Default::default(), None).await.unwrap().ok().unwrap()
     }
 
     pub(super) async fn commit(turn: &Turn) {

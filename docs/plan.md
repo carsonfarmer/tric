@@ -61,12 +61,12 @@
   - After the answer, writes fail, and the body streams on, read-only.
 - **Turns are optimistic.**
   - If another turn commits first, the instance is discarded and the request re-runs, which no one can observe.
-  - A turn claims its name at its first irreversible step: an unsafe outbound request, reading past the body
-    buffer, or running too long.
-  - A claimed turn never runs again: if its commit fails, or another write landed first as its claim ran out, it
-    answers 500.
-  - A busy name answers 429 with `Retry-After`.
-- **Versions are ETags.** The head's version is the ETag, and `If-Match` is honoured, with 412 on a mismatch.
+  - It re-runs until its deadline, 5 s after it began, and only while it is repeatable: while tric holds all its
+    body, which is 6 MiB or less, and it has sent no unsafe outbound request.
+  - A turn that loses a race and may not re-run lands nothing, and answers 503 with `Retry-After`. What it sent stays
+    sent.
+- **The `ETag` is the name's last commit.** It is the id of the commit that last wrote the name, and `If-Match` is
+  honoured, with 412 on a mismatch.
 - **`Idempotency-Key` applies a turn once.** A key is one field of 1 to 255 visible ASCII bytes other than a comma,
   else 400.
   - A turn that commits records in its head's tree, whatever it changed, the key's SHA-256, the request's fingerprint
@@ -77,7 +77,7 @@
   - Safe methods, and requests without a name, ignore the header.
 - **Calls are fetches.**
   - A `fetch` to the app's own origin runs in-process, as a request with `Forwarded: for=_tric`.
-  - An unsafe call claims the caller's name first.
+  - An unsafe call is an unsafe outbound request, after which the caller does not re-run.
   - A cycle answers 508.
 - **Background requests.** An outbound request sent during a turn with `Prefer: respond-async` (RFC 7240):
   - gets `202` and `Preference-Applied: respond-async` at once;
@@ -86,8 +86,7 @@
     delivered again within a day is applied once;
   - is delivered at least once, in order within its turn.
 
-  A turn's held requests total at most 1 MB. A name with 1,000 commits still undelivered refuses a new background
-  request: the guest's fetch gets `503`, and the request is not sent, now or later.
+  A turn's held requests total at most 1 MB.
 - **Cron.** `[cron]` in `tric.toml` maps POSIX crontab fields to a path. That path gets a `POST` with
   `Forwarded: for=_cron`.
 - **`Forwarded`.** Every request carries exactly one `Forwarded` header, set by tric:
@@ -134,12 +133,9 @@ ws/channels/<app>/<channel>/<id> a socket's subscription to a channel (router on
     - `root`: the name's tree, its top node held inline (see "Files and state");
     - `bytes` and `entries`: the name's budgets, exact at each commit;
     - `seq`: the last inode number given out, which no inode is given again (absent until a file is made);
-  - `pending`: commit id → {SHA-256 of its delivery event, time};
-  - an optional claim;
-  - `commit`: the random id of the commit that wrote it, which a claim and its release keep (absent before the first);
-  - `over`: the version id of the head it was written over (absent for the first head), so that no head's bytes, and
-    so no head's `ETag`, are ever another's, and a commit whose answer was lost can read back along the versions to
-    the one written over its base, which says whether it landed.
+  - `commit`: the random id of the commit that wrote it, new to each, so that no head's bytes, and so no head's `ETag`
+    in the bucket, are ever another's, and a commit whose answer was lost can read the head to learn whether it
+    landed. It is the name's `ETag` to clients.
 - **Objects.** Each node, block or large value is immutable, named by a random id under its name, and read by the
   version id in the link that points to it, and checked against that link's SHA-256 and length.
   - A turn deletes nothing, whether it lands, loses its race, fails or is discarded: what a commit replaces, and what
@@ -147,9 +143,6 @@ ws/channels/<app>/<channel>/<id> a socket's subscription to a channel (router on
     marker, so old heads still read objects by version id.
   - One lifecycle rule expires noncurrent versions after `noncurrent_days` (1 by default) and removes expired delete
     markers. A head's noncurrent versions are its history, which the sweep keeps whole.
-- **`pending`.** Each commit drops pending entries older than the retry window (24 h) and an hour. A name holds at most
-  1,000 live ones, so its head stays an eighth under its 1 MiB; the 1,001st background request is refused (503), and no
-  old entry is ever dropped for it.
 - **A 403 is read as not found.** S3 answers 403 for a missing key when the caller can't list.
 
 ### Files and state: one tree per name
@@ -178,17 +171,20 @@ f/<ino>              an inode: kind, link count, size, times; a symlink's target
 f/<ino>/<block>      a block of a file's data
 d/<dir>/<name>       a directory entry: the inode it names, and that inode's kind
 i/<day>/<key>        the record of an `Idempotency-Key`: the request's fingerprint, the status, `Location`
+o/<day>/<digest>     the record of a delivery event, which is empty
 ```
 
 - `<ino>` and `<dir>` are decimal and `<block>` is 16 hex digits, so the blocks of a file sort as numbers. (Nothing
   depends on the order of inode numbers: a prefix ends in its `/`.) Inode 1 is the root directory, empty until written.
   New inodes count up from the head's `seq` and are never reused, so a number names one file for the life of the name,
-  which `is-same-object` and a stale descriptor both rely on. A name emptied by deletes keeps its `seq`, so its head
+  which `is-same-object` and a stale descriptor both rely on. A name emptied by deletes keeps its `seq`, so its tree
   is `{"seq": N}`, not empty.
-- `<day>` is the Unix day a record was made, six decimal digits, and `<key>` the key's SHA-256 in hex. A lookup reads
-  yesterday's, today's and tomorrow's, so clocks may differ by a day. A commit that puts a head first deletes up to
-  1,000 records made before yesterday, from the oldest, so a record lasts one to two days. Records count against the
-  name's budgets, and a name too full for one fails the commit with 500.
+- `<day>` is the Unix day a record was made, six decimal digits, `<key>` the key's SHA-256 in hex, and `<digest>` the
+  SHA-256 of the event's JSON, whose `day` is the record's. A lookup of a key reads yesterday's, today's and tomorrow's,
+  so clocks may differ by a day. A commit that puts a head first deletes up to 1,000 records of keys made before
+  yesterday, and as many of events made two days or more before, from the oldest, so a key's record lasts one to two
+  days, and an event's two to three, past the window its delivery is tried in. Records count against the name's budgets,
+  and a name too full for one fails the commit with 500.
 - An inode sits next to its blocks, and a directory's entries sit together, so an `open` and the first reads of a small
   file touch one leaf, and a `readdir` is a range scan. A guest's file names live inside leaves, never in object keys.
 - A **leaf** is a sorted list of (key, item), and a **branch** a sorted list of (separator, link) to its children: the
@@ -199,9 +195,9 @@ i/<day>/<key>        the record of an `Idempotency-Key`: the request's fingerpri
   the local memory store), and the SHA-256 and length of the bytes. An object is read at its version and checked for
   both, so the head pins every node and block below it by hash. A link read from a head or a node is checked before it
   is used: the id is 32 lowercase hex digits, so it can't name another prefix, and the version is short and plain.
-- A **head** is `{tree: {root, bytes, entries, seq}, pending, claim, commit, over}`. The root node is inline, so the
-  top of every lookup costs no request. `bytes` counts the data in values and blocks, and `entries` the keys, both
-  exact: a commit lands only over the head it read, so the deltas it counts while editing are the totals.
+- A **head** is `{tree: {root, bytes, entries, seq}, commit}`. The root node is inline, so the top of every lookup
+  costs no request. `bytes` counts the data in values and blocks, and `entries` the keys, both exact: a commit lands
+  only over the head it read, so the deltas it counts while editing are the totals.
 - A turn's size estimates a link at its longest (208 bytes), so a node never encodes to more than the size it was
   split by. A branch holds about 300 links, and a leaf several hundred entries (a directory entry is about 60 bytes, a
   block's link 230), so 4 Mi entries need three levels at the most, the root included.
@@ -466,12 +462,12 @@ overlay applied at the commit.
   failed exchange, it keeps the event in the bucket as `outbox/<app>/<commit>` and creates a one-time EventBridge
   Scheduler schedule, in a group of its own, which invokes the router's `retry` alias with a reference to it: the app,
   the commit, the number of tries and the deadline. Each try goes to serve as an outbox event does, and serve delivers
-  it only if the commit is pending in the head with the event's digest. A failure schedules the next try.
+  it only if the name's head holds the record its commit made of the event's digest. A failure schedules the next try.
   - The window is 24 h from the first failure, as EventBridge's default retry policy has it, with exponential backoff
     (a minute, doubling to an hour) and jitter. `Retry-After` is a floor.
   - Any other 4xx is an answer, and is final. A delivered or dropped event deletes its object.
-  - After the window, the router logs a warning with the app and the commit, deletes the object, and leaves `pending`
-    to expire.
+  - After the window, the router logs a warning with the app and the commit, and deletes the object. The record in
+    the name's tree expires as the others do.
   - Locally, `outbox::relay` follows the same backoff and window in the router's memory, and a restart loses them.
 - **The three inputs are kept apart.**
   - The router accepts outbox events only when invoked as `outbox`, retries only as `retry`, and cron events only
@@ -498,18 +494,21 @@ overlay applied at the commit.
   2. load `native/<app>/<compat>/<sha>` if present;
   3. otherwise fetch the component, compile it and write the native code.
 - **It handles a `POST` carrying `Forwarded: for=_tric` as a delivery event.** Only the router can set that marker.
-  1. Wait for the sender's commit: `If-None-Match` on the version the turn started from, up to the turn deadline.
-  2. Drop the event unless its commit id and its digest are in `pending`.
+  1. Drop the event unless it names this app.
+  2. Wait for the sender's commit: read the name's head until it holds `o/<day>/<digest>`, the record the commit
+     made of the event. Drop the event if the head, without the record, is no longer the one the turn started from,
+     or still is after `SETTLE` (30 s) and 30 s more, as then the commit can never land.
   3. Send each request in order:
      - to the app's own origin: in-process, as a turn;
      - anywhere else: over the network, under the allow list.
-  4. Clear the commit from `pending`.
+
+  The record stays, so an event delivered again sends its requests again, with the same `Idempotency-Key`s.
 
   A 5xx, a 429 or a failed exchange answers 5xx, and the router retries as above. Any other answer is final.
 - **It handles a `POST` carrying `Forwarded: for=_ws` as a socket's event,** which only the router sends: the
   socket's record, its id and the event. It runs the turn of it at the URL the socket opened at.
 - **At a turn's answer, with background requests:** invoke the router's `outbox` alias first, then commit, recording
-  the digest in `pending`.
+  the event's digest in the name's tree.
 - **It is a plain HTTP server.** On Lambda, the Lambda Web Adapter translates.
 
 ### Local
@@ -557,8 +556,9 @@ overlay applied at the commit.
 
 1. **Outbox events go through the router.** serve can't mint credentials, so "invoke our own function" becomes
    "invoke the router's `outbox` alias". The router then invokes serve with the tenant id.
-2. **The digest in `pending`.** Without it, an app that learnt another app's commit id (from an `Idempotency-Key` sent
-   to it) could forge that app's deliveries.
+2. **The event's digest in the sender's tree.** Without it, an app that learnt another app's commit id (from an
+   `Idempotency-Key` sent to it) could forge that app's deliveries. An event sent again byte for byte is the commit's
+   own, and is delivered again, as any delivery may be.
 3. **`Prefer: respond-async` with no commit is not applied.** This covers a request without a name, or one sent after
    the answer.
    - The request goes out at once, as an ordinary fetch, with no `Preference-Applied`. RFC 7240 lets a server ignore a
@@ -589,7 +589,7 @@ overlay applied at the commit.
    through `route`. The app sees only the router's `Forwarded`, and no `X-Tric-*` or `X-Amz*` header.
 3. **Pinning.** serve refuses a tenant id that differs from the Host's app, and a request without credentials.
 4. **Unknown apps.** `route` answers 404 without calling serve.
-5. **Forged outbox events.** An event naming app B is dropped unless its commit and digest are pending in B's head.
+5. **Forged outbox events.** An event naming app B is dropped unless B's head holds the record of its digest.
 6. **Cron** reaches the app through `route` as a `POST` with `for=_cron`.
 7. **Native code** is written under `native/<app>/…` with the app's credentials.
 8. **The app semantics** pass through `route` → `serve`: names, turns, `Idempotency-Key`, the outbox, self-fetch,

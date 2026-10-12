@@ -2,8 +2,8 @@
 //! bucket as `outbox/<app>/<commit>`, which only the router writes; and a one-time EventBridge Scheduler schedule, in a
 //! group of its own, has the router's `retry` alias try it again, as `outbox::backoff` says, until it is delivered or
 //! `outbox::WINDOW` is over. The schedule carries a reference to the event, not the event: Scheduler takes 256 KB, and
-//! an event may be 1 MB. Each try goes to the app's serve, which delivers the event only if its commit is pending in
-//! the head with the event's digest, so what waits in the bucket can send no more than the commit it is of.
+//! an event may be 1 MB. Each try goes to the app's serve, which delivers the event only if the name's head holds the
+//! record its commit made of the event's digest, so what waits in the bucket can send no more than the commit it is of.
 use crate::deploy::{self, Scheduler};
 use crate::outbox::{self, EVENT_MAX, WINDOW};
 use crate::route::{Route, body};

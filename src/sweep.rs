@@ -574,6 +574,9 @@ mod tests {
         (store, kept)
     }
 
+    /// A head whose tree is empty.
+    const EMPTY: &[u8] = br#"{"commit":"c"}"#;
+
     /// A tree of `keys` values that are each an object, in `name`, from the tree of `from` if given, with its head as
     /// the name's latest version: the head's id, its tree, and the objects that are in `name` now.
     async fn commit(kept: &Kept, name: &str, keys: usize, from: &Root) -> (String, Root, BTreeSet<Path>) {
@@ -581,7 +584,8 @@ mod tests {
         let edits = (0..keys).map(|i| (format!("k/{i:03}"), Some(Bytes::from(vec![i as u8; 40])))).collect();
         tree.write(edits).await.unwrap();
         let root = tree.finish().await.unwrap();
-        let id = kept.put(name, serde_json::to_vec(&serde_json::json!({ "tree": root })).unwrap()).await;
+        let head = serde_json::json!({ "tree": root, "commit": store::random() });
+        let id = kept.put(name, serde_json::to_vec(&head).unwrap()).await;
         (id, root, held(&kept.store, name).await)
     }
 
@@ -891,7 +895,7 @@ mod tests {
         // No head: no object of the name is named, however many. Nor is any when the head's tree is empty.
         let (one, two) = (stray(&store, "a", "m").await, stray(&store, "a", "m").await);
         let three = stray(&store, "a", "e").await;
-        kept.put("e", b"{}".to_vec()).await;
+        kept.put("e", EMPTY.to_vec()).await;
         let report = run(&store, &kept, "a", later(), long()).await.unwrap();
         assert_eq!(report, Report { swept: 2, deleted: 3, bytes: 15, done: true, ..Default::default() });
         for path in [one, two, three] {
@@ -940,7 +944,7 @@ mod tests {
 
         // And once the second has too, with a head of an empty tree after it, what is left was the second's alone.
         kept.expire(&second);
-        kept.put("n", b"{}".to_vec()).await;
+        kept.put("n", EMPTY.to_vec()).await;
         let report = run(&store, &kept, "a", later(), long()).await.unwrap();
         assert_eq!(report.deleted, left.len());
         assert!(held(&store, "n").await.is_empty());
@@ -995,10 +999,10 @@ mod tests {
         // Markers that are the latest and that are not, among versions: a marker read would fail the name.
         let (first, _, live) = commit(&kept, "n", 5, &Root::default()).await;
         kept.delete("n").await;
-        kept.put("n", b"{}".to_vec()).await;
+        kept.put("n", EMPTY.to_vec()).await;
         kept.delete("n").await;
         let (m1, m2) = (stray(&store, "a", "n").await, stray(&store, "a", "m").await);
-        kept.put("m", b"{}".to_vec()).await;
+        kept.put("m", EMPTY.to_vec()).await;
         kept.delete("m").await;
         let report = run(&store, &kept, "a", later(), long()).await.unwrap();
         assert_eq!(report, Report { swept: 2, deleted: 2, bytes: 10, done: true, ..Default::default() });
@@ -1095,11 +1099,11 @@ mod tests {
         let (store, kept) = kept();
         // `n` has two versions, and `n2` and `n~` (`n%7E`), whose keys begin with `n`'s, have more after them.
         for _ in 0..2 {
-            kept.put("n", b"{}".to_vec()).await;
+            kept.put("n", EMPTY.to_vec()).await;
         }
         for _ in 0..7 {
-            kept.put("n2", b"{}".to_vec()).await;
-            kept.put("n~", b"{}".to_vec()).await;
+            kept.put("n2", EMPTY.to_vec()).await;
+            kept.put("n~", EMPTY.to_vec()).await;
         }
         let path = name::path("a", "n");
         let versions = listed(&kept, &path, 2).await.unwrap().unwrap();
@@ -1124,7 +1128,7 @@ mod tests {
         let (store, kept) = kept();
         let hot = plant(&kept, "hot", 3).await;
         for _ in 0..9 {
-            kept.put("hot", b"{}".to_vec()).await;
+            kept.put("hot", EMPTY.to_vec()).await;
         }
         plant(&kept, "cold", 3).await;
         let (in_hot, in_cold) = (stray(&store, "a", "hot").await, stray(&store, "a", "cold").await);

@@ -792,7 +792,7 @@ for V in std binding; do
   done
   is "$V: and /etc/passwd is none in the name's own tree" "$(fget "$A" $e 'op=read&path=/etc/passwd' | errkind)" $NOENT
 
-  # Turns at one name race: each that answered 200 counted once, and no other did (the rest are refused, with a 429).
+  # Turns at one name race: each that answered 200 counted once, and no other did (the rest are refused, with a 503).
   codes=$(mktemp)
   for _ in 1 2 3 4; do
     (for _ in 1 2 3 4 5; do code -X POST "$A/@${X}race-$run/$R?op=incr&path=/n"; echo; done) >>"$codes" &
@@ -832,24 +832,30 @@ if echo=$(wait_echo "$B" i-$run echo 90); then
 else fail "beta's held request is delivered within 90 s"; fi
 
 echo "== forged events (as this admin, who may invoke anything)"
+# A delivery goes ahead only once its name's head holds the record its commit made of the event's digest. So one of a
+# real commit, j-$run's (its ETag), with requests that commit did not hold is dropped, as is one over a head its name
+# never had.
+commit=$(post "$B/@j-$run/kv?op=set&key=x&value=1" -D - -o /dev/null | tr -d '\r' |
+  awk 'tolower($1) == "etag:" { gsub(/"/, "", $2); print $2 }')
+[ -n "$commit" ] || fail "a turn's answer has the name's ETag"
 since=$(now)
-post "$B/@j-$run/kv?op=set&key=x&value=1" >/dev/null # j has a head, and no pending commit
-forged=$(jq -cn --arg h "beta.$DOMAIN" --arg n "j-$run" '{app: "beta", host: $h, name: $n, commit: "forged",
-  requests: [{method: "POST", uri: "https://\($h)/@\($n)/echo", headers: [], body: ""}]}')
+forged=$(jq -cn --arg h "beta.$DOMAIN" --arg n "j-$run" --arg c "$commit" '{app: "beta", host: $h, name: $n,
+  day: (now / 86400 | floor), commit: $c, requests: [{method: "POST", uri: "https://\($h)/@\($n)/echo", headers: [],
+  body: ""}]}')
 invoke $NAME-events "$forged" --qualifier outbox >/dev/null || fail "invoke the outbox alias"
-if awaitlog serve "$since" "its commit is not pending" 60; then pass "a forged delivery is dropped for its digest"
-else fail "a forged delivery is dropped for its digest" "no 'its commit is not pending' in serve's log"; fi
+if awaitlog serve "$since" "no commit recorded it" 60; then pass "a forged delivery is dropped for its digest"
+else fail "a forged delivery is dropped for its digest" "no 'no commit recorded it' in serve's log"; fi
 is "and stores nothing" "$(value "$B" j-$run echo)" null
 since=$(now)
-invoke $NAME-events "$(jq -cn --arg n "ghost-$run" '{app: $n, host: "x", name: "g", commit: "c", requests: []}')" \
-  --qualifier outbox >/dev/null
+invoke $NAME-events "$(jq -cn --arg n "ghost-$run" '{app: $n, host: "x", name: "g", day: 0, commit: "c",
+  requests: []}')" --qualifier outbox >/dev/null
 if awaitlog events "$since" "has no release" 60; then pass "a delivery for an app with no release is dropped"
 else fail "a delivery for an app with no release is dropped"; fi
 since=$(now)
 invoke $NAME-events "$(jq -cn --arg h "beta.$DOMAIN" --arg n "nohead-$run" '{app: "beta", host: $h, name: $n,
-  commit: "forged", requests: []}')" --qualifier outbox >/dev/null
-if awaitlog serve "$since" "its commit never landed" 20; then pass "a delivery whose commit never lands is dropped"
-else fail "a delivery whose commit never lands is dropped"; fi
+  day: (now / 86400 | floor), base: "forged", commit: "forged", requests: []}')" --qualifier outbox >/dev/null
+if awaitlog serve "$since" "no commit recorded it" 20; then pass "a delivery over a head its name never had is dropped"
+else fail "a delivery over a head its name never had is dropped"; fi
 invoke $NAME-events "{\"app\":\"beta\",\"path\":\"/@forged-$run/echo\"}" --qualifier outbox >/dev/null
 evt=$(jq -cn --arg h "alpha.$DOMAIN" --arg n "x-$run" '{app: "alpha", host: $h, name: $n, commit: "forged",
   requests: [{method: "POST", uri: "https://\($h)/@\($n)/echo", headers: [], body: ""}]}')
@@ -960,7 +966,7 @@ for stream, at, f in rows:
     else:
         puts.append(f["ms"])
         r = last.get(k)
-        if r and r["wrote"] is None and r["etag"] == f.get("over", ""):
+        if r and r["wrote"] is None and r["etag"] == f.get("base", ""):
             r["wrote"] = at - r["at"]  # the run and the write, which a miss would waste
         if "etag" in f:
             known[k] = etag

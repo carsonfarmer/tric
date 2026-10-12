@@ -1,7 +1,8 @@
 //! Running an app: each request in a fresh instance. A request with an unsafe method to `/@<name>` is a turn on the
-//! name: its writes, and the requests it holds, commit if it answers anything but 5xx. A conflict runs it again.
+//! name: its writes, and the requests it holds, commit if it answers anything but 5xx. A conflict runs it again, if
+//! it may.
 use crate::engine::App;
-use crate::name::{self, Answer, BUSY, Committed, Conditions, Failed, Idempotency, Record, Turn};
+use crate::name::{self, Answer, Committed, Conditions, Failed, Idempotency, Record, Turn};
 use crate::outbound::{self, Allow, Fut, Sent};
 use crate::outbox::{self, Held, Sink};
 use crate::store::Store;
@@ -18,7 +19,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::{sync::Mutex, time::sleep};
+use tokio::sync::Mutex;
 use wasmtime_wasi_http::{RequestOptions, WasiBody, WasiHttpHooks, io::TokioIo};
 
 pub type Request = http::Request<WasiBody>;
@@ -31,10 +32,11 @@ pub const CREDENTIALS: HeaderName = HeaderName::from_static("x-tric-credentials"
 /// What marks the answer of a turn sent again with its `Idempotency-Key`, as Stripe marks one.
 const IDEMPOTENT_REPLAYED: HeaderName = HeaderName::from_static("idempotent-replayed");
 
-/// A turn's request body is kept up to this, so the turn can run again; past it, the turn claims its name first.
+/// A turn's request body is kept up to this, so the turn can run again; past it, the turn runs once.
 const REPLAY_MAX: usize = 6 << 20;
-/// A turn that has run this long claims its name, so that shorter ones do not keep it from committing.
-const CLAIM_AFTER: Duration = Duration::from_secs(1);
+/// A turn's deadline: one that another commit beat runs again until then, and after it answers 503. A run begun before
+/// it has the guest's `ANSWER`, and its commit `SETTLE`, all in CloudFront's 60 s for an answer from the origin.
+const DEADLINE: Duration = Duration::from_secs(5);
 const DEPTH_MAX: usize = 16; // requests to itself, one inside another
 
 /// An app, ready to run requests: its code, its state, where it may send requests and where its commits hand their
@@ -67,19 +69,19 @@ pub fn status(code: StatusCode) -> Response {
     http::Response::builder().status(code).body(Default::default()).unwrap()
 }
 
-/// 429, or 503, with `Retry-After: 1`.
-fn later(code: StatusCode) -> Response {
-    let mut res = status(code);
+/// 503, with `Retry-After: 1`.
+fn later() -> Response {
+    let mut res = status(StatusCode::SERVICE_UNAVAILABLE);
     res.headers_mut().insert(RETRY_AFTER, HeaderValue::from_static("1"));
     res
 }
 
-/// The answer of a turn whose commit failed with `e`: 503, with `Retry-After: 1`, if it was unclaimed and failed before
-/// its put ([`Failed::Unsent`]), so nothing landed; else 500, so a client does not run the turn again, as it may have
-/// landed, did what it claimed the name for, or would fail again.
+/// The answer of a turn whose commit failed with `e`: 503, with `Retry-After: 1`, if it failed before its put
+/// ([`Failed::Unsent`]), so nothing landed; else 500, so a client does not run the turn again, as it may have landed,
+/// or would fail again.
 pub(crate) fn failed(e: &wasmtime::Error) -> Response {
     match e.downcast_ref::<Failed>() {
-        Some(Failed::Unsent) => later(StatusCode::SERVICE_UNAVAILABLE),
+        Some(Failed::Unsent) => later(),
         _ => status(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -211,7 +213,8 @@ impl Tric {
         self.dispatch(req, host, vec![], 0).await
     }
 
-    /// Runs `req` in an instance, as a turn if it is one, as often as a turn on its name takes.
+    /// Runs `req` in an instance, as a turn if it is one: again while another commit beats it, if it may run again and
+    /// its deadline has not passed, and else answering 503, as nothing it wrote landed.
     async fn dispatch(self: &Arc<Self>, req: Request, host: &str, chain: Vec<String>, depth: usize) -> Response {
         let named = name::of(req.uri().path()).map(str::to_owned);
         let ctx = |turn, chain| {
@@ -243,34 +246,29 @@ impl Tric {
             (Some(_), Body::Once(_)) => return status(StatusCode::PAYLOAD_TOO_LARGE), // too large to fingerprint
             (None, _) => None,
         };
-        let (mut claim, until) = (matches!(body, Body::Once(_)), Instant::now() + BUSY);
+        let until = Instant::now() + DEADLINE;
         let chain: Vec<String> = chain.into_iter().chain([name.clone()]).collect();
         loop {
-            let Some(body) = body.take() else { return later(StatusCode::SERVICE_UNAVAILABLE) }; // read, and lost
-            let turn = match Turn::open(&self.store, &self.app, &name, claim, &conditions, once.as_ref(), until).await {
+            let Some(body) = body.take() else { return later() }; // read once, so it cannot run again
+            let turn = match Turn::open(&self.store, &self.app, &name, &conditions, once.as_ref()).await {
                 Ok(Ok(turn)) => turn,
                 Ok(Err(Answer::Replay(record))) => return replay(record),
-                Ok(Err(Answer::Refused(StatusCode::TOO_MANY_REQUESTS))) => return later(StatusCode::TOO_MANY_REQUESTS),
                 Ok(Err(Answer::Refused(refused))) => return status(refused),
                 Err(e) => {
                     tracing::warn!(app = self.app, name, "{e:#}");
-                    return later(StatusCode::SERVICE_UNAVAILABLE);
+                    return later();
                 }
             };
-            let timer = turn.clone();
-            tokio::spawn(async move {
-                sleep(CLAIM_AFTER).await;
-                timer.claim().await;
-            });
             let req = http::Request::from_parts(parts.clone(), body);
             match self.attempt(&turn, req, ctx(Some(turn.clone()), chain.clone()), host).await {
                 Some(res) => return res,
-                None => claim = true,
+                None if turn.repeatable() && Instant::now() < until => {}
+                None => return later(),
             }
         }
     }
 
-    /// Runs `req` as the turn `turn`, and commits or discards it. The answer is none if the turn must run again.
+    /// Runs `req` as the turn `turn`, and commits or discards it. The answer is none if another commit beat it.
     async fn attempt(
         &self,
         turn: &Arc<Turn>,
@@ -279,16 +277,7 @@ impl Tric {
         host: &str,
     ) -> Option<Response> {
         let name = &turn.name;
-        let answer = self.code.call(req, ctx).await;
-        if turn.doomed() {
-            // A claim failed, so another turn committed first: whatever this one answered, it runs again.
-            if let Ok((_, instance)) = &answer {
-                instance.abort();
-            }
-            turn.discard().await;
-            return None;
-        }
-        let (res, instance) = match answer {
+        let (res, instance) = match self.code.call(req, ctx).await {
             Ok(answer) => answer,
             Err(e) => {
                 tracing::warn!(app = self.app, name, "{e:#}");
@@ -364,9 +353,9 @@ impl Ctx {
         }
     }
 
-    /// Sends an outbound request: held for the outbox if it asks to be and the turn is open, or else refused with 503
-    /// if the name has too many commits pending; to the app itself in-process; and, if it is unsafe and the request a
-    /// turn, once the turn's name is claimed.
+    /// Sends an outbound request: held for the outbox if it asks to be and the turn is open; to the app itself
+    /// in-process; and, if it is unsafe and the request a turn, once the turn is ready for it, as
+    /// [`Turn::before_unsafe`] says.
     async fn send(self: Arc<Self>, mut req: Request) -> Sent {
         let me = req.uri().authority().is_some_and(|a| a.as_str().eq_ignore_ascii_case(&self.host));
         if !me {
@@ -378,9 +367,6 @@ impl Ctx {
             && turn.is_open()
             && outbox::respond_async(req.headers())
         {
-            if turn.backlogged() {
-                return Ok((status(StatusCode::SERVICE_UNAVAILABLE), done)); // refused, and not sent at once
-            }
             turn.hold(Held::of(req).await?).map_err(|e| internal(&e))?;
             return Ok((outbox::accepted(), done));
         }
@@ -421,7 +407,6 @@ mod tests {
         assert_eq!(answer(unsent), (503, Some(HeaderValue::from_static("1"))), "nothing landed");
         assert_eq!(answer(wasmtime::Error::msg(Failed::TooLarge)), (500, None), "it would fail again");
         assert_eq!(answer(wasmtime::Error::msg(Failed::Unsettled)), (500, None), "it may have landed");
-        assert_eq!(answer(wasmtime::Error::msg(Failed::Lapsed)), (500, None), "it sent what it claimed the name for");
         assert_eq!(answer(wasmtime::format_err!("anything else")), (500, None), "it may have landed");
     }
 }
