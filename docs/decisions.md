@@ -801,14 +801,23 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
 - **Hard links join files and symlinks, not directories.** A link made with `symlink-follow` is `invalid`, since a
   link to what a symlink points at would need a second resolution at the link.
 - **A path is resolved once, in `ops`, by the operation that uses it.** `ops::mkdir`, `symlink`, `readlink`, `remove`,
-  `rename` and `link` each take the path and read its entry once, with the tree held, and decide from that entry; the
-  descriptor only checks that it is a directory and takes the tree. An earlier version resolved the path in `src/fs.rs`
-  and then had `ops` read the entry again, and check the name and the parent's kind again, which could not fail:
-  `locate` yields only a name that is not empty, `.` or `..`, at most 255 bytes and without `/` or NUL, and a parent
-  from its own stack of directories. `unlink-file-at` and `remove-directory-at` are one `remove`, told which by a flag.
-  Two answers now follow Linux where they did not: `link-at` to an entry that exists, written with a trailing slash,
-  is `exist`, as `symlink-at` already was, and `readlink-at` of a file written with a trailing slash is
+  `rename`, `link` and `open` each take the path and read its entry once, with the tree held, and decide from that
+  entry; the descriptor only checks that it is a directory and takes the tree. An earlier version resolved the path in
+  `src/fs.rs` and then had `ops` read the entry again, and check the name and the parent's kind again, which could not
+  fail: `locate` yields only a name that is not empty, `.` or `..`, at most 255 bytes and without `/` or NUL, and a
+  parent from its own stack of directories. `unlink-file-at` and `remove-directory-at` are one `remove`, told which by
+  a flag. Two answers now follow Linux where they did not: `link-at` to an entry that exists, written with a trailing
+  slash, is `exist`, as `symlink-at` already was, and `readlink-at` of a file written with a trailing slash is
   `not-directory`, as `readlinkat` has it.
+- **`open-at` is two calls on one decision.** `ops::open` reads a view, for an open that neither creates nor
+  truncates, and `ops::open_mut` edits the tree, for one that does; both decide what the path leads to the same way.
+  The descriptor keeps the two checks that are not about the path, in the order they were: a directory opened to
+  create, be exclusive or truncate is `invalid` before the tree is taken, and a write, or a change to a directory's
+  entries, in a turn that has answered is `read-only` once the path is found. So `locate`, its answer, a directory
+  entry and `create` are private to `ops`, and nothing outside it can make an entry under a name that `locate` did not
+  check and find free. A test that needs a damaged tree, with an absolute symlink in it, makes one with a helper in
+  `ops`'s tests. Opening to truncate no longer checks that it found a file: only a file is found by an open that
+  changes it, and `set_size` refuses anything else.
 - **A file is as large as the name: `FILE_MAX = DATA_MAX`** (16 GiB). A smaller cap would be a second limit to explain,
   and the name's own budget, which is exact, already stops a write.
 - **An operation is one atomic batch of tree edits,** so that a failure leaves the tree as it was, with two exceptions:

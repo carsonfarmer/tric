@@ -133,19 +133,9 @@ impl Inode {
 /// A directory entry: the inode it names, and what that is, so a listing need not read each.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Dirent {
+struct Dirent {
     i: u64,
     k: Kind,
-}
-
-impl Dirent {
-    pub fn ino(&self) -> u64 {
-        self.i
-    }
-
-    pub fn kind(&self) -> Kind {
-        self.k
-    }
 }
 
 /// What an inode says of itself.
@@ -257,7 +247,7 @@ async fn dirent(tree: &Tree, dir: u64, name: &str) -> Res<Option<Dirent>> {
 
 /// What a path leads to.
 #[derive(Debug)]
-pub enum Loc {
+enum Loc {
     /// A directory the path ends at by `.` or `..`, or that it started at.
     Dir(u64),
     /// An entry of `parent`, if there is one at `at`. `slash` is whether the path ended in one, so that it asks for
@@ -268,7 +258,7 @@ pub enum Loc {
 /// Resolves `path` from the directory `start`, which it never leaves: a `..` above it, and an absolute path or
 /// symlink, are `NotPermitted`. A symlink is followed in the middle of a path, and at the end if `follow` is set or the
 /// path ends in a slash.
-pub async fn locate(tree: &Tree, start: u64, path: &str, follow: bool) -> Res<Loc> {
+async fn locate(tree: &Tree, start: u64, path: &str, follow: bool) -> Res<Loc> {
     if path.is_empty() {
         return Err(Errno::NoEntry);
     }
@@ -466,7 +456,7 @@ async fn vacant(tree: &Tree, start: u64, path: &str, dir: bool) -> Res<(u64, Str
 
 /// A new file, directory or symlink (with its `target`) named `name` in the directory `parent`. The name is one that
 /// `locate` gave, and found free, with the tree held as it is now. Returns its inode.
-pub async fn create(tree: &mut Tree, parent: u64, name: &str, kind: Kind, target: Option<&str>) -> Res<u64> {
+async fn create(tree: &mut Tree, parent: u64, name: &str, kind: Kind, target: Option<&str>) -> Res<u64> {
     live(tree, parent).await?;
     let ino = alloc(tree);
     let mut tx = Tx::new(tree);
@@ -513,6 +503,70 @@ pub async fn readlink(tree: &Tree, start: u64, path: &str) -> Res<String> {
     match lookup(tree, start, path, false).await? {
         (ino, Kind::Link) => Ok(fetch(tree, ino).await?.t.unwrap_or_default()),
         _ => Err(Errno::Invalid),
+    }
+}
+
+/// How a path is opened.
+#[derive(Clone, Copy, Default)]
+pub struct Mode {
+    pub follow: bool,
+    pub create: bool,
+    pub directory: bool,
+    pub exclusive: bool,
+    pub truncate: bool,
+    pub read: bool,
+    pub write: bool,
+    /// For a directory: that it be opened to change its entries, which `get-flags` reports back.
+    pub mutate: bool,
+}
+
+/// What `open` finds.
+enum Found {
+    Existing(u64, Kind),
+    Missing { parent: u64, name: String },
+}
+
+/// What `path` leads to, for `m` to open. A name that is free is found only if `m` creates, and if `m` creates,
+/// truncates or writes, nothing else is found but a file.
+async fn find(tree: &Tree, start: u64, path: &str, m: &Mode) -> Res<Found> {
+    let changes = m.create || m.truncate || m.write;
+    match locate(tree, start, path, m.follow).await? {
+        Loc::Dir(_) if m.create && m.exclusive => Err(Errno::Exist),
+        Loc::Dir(_) if changes => Err(Errno::IsDirectory),
+        Loc::Dir(ino) => Ok(Found::Existing(ino, Kind::Dir)),
+        Loc::Entry { at: None, .. } if !m.create => Err(Errno::NoEntry),
+        Loc::Entry { at: None, slash: true, .. } => Err(Errno::IsDirectory),
+        Loc::Entry { parent, name, at: None, .. } => Ok(Found::Missing { parent, name }),
+        Loc::Entry { at: Some(_), .. } if m.create && m.exclusive => Err(Errno::Exist),
+        Loc::Entry { at: Some(d), slash, .. } => match d.k {
+            Kind::Link => Err(if m.directory { Errno::NotDirectory } else { Errno::Loop }),
+            Kind::Dir if changes => Err(Errno::IsDirectory),
+            Kind::Dir => Ok(Found::Existing(d.i, Kind::Dir)),
+            Kind::File if m.directory || slash => Err(Errno::NotDirectory),
+            Kind::File => Ok(Found::Existing(d.i, Kind::File)),
+        },
+    }
+}
+
+/// The file or directory at `path`, for `m` to open, which neither creates nor truncates: its inode, and what it is.
+pub async fn open(tree: &Tree, start: u64, path: &str, m: &Mode) -> Res<(u64, Kind)> {
+    let Found::Existing(ino, kind) = find(tree, start, path, m).await? else {
+        return Err(Errno::NoEntry); // not reached: only a create finds a name that is free
+    };
+    Ok((ino, kind))
+}
+
+/// Opens `path` by `m`, which creates or truncates: the file is made if `m` creates and it is not there, and emptied
+/// if `m` truncates and it is. Returns its inode, and what it is.
+pub async fn open_mut(tree: &mut Tree, start: u64, path: &str, m: &Mode) -> Res<(u64, Kind)> {
+    match find(tree, start, path, m).await? {
+        Found::Existing(ino, kind) => {
+            if m.truncate {
+                set_size(tree, ino, 0).await?;
+            }
+            Ok((ino, kind))
+        }
+        Found::Missing { parent, name } => Ok((create(tree, parent, &name, Kind::File, None).await?, Kind::File)),
     }
 }
 
@@ -817,7 +871,7 @@ pub async fn readdir(tree: &Tree, dir: u64, after: Option<&str>, limit: usize) -
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::store::Store;
     use crate::tree::counting::counting;
@@ -837,6 +891,12 @@ mod tests {
 
     async fn warm(tree: &Tree, ino: u64, offset: u64, len: u64) -> Res<()> {
         plan(tree, ino, offset, len).await?.warm().await
+    }
+
+    /// Puts a symlink to `target` at `name` in the directory `dir`, as a damaged tree could hold it: `target` may be one
+    /// that `symlink` refuses.
+    pub async fn damaged_link(tree: &mut Tree, dir: u64, name: &str, target: &str) {
+        create(tree, dir, name, Kind::Link, Some(target)).await.unwrap();
     }
 
     #[tokio::test]
@@ -902,7 +962,7 @@ mod tests {
         assert_eq!(symlink(&mut t, sub, "abs", "/out").await, Err(Errno::NotPermitted), "refused when made");
         assert_eq!(readlink(&t, sub, "up").await.as_deref(), Ok("../out"));
         // Inserted as a damaged tree could hold it, to see that following one still leads nowhere.
-        create(&mut t, sub, "abs", Kind::Link, Some("/out")).await.unwrap();
+        damaged_link(&mut t, sub, "abs", "/out").await;
         symlink(&mut t, sub, "high", "../../out").await.unwrap();
         symlink(&mut t, sub, "self", "self").await.unwrap();
         symlink(&mut t, sub, "dot", ".").await.unwrap();
