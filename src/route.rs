@@ -232,13 +232,13 @@ impl Route {
             };
             if Cron::parse(&sweep::schedule(app, self.every)).is_ok_and(|c| c.matches(t)) {
                 tracing::info!(app, "cron: sweep due");
-                let (route, app) = (self.clone(), app.to_owned());
-                tokio::spawn(async move { route.sweep(&app).await });
+                let (route, job) = (self.clone(), Job::Sweep(Sweep { app: app.into(), sweep: true }));
+                tokio::spawn(async move { route.fire(&job).await });
             }
             let due = release.cron.into_iter().filter(|(fields, _)| Cron::parse(fields).is_ok_and(|c| c.matches(t)));
             for (_, path) in due {
-                let (route, app) = (self.clone(), app.to_owned());
-                tokio::spawn(async move { route.fire(&app, &path).await });
+                let (route, job) = (self.clone(), Job::Cron(Fire { app: app.into(), path }));
+                tokio::spawn(async move { route.fire(&job).await });
             }
         }
     }
@@ -250,34 +250,24 @@ impl Route {
             Ok(_) => return status(StatusCode::BAD_REQUEST),
             Err(code) => return status(code),
         };
-        let fired = match &job {
-            Job::Cron(Fire { app, path }) => self.fire(app, path).await,
-            Job::Sweep(Sweep { app, .. }) => self.sweep(app).await,
-        };
-        match fired {
+        match self.fire(&job).await {
             true => status(StatusCode::NO_CONTENT),
             false => status(StatusCode::NOT_FOUND), // an app with no release has no tenant
         }
     }
 
-    /// Fires the cron job at `path` of `app`, and logs how it went; false if `app` has no release.
-    async fn fire(&self, app: &str, path: &str) -> bool {
-        match self.event(app, path, "for=_cron", Bytes::new()).await {
-            Ok(Some(res)) => tracing::info!(app, path, status = res.status().as_u16(), "cron"),
+    /// Has serve run `job`, a cron job or a sweep (see `sweep`), and logs how it went; false if its app has no
+    /// release. A sweep runs in serve, with the app's own credentials, as its tenant; serve answers when it is done,
+    /// and it is not tried again if it fails: tomorrow's sweep does what this one did not.
+    async fn fire(&self, job: &Job) -> bool {
+        let (app, path, from, what) = match job {
+            Job::Cron(Fire { app, path }) => (app, path.as_str(), "for=_cron", "cron"),
+            Job::Sweep(Sweep { app, .. }) => (app, "/", "for=_sweep", "sweep"),
+        };
+        match self.event(app, path, from, Bytes::new()).await {
+            Ok(Some(res)) => tracing::info!(app, path, status = res.status().as_u16(), "{what}"),
             Ok(None) => return false,
-            Err(e) => tracing::warn!(app, path, "cron: {e:#}"),
-        }
-        true
-    }
-
-    /// Has serve sweep `app` (see `sweep`), and logs how it went; false if `app` has no release. The sweep runs in
-    /// serve, with `app`'s own credentials, as `app`'s tenant; serve answers when it is done, and it is not tried
-    /// again if it fails: tomorrow's sweep does what this one did not.
-    async fn sweep(&self, app: &str) -> bool {
-        match self.event(app, "/", "for=_sweep", Bytes::new()).await {
-            Ok(Some(res)) => tracing::info!(app, status = res.status().as_u16(), "sweep"),
-            Ok(None) => return false,
-            Err(e) => tracing::warn!(app, "sweep: {e:#}"),
+            Err(e) => tracing::warn!(app, path, "{what}: {e:#}"),
         }
         true
     }
