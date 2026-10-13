@@ -118,10 +118,10 @@ There is no web platform under QuickJS (no `TextEncoder`, `URL`, `fetch` or `con
   5xx or a trap, and a write after the answer fails. A name holds 16 GiB and 4 Mi entries. It is real: directories,
   symlinks, hard links, `rename`, and files that can be unlinked while open. A path can't leave `/`, and a file's
   bytes are checked against the hash its parent holds. An app that never opens a file pays nothing for it.
-- **Turns commit at the answer**, unless it is a 5xx, or the instance traps. A turn that loses a race runs again,
-  unseen, for up to 5 seconds, while it can: while tric holds all its body (6 MiB or less) and it has sent no unsafe
-  request. One that cannot lands nothing and answers 503 with `Retry-After`, and what it sent stays sent. The name's
-  `ETag` is the id of its last commit, and `If-Match` is honoured.
+- **Turns commit at the answer**, unless it is a 5xx, or the instance traps. A turn's body is 4 MiB at most, else
+  413, and tric holds it whole, so a turn that loses a race runs again, unseen, for up to 5 seconds, unless it has
+  sent an unsafe request. One that cannot lands nothing and answers 503 with `Retry-After`, and what it sent stays
+  sent. The name's `ETag` is the id of its last commit, and `If-Match` is honoured.
 - **`Idempotency-Key`.** A turn sent again with the key of one that committed is answered, for a day at least, with
   its status and `Location`, `Idempotent-Replayed: true` and no body, and does not run; another request with the key
   gets 422. A turn that answered 5xx is not recorded, and runs again.

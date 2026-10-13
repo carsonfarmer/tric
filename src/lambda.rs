@@ -2,7 +2,7 @@
 //! app's tenant, and the answer read from the event stream, as a function URL reads it: a prelude, eight NULs, then the
 //! body.
 use crate::aws::{Aws, query};
-use crate::tric::{Request, Response, status};
+use crate::tric::{BODY_MAX, Request, Response, status};
 use base64::{Engine as _, prelude::BASE64_STANDARD as B64};
 use bytes::{Buf, Bytes, BytesMut};
 use futures_util::stream::{self, BoxStream, StreamExt};
@@ -21,8 +21,6 @@ use wasmtime_wasi_http::Error;
 const MESSAGE_MAX: usize = 16 << 20;
 /// The most a response's prelude may be.
 const PRELUDE_MAX: usize = 1 << 20;
-/// The most a request's body may be: Lambda takes events of up to 6 MB, and the body goes in base64.
-const BODY_MAX: usize = 4 << 20;
 
 /// The start of a function URL's answer: what goes before the eight NULs.
 #[derive(Deserialize)]
