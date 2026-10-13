@@ -3,11 +3,7 @@
 mod app;
 #[cfg(feature = "app")]
 mod chat;
-#[cfg(feature = "app")]
-mod files;
 #[cfg(feature = "guard")]
 mod guard;
 #[cfg(feature = "app")]
 mod kv;
-#[cfg(feature = "app")]
-mod std_files;
