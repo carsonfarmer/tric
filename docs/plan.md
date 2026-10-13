@@ -232,8 +232,8 @@ changed nothing puts nothing.
 **The read path:**
 1. The head is read as now: one GET, with its root node in it.
 2. A lookup descends from the root. A node not in memory is one GET, at its version, checked by its hash. Nodes read are
-   kept by the process in a cache of immutable nodes, byte-capped (16 MiB), keyed by the object's full path and its
-   version (app, name, id, version), so an entry is never stale and never crosses apps.
+   kept by the process in a cache of immutable nodes, byte-capped (16 MiB), keyed by the object's full path, its
+   version and its hash (app, name, id, version, hash), so an entry is never stale and never crosses apps.
 3. A large value is one GET more, whole, as its hash needs all of it, and is kept in the cache of values (32 MiB), keyed
    the same way.
 
@@ -255,8 +255,7 @@ a changed large value takes D + 1 (the values, a round per level, then the head)
 takes today. A write of one key to a name of 1 GiB puts its value if that is large, a leaf of at most 64 KiB, the
 branches above it and the head, and not the 1 GiB.
 
-**Seeing it.** At debug, each turn logs its tree next to the head: GETs, PUTs, cache hits, depth, and the bytes read and
-written, with the splits, merges and collapses of the root.
+**Seeing it.** At debug, each turn logs its tree next to the head: the objects it fetched (GETs) and uploaded (PUTs).
 
 **Snapshots.** A read at an older head keeps working while newer commits land: every object is immutable and read by
 version, and a commit deletes nothing.
