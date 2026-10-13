@@ -268,29 +268,20 @@ pub enum Committed {
 /// Why a commit failed, where that decides how the turn answers: only a commit that failed before its put
 /// ([`Failed::Unsent`]) answers 503, so a client may try again, as nothing landed; any other failure answers 500, as it
 /// may have landed. An error carries at most one.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, thiserror::Error)]
 pub enum Failed {
     /// The name's tree would be over its limits with the commit's records, of its `Idempotency-Key` and its delivery
     /// event. Running again would fail again, as for a trap, so it is never `Unsent`.
+    #[error("the name would be over its limits")]
     TooLarge,
     /// The commit failed before its head was put, so nothing landed.
+    #[error("the commit failed before its head was put")]
     Unsent,
     /// The put had no sure answer, and the head did not say that it landed: it was another commit's, which may have
     /// been written over the turn's, or it could not be read within `SETTLE`. It may have landed, so a client that tried
     /// again could run the turn twice.
+    #[error("the commit may have landed, and the name did not say whether it did")]
     Unsettled,
-}
-
-impl std::fmt::Display for Failed {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            Failed::TooLarge => write!(f, "the name would be over its limits"),
-            Failed::Unsent => write!(f, "the commit failed before its head was put"),
-            Failed::Unsettled => {
-                write!(f, "the commit may have landed, and the name did not say whether it did")
-            }
-        }
-    }
 }
 
 /// The key of `key` in the tree: the keys of the keyvalue store are under `k/`.
