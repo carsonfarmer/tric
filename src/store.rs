@@ -66,7 +66,7 @@ pub struct S3 {
 }
 
 impl S3 {
-    pub fn new(s3: AmazonS3Builder) -> Result<Self> {
+    fn new(s3: AmazonS3Builder) -> Result<Self> {
         let s3 = s3.with_http_connector(Shared);
         let (many, once) = (s3.clone().build()?, s3);
         let once = once.with_credentials(many.credentials().clone());
