@@ -44,6 +44,8 @@ pub(crate) struct Route {
     origin: Option<String>,
     /// On Lambda, where a delivery that fails waits to be tried again.
     pub(crate) retries: Option<Scheduler>,
+    /// On Lambda, whether serve has tenancy, and so is invoked as the app's tenant.
+    tenancy: bool,
     /// Locally, where the router ticks cron itself, how often each app is swept.
     every: Every,
     pub(crate) store: Store,
@@ -75,21 +77,48 @@ async fn cached<V: Clone>(
     Ok(v)
 }
 
+/// `tric route`'s flags and environment.
+#[derive(clap::Args)]
+pub struct Args {
+    #[arg(long, default_value = "127.0.0.1:3000")]
+    listen: SocketAddr,
+    /// Where serve hands over delivery events
+    #[arg(long, default_value = "127.0.0.1:3001")]
+    outbox_listen: SocketAddr,
+    /// Apps are at `<app>.DOMAIN`, the port included
+    #[arg(long, env = "TRIC_DOMAIN")]
+    domain: String,
+    #[arg(long, env = "TRIC_BUCKET")]
+    bucket: String,
+    /// serve: a Lambda function, by its ARN, which runs this router as Lambda's, or `host:port`
+    #[arg(long, env = "TRIC_SERVE")]
+    serve: String,
+    /// The role whose sessions are the apps' credentials; none where STS takes none, as RustFS's
+    #[arg(long, env = "TRIC_ROLE")]
+    role: Option<String>,
+    /// The secret CloudFront sends as `X-Tric-Origin`, without which a request, or a socket's opening, is refused;
+    /// a router without one takes only events
+    #[arg(long, env = "TRIC_ORIGIN", hide_env_values = true)]
+    origin: Option<String>,
+    /// On AWS, where a failed delivery's retries are scheduled
+    #[command(flatten)]
+    retries: Option<Scheduler>,
+    /// On AWS, whether serve has tenancy (`PER_TENANT`), and so is invoked as the app's tenant; `false` only for a
+    /// test account that can't make such a function, where serve's execution environments are shared across apps
+    #[arg(long, env = "TRIC_TENANCY", default_value_t = true, action = clap::ArgAction::Set)]
+    tenancy: bool,
+    /// Where it ticks cron itself, how often each app is swept: hours that divide a day, as `6h`, or days, as `2d`
+    #[arg(long, env = "TRIC_SWEEP_EVERY", default_value = "1d")]
+    sweep_every: Every,
+}
+
 /// Routes requests for `<app>.<domain>` on `listen` to serve, with credentials for `bucket` minted as `role`. serve is
 /// a Lambda function, by its ARN, and then `retries` is where deliveries wait, or else at `host:port`, and then the
-/// router takes invocations on `outbox`, and ticks cron, sweeping each app `every` so often.
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    listen: SocketAddr,
-    outbox: SocketAddr,
-    domain: String,
-    bucket: String,
-    serve: String,
-    role: Option<String>,
-    origin: Option<String>,
-    retries: Option<Scheduler>,
-    every: Every,
-) -> Result<()> {
+/// router takes invocations on `outbox_listen`, and ticks cron, sweeping each app `sweep_every` so often.
+pub async fn run(args: Args) -> Result<()> {
+    let Args { listen, outbox_listen, domain, bucket, serve, role, origin, retries, tenancy, sweep_every: every } =
+        args;
+    let origin = origin.filter(|o| !o.is_empty()); // an empty secret is none
     ensure!(
         serve.starts_with("arn:") == retries.is_some(),
         "a router has retries if, and only if, its serve is a Lambda function"
@@ -98,12 +127,13 @@ pub async fn run(
     let aws = Aws::new(&s3)?;
     let (known, creds) = (Mutex::default(), Mutex::default());
     let store = Store::s3(s3);
-    let route = Arc::new(Route { domain, bucket, serve, role, origin, retries, every, store, aws, known, creds });
+    let route = Route { domain, bucket, serve, role, origin, retries, tenancy, every, store, aws, known, creds };
+    let route = Arc::new(route);
     let clients = TcpListener::bind(listen).await?;
     // Locally, events have a listener of their own, which is up before the router says it is.
     let events = match route.serve.starts_with("arn:") {
         true => None,
-        false => Some(TcpListener::bind(outbox).await?),
+        false => Some(TcpListener::bind(outbox_listen).await?),
     };
     eprintln!("routing at http://{}", clients.local_addr()?);
     let Some(events) = events else {
@@ -191,14 +221,15 @@ impl Route {
         creds.await.map(Some)
     }
 
-    /// Sends `req` to serve, as `app`'s tenant, with `app`'s credentials.
+    /// Sends `req` to serve, as `app`'s tenant, with `app`'s credentials. The request names `app` as its tenant, which
+    /// serve checks; so does the invocation, where serve has tenancy.
     async fn send(&self, app: &str, creds: HeaderValue, mut req: Request) -> Response {
         req.headers_mut().insert(CREDENTIALS, creds);
         if let Ok(app) = HeaderValue::try_from(app) {
             req.headers_mut().insert(TENANT, app);
         }
         let res = match self.serve.starts_with("arn:") {
-            true => lambda::invoke(&self.aws, &self.serve, app, req).await,
+            true => lambda::invoke(&self.aws, &self.serve, self.tenancy.then_some(app), req).await,
             false => outbound::internal(&self.serve, req).await.map(|(res, _)| res).map_err(|e| format_err!("{e:?}")),
         };
         match res {

@@ -1,5 +1,4 @@
 //! Names: each name's state is one object, its head, which a turn changes with a compare-and-swap when it commits.
-use crate::fs;
 use crate::kv::{Error, KeyResponse, other};
 use crate::outbox::{Event, Held, Sink};
 use crate::store::{self, Store};
@@ -87,7 +86,7 @@ pub fn path(app: &str, name: &str) -> Path {
 
 /// The head at `path`, with its version. Each read and write of a head logs, at debug, the bucket's `ETag` of it and
 /// what it took: the numbers that say whether a cache of heads in each environment would pay.
-pub async fn read(store: &Store, path: &Path) -> Result<Option<(Head, UpdateVersion)>> {
+async fn read(store: &Store, path: &Path) -> Result<Option<(Head, UpdateVersion)>> {
     let start = Instant::now();
     let read = store.json(path, HEAD_MAX as u64).await;
     let etag = read.as_ref().ok().and_then(Option::as_ref).and_then(|(_, v)| v.e_tag.as_deref());
@@ -243,8 +242,7 @@ struct State {
 /// A request that may write one name: its writes are in its tree, which is committed or discarded once it answers. A
 /// snapshot is a turn that has answered: it reads the name as it was, and writes nothing.
 ///
-/// The locks are taken in the order the file system's gate (which a commit takes and lets go of at once), `tree`,
-/// `state`; `state` is never held across an await.
+/// The locks are taken in the order `tree`, `state`; `state` is never held across an await.
 pub struct Turn {
     store: Store,
     app: String,
@@ -252,8 +250,6 @@ pub struct Turn {
     path: Path,
     state: Mutex<State>,
     tree: RwLock<Tree>,
-    /// What the file system keeps: the descriptors open on it, and the gate its changes pass.
-    pub fs: fs::State,
     settled: watch::Sender<Option<bool>>, // whether it committed, once it is known
     once: Option<Idempotency>,
 }
@@ -268,29 +264,20 @@ pub enum Committed {
 /// Why a commit failed, where that decides how the turn answers: only a commit that failed before its put
 /// ([`Failed::Unsent`]) answers 503, so a client may try again, as nothing landed; any other failure answers 500, as it
 /// may have landed. An error carries at most one.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, thiserror::Error)]
 pub enum Failed {
     /// The name's tree would be over its limits with the commit's records, of its `Idempotency-Key` and its delivery
     /// event. Running again would fail again, as for a trap, so it is never `Unsent`.
+    #[error("the name would be over its limits")]
     TooLarge,
     /// The commit failed before its head was put, so nothing landed.
+    #[error("the commit failed before its head was put")]
     Unsent,
     /// The put had no sure answer, and the head did not say that it landed: it was another commit's, which may have
     /// been written over the turn's, or it could not be read within `SETTLE`. It may have landed, so a client that tried
     /// again could run the turn twice.
+    #[error("the commit may have landed, and the name did not say whether it did")]
     Unsettled,
-}
-
-impl std::fmt::Display for Failed {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            Failed::TooLarge => write!(f, "the name would be over its limits"),
-            Failed::Unsent => write!(f, "the commit failed before its head was put"),
-            Failed::Unsettled => {
-                write!(f, "the commit may have landed, and the name did not say whether it did")
-            }
-        }
-    }
 }
 
 /// The key of `key` in the tree: the keys of the keyvalue store are under `k/`.
@@ -337,7 +324,7 @@ impl Turn {
         let tree = RwLock::new(tree::open(store, app, name, &head.tree, tree::config())?);
         let state = Mutex::new(State { head, base, answered, ..Default::default() });
         let (app, name, path, settled) = (app.into(), name.into(), path(app, name), watch::Sender::new(None));
-        Ok(Arc::new(Self { store: store.clone(), app, name, path, state, tree, fs: Default::default(), settled, once }))
+        Ok(Arc::new(Self { store: store.clone(), app, name, path, state, tree, settled, once }))
     }
 
     /// A snapshot of `name`: as it is now.
@@ -408,11 +395,6 @@ impl Turn {
 
     pub fn is_open(&self) -> bool {
         !self.state().answered
-    }
-
-    /// The tree, which the file system reads and changes by its own rules.
-    pub fn tree(&self) -> &RwLock<Tree> {
-        &self.tree
     }
 
     /// Holds `held` for the outbox, unless the turn is answered or holds too much.
@@ -532,17 +514,12 @@ impl Turn {
             s.answered = true;
             (s.head.clone(), s.base.clone(), std::mem::take(&mut s.held))
         };
-        self.fs.drain().await; // so the file system's changes that were admitted land first
         let mut tree = self.tree.write().await; // after the writes that were in flight
         if !tree.edited() && held.is_empty() && self.once.is_none() {
             return Ok(Committed::Done(self.etag()));
         }
         let (commit, was) = (store::random(), base.is_some().then(|| head.commit.clone()));
         let ready = async {
-            let mut kept = None;
-            if tree.edited() {
-                kept = self.fs.settle(&mut tree).await?;
-            }
             // An `Idempotency-Key`'s record is read until the day after its own; a delivery event's until two days
             // after, past the window its delivery is tried in.
             let today = now() / DAY;
@@ -581,25 +558,17 @@ impl Turn {
             if let Some(event) = event {
                 sink(event).await?; // before the head is put, so a commit that lands has handed it over
             }
-            Ok::<_, wasmtime::Error>(kept)
+            Ok::<_, wasmtime::Error>(())
         };
-        let kept = match ready.await {
-            Ok(kept) => kept,
-            // Nothing landed, so the client may try again, unless it would fail again.
-            Err(e) => {
-                tree.reset();
-                let again = e.downcast_ref::<Failed>().is_none(); // so not `TooLarge`
-                return Err(if again { e.context(Failed::Unsent) } else { e });
-            }
-        };
+        // Nothing landed, so the client may try again, unless it would fail again.
+        if let Err(e) = ready.await {
+            tree.reset();
+            let again = e.downcast_ref::<Failed>().is_none(); // so not `TooLarge`
+            return Err(if again { e.context(Failed::Unsent) } else { e });
+        }
         let landed = self.land(&head, base, was.as_deref()).await;
-        match &landed {
-            Ok(Committed::Done(_)) => {
-                if let Some(kept) = kept {
-                    self.fs.keep(kept); // under the write lock, so a read sees it from the first
-                }
-            }
-            _ => tree.reset(),
+        if !matches!(landed, Ok(Committed::Done(_))) {
+            tree.reset();
         }
         landed
     }
@@ -649,7 +618,6 @@ impl Turn {
             s.answered = true;
             s.held.clear();
         }
-        self.fs.drain().await;
         self.tree.write().await.reset();
         self.settled.send_replace(Some(false));
     }
@@ -897,7 +865,7 @@ mod tests {
         lossy.plan(Put::Lands, false);
         let turn = writes(&store, "k").await.unwrap();
         let done = commit(&turn).await.unwrap();
-        assert_eq!(lossy.tries.load(SeqCst), 2, "tried again, and refused as it had landed");
+        assert_eq!(lossy.tries.load(SeqCst), 1, "not put again, as the head says it landed");
         assert_eq!(done, done_now(&store).await, "not a conflict, so the turn does not run again");
         assert_eq!(value(&store, "k").await, Some(Bytes::from(vec![7; 5000])));
         assert_eq!(objects(&store).await, 2, "the base's and the turn's");
@@ -907,22 +875,22 @@ mod tests {
     async fn a_commit_that_did_not_land_is_put_again() {
         // Nothing else changed the name, so it is put again, and lands.
         let (store, lossy) = based().await;
-        for _ in 0..store::TRIES {
+        for _ in 0..3 {
             lossy.plan(Put::Fails, false);
         }
         let turn = writes(&store, "k").await.unwrap();
         assert_eq!(commit(&turn).await.unwrap(), done_now(&store).await);
-        assert_eq!((lossy.tries.load(SeqCst), objects(&store).await), (store::TRIES as usize + 1, 2));
+        assert_eq!((lossy.tries.load(SeqCst), objects(&store).await), (4, 2));
 
         // A try landed after all, as it was put again, so that was refused: the head says it landed.
         let (store, lossy) = based().await;
-        for _ in 0..store::TRIES {
+        for _ in 0..3 {
             lossy.plan(Put::Fails, false);
         }
         lossy.plan(Put::Late, false);
         let turn = writes(&store, "k").await.unwrap();
         assert_eq!(commit(&turn).await.unwrap(), done_now(&store).await);
-        assert_eq!(lossy.tries.load(SeqCst), store::TRIES as usize + 1);
+        assert_eq!(lossy.tries.load(SeqCst), 4);
         assert_eq!(value(&store, "k").await, Some(Bytes::from(vec![7; 5000])));
     }
 
@@ -932,15 +900,15 @@ mod tests {
         lossy.plan(Put::Lands, false);
         let turn = writes(&store, "k").await.unwrap();
         assert_eq!(commit(&turn).await.unwrap(), done_now(&store).await);
-        assert_eq!(lossy.tries.load(SeqCst), 2);
+        assert_eq!(lossy.tries.load(SeqCst), 1);
 
         let (store, lossy) = fresh();
-        for _ in 0..store::TRIES {
+        for _ in 0..3 {
             lossy.plan(Put::Fails, false);
         }
         let turn = writes(&store, "k").await.unwrap();
         assert_eq!(commit(&turn).await.unwrap(), done_now(&store).await);
-        assert_eq!(lossy.tries.load(SeqCst), store::TRIES as usize + 1);
+        assert_eq!(lossy.tries.load(SeqCst), 4);
     }
 
     #[tokio::test]
@@ -1227,7 +1195,7 @@ mod tests {
         put(&store, &path("a", "n"), &head, None).await.unwrap().unwrap();
         commit(&writes(&store, "k").await.unwrap()).await.unwrap();
         let snap = Turn::snap(&store, "a", "n").await.unwrap();
-        let tree = snap.tree().read().await;
+        let tree = snap.tree.read().await;
         assert_eq!(tree.scan("i/", None, 10).await.unwrap(), [record_key(today - 1, "k")]);
         assert_eq!(tree.scan("o/", None, 10).await.unwrap(), [event_key(today - 2, "e")]);
     }

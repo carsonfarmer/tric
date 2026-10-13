@@ -28,6 +28,10 @@ ws = ["dep:hyper-util", "dep:tokio-tungstenite"]
 
 [dependencies]
 async-trait = "0.1" # as object_store has it, for a store of tric's own
+# AWS's own reader of an event stream, as `InvokeWithResponseStream` answers, which checks its CRCs; and the types
+# it reads into.
+aws-smithy-eventstream = "0.61"
+aws-smithy-types = "1"
 base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", default-features = false } # as object_store has it, for cron's calendar
@@ -46,6 +50,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 target-lexicon = "0.13"
+thiserror = "2" # as object_store has it, for why a commit failed
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 # aws-lc-rs, as object_store's S3 client uses, so one TLS provider is linked, not two.
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
@@ -62,7 +67,7 @@ webpki-root-certs = "1"
 # The defaults minus what tric never uses: cache, profiling, coredump, debug, stack-switching, gc-copying and
 # compile-time-builtins (so no wit-parser either).
 wasmtime = { version = "=49.0.2", default-features = false, features = [
-    "addr2line", "anyhow", "async", "backtrace", "component-model", "component-model-async", "component-model-bytes",
+    "addr2line", "anyhow", "async", "backtrace", "component-model", "component-model-async",
     "cranelift", "demangle", "gc", "gc-drc", "gc-null", "parallel-compilation", "pooling-allocator", "runtime", "std",
     "threads", "wat",
 ] }

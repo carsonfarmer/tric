@@ -14,7 +14,6 @@ use object_store::PutMode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 use wasmtime::{Result, ensure, error::Context};
 
 /// The most a release takes: it holds the app's environment.
@@ -31,28 +30,44 @@ pub struct Release {
 }
 
 /// On AWS, where schedules are: a schedule group, the router's events function or alias, by its ARN, which they invoke,
-/// and the role they do so as. Apps' cron has one, and the router's retries another.
+/// and the role they do so as. Apps' cron has one, and the router's retries another. Each is required once any is
+/// given: clap parses an `Option<Scheduler>` only then, and names the first that is missing.
+#[derive(clap::Args)]
 pub struct Scheduler {
+    /// On AWS, the EventBridge Scheduler group the schedules go in: apps' cron, for deploy, or failed deliveries'
+    /// retries, for route
+    #[arg(id = "scheduler-group", long, value_name = "NAME", env = "TRIC_SCHEDULER_GROUP", required = false)]
     pub group: String,
+    /// On AWS, the router's events function or alias, by its ARN, which the schedules invoke
+    #[arg(id = "scheduler-target", long, value_name = "ARN", env = "TRIC_SCHEDULER_TARGET", required = false)]
     pub target: String,
+    /// On AWS, the role the schedules invoke it as
+    #[arg(id = "scheduler-role", long, value_name = "ARN", env = "TRIC_SCHEDULER_ROLE", required = false)]
     pub role: String,
 }
 
-/// Deploys the app at `path` to `bucket`, with `env` as its environment and `allow` added to its allowed hosts, and its
-/// sweep `every` so often.
-pub async fn run(
-    path: &Path,
-    allow: &[String],
-    env: Vec<(String, String)>,
-    bucket: &str,
+/// `tric deploy`'s flags and environment.
+#[derive(clap::Args)]
+pub struct Args {
+    #[command(flatten)]
+    app: crate::App,
+    #[arg(long, env = "TRIC_BUCKET")]
+    bucket: String,
+    #[command(flatten)]
     scheduler: Option<Scheduler>,
-    every: Every,
-) -> Result<()> {
-    let app = manifest::read(path, allow).await?;
+    /// On AWS, how often the app is swept: hours that divide a day, as `6h`, or days, as `2d`
+    #[arg(long, env = "TRIC_SWEEP_EVERY", default_value = "1d")]
+    sweep_every: Every,
+}
+
+/// Deploys the app at `args.app.path` to the bucket, with its environment and the hosts it allows besides its own; on
+/// AWS, then its cron and its sweep, every `sweep_every`.
+pub async fn run(args: Args) -> Result<()> {
+    let app = manifest::read(&args.app.path, &args.app.allow).await?;
     ensure!(label(&app.name), "the app's name, {:?}, is not 2 to 63 of a-z, 0-9 and - (a DNS label)", app.name);
     Engine::new()?.compile(&app.wasm)?;
     let sha = store::hash(&app.wasm);
-    let s3 = store::s3(bucket, None)?;
+    let s3 = store::s3(&args.bucket, None)?;
     let aws = Aws::new(&s3)?;
     let store = Store::s3(s3);
     store.put(&store::app(&app.name, &["components", &sha]), app.wasm.into(), PutMode::Overwrite).await?;
@@ -60,11 +75,11 @@ pub async fn run(
         component: sha.clone(),
         allowed_outbound_hosts: app.allowed_outbound_hosts,
         cron: app.cron,
-        env: env.into_iter().collect(),
+        env: args.app.e.into_iter().collect(),
     };
     store.put(&store::app(&app.name, &["current"]), serde_json::to_vec(&release)?.into(), PutMode::Overwrite).await?;
-    if let Some(scheduler) = scheduler {
-        schedule(&aws, &app.name, &release.cron, &scheduler, every).await?;
+    if let Some(scheduler) = args.scheduler {
+        schedule(&aws, &app.name, &release.cron, &scheduler, args.sweep_every).await?;
     }
     println!("{} {sha}", app.name);
     Ok(())
