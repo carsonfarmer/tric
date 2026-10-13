@@ -297,11 +297,15 @@ echo "== deploy"
 toml() {
   mkdir -p "$work/$1" && printf 'component = "/src/tests/fixtures/app.wasm"\n%s' "${2:-}" >"$work/$1/tric.toml"
 }
-deploy() {
-  if docker run --rm -v "$PWD:/src" -v ${P}_cargo:/opt/cargo/registry -v ${P}_target:/src/target -v "$work:/work" \
+# Runs tric, as this checkout builds it, with this admin's credentials and the install's settings.
+tric() {
+  docker run --rm -v "$PWD:/src" -v ${P}_cargo:/opt/cargo/registry -v ${P}_target:/src/target -v "$work:/work" \
     -w /src -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN -e AWS_REGION \
     -e TRIC_BUCKET -e TRIC_SCHEDULER_GROUP -e TRIC_SCHEDULER_TARGET -e TRIC_SCHEDULER_ROLE -e TRIC_SWEEP_EVERY \
-    $P-build cargo run --locked --release -q -- deploy "/work/$1" </dev/null; then pass "deploy $1"
+    $P-build cargo run --locked --release -q -- "$@" </dev/null
+}
+deploy() {
+  if tric deploy "/work/$1"; then pass "deploy $1"
   else fail "deploy $1"; fi
 }
 # Alpha's cron, removed by deploying alpha without it (deploy syncs the schedules even when there are none): its sweep
@@ -720,6 +724,25 @@ bigs() { get "$A/@big-$run/kv?op=get-many&keys=a,b,c,d" | jq -r --arg v "$big" '
 is "a turn keeps four values too big to inline" "$(post "$A/@big-$run/kv?op=set-many&keys=a,b,c,d&value=$big")" \
   '{"ok":null}'
 is "a later request reads them back" "$(bigs)" true
+
+echo "== recover"
+# `tric recover` puts back the keys a name held at an old head, given the version of it that the bucket lists, with a
+# commit over the head it has now (src/name.rs's `recover`): a value too big to inline comes back from its old object,
+# read by its version, a key deleted since comes back, and one set since goes.
+post "$A/@rec-$run/kv?op=set&key=a&value=one$big" >/dev/null
+post "$A/@rec-$run/kv?op=set&key=b&value=one" >/dev/null
+old=$(aws s3api list-object-versions --bucket "$TRIC_BUCKET" --prefix "apps/alpha/names/rec-$run" \
+  --query 'Versions[?IsLatest].VersionId' --output text)
+post "$A/@rec-$run/kv?op=set&key=a&value=two" >/dev/null
+post "$A/@rec-$run/kv?op=delete&key=b" >/dev/null
+post "$A/@rec-$run/kv?op=set&key=c&value=three" >/dev/null
+etag=$(tric recover alpha "rec-$run" "$old") || fail "recover rec-$run"
+is "a recovery puts back the keys the old head held" "$(value "$A" "rec-$run" a | jq --arg v "one$big" '. == $v')/$(
+  value "$A" "rec-$run" b)/$(value "$A" "rec-$run" c)" 'true/"one"/null'
+is "and prints the ETag the name answers with now" "$etag" "$(get "$A/@rec-$run/kv?op=get&key=c" -D - -o /dev/null |
+  tr -d '\r' | awk 'tolower($1) == "etag:" { print $2 }')"
+is "a recovery again changes nothing, so puts no head and prints the same" "$(tric recover alpha "rec-$run" "$old")" \
+  "$etag"
 
 echo "== outbox"
 # One to fail: it waits in outbox/ and is tried again by Scheduler, a minute on and then two. Checked at the end.

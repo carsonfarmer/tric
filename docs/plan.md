@@ -283,8 +283,8 @@ sweep.
   since the listing and names only what is younger, and no attempt lasts an hour, which the build asserts against the
   limits of a turn. Only a key a tree could have made is ever deleted, and a head is read fresh.
 - The head a name has now is the only root: what a head it replaced alone named goes with the rest, and is read by
-  version until the lifecycle expires it. So a name can't simply be put back as an older head; nothing puts one back,
-  and `docs/decisions.md` has what that would take.
+  version until the lifecycle expires it. So a name is not put back as an older head: `tric recover` commits the keys
+  an old head held over the head it has now, as `docs/decisions.md` has.
 - It needs `s3:ListBucket` on the app's `values/*` and `names/*` only, by an `s3:prefix` condition, in the router's
   policy (`src/route.rs`), `infra/aws/main.tf`, `docker/router-policy.json` and the module's test, with assertions.
   The listing of the heads is also what tells a missing head from a refused read, which a GET can't: a head that is
@@ -469,6 +469,10 @@ the commit.
   2. compile, to check the component;
   3. write `components/<sha>`, then `current`;
   4. on AWS, sync the app's schedules.
+- **`tric recover APP NAME VERSION`** puts back the keys a name held at an old head, `VERSION` being the bucket's id
+  of that head's version, with a commit over the head it has now. The head keeps its records of `Idempotency-Key`s and
+  delivery events, the values go back as new objects, and it reaches back `noncurrent_days`, as the old head and what
+  only it named expire then.
 
 ### AWS (OpenTofu)
 

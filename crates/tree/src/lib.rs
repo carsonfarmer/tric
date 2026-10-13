@@ -284,12 +284,32 @@ impl Value {
             _ => 0,
         }
     }
+
+    /// The SHA-256 of what it holds, in hex, which an object's link has; none of base64 that is not well-formed.
+    fn digest(&self) -> Option<String> {
+        match self {
+            Self::Inline(s) => B64.decode(s).ok().map(|bytes| hash(&bytes)),
+            Self::Object(link) => Some(link.h.clone()),
+            Self::Held(bytes) => Some(hash(bytes)),
+        }
+    }
 }
 
 /// What a key holds, as a read finds it: the value, or a link to the object that holds it. [`Tree::value`] reads the
 /// value.
 #[derive(Clone, Debug)]
 pub struct Item(Value);
+
+/// Two items are equal when they hold the same bytes, which is known without reading an object, as its link has its
+/// SHA-256: so a copy from one tree to another need not read what both hold.
+impl PartialEq for Item {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Value::Inline(a), Value::Inline(b)) => a == b, // base64 that decodes is the one encoding of its bytes
+            (a, b) => a.len() == b.len() && a.digest().is_some_and(|d| b.digest() == Some(d)),
+        }
+    }
+}
 
 impl Item {
     /// The length of the value, which is known without reading it.
@@ -1883,6 +1903,31 @@ mod tests {
             assert!(matches!(&err, Error::Corrupt(why) if why.contains("is missing")), "{other}: {err}");
         }
         assert_eq!(counts.gets.load(SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn items_are_equal_when_they_hold_the_same_bytes_without_a_read() {
+        let (store, counts) = counting();
+        let mut tree = at(&store, &Root::default());
+        let values = [("k/a", &[1; 60][..]), ("k/b", &[1; 60]), ("k/c", &[2; 60]), ("k/d", &[1; 4]), ("k/e", &[1; 4])];
+        for (key, value) in values {
+            set(&mut tree, key, value).await;
+        }
+        // A larger config, which reads what a smaller one wrote, keeps the bytes of `k/a` in a node.
+        let mut tree = open(&store, &commit(&mut tree).await, Config::default());
+        set(&mut tree, "k/f", &[1; 60]).await;
+        let tree = open(&store, &commit(&mut tree).await, Config::default());
+        counts.gets.store(0, SeqCst);
+        let mut items = HashMap::new();
+        for key in ["k/a", "k/b", "k/c", "k/d", "k/e", "k/f"] {
+            items.insert(key, tree.get(key).await.unwrap().unwrap());
+        }
+        assert_eq!(items["k/a"], items["k/b"], "two objects of the same bytes");
+        assert_ne!(items["k/a"], items["k/c"], "an object of other bytes");
+        assert_eq!(items["k/d"], items["k/e"], "the same bytes in a node");
+        assert_ne!(items["k/a"], items["k/d"]);
+        assert_eq!(items["k/a"], items["k/f"], "an object, and the same bytes in a node");
+        assert_eq!(counts.gets.load(SeqCst), 0, "no object was read");
     }
 
     #[tokio::test]

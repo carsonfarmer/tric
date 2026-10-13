@@ -8,7 +8,7 @@ use std::sync::Arc;
 use wasmtime::component::Resource;
 
 const BATCH_MAX: usize = 16 << 20; // bytes of values in one `get-many` reply
-const IN_FLIGHT: usize = 32; // value objects read at once for one batch
+pub const IN_FLIGHT: usize = 32; // value objects read at once, for one batch or by a recovery
 
 wasmtime::component::bindgen!({
     path: "wit/keyvalue",

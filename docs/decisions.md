@@ -478,8 +478,8 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "State: 
   no call for, so a signed request and a parser of our own, with `quick-xml`'s `overlapped-lists`), a read of each,
   one set and one bound over them all, a bound on the versions (`VERSIONS_MAX`), the grant of
   `s3:ListBucketVersions`, and rules to tell a deleted head, a delete marker and a version that expired from an error.
-  Nothing ever put a version back. What it costs is what putting a head back would take, which the bullet on that
-  has: a head put back names what the sweep may have deleted, which must be brought back first. Not built.
+  Nothing ever put a version back. A name is recovered otherwise, by a commit of the keys an old head held, which
+  needs only that head's version and what its tree names to be kept: the bullet on recovering a name has it.
 - **The sweep's trigger is a schedule per app, every `TRIC_SWEEP_EVERY`, in the cron group, and nothing else.** Deploy
   adds one schedule to an app's cron entries, named and reconciled with them (its name has the hash of its body, so a
   change is a new schedule made before the old one is deleted), with the input `{"app": "<app>", "sweep": true}` where a
@@ -574,21 +574,29 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "State: 
   are the roots. `src/sweep.rs` states the grace as assertions that fail the build: `GRACE` is an hour at least,
   `TOTAL + SKEW < GRACE`, `LAMBDA_MAX + SKEW < GRACE`, and a run (`RUN`, 240 s) and 30 s more fit in `TOTAL`, so a
   limit raised past the grace cannot be built. A node the mark finds in the process cache was verified when it was
-  cached, and the cache's key is its path and version, so the mark uses what a read would. Only putting a head back
-  breaks the chain, as it descends from no current head: the next bullet has what that would take.
-- **Putting a head back is no commit, and would first have to bring back what it names.** Nothing in tric puts a head
-  back; an operator could, by copying a version of `names/<name>` over the key. Such a head names objects that the
-  current head does not, and the sweep deletes those that are past the grace: some may be delete markers already over
-  versions that the lifecycle expires `noncurrent_days` after the delete, and a run under way may yet delete others. A
-  tool that puts a head back would check that every object the head names can still be read by its version; put the
-  head as a commit is put, conditional on the current head's ETag, so that it writes over no commit, and with a fresh
-  `commit` id, as the old bytes have the old `ETag` in the bucket, so a commit sent over that head before could land
-  on it, after its delivery event was dropped as never to land, and a client's `If-Match` with the old `ETag` would
-  hold again; wait out any run that read the head before the put (900 s); and then remove the delete marker over each
-  object the head names that has one, which makes the version that its link names the current one again (a copy would
-  make a new version, which no link names). That needs `s3:DeleteObjectVersion`, which only the bucket's owner has. A
-  head put back holds the records of the commits up to it, and not of those after, so their delivery events not yet
-  sent are dropped.
+  cached, and the cache's key is its path and version, so the mark uses what a read would. A recovery is in the chain
+  as a turn is: the next bullet has how.
+- **A name is recovered with a commit of the keys an old head held, and not by putting the old head back.**
+  `tric recover APP NAME VERSION` reads the version `VERSION` of `names/<name>`, opens its tree, and copies its keys
+  (`k/`) over the head the name has now: each that differs is set, and each the old head lacked is deleted. It commits
+  as a turn does, over the current head's ETag, with a fresh `commit` id, and copies again over a commit that lands
+  first. A value that both heads hold is not read, as two items are equal when their lengths and SHA-256 are, which a
+  link has. Putting the old head back, by copying its version over the key, would be wrong three ways. The objects it
+  names may be deleted already, or by a sweep under way, as no current head names them: bringing them back would take
+  removing their delete markers, which needs `s3:DeleteObjectVersion`, which only the bucket's owner has. Its bytes
+  have the old `ETag`, so a commit sent over that head could land on it, after its delivery event was dropped as never
+  to land, and a client's `If-Match` of it would hold again. And it holds the records of the commits up to it only, so
+  an `Idempotency-Key` answered since would run again, and the delivery events not yet sent would be dropped. A
+  recovery keeps the current head's records (`i/` and `o/`); writes each value it sets as a new object, so the new head
+  names nothing that the sweep deleted; and lasts `TOTAL` at most, so it is one more commit in the chain the sweep's
+  grace covers. If an object the old tree names has expired, the read fails and nothing changes. A head can be
+  recovered for `noncurrent_days` (1 to 2 days, by default) after a commit replaced it, as its version expires then; a
+  larger `noncurrent_days` reaches further back. A recovery with nothing to change puts no head, and gives the current
+  ETag, so one that timed out, and may have landed, is run again to learn whether it did.
+- **A recovery is the install's, as a deploy is.** One principal holds the install's AWS credentials, and deploys,
+  recovers and reads the bucket: tric has no owners of apps distinct from it. A recovery needs only to read versions
+  and put objects under `apps/<app>/`, which an app-scoped role could be given if apps get owners of their own; it is a
+  command of the CLI, beside `deploy`, and not a route of the router, which would need a principal to check.
 - **A name's mark is bounded, and the valve is a last resort.** A name's head is marked into a set of `u128`
   (`Head::mark`, which is `Tree::mark`), reading its tree's nodes level by level, `IN_FLIGHT` (16) at once, each
   checked against its link. These figures are estimates, not measurements: a GET of a node takes about 25 ms from

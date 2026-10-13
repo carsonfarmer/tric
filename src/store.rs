@@ -6,7 +6,7 @@ use futures_util::{StreamExt, stream};
 use object_store::aws::{AmazonS3, AmazonS3Builder, AwsCredential};
 use object_store::client::{HttpClient, HttpConnector, ReqwestConnector};
 use object_store::{
-    Certificate, ClientOptions, ListResult, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, RetryConfig,
+    Certificate, ClientOptions, GetOptions, ListResult, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, RetryConfig,
     StaticCredentialProvider,
 };
 use object_store::{UpdateVersion, memory::InMemory, path::Path};
@@ -146,6 +146,15 @@ impl Store {
         ensure!(got.meta.size <= max, "{path} is over {max} bytes");
         let version = UpdateVersion { e_tag: got.meta.e_tag.clone(), version: got.meta.version.clone() };
         Ok(Some((got.bytes().await?, version)))
+    }
+
+    /// The object at `path` as it was at `version`, the bucket's id of one of its versions; it must be `max` bytes or
+    /// less.
+    pub async fn version(&self, path: &Path, version: &str, max: u64) -> Result<Bytes> {
+        let opts = GetOptions { version: Some(version.into()), ..Default::default() };
+        let got = self.inner.get_opts(path, opts).await.with_context(|| format!("{path} at the version {version}"))?;
+        ensure!(got.meta.size <= max, "{path} is over {max} bytes");
+        Ok(got.bytes().await?)
     }
 
     pub async fn json<T: DeserializeOwned>(&self, path: &Path, max: u64) -> Result<Option<(T, UpdateVersion)>> {

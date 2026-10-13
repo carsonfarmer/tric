@@ -52,6 +52,15 @@ enum Cmd {
     },
     /// Route requests to serve, each with its app's tenant id and storage credentials; tick cron; relay the outbox
     Route(route::Args),
+    /// Put back the keys a name held at an old head, with a commit over its head now; print the new head's ETag
+    Recover {
+        app: String,
+        name: String,
+        /// The old head's version, as `aws s3api list-object-versions --prefix apps/APP/names/NAME` lists it
+        version: String,
+        #[arg(long, env = "TRIC_BUCKET")]
+        bucket: String,
+    },
 }
 
 #[derive(Args)]
@@ -86,5 +95,12 @@ async fn main() -> Result<()> {
         Cmd::Deploy(args) => deploy::run(args).await,
         Cmd::Serve { listen, domain, bucket, outbox } => serve::run(listen, domain, bucket, outbox).await,
         Cmd::Route(args) => route::run(args).await,
+        Cmd::Recover { app, name, version, bucket } => {
+            let store = store::Store::s3(store::s3(&bucket, None)?);
+            if let Some(etag) = name::recover(&store, &app, &name, &version).await? {
+                println!("{etag}");
+            }
+            Ok(())
+        }
     }
 }

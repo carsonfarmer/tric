@@ -1,24 +1,26 @@
 //! Names: each name's state is one object, its head, which a turn changes with a compare-and-swap when it commits.
-use crate::kv::{Error, KeyResponse, other};
+use crate::engine::TOTAL;
+use crate::kv::{Error, IN_FLIGHT, KeyResponse, other};
 use crate::outbox::{Event, Held, Sink};
 use crate::store::{self, Store};
 use crate::tree::{self, Full, Root, Tree};
 use bytes::Bytes;
+use futures_util::future;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use object_store::{PutMode, UpdateVersion, path::Path};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::{sync::RwLock, sync::watch, time::sleep, time::timeout_at};
-use wasmtime::{Result, error::Context};
+use tokio::{sync::RwLock, sync::watch, time::sleep, time::timeout, time::timeout_at};
+use wasmtime::{Result, bail, ensure, error::Context};
 
 const NAME_MAX: usize = 128;
 const KEY_MAX: usize = 256; // bytes
 const VALUE_MAX: usize = 1 << 20;
 pub const HEAD_MAX: usize = 1 << 20;
 const HELD_MAX: usize = 1_000_000; // bytes of held requests, as JSON, so an event is within Lambda's 1 MB
-const PAGE: usize = 1000; // keys per `list-keys`
+const PAGE: usize = 1000; // keys per `list-keys`, and per page a recovery compares
 /// How long a commit's put may take, with learning whether it landed when its answer is lost; past that, the commit
 /// fails with [`Failed::Unsettled`]. A turn's runs, which begin before its deadline (`tric::DEADLINE`), the guest's
 /// `ANSWER` and this fit in CloudFront's 60 s for an answer from the origin, so the client hears the 500, and not a 504
@@ -219,6 +221,83 @@ pub async fn holds(store: &Store, app: &str, name: &str, day: u64, digest: &str)
     let Some((head, _)) = read(store, &path(app, name)).await? else { return Ok((false, None)) };
     let tree = tree::open(store, app, name, &head.tree, tree::config())?;
     Ok((tree.get(&event_key(day, digest)).await?.is_some(), Some(head.commit)))
+}
+
+/// Makes `name` hold the keys it held at the version `version` of its head, as the bucket numbers them, with a commit
+/// over the head it has now; and gives that commit's `ETag`, or the head's own if it holds them already. Only the keys
+/// go back: the head keeps its records of `Idempotency-Key`s and of delivery events, so what was answered or sent since
+/// stays so, and a client's `If-Match` of the old head fails. The old tree is read by its versions, and what the commit
+/// writes is new objects, as any commit's is: so what the sweep or the bucket's lifecycle has deleted fails the
+/// recovery, and what they may yet delete is nothing the new head names. A recovery takes `TOTAL` at most, as a turn
+/// does, as the sweep's grace counts on: see `sweep.rs`.
+pub async fn recover(store: &Store, app: &str, name: &str, version: &str) -> Result<Option<String>> {
+    ensure!(crate::tric::label(app), "{app:?} is not an app's name");
+    ensure!(is_name(name), "{name:?} is not a name");
+    let old: Head = serde_json::from_slice(&store.version(&path(app, name), version, HEAD_MAX as u64).await?)?;
+    match timeout(TOTAL, restore(store, app, name, &old.tree)).await {
+        Ok(done) => done,
+        Err(_) => {
+            bail!("the recovery did not finish within {TOTAL:?}: it may have landed, which running it again shows")
+        }
+    }
+}
+
+/// Makes `name` hold the keys of the tree at `root`, with a commit over its head, or over one that lands first.
+async fn restore(store: &Store, app: &str, name: &str, root: &Root) -> Result<Option<String>> {
+    let from = tree::open(store, app, name, root, tree::config())?;
+    // A recovery holds no requests, so it hands over no event; and it has no `Idempotency-Key` to record an answer of.
+    let sink: Sink = Arc::new(|_| Box::pin(async { bail!("a recovery holds no requests") }));
+    loop {
+        let turn = Turn::new(store, app, name, read(store, &path(app, name)).await?, false, None)?;
+        copy(&from, &mut *turn.tree.write().await).await?;
+        match turn.commit("", &sink, StatusCode::OK, None).await? {
+            Committed::Done(etag) => return Ok(etag),
+            Committed::Conflict => {} // so it is copied again, over the head that landed
+        }
+    }
+}
+
+/// Makes the keys of `to` those of `from`, a page at a time: each that `from` holds and `to` lacks, or holds otherwise,
+/// is set to what `from` holds, read `IN_FLIGHT` at once and written as they are read, so a page of values is never all
+/// held; and then each that `from` lacks is deleted. A value that both hold is not read.
+async fn copy(from: &Tree, to: &mut Tree) -> Result<()> {
+    let mut after = None;
+    loop {
+        let keys = from.scan("k/", after.as_deref(), PAGE).await?;
+        let mut changed = vec![];
+        for key in &keys {
+            if let Some(item) = from.get(key).await?
+                && to.get(key).await?.as_ref() != Some(&item)
+            {
+                changed.push((key, item));
+            }
+        }
+        for chunk in changed.chunks(IN_FLIGHT) {
+            let reads = chunk.iter().map(|(key, item)| async move {
+                Ok::<_, tree::Error>(((*key).clone(), Some(from.value(item).await?)))
+            });
+            to.write(future::try_join_all(reads).await?).await?;
+        }
+        match keys.len() == PAGE {
+            true => after = keys.last().cloned(),
+            false => break,
+        }
+    }
+    let mut after = None;
+    loop {
+        let keys = to.scan("k/", after.as_deref(), PAGE).await?;
+        let mut gone = vec![];
+        for key in &keys {
+            if from.get(key).await?.is_none() {
+                gone.push((key.clone(), None));
+            }
+        }
+        to.write(gone).await?;
+        match keys.len() == PAGE {
+            true => after = keys.last().cloned(),
+            false => return Ok(()),
+        }
+    }
 }
 
 /// What a turn that does not run answers.
@@ -1198,5 +1277,32 @@ mod tests {
         let tree = snap.tree.read().await;
         assert_eq!(tree.scan("i/", None, 10).await.unwrap(), [record_key(today - 1, "k")]);
         assert_eq!(tree.scan("o/", None, 10).await.unwrap(), [event_key(today - 2, "e")]);
+    }
+
+    #[tokio::test]
+    async fn a_recovery_brings_back_the_keys_of_an_old_head_and_keeps_the_records_of_the_new() {
+        let (store, _) = fresh();
+        let (big, small) = (|b| Some(Bytes::from(vec![b; 5000])), Some(Bytes::from_static(b"c")));
+        let turn = Turn::open(&store, "a", "n", &Default::default(), None).await.unwrap().unwrap();
+        turn.write(vec![("a".into(), big(7)), ("b".into(), big(7)), ("c".into(), small.clone())]).await.unwrap();
+        commit(&turn).await.unwrap();
+        let old = head_now(&store).await.tree;
+        let turn = keyed(&store, &once("1")).await.unwrap();
+        turn.write(vec![("a".into(), big(8)), ("b".into(), None), ("d".into(), big(8))]).await.unwrap();
+        answered(&turn, 200, None).await;
+        let was = head_now(&store).await;
+
+        let etag = restore(&store, "a", "n", &old).await.unwrap();
+        let now = head_now(&store).await;
+        assert_eq!(etag, Some(now.etag()));
+        assert_ne!(now.commit, was.commit, "a commit of its own");
+        for (key, held) in [("a", big(7)), ("b", big(7)), ("c", small), ("d", None)] {
+            assert_eq!(value(&store, key).await, held, "{key}");
+        }
+        assert!(matches!(keyed(&store, &once("1")).await, Err(Answer::Replay(_))), "the key's record stays");
+
+        // Again, with nothing to change, it is done without a commit.
+        assert_eq!(restore(&store, "a", "n", &old).await.unwrap(), etag);
+        assert_eq!(head_now(&store).await.commit, now.commit);
     }
 }
