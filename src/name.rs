@@ -87,7 +87,7 @@ pub fn path(app: &str, name: &str) -> Path {
 
 /// The head at `path`, with its version. Each read and write of a head logs, at debug, the bucket's `ETag` of it and
 /// what it took: the numbers that say whether a cache of heads in each environment would pay.
-pub async fn read(store: &Store, path: &Path) -> Result<Option<(Head, UpdateVersion)>> {
+async fn read(store: &Store, path: &Path) -> Result<Option<(Head, UpdateVersion)>> {
     let start = Instant::now();
     let read = store.json(path, HEAD_MAX as u64).await;
     let etag = read.as_ref().ok().and_then(Option::as_ref).and_then(|(_, v)| v.e_tag.as_deref());
