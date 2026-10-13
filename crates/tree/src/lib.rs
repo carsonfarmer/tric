@@ -69,7 +69,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedMutexGuard, Semaphore};
 
@@ -643,27 +643,16 @@ impl Drop for Flight<'_> {
     }
 }
 
-/// What a tree and its forks did with the store, for the debug log, which is written when the last of them is gone.
-#[derive(Default)]
-struct Stats {
-    gets: AtomicU64,
-    hits: AtomicU64,
-    read: AtomicU64,
-    puts: AtomicU64,
-    written: AtomicU64,
-    depth: AtomicUsize,
-    splits: AtomicU64,
-    merges: AtomicU64,
-    collapses: AtomicU64,
-}
-
 /// Where a tree's objects are, and how to read them.
 struct Reader {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
     cache: Arc<Cache>,
     config: Config,
-    stats: Stats,
+    /// The objects a tree and its forks fetched and uploaded, for the debug log, which is written when the last of
+    /// them is gone.
+    gets: AtomicU64,
+    puts: AtomicU64,
 }
 
 impl Reader {
@@ -691,8 +680,7 @@ impl Reader {
             return corrupt(format!("{path} is over {max} bytes"));
         }
         let bytes = got.bytes().await?;
-        self.stats.gets.fetch_add(1, Relaxed);
-        self.stats.read.fetch_add(bytes.len() as u64, Relaxed);
+        self.gets.fetch_add(1, Relaxed);
         if bytes.len() as u64 != link.n || hash(&bytes) != link.h {
             return corrupt(format!("{path} is not what its link says"));
         }
@@ -709,7 +697,6 @@ impl Reader {
         link.check()?;
         let key = self.key(link);
         if let Some(node) = self.cache.nodes.lock().unwrap().get(&key, &link.h) {
-            self.stats.hits.fetch_add(1, Relaxed);
             return Ok(node);
         }
         let bytes = self.fetch(link, self.config.node as u64).await?;
@@ -732,9 +719,7 @@ impl Reader {
 
     /// The value `link` names, if the cache has it.
     fn kept(&self, key: &CacheKey, link: &Link) -> Option<Bytes> {
-        let bytes = self.cache.values.lock().unwrap().get(key, &link.h)?;
-        self.stats.hits.fetch_add(1, Relaxed);
-        Some(bytes)
+        self.cache.values.lock().unwrap().get(key, &link.h)
     }
 
     /// The value `value` holds.
@@ -765,27 +750,22 @@ impl Reader {
 
 impl Drop for Reader {
     fn drop(&mut self) {
-        let s = &self.stats;
-        let (gets, hits, puts) = (s.gets.load(Relaxed), s.hits.load(Relaxed), s.puts.load(Relaxed));
-        if gets + hits + puts > 0 {
-            let (read, written, depth) = (s.read.load(Relaxed), s.written.load(Relaxed), s.depth.load(Relaxed));
-            let (splits, merges, collapses) =
-                (s.splits.load(Relaxed), s.merges.load(Relaxed), s.collapses.load(Relaxed));
+        let (gets, puts) = (*self.gets.get_mut(), *self.puts.get_mut());
+        if gets + puts > 0 {
             let prefix = &self.prefix;
-            tracing::debug!(%prefix, gets, hits, puts, read, written, depth, splits, merges, collapses, "tree");
+            tracing::debug!(%prefix, gets, puts, "tree");
         }
     }
 }
 
 /// The value at `key`, below `node`.
-fn find<'a>(r: &'a Reader, node: &'a Node, key: &'a str, depth: usize) -> BoxFuture<'a, Result<Option<Value>>> {
+fn find<'a>(r: &'a Reader, node: &'a Node, key: &'a str) -> BoxFuture<'a, Result<Option<Value>>> {
     Box::pin(async move {
-        r.stats.depth.fetch_max(depth, Relaxed);
         match &node.body {
             Body::Leaf(es) => Ok(es.binary_search_by(|(k, _)| k.as_str().cmp(key)).ok().map(|i| es[i].1.clone())),
             Body::Branch(kids) => match &kids[slot(kids, key)].at {
-                At::Dirty(below) => find(r, below, key, depth + 1).await,
-                At::Clean(link) => find(r, &*r.node(link).await?, key, depth + 1).await,
+                At::Dirty(below) => find(r, below, key).await,
+                At::Clean(link) => find(r, &*r.node(link).await?, key).await,
             },
         }
     })
@@ -799,10 +779,8 @@ fn walk<'a, T: Send>(
     (prefix, after, limit): (&'a str, Option<&'a str>, usize),
     out: &'a mut Vec<T>,
     pick: fn(&str, &Value) -> T,
-    depth: usize,
 ) -> BoxFuture<'a, Result<()>> {
     Box::pin(async move {
-        r.stats.depth.fetch_max(depth, Relaxed);
         match &node.body {
             Body::Leaf(es) => {
                 let before = |k: &str| k < prefix || after.is_some_and(|a| k <= a);
@@ -822,10 +800,10 @@ fn walk<'a, T: Send>(
                         break;
                     }
                     match &kid.at {
-                        At::Dirty(below) => walk(r, below, (prefix, after, limit), &mut *out, pick, depth + 1).await?,
+                        At::Dirty(below) => walk(r, below, (prefix, after, limit), &mut *out, pick).await?,
                         At::Clean(link) => {
                             let node = r.node(link).await?;
-                            walk(r, &node, (prefix, after, limit), &mut *out, pick, depth + 1).await?
+                            walk(r, &node, (prefix, after, limit), &mut *out, pick).await?
                         }
                     }
                 }
@@ -901,7 +879,6 @@ fn fix<'a>(r: &'a Reader, node: &'a mut Node) -> BoxFuture<'a, Result<()>> {
             }
             let At::Dirty(left) = &mut kids[a].at else { unreachable!("a node was just loaded") };
             left.append(*right)?;
-            r.stats.merges.fetch_add(1, Relaxed);
             i = a;
             if left.size > r.config.node {
                 let right = left.split_off()?;
@@ -931,10 +908,8 @@ impl Work {
         node: &'a mut Node,
         key: &'a str,
         value: Option<Value>,
-        depth: usize,
     ) -> BoxFuture<'a, Result<Option<(String, Node)>>> {
         Box::pin(async move {
-            r.stats.depth.fetch_max(depth, Relaxed);
             match &mut node.body {
                 Body::Leaf(es) => match (es.binary_search_by(|(k, _)| k.as_str().cmp(key)), value) {
                     (Ok(i), Some(new)) => {
@@ -964,7 +939,7 @@ impl Work {
                     let link = if let At::Clean(link) = &kids[i].at { Some(link.wire()) } else { None };
                     let below = dirty(r, &mut kids[i].at).await?;
                     node.size = node.size + link.map_or(0, |_| LINK_SIZE) - link.unwrap_or(0);
-                    if let Some((least, right)) = self.edit(r, below, key, value, depth + 1).await? {
+                    if let Some((least, right)) = self.edit(r, below, key, value).await? {
                         node.size += json_len(&least) + LINK_SIZE + 4;
                         kids.insert(i + 1, Child { key: least, at: At::Dirty(Box::new(right)) });
                     }
@@ -973,7 +948,6 @@ impl Work {
             if node.size <= r.config.node {
                 return Ok(None);
             }
-            r.stats.splits.fetch_add(1, Relaxed);
             let right = node.split_off()?;
             Ok(Some((right.first_key().to_owned(), right)))
         })
@@ -998,8 +972,7 @@ impl<'a> Flush<'a> {
         let path = self.reader.path(&id);
         let _permit = self.permits.acquire().await.expect("the semaphore is never closed");
         let put = self.reader.store.put_opts(&path, bytes.clone().into(), PutMode::Overwrite.into()).await?;
-        self.reader.stats.puts.fetch_add(1, Relaxed);
-        self.reader.stats.written.fetch_add(bytes.len() as u64, Relaxed);
+        self.reader.puts.fetch_add(1, Relaxed);
         let link = Link { id, v: put.version, h, n: bytes.len() as u64 };
         link.check()?;
         Ok(link)
@@ -1093,7 +1066,7 @@ impl Tree {
         root: &Root,
         config: Config,
     ) -> Result<Self> {
-        let reader = Reader { store, prefix, cache, config, stats: Stats::default() };
+        let reader = Reader { store, prefix, cache, config, gets: 0.into(), puts: 0.into() };
         let node = Node::of(root.root.clone())?;
         let work = Work { bytes: root.bytes, entries: root.entries, seq: root.seq };
         let base = (node.clone(), work.clone());
@@ -1115,7 +1088,7 @@ impl Tree {
 
     /// The item at `key`.
     pub async fn get(&self, key: &str) -> Result<Option<Item>> {
-        Ok(find(&self.reader, &self.root, key, 1).await?.map(Item))
+        Ok(find(&self.reader, &self.root, key).await?.map(Item))
     }
 
     /// The value `item` holds, checked against its link if it is an object, and fetched once for the reads that come
@@ -1132,7 +1105,7 @@ impl Tree {
     /// The first `limit` keys that start with `prefix` and follow `after`, if given, in order.
     pub async fn scan(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Vec<String>> {
         let mut keys = vec![];
-        walk(&self.reader, &self.root, (prefix, after, limit), &mut keys, |k, _| k.to_owned(), 1).await?;
+        walk(&self.reader, &self.root, (prefix, after, limit), &mut keys, |k, _| k.to_owned()).await?;
         Ok(keys)
     }
 
@@ -1140,7 +1113,7 @@ impl Tree {
     pub async fn entries(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Vec<(String, Item)>> {
         let mut entries = vec![];
         let pick = |k: &str, value: &Value| (k.to_owned(), Item(value.clone()));
-        walk(&self.reader, &self.root, (prefix, after, limit), &mut entries, pick, 1).await?;
+        walk(&self.reader, &self.root, (prefix, after, limit), &mut entries, pick).await?;
         Ok(entries)
     }
 
@@ -1217,11 +1190,11 @@ impl Tree {
 
     async fn apply(&mut self, edits: Vec<(String, Option<Value>)>) -> Result<()> {
         for (key, value) in edits {
-            if value.is_none() && find(&self.reader, &self.root, &key, 1).await?.is_none() {
+            if value.is_none() && find(&self.reader, &self.root, &key).await?.is_none() {
                 continue; // nothing to remove, so nothing to copy
             }
             self.edited = true;
-            if let Some((least, right)) = self.work.edit(&self.reader, &mut self.root, &key, value, 1).await? {
+            if let Some((least, right)) = self.work.edit(&self.reader, &mut self.root, &key, value).await? {
                 let left = std::mem::replace(&mut self.root, Node::leaf());
                 let first = Child { key: left.first_key().to_owned(), at: At::Dirty(Box::new(left)) };
                 let second = Child { key: least, at: At::Dirty(Box::new(right)) };
@@ -1251,7 +1224,6 @@ impl Tree {
                         let Some(Child { mut at, .. }) = kids.pop() else { break };
                         let only = dirty(r, &mut at).await?;
                         self.root = std::mem::replace(only, Node::leaf());
-                        r.stats.collapses.fetch_add(1, Relaxed);
                     }
                     _ => break,
                 }
@@ -1314,13 +1286,6 @@ impl Tree {
             }
         }
         Ok(Some(nodes))
-    }
-
-    /// How often the tree split, merged and gave up a level of its root.
-    #[cfg(test)]
-    fn rebalanced(&self) -> (u64, u64, u64) {
-        let s = &self.reader.stats;
-        (s.splits.load(Relaxed), s.merges.load(Relaxed), s.collapses.load(Relaxed))
     }
 }
 
@@ -1485,7 +1450,8 @@ mod tests {
             prefix: prefix(),
             cache: store.cache.clone(),
             config: tiny(),
-            stats: Default::default(),
+            gets: 0.into(),
+            puts: 0.into(),
         };
         let node = Node::of(root.root.clone()).unwrap();
         let mut out = Audit::default();
@@ -1512,7 +1478,7 @@ mod tests {
         let (mut store, mut rng) = (memory(), Rng(0x5EED));
         let (mut model, mut root) = (BTreeMap::<String, Vec<u8>>::new(), Root::default());
         let mut before = BTreeSet::new(); // the objects stored after the round before
-        let (mut splits, mut merges, mut collapses, mut deepest) = (0, 0, 0, 0);
+        let (mut deepest, mut gave_way) = (0, false);
         for round in 0..300 {
             if rng.below(2) == 0 {
                 store.cache = Arc::default(); // a cold cache, as in another process
@@ -1583,8 +1549,6 @@ mod tests {
             // It is finished and swapped in, or is finished and loses the race, or is thrown away as it is.
             let outcome = rng.below(10);
             let finished = if tree.edited() && outcome < 9 { Some(tree.finish().await.unwrap()) } else { None };
-            let (a, b, c) = tree.rebalanced();
-            (splits, merges, collapses) = (splits + a, merges + b, collapses + c);
             if outcome < 7 {
                 root = finished.unwrap_or(root);
                 model = staged;
@@ -1599,6 +1563,7 @@ mod tests {
             drop(tree);
 
             let audit = audit(&store, &root).await;
+            gave_way |= audit.depth < deepest; // only a root that gives up a level makes a tree shallower
             deepest = deepest.max(audit.depth);
             assert_eq!(audit.items.keys().collect::<Vec<_>>(), model.keys().collect::<Vec<_>>(), "round {round}");
             let fresh = open(&store, &root, config);
@@ -1615,7 +1580,7 @@ mod tests {
             before = stored;
         }
         assert!(deepest >= 4, "the tree was {deepest} deep");
-        assert!(splits > 0 && merges > 0 && collapses > 0, "{splits} splits, {merges} merges, {collapses} collapses");
+        assert!(gave_way, "the root never gave up a level");
     }
 
     #[test]
@@ -1754,7 +1719,7 @@ mod tests {
         assert_eq!(counts.gets.load(SeqCst), below);
         assert!(tree.get("k/077").await.unwrap().is_some());
         assert_eq!(counts.gets.load(SeqCst), below, "a node is read once");
-        assert_eq!(tree.reader.stats.hits.load(Relaxed) as usize, below);
+        assert_eq!(tree.reader.gets.load(Relaxed) as usize, below, "the log counts what the store was asked");
         drop(tree);
 
         // A tree that wrote nothing writes nothing, and one that removes what is not there copies nothing.
@@ -1773,10 +1738,32 @@ mod tests {
         assert_eq!(counts.gets.load(SeqCst), below);
         let root = tree.finish().await.unwrap();
         assert_eq!(counts.puts.load(SeqCst), below);
-        assert_eq!(tree.reader.stats.depth.load(Relaxed), levels);
+        assert_eq!(tree.reader.puts.load(Relaxed) as usize, below);
         assert_eq!(audit(&store, &root).await.depth, levels);
         drop(tree);
         assert_eq!(counts.deletes.load(SeqCst), 0, "a tree deletes nothing, not even the nodes it replaced");
+    }
+
+    #[tokio::test]
+    async fn shrinks_as_it_is_emptied() {
+        let store = memory();
+        let root = grown(&store).await;
+        let full = audit(&store, &root).await;
+        assert!(full.depth >= 3, "{} levels", full.depth);
+
+        // Three keys of four go, from every leaf and none whole, so there are fewer nodes only if thin ones merged.
+        let mut tree = at(&store, &root);
+        tree.write((0..400).filter(|i| i % 4 > 0).map(|i| (format!("k/{i:03}"), None)).collect()).await.unwrap();
+        let root = commit(&mut tree).await;
+        let thinned = audit(&store, &root).await;
+        assert_eq!(thinned.items.len(), 100);
+        assert!(thinned.ids.len() < full.ids.len(), "{} nodes, of {}", thinned.ids.len(), full.ids.len());
+
+        // All but one go, and the root gives up its levels for the leaf that holds it.
+        tree.write((4..400).step_by(4).map(|i| (format!("k/{i:03}"), None)).collect()).await.unwrap();
+        let root = commit(&mut tree).await;
+        assert_eq!(audit(&store, &root).await.depth, 1);
+        assert_eq!(text(&tree, "k/000").await, [0; 5]);
     }
 
     #[tokio::test]
@@ -2113,7 +2100,6 @@ mod tests {
             assert_eq!(tree.value(&item).await.unwrap().as_ref(), &[1; 60]);
         }
         assert_eq!(counts.gets.load(SeqCst), 1);
-        assert_eq!(tree.reader.stats.hits.load(Relaxed), 2);
 
         // A link that names the same object, but another hash, is not answered from the cache: the store is asked, and
         // what it gives is not what that link says.

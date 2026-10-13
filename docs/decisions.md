@@ -793,9 +793,8 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   a read would fetch, and never one of another app's. A node a commit uploads is put in it, since the next request is
   the one that will read it. It is not the cache of heads above, which waits for numbers: a head is the one mutable
   thing, and the cache never holds it. Blocks are not cached; the files stage decides that with the numbers.
-- **A turn logs its tree at debug,** next to the head's logs: the GETs, the PUTs, the cache hits, the depth reached and
-  the bytes read and written, with the splits, merges and root collapses, so that the cost model in the plan can be
-  checked against a real run.
+- **A turn logs its tree at debug,** next to the head's logs: the GETs and the PUTs, so that the cost model in the plan
+  can be checked against a real run.
 - **The guest sees only what it can act on of a tree error.** A name that is over a budget is told which, with the
   limit. Anything else (a GET that failed, an object that does not match its hash, a node over its limit) is logged in
   full, with the object, its version and the detail, and the guest gets that the name could not be read or written.
@@ -1242,6 +1241,13 @@ The tree is the crate `tric-tree`, in `crates/tree`, and the root is a workspace
   two: the crate's `a_sequence_is_kept_in_the_root`, and the file system's
   `inode_numbers_count_up_from_the_root_and_go_on_from_a_committed_tree`. The crate adds
   `a_mark_shares_what_it_has_seen_across_roots`, and a doctest on the memory store.
+- **A tree counts only what it fetched and uploaded.** The live check reads the GETs and PUTs of each turn's "tree"
+  line, and passes when a commit of a file of four blocks put four objects at least; those two counters on the reader
+  are all it needs. The tree also counted cache hits, the depth reached, the bytes read and written, and its splits,
+  merges and root collapses: nothing but the check's notes and three tests read them, and the depth was a parameter of
+  every walk and edit. The tests see what those counted in the store instead: the model test asserts that the tree
+  grew four levels deep and that a root gave up a level (a committed tree shallower than one before it), and
+  `shrinks_as_it_is_emptied` that thinned leaves merge into fewer nodes and that a tree emptied to one key is a leaf.
 - **The gate covers the crate:** `fmt` of the workspace, `clippy` of the crate with all its features as well as of
   tric's two feature sets, the crate's tests and doctest, and `cargo publish --workspace --dry-run`, which packages
   the crate and then tric on it.

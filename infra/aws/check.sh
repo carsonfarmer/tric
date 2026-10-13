@@ -1110,9 +1110,8 @@ is "and nothing of this run's is changed" "$(mine)" "$before"
 echo "== trees (what the turns of the run asked of the bucket)"
 # Serve's debug log has a "tree" line for each turn and name, by the tree's prefix, when the last of the turn's trees is
 # gone (crates/tree's Reader): the objects it fetched (`gets`: nodes and blobs, which the line doesn't tell apart, and
-# `read` is their bytes), those the process's cache gave instead (`hits`), and those it uploaded (`puts`, nodes and
-# blobs, so a commit's bucket writes). The sweep's report is its "swept" line. Kept in tree-$run.json, with the sweep's
-# own walks apart.
+# not those the process's cache gave instead) and those it uploaded (`puts`, nodes and blobs, so a commit's bucket
+# writes). The sweep's report is its "swept" line. Kept in tree-$run.json, with the sweep's own walks apart.
 if [ $debug != yes ]; then
   note "no numbers for the trees: serve does not log at debug (apply with -var log=warn,tric=debug)"
 else
@@ -1126,7 +1125,7 @@ else
 import json, sys
 tree, swept, out, run, t0, t1 = sys.argv[1:]
 t0, t1 = int(t0), int(t1)
-KEYS = ("gets", "hits", "puts", "read", "written", "depth", "splits", "merges", "collapses")
+KEYS = ("gets", "puts")
 def lines(path):
     for e in json.load(open(path))["events"]:
         try:
@@ -1152,11 +1151,10 @@ def total(rows, k):
 def show(label, rows):
     if not rows:
         return note(f"trees: no {label}")
-    gets, hits, puts = total(rows, "gets"), total(rows, "hits"), total(rows, "puts")
+    gets, puts = total(rows, "gets"), total(rows, "puts")
     commits = sum(1 for r in rows if r["puts"])
-    note(f"trees: {label}: {len(rows)} lines; {gets} gets, {hits} cache hits ({100 * hits // max(1, gets + hits)}%),",
-         f"{total(rows, 'read')} bytes read; {puts} puts in {commits} commits ({puts / max(1, commits):.1f} a commit),",
-         f"{total(rows, 'written')} bytes written; depth {max(r['depth'] for r in rows)}")
+    note(f"trees: {label}: {len(rows)} lines; {gets} gets; {puts} puts in {commits} commits",
+         f"({puts / max(1, commits):.1f} a commit)")
 show("the turns", turns)
 for name in sorted({r["name"] for r in turns}):
     show(name[: -len(run) - 1], [r for r in turns if r["name"] == name])

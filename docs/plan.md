@@ -284,8 +284,7 @@ of a changed block takes D + 1 (the blocks, a round per level, then the head). A
 takes what it takes today. A 1-byte write to a 10 MiB file puts one 256 KiB block, a leaf of at most 64 KiB, the
 branches above it and the head, and not the 10 MiB.
 
-**Seeing it.** At debug, each turn logs its tree next to the head: GETs, PUTs, cache hits, depth, and the bytes read and
-written, with the splits, merges and collapses of the root.
+**Seeing it.** At debug, each turn logs its tree next to the head: the objects it fetched (GETs) and uploaded (PUTs).
 
 **Snapshots.** A read at an older head keeps working while newer commits land: every object is immutable and read by
 version, and a commit deletes nothing.
