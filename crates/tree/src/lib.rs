@@ -69,9 +69,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
-use tokio::sync::{OwnedMutexGuard, Semaphore};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use tokio::sync::Semaphore;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -286,8 +286,8 @@ impl Value {
     }
 }
 
-/// What a key holds, as a read finds it: the value, or a link to the object that holds it. [`Tree::value`] and
-/// [`Values::get`] read the value.
+/// What a key holds, as a read finds it: the value, or a link to the object that holds it. [`Tree::value`] reads the
+/// value.
 #[derive(Clone, Debug)]
 pub struct Item(Value);
 
@@ -307,8 +307,8 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
-/// A tree as its caller keeps it: the root node, the totals the config holds it to, and the caller's number. It is
-/// small, at most a node, and serialises to `{}` when it is empty.
+/// A tree as its caller keeps it: the root node, and the totals the config holds it to. It is small, at most a node,
+/// and serialises to `{}` when it is empty.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Root {
@@ -318,16 +318,12 @@ pub struct Root {
     bytes: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
     entries: u64,
-    /// A number the caller keeps with the root: see [`Tree::sequence`].
-    #[serde(default, skip_serializing_if = "is_zero")]
-    seq: u64,
 }
 
 impl Root {
-    /// Whether it is the root of a tree that holds nothing, and whose number is 0: such a root is the default one, and
-    /// need not be kept.
+    /// Whether it is the root of a tree that holds nothing: such a root is the default one, and need not be kept.
     pub fn is_empty(&self) -> bool {
-        self.root.is_empty() && self.bytes == 0 && self.entries == 0 && self.seq == 0
+        self.root.is_empty() && self.bytes == 0 && self.entries == 0
     }
 }
 
@@ -510,93 +506,54 @@ impl Node {
 }
 
 /// The objects read, for the trees that share it: nodes, and the values too large to sit in one. An object never
-/// changes, and is kept by its full path and version; a hit must also be what its link says, by its hash, so trees
-/// under any prefix, of any store, may share one.
+/// changes, and is kept by its full path, its version and the hash it was checked against, so a hit is what its link
+/// says, and trees under any prefix, of any store, may share one. Reads that come to an object that another read is
+/// fetching, as two reads of one value at once do, wait for that fetch and have what it checked, instead of fetching
+/// it again; when the one that fetches is cancelled, the next in turn does.
 pub struct Cache {
-    nodes: Mutex<Lru<Arc<Node>>>,
-    values: Mutex<Lru<Bytes>>,
-    /// The values that are being fetched: see [`Flight`].
-    flights: Mutex<HashMap<CacheKey, Gate>>,
+    nodes: quick_cache::sync::Cache<Key, Arc<Node>, Size>,
+    values: quick_cache::sync::Cache<Key, Bytes, Size>,
 }
 
-/// The gate of a value that is being fetched, and how many reads have come to it: the one that holds it, and those
-/// that wait. The count is kept with the map locked, so it is exact, and the gate goes when it is back to none.
-#[derive(Default)]
-struct Gate {
-    lock: Arc<tokio::sync::Mutex<()>>,
-    comers: usize,
-}
+/// An object's path, version and hash.
+type Key = (Path, Option<String>, String);
 
-type CacheKey = (Path, Option<String>);
+/// What an entry weighs in the cache: its bytes, or the most a node is thought to be as JSON.
+#[derive(Clone)]
+struct Size;
 
-/// What a cache keeps of an object: the value, the hash it was checked against, its size, and when it was last used.
-struct Used<V> {
-    value: V,
-    hash: String,
-    size: usize,
-    used: u64,
-}
-
-struct Lru<V> {
-    entries: HashMap<CacheKey, Used<V>>,
-    bytes: usize,
-    tick: u64,
-    max: usize,
-}
-
-impl<V: Clone> Lru<V> {
-    fn new(max: usize) -> Mutex<Self> {
-        Mutex::new(Self { entries: HashMap::new(), bytes: 0, tick: 0, max })
+impl quick_cache::Weighter<Key, Arc<Node>> for Size {
+    fn weight(&self, _: &Key, node: &Arc<Node>) -> u64 {
+        node.size as u64
     }
+}
 
-    /// The value at `key`, if it was checked against `hash`.
-    fn get(&mut self, key: &CacheKey, hash: &str) -> Option<V> {
-        self.tick += 1;
-        let hit = self.entries.get_mut(key).filter(|hit| hit.hash == hash)?;
-        hit.used = self.tick;
-        Some(hit.value.clone())
+impl quick_cache::Weighter<Key, Bytes> for Size {
+    fn weight(&self, _: &Key, bytes: &Bytes) -> u64 {
+        (bytes.len() as u64).max(1) // an entry that weighs nothing is never forgotten
     }
+}
 
-    fn put(&mut self, key: CacheKey, value: V, hash: String, size: usize) {
-        self.tick += 1;
-        self.bytes += size;
-        if let Some(old) = self.entries.insert(key, Used { value, hash, size, used: self.tick }) {
-            self.bytes -= old.size;
-        }
-        if self.bytes > self.max {
-            let mut by_use: Vec<_> = self.entries.iter().map(|(k, e)| (e.used, k.clone())).collect();
-            by_use.sort();
-            for (_, key) in by_use {
-                if self.bytes <= self.max / 8 * 7 {
-                    break;
-                }
-                if let Some(old) = self.entries.remove(&key) {
-                    self.bytes -= old.size;
-                }
-            }
-        }
-    }
+/// A cache of up to `bytes`, in one shard: in several, each would have a share of the bound, and keep nothing over its
+/// share. Its tables are sized for objects of about 16 KiB, a quarter of a default node.
+fn pool<V: Clone>(bytes: usize) -> quick_cache::sync::Cache<Key, V, Size>
+where
+    Size: quick_cache::Weighter<Key, V>,
+{
+    let options = quick_cache::OptionsBuilder::new()
+        .shards(1)
+        .estimated_items_capacity(bytes / (16 << 10) + 1)
+        .weight_capacity(bytes as u64)
+        .build()
+        .expect("both capacities are set");
+    quick_cache::sync::Cache::with_options(options, Size, Default::default(), Default::default())
 }
 
 impl Cache {
     /// A cache that keeps up to `nodes` bytes of nodes, as JSON, and `values` bytes of values. Past either, it forgets
-    /// what it used least, down to seven eighths.
+    /// what was used least, as `quick_cache` judges it.
     pub fn new(nodes: usize, values: usize) -> Self {
-        Self { nodes: Lru::new(nodes), values: Lru::new(values), flights: Mutex::default() }
-    }
-
-    /// Waits for its turn to fetch the value at `key`, and has it.
-    async fn flight(&self, key: &CacheKey) -> Flight<'_> {
-        let lock = {
-            let mut flights = self.flights.lock().unwrap();
-            let gate = flights.entry(key.clone()).or_default();
-            gate.comers += 1;
-            gate.lock.clone()
-        };
-        // From here on the count is the flight's to give back, wherever it is dropped: while it waits too.
-        let mut flight = Flight { cache: self, key: key.clone(), held: None };
-        flight.held = Some(lock.lock_owned().await);
-        flight
+        Self { nodes: pool(nodes), values: pool(values) }
     }
 }
 
@@ -609,52 +566,11 @@ impl Default for Cache {
 
 impl fmt::Debug for Cache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (nodes, values) = (self.nodes.lock().unwrap(), self.values.lock().unwrap());
         f.debug_struct("Cache")
-            .field("nodes", &(nodes.bytes, nodes.max))
-            .field("values", &(values.bytes, values.max))
+            .field("nodes", &(self.nodes.weight(), self.nodes.capacity()))
+            .field("values", &(self.values.weight(), self.values.capacity()))
             .finish_non_exhaustive()
     }
-}
-
-/// The right to fetch one value. Reads that come to a value that another read is fetching, which a stream that reads
-/// ahead and the read that catches up with it both do, wait for it and then find it in the cache, instead of fetching
-/// it again. A value is checked against its link by whoever fetches it, and by whoever finds it in the cache, so
-/// waiting does not take anything on trust. When the one that holds it is cancelled, the next in turn fetches. A read
-/// that is cancelled while it waits is counted out as well, so that the gate does not outlive the reads that come to
-/// it: what is counted is the flights, and not who holds a reference to the gate, which depends on the order in which
-/// a cancelled future drops what it holds.
-struct Flight<'a> {
-    cache: &'a Cache,
-    key: CacheKey,
-    held: Option<OwnedMutexGuard<()>>,
-}
-
-impl Drop for Flight<'_> {
-    fn drop(&mut self) {
-        drop(self.held.take());
-        let mut flights = self.cache.flights.lock().unwrap();
-        if let Some(gate) = flights.get_mut(&self.key) {
-            gate.comers -= 1;
-            if gate.comers == 0 {
-                flights.remove(&self.key);
-            }
-        }
-    }
-}
-
-/// What a tree and its forks did with the store, for the debug log, which is written when the last of them is gone.
-#[derive(Default)]
-struct Stats {
-    gets: AtomicU64,
-    hits: AtomicU64,
-    read: AtomicU64,
-    puts: AtomicU64,
-    written: AtomicU64,
-    depth: AtomicUsize,
-    splits: AtomicU64,
-    merges: AtomicU64,
-    collapses: AtomicU64,
 }
 
 /// Where a tree's objects are, and how to read them.
@@ -663,7 +579,9 @@ struct Reader {
     prefix: Path,
     cache: Arc<Cache>,
     config: Config,
-    stats: Stats,
+    /// The objects the tree fetched and uploaded, for the debug log, which is written when the tree is gone.
+    gets: AtomicU64,
+    puts: AtomicU64,
 }
 
 impl Reader {
@@ -671,8 +589,8 @@ impl Reader {
         object(&self.prefix, id)
     }
 
-    fn key(&self, link: &Link) -> CacheKey {
-        (self.path(&link.id), link.v.clone())
+    fn key(&self, link: &Link) -> Key {
+        (self.path(&link.id), link.v.clone(), link.h.clone())
     }
 
     /// The object `link` names, which must be `max` bytes or less, and be what the link says.
@@ -691,8 +609,7 @@ impl Reader {
             return corrupt(format!("{path} is over {max} bytes"));
         }
         let bytes = got.bytes().await?;
-        self.stats.gets.fetch_add(1, Relaxed);
-        self.stats.read.fetch_add(bytes.len() as u64, Relaxed);
+        self.gets.fetch_add(1, Relaxed);
         if bytes.len() as u64 != link.n || hash(&bytes) != link.h {
             return corrupt(format!("{path} is not what its link says"));
         }
@@ -708,109 +625,77 @@ impl Reader {
     async fn load(&self, link: &Link, keep: bool) -> Result<Arc<Node>> {
         link.check()?;
         let key = self.key(link);
-        if let Some(node) = self.cache.nodes.lock().unwrap().get(&key, &link.h) {
-            self.stats.hits.fetch_add(1, Relaxed);
-            return Ok(node);
-        }
-        let bytes = self.fetch(link, self.config.node as u64).await?;
-        let body = match serde_json::from_slice(&bytes) {
-            Ok(body) => body,
-            Err(e) => return corrupt(format!("{}: {e}", key.0)),
+        let read = async {
+            let bytes = self.fetch(link, self.config.node as u64).await?;
+            match serde_json::from_slice(&bytes) {
+                Ok(body) => Ok(Arc::new(Node::of(body)?)),
+                Err(e) => corrupt(format!("{}: {e}", key.0)),
+            }
         };
-        let node = Arc::new(Node::of(body)?);
         if keep {
-            self.cache.nodes.lock().unwrap().put(key, node.clone(), link.h.clone(), node.size);
+            return self.cache.nodes.get_or_insert_async(&key, read).await;
         }
-        Ok(node)
-    }
-
-    /// Keeps a value the tree uploaded, for the next read.
-    fn keep(&self, link: &Link, bytes: &Bytes) {
-        let values = &mut *self.cache.values.lock().unwrap();
-        values.put(self.key(link), bytes.clone(), link.h.clone(), bytes.len());
-    }
-
-    /// The value `link` names, if the cache has it.
-    fn kept(&self, key: &CacheKey, link: &Link) -> Option<Bytes> {
-        let bytes = self.cache.values.lock().unwrap().get(key, &link.h)?;
-        self.stats.hits.fetch_add(1, Relaxed);
-        Some(bytes)
+        match self.cache.nodes.peek(&key) {
+            Some(node) => Ok(node),
+            None => read.await,
+        }
     }
 
     /// The value `value` holds.
     async fn value(&self, value: &Value) -> Result<Bytes> {
         match value {
             Value::Inline(s) => B64.decode(s).map(Bytes::from).or_else(|e| corrupt(format!("a value in a node: {e}"))),
-            Value::Object(link) => self.block(link).await,
+            Value::Object(link) => self.large_value(link).await,
             Value::Held(bytes) => Ok(bytes.clone()),
         }
     }
 
-    /// The value `link` names, which is an object of its own.
-    async fn block(&self, link: &Link) -> Result<Bytes> {
+    /// The large value `link` names, which is an object of its own.
+    async fn large_value(&self, link: &Link) -> Result<Bytes> {
         link.check()?;
-        let key = self.key(link);
-        if let Some(bytes) = self.kept(&key, link) {
-            return Ok(bytes);
-        }
-        let _flight = self.cache.flight(&key).await;
-        if let Some(bytes) = self.kept(&key, link) {
-            return Ok(bytes);
-        }
-        let bytes = self.fetch(link, self.config.blob).await?;
-        self.keep(link, &bytes);
-        Ok(bytes)
+        self.cache.values.get_or_insert_async(&self.key(link), self.fetch(link, self.config.blob)).await
     }
 }
 
 impl Drop for Reader {
     fn drop(&mut self) {
-        let s = &self.stats;
-        let (gets, hits, puts) = (s.gets.load(Relaxed), s.hits.load(Relaxed), s.puts.load(Relaxed));
-        if gets + hits + puts > 0 {
-            let (read, written, depth) = (s.read.load(Relaxed), s.written.load(Relaxed), s.depth.load(Relaxed));
-            let (splits, merges, collapses) =
-                (s.splits.load(Relaxed), s.merges.load(Relaxed), s.collapses.load(Relaxed));
+        let (gets, puts) = (*self.gets.get_mut(), *self.puts.get_mut());
+        if gets + puts > 0 {
             let prefix = &self.prefix;
-            tracing::debug!(%prefix, gets, hits, puts, read, written, depth, splits, merges, collapses, "tree");
+            tracing::debug!(%prefix, gets, puts, "tree");
         }
     }
 }
 
 /// The value at `key`, below `node`.
-fn find<'a>(r: &'a Reader, node: &'a Node, key: &'a str, depth: usize) -> BoxFuture<'a, Result<Option<Value>>> {
+fn find<'a>(r: &'a Reader, node: &'a Node, key: &'a str) -> BoxFuture<'a, Result<Option<Value>>> {
     Box::pin(async move {
-        r.stats.depth.fetch_max(depth, Relaxed);
         match &node.body {
             Body::Leaf(es) => Ok(es.binary_search_by(|(k, _)| k.as_str().cmp(key)).ok().map(|i| es[i].1.clone())),
             Body::Branch(kids) => match &kids[slot(kids, key)].at {
-                At::Dirty(below) => find(r, below, key, depth + 1).await,
-                At::Clean(link) => find(r, &*r.node(link).await?, key, depth + 1).await,
+                At::Dirty(below) => find(r, below, key).await,
+                At::Clean(link) => find(r, &*r.node(link).await?, key).await,
             },
         }
     })
 }
 
-/// Adds to `out` what `pick` makes of the entries below `node` whose keys start with `prefix`, and follow `after` if
-/// there is one, up to `limit`.
-fn walk<'a, T: Send>(
+/// Adds to `out` the keys below `node` that start with `prefix`, and follow `after` if there is one, up to `limit`.
+fn walk<'a>(
     r: &'a Reader,
     node: &'a Node,
     (prefix, after, limit): (&'a str, Option<&'a str>, usize),
-    out: &'a mut Vec<T>,
-    pick: fn(&str, &Value) -> T,
-    depth: usize,
+    out: &'a mut Vec<String>,
 ) -> BoxFuture<'a, Result<()>> {
     Box::pin(async move {
-        r.stats.depth.fetch_max(depth, Relaxed);
         match &node.body {
             Body::Leaf(es) => {
                 let before = |k: &str| k < prefix || after.is_some_and(|a| k <= a);
-                for (k, value) in &es[es.partition_point(|(k, _)| before(k))..] {
+                for (k, _) in &es[es.partition_point(|(k, _)| before(k))..] {
                     if out.len() >= limit || !k.starts_with(prefix) {
                         break;
                     }
-                    out.push(pick(k, value));
+                    out.push(k.clone());
                 }
             }
             Body::Branch(kids) => {
@@ -822,10 +707,10 @@ fn walk<'a, T: Send>(
                         break;
                     }
                     match &kid.at {
-                        At::Dirty(below) => walk(r, below, (prefix, after, limit), &mut *out, pick, depth + 1).await?,
+                        At::Dirty(below) => walk(r, below, (prefix, after, limit), &mut *out).await?,
                         At::Clean(link) => {
                             let node = r.node(link).await?;
-                            walk(r, &node, (prefix, after, limit), &mut *out, pick, depth + 1).await?
+                            walk(r, &node, (prefix, after, limit), &mut *out).await?
                         }
                     }
                 }
@@ -901,7 +786,6 @@ fn fix<'a>(r: &'a Reader, node: &'a mut Node) -> BoxFuture<'a, Result<()>> {
             }
             let At::Dirty(left) = &mut kids[a].at else { unreachable!("a node was just loaded") };
             left.append(*right)?;
-            r.stats.merges.fetch_add(1, Relaxed);
             i = a;
             if left.size > r.config.node {
                 let right = left.split_off()?;
@@ -919,7 +803,6 @@ fn fix<'a>(r: &'a Reader, node: &'a mut Node) -> BoxFuture<'a, Result<()>> {
 struct Work {
     bytes: u64,
     entries: u64,
-    seq: u64,
 }
 
 impl Work {
@@ -931,10 +814,8 @@ impl Work {
         node: &'a mut Node,
         key: &'a str,
         value: Option<Value>,
-        depth: usize,
     ) -> BoxFuture<'a, Result<Option<(String, Node)>>> {
         Box::pin(async move {
-            r.stats.depth.fetch_max(depth, Relaxed);
             match &mut node.body {
                 Body::Leaf(es) => match (es.binary_search_by(|(k, _)| k.as_str().cmp(key)), value) {
                     (Ok(i), Some(new)) => {
@@ -964,7 +845,7 @@ impl Work {
                     let link = if let At::Clean(link) = &kids[i].at { Some(link.wire()) } else { None };
                     let below = dirty(r, &mut kids[i].at).await?;
                     node.size = node.size + link.map_or(0, |_| LINK_SIZE) - link.unwrap_or(0);
-                    if let Some((least, right)) = self.edit(r, below, key, value, depth + 1).await? {
+                    if let Some((least, right)) = self.edit(r, below, key, value).await? {
                         node.size += json_len(&least) + LINK_SIZE + 4;
                         kids.insert(i + 1, Child { key: least, at: At::Dirty(Box::new(right)) });
                     }
@@ -973,7 +854,6 @@ impl Work {
             if node.size <= r.config.node {
                 return Ok(None);
             }
-            r.stats.splits.fetch_add(1, Relaxed);
             let right = node.split_off()?;
             Ok(Some((right.first_key().to_owned(), right)))
         })
@@ -998,8 +878,7 @@ impl<'a> Flush<'a> {
         let path = self.reader.path(&id);
         let _permit = self.permits.acquire().await.expect("the semaphore is never closed");
         let put = self.reader.store.put_opts(&path, bytes.clone().into(), PutMode::Overwrite.into()).await?;
-        self.reader.stats.puts.fetch_add(1, Relaxed);
-        self.reader.stats.written.fetch_add(bytes.len() as u64, Relaxed);
+        self.reader.puts.fetch_add(1, Relaxed);
         let link = Link { id, v: put.version, h, n: bytes.len() as u64 };
         link.check()?;
         Ok(link)
@@ -1015,7 +894,7 @@ impl<'a> Flush<'a> {
                     try_join_all(held.map(|(_, value)| async move {
                         let Value::Held(bytes) = &*value else { return Ok::<_, Error>(()) };
                         let link = self.upload(bytes.clone()).await?;
-                        self.reader.keep(&link, bytes); // for the next read
+                        self.reader.cache.values.insert(self.reader.key(&link), bytes.clone()); // for the next read
                         *value = Value::Object(link);
                         Ok(())
                     }))
@@ -1041,31 +920,10 @@ impl<'a> Flush<'a> {
             return Err(Error::TooLarge(format!("a node is over {max} bytes")));
         }
         let link = self.upload(json.into()).await?;
-        let (key, hash) = (self.reader.key(&link), link.h.clone());
+        let key = self.reader.key(&link);
         let At::Dirty(node) = std::mem::replace(&mut kid.at, At::Clean(link)) else { unreachable!("it is in memory") };
-        let size = node.size;
-        self.reader.cache.nodes.lock().unwrap().put(key, Arc::new(*node), hash, size); // for the next read
+        self.reader.cache.nodes.insert(key, Arc::new(*node)); // for the next read
         Ok(())
-    }
-}
-
-/// Reads values apart from their tree. An item holds its value, or names an object that never changes and is checked
-/// against its hash when it is read, so what it gives does not depend on the tree, and a read of it need not hold the
-/// tree for a round trip to the store. The tree is for finding the items, and that is the part that holds it.
-#[derive(Clone)]
-pub struct Values(Arc<Reader>);
-
-impl Values {
-    /// The value `item` holds, checked as [`Tree::value`] checks it, and fetched once for the reads that come to it at
-    /// once.
-    pub async fn get(&self, item: &Item) -> Result<Bytes> {
-        self.0.value(&item.0).await
-    }
-}
-
-impl fmt::Debug for Values {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Values").field("prefix", &self.0.prefix).finish_non_exhaustive()
     }
 }
 
@@ -1075,7 +933,7 @@ impl fmt::Debug for Values {
 /// [`Tree::finish`] uploads the rest and gives the new root, and [`Tree::reset`] goes back to the root it was opened
 /// at. Reads take `&self`, and see the writes made so far.
 pub struct Tree {
-    reader: Arc<Reader>,
+    reader: Reader,
     base: (Node, Work), // as opened: the root, and the totals
     root: Node,
     work: Work,
@@ -1093,29 +951,16 @@ impl Tree {
         root: &Root,
         config: Config,
     ) -> Result<Self> {
-        let reader = Reader { store, prefix, cache, config, stats: Stats::default() };
+        let reader = Reader { store, prefix, cache, config, gets: 0.into(), puts: 0.into() };
         let node = Node::of(root.root.clone())?;
-        let work = Work { bytes: root.bytes, entries: root.entries, seq: root.seq };
+        let work = Work { bytes: root.bytes, entries: root.entries };
         let base = (node.clone(), work.clone());
-        Ok(Self { reader: reader.into(), base, root: node, work, poisoned: false, edited: false })
-    }
-
-    /// A copy of the tree as it is, which goes its own way: it shares the store, the cache and the objects, and neither
-    /// sees what the other writes after. Either may be finished, and either resets to the root they were opened at.
-    pub fn fork(&self) -> Self {
-        Self {
-            reader: self.reader.clone(),
-            base: self.base.clone(),
-            root: self.root.clone(),
-            work: self.work.clone(),
-            poisoned: self.poisoned,
-            edited: self.edited,
-        }
+        Ok(Self { reader, base, root: node, work, poisoned: false, edited: false })
     }
 
     /// The item at `key`.
     pub async fn get(&self, key: &str) -> Result<Option<Item>> {
-        Ok(find(&self.reader, &self.root, key, 1).await?.map(Item))
+        Ok(find(&self.reader, &self.root, key).await?.map(Item))
     }
 
     /// The value `item` holds, checked against its link if it is an object, and fetched once for the reads that come
@@ -1124,41 +969,16 @@ impl Tree {
         self.reader.value(&item.0).await
     }
 
-    /// A way to read the values of items that does not hold the tree: see [`Values`].
-    pub fn values(&self) -> Values {
-        Values(self.reader.clone())
-    }
-
     /// The first `limit` keys that start with `prefix` and follow `after`, if given, in order.
     pub async fn scan(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Vec<String>> {
         let mut keys = vec![];
-        walk(&self.reader, &self.root, (prefix, after, limit), &mut keys, |k, _| k.to_owned(), 1).await?;
+        walk(&self.reader, &self.root, (prefix, after, limit), &mut keys).await?;
         Ok(keys)
-    }
-
-    /// The first `limit` entries whose keys start with `prefix` and follow `after`, if given, in order.
-    pub async fn entries(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<Vec<(String, Item)>> {
-        let mut entries = vec![];
-        let pick = |k: &str, value: &Value| (k.to_owned(), Item(value.clone()));
-        walk(&self.reader, &self.root, (prefix, after, limit), &mut entries, pick, 1).await?;
-        Ok(entries)
     }
 
     /// Whether the tree was changed since it was opened or reset.
     pub fn edited(&self) -> bool {
         self.edited
-    }
-
-    /// The number kept with the root, for the caller's own use, such as the last id it gave out. It is 0 in a new tree,
-    /// is set by [`Tree::set_sequence`], is in the root [`Tree::finish`] gives, and goes back with [`Tree::reset`].
-    pub fn sequence(&self) -> u64 {
-        self.work.seq
-    }
-
-    /// Sets the number kept with the root. It does not mark the tree edited: a number is worth keeping once a key uses
-    /// it, and a write that does marks the tree.
-    pub fn set_sequence(&mut self, seq: u64) {
-        self.work.seq = seq;
     }
 
     /// Sets each key to its value, or removes it if the value is none, in order, all or none.
@@ -1217,11 +1037,11 @@ impl Tree {
 
     async fn apply(&mut self, edits: Vec<(String, Option<Value>)>) -> Result<()> {
         for (key, value) in edits {
-            if value.is_none() && find(&self.reader, &self.root, &key, 1).await?.is_none() {
+            if value.is_none() && find(&self.reader, &self.root, &key).await?.is_none() {
                 continue; // nothing to remove, so nothing to copy
             }
             self.edited = true;
-            if let Some((least, right)) = self.work.edit(&self.reader, &mut self.root, &key, value, 1).await? {
+            if let Some((least, right)) = self.work.edit(&self.reader, &mut self.root, &key, value).await? {
                 let left = std::mem::replace(&mut self.root, Node::leaf());
                 let first = Child { key: left.first_key().to_owned(), at: At::Dirty(Box::new(left)) };
                 let second = Child { key: least, at: At::Dirty(Box::new(right)) };
@@ -1241,7 +1061,7 @@ impl Tree {
     /// Uploads the values the tree holds, and, if `nodes`, the nodes it changed too, after it merges what is thin and
     /// drops what is empty, as at the commit, and gives up the levels of the root that have one child.
     async fn flush(&mut self, nodes: bool) -> Result<()> {
-        let r = &*self.reader;
+        let r = &self.reader;
         if nodes {
             fix(r, &mut self.root).await?;
             while let Body::Branch(kids) = &mut self.root.body {
@@ -1251,7 +1071,6 @@ impl Tree {
                         let Some(Child { mut at, .. }) = kids.pop() else { break };
                         let only = dirty(r, &mut at).await?;
                         self.root = std::mem::replace(only, Node::leaf());
-                        r.stats.collapses.fetch_add(1, Relaxed);
                     }
                     _ => break,
                 }
@@ -1278,8 +1097,8 @@ impl Tree {
         if self.root.size > max {
             return Err(Error::TooLarge(format!("the root is over {max} bytes")));
         }
-        let Work { bytes, entries, seq } = self.work;
-        Ok(Root { root: self.root.body.clone(), bytes, entries, seq })
+        let Work { bytes, entries } = self.work;
+        Ok(Root { root: self.root.body.clone(), bytes, entries })
     }
 
     /// Goes back to the root the tree was opened at, as when the caller's swap of a finished root fails, or a write
@@ -1306,7 +1125,7 @@ impl Tree {
             if nodes > max {
                 return Ok(None);
             }
-            let (r, links) = (&*self.reader, std::mem::take(&mut next));
+            let (r, links) = (&self.reader, std::mem::take(&mut next));
             let reads = stream::iter(links).map(|link| async move { r.load(&link, false).await });
             let mut reads = reads.buffer_unordered(IN_FLIGHT);
             while let Some(node) = reads.try_next().await? {
@@ -1314,13 +1133,6 @@ impl Tree {
             }
         }
         Ok(Some(nodes))
-    }
-
-    /// How often the tree split, merged and gave up a level of its root.
-    #[cfg(test)]
-    fn rebalanced(&self) -> (u64, u64, u64) {
-        let s = &self.reader.stats;
-        (s.splits.load(Relaxed), s.merges.load(Relaxed), s.collapses.load(Relaxed))
     }
 }
 
@@ -1479,17 +1291,16 @@ mod tests {
         })
     }
 
+    /// A reader of the objects under `prefix`, as a tree has one.
+    fn reader(store: &Store, prefix: Path) -> Reader {
+        let (store, cache) = (store.inner.clone(), store.cache.clone());
+        Reader { store, prefix, cache, config: tiny(), gets: 0.into(), puts: 0.into() }
+    }
+
     async fn audit(store: &Store, root: &Root) -> Audit {
-        let r = Reader {
-            store: store.inner.clone(),
-            prefix: prefix(),
-            cache: store.cache.clone(),
-            config: tiny(),
-            stats: Default::default(),
-        };
         let node = Node::of(root.root.clone()).unwrap();
         let mut out = Audit::default();
-        dig(&r, &node, 0, (None, None), &mut out).await;
+        dig(&reader(store, prefix()), &node, 0, (None, None), &mut out).await;
         assert_eq!(out.items.len() as u64, root.entries);
         assert_eq!(out.items.values().map(Value::len).sum::<u64>(), root.bytes);
         out
@@ -1512,7 +1323,7 @@ mod tests {
         let (mut store, mut rng) = (memory(), Rng(0x5EED));
         let (mut model, mut root) = (BTreeMap::<String, Vec<u8>>::new(), Root::default());
         let mut before = BTreeSet::new(); // the objects stored after the round before
-        let (mut splits, mut merges, mut collapses, mut deepest) = (0, 0, 0, 0);
+        let (mut deepest, mut gave_way) = (0, false);
         for round in 0..300 {
             if rng.below(2) == 0 {
                 store.cache = Arc::default(); // a cold cache, as in another process
@@ -1583,8 +1394,6 @@ mod tests {
             // It is finished and swapped in, or is finished and loses the race, or is thrown away as it is.
             let outcome = rng.below(10);
             let finished = if tree.edited() && outcome < 9 { Some(tree.finish().await.unwrap()) } else { None };
-            let (a, b, c) = tree.rebalanced();
-            (splits, merges, collapses) = (splits + a, merges + b, collapses + c);
             if outcome < 7 {
                 root = finished.unwrap_or(root);
                 model = staged;
@@ -1599,6 +1408,7 @@ mod tests {
             drop(tree);
 
             let audit = audit(&store, &root).await;
+            gave_way |= audit.depth < deepest; // only a root that gives up a level makes a tree shallower
             deepest = deepest.max(audit.depth);
             assert_eq!(audit.items.keys().collect::<Vec<_>>(), model.keys().collect::<Vec<_>>(), "round {round}");
             let fresh = open(&store, &root, config);
@@ -1615,7 +1425,7 @@ mod tests {
             before = stored;
         }
         assert!(deepest >= 4, "the tree was {deepest} deep");
-        assert!(splits > 0 && merges > 0 && collapses > 0, "{splits} splits, {merges} merges, {collapses} collapses");
+        assert!(gave_way, "the root never gave up a level");
     }
 
     #[test]
@@ -1754,7 +1564,7 @@ mod tests {
         assert_eq!(counts.gets.load(SeqCst), below);
         assert!(tree.get("k/077").await.unwrap().is_some());
         assert_eq!(counts.gets.load(SeqCst), below, "a node is read once");
-        assert_eq!(tree.reader.stats.hits.load(Relaxed) as usize, below);
+        assert_eq!(tree.reader.gets.load(Relaxed) as usize, below, "the log counts what the store was asked");
         drop(tree);
 
         // A tree that wrote nothing writes nothing, and one that removes what is not there copies nothing.
@@ -1773,10 +1583,32 @@ mod tests {
         assert_eq!(counts.gets.load(SeqCst), below);
         let root = tree.finish().await.unwrap();
         assert_eq!(counts.puts.load(SeqCst), below);
-        assert_eq!(tree.reader.stats.depth.load(Relaxed), levels);
+        assert_eq!(tree.reader.puts.load(Relaxed) as usize, below);
         assert_eq!(audit(&store, &root).await.depth, levels);
         drop(tree);
         assert_eq!(counts.deletes.load(SeqCst), 0, "a tree deletes nothing, not even the nodes it replaced");
+    }
+
+    #[tokio::test]
+    async fn shrinks_as_it_is_emptied() {
+        let store = memory();
+        let root = grown(&store).await;
+        let full = audit(&store, &root).await;
+        assert!(full.depth >= 3, "{} levels", full.depth);
+
+        // Three keys of four go, from every leaf and none whole, so there are fewer nodes only if thin ones merged.
+        let mut tree = at(&store, &root);
+        tree.write((0..400).filter(|i| i % 4 > 0).map(|i| (format!("k/{i:03}"), None)).collect()).await.unwrap();
+        let root = commit(&mut tree).await;
+        let thinned = audit(&store, &root).await;
+        assert_eq!(thinned.items.len(), 100);
+        assert!(thinned.ids.len() < full.ids.len(), "{} nodes, of {}", thinned.ids.len(), full.ids.len());
+
+        // All but one go, and the root gives up its levels for the leaf that holds it.
+        tree.write((4..400).step_by(4).map(|i| (format!("k/{i:03}"), None)).collect()).await.unwrap();
+        let root = commit(&mut tree).await;
+        assert_eq!(audit(&store, &root).await.depth, 1);
+        assert_eq!(text(&tree, "k/000").await, [0; 5]);
     }
 
     #[tokio::test]
@@ -2005,89 +1837,10 @@ mod tests {
                             .collect();
                         let what = format!("round {round}: {prefix:?} after {after:?}, {limit}");
                         assert_eq!(tree.scan(prefix, after, limit).await.unwrap(), want, "{what}");
-                        let entries = tree.entries(prefix, after, limit).await.unwrap();
-                        assert_eq!(entries.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), want, "{what}");
-                        for (key, item) in &entries {
-                            assert_eq!(tree.value(item).await.unwrap().as_ref(), model[key].as_slice(), "{key}");
-                        }
                     }
                 }
             }
         }
-    }
-
-    #[tokio::test]
-    async fn a_fork_is_a_tree_of_its_own() {
-        let (store, counts) = counting();
-        let root = grown(&store).await;
-        let mut tree = at(&store, &root);
-        set(&mut tree, "k/000", b"was").await;
-        set(&mut tree, "k/001", &[7; 90]).await; // a value to upload, held in the node
-
-        // It has what the tree had, and then neither sees what the other does.
-        let mut fork = tree.fork();
-        assert_eq!(text(&fork, "k/000").await, b"was");
-        assert_eq!(text(&fork, "k/001").await, [7; 90]);
-        set(&mut tree, "k/000", b"tree").await;
-        tree.write(vec![("k/200".into(), None)]).await.unwrap();
-        set(&mut fork, "k/001", b"fork").await;
-        fork.write(vec![("k/300".into(), None)]).await.unwrap();
-        assert_eq!(text(&tree, "k/000").await, b"tree");
-        assert_eq!(text(&fork, "k/000").await, b"was");
-        assert_eq!(text(&tree, "k/001").await, [7; 90]);
-        assert_eq!(text(&fork, "k/001").await, b"fork");
-        assert!(tree.get("k/200").await.unwrap().is_none() && fork.get("k/200").await.unwrap().is_some());
-        assert!(tree.get("k/300").await.unwrap().is_some() && fork.get("k/300").await.unwrap().is_none());
-
-        // Each is finished as a tree of its own.
-        let (mine, theirs) = (commit(&mut tree).await, commit(&mut fork).await);
-        let (mine, theirs) = (at(&store, &mine), at(&store, &theirs));
-        assert_eq!((text(&mine, "k/000").await, text(&mine, "k/001").await), (b"tree".to_vec(), vec![7; 90]));
-        assert_eq!((text(&theirs, "k/000").await, text(&theirs, "k/001").await), (b"was".to_vec(), b"fork".to_vec()));
-
-        // Whatever a tree uploaded before, a fork reads, and dropping either deletes none of it.
-        drop((fork, tree));
-        counts.puts.store(0, SeqCst);
-        let mut tree = at(&store, &root);
-        for i in 0..60 {
-            set(&mut tree, &format!("k/{i:03}"), &[i as u8; 100]).await;
-        }
-        assert!(counts.puts.load(SeqCst) > 0, "it spilled");
-        let fork = tree.fork();
-        for i in 0..60 {
-            assert_eq!(text(&fork, &format!("k/{i:03}")).await, [i as u8; 100]);
-        }
-        drop((fork, tree));
-        assert_eq!(counts.deletes.load(SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn a_sequence_is_kept_in_the_root() {
-        let store = memory();
-        let mut tree = at(&store, &Root::default());
-        assert_eq!(tree.sequence(), 0);
-        tree.set_sequence(3);
-        assert!(!tree.edited(), "a number alone is not a change");
-        set(&mut tree, "f/3", b"x").await;
-        let root = commit(&mut tree).await;
-        let root: Root = serde_json::from_str(&serde_json::to_string(&root).unwrap()).unwrap();
-        assert_eq!(root.seq, 3);
-
-        // A tree goes on from the root, and one that is reset gives back what it set.
-        let mut next = at(&store, &root);
-        assert_eq!(next.sequence(), 3);
-        next.set_sequence(5);
-        next.reset();
-        assert_eq!(next.sequence(), 3);
-
-        // A tree emptied keeps its number, so its root is not empty.
-        next.set_sequence(4);
-        next.write(vec![("f/3".into(), None)]).await.unwrap();
-        let emptied = next.finish().await.unwrap();
-        assert!(emptied.root.is_empty() && emptied.entries == 0 && emptied.bytes == 0);
-        assert!(!emptied.is_empty());
-        assert_eq!(serde_json::to_string(&emptied).unwrap(), r#"{"seq":4}"#);
-        assert_eq!(at(&store, &emptied).sequence(), 4);
     }
 
     #[tokio::test]
@@ -2113,7 +1866,6 @@ mod tests {
             assert_eq!(tree.value(&item).await.unwrap().as_ref(), &[1; 60]);
         }
         assert_eq!(counts.gets.load(SeqCst), 1);
-        assert_eq!(tree.reader.stats.hits.load(Relaxed), 2);
 
         // A link that names the same object, but another hash, is not answered from the cache: the store is asked, and
         // what it gives is not what that link says.
@@ -2134,7 +1886,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_block_that_is_being_fetched_is_waited_for_by_the_reads_that_come_to_it() {
+    async fn a_large_value_that_is_being_fetched_is_waited_for_by_the_reads_that_come_to_it() {
         let (mut store, counts) = counting();
         let mut tree = at(&store, &Root::default());
         set(&mut tree, "k/a", &[1; 60]).await;
@@ -2143,87 +1895,63 @@ mod tests {
         store.cache = Arc::default();
         let tree = Arc::new(at(&store, &root));
         let item = tree.get("k/a").await.unwrap().unwrap();
+        let read = |tree: &Arc<Tree>| {
+            let (tree, item) = (tree.clone(), item.clone());
+            tokio::spawn(async move { tree.value(&item).await })
+        };
         counts.gets.store(0, SeqCst);
         counts.delay.store(50, SeqCst);
 
-        // Eight reads at once are one fetch, and each has the value.
-        let reads = (0..8).map(|_| {
-            let (tree, item) = (tree.clone(), item.clone());
-            tokio::spawn(async move { tree.value(&item).await.unwrap() })
-        });
+        // Eight reads at once are one fetch, and each has the value, which the cache then keeps.
+        let reads: Vec<_> = (0..8).map(|_| read(&tree)).collect();
         for read in futures_util::future::join_all(reads).await {
-            assert_eq!(read.unwrap().as_ref(), &[1; 60]);
+            assert_eq!(read.unwrap().unwrap().as_ref(), &[1; 60]);
         }
         assert_eq!(counts.gets.load(SeqCst), 1);
-        assert!(store.cache.flights.lock().unwrap().is_empty(), "the gate of a value is gone with the fetch");
+        assert_eq!(tree.value(&item).await.unwrap().as_ref(), &[1; 60]);
+        assert_eq!(counts.gets.load(SeqCst), 1);
+
+        // A read that is cancelled while it waits fetches nothing, and the one that fetches has the value to itself.
+        store.cache = Arc::default();
+        let tree = Arc::new(at(&store, &root));
+        counts.gets.store(0, SeqCst);
+        counts.delay.store(200, SeqCst);
+        let leader = read(&tree);
+        while counts.gets.load(SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let waiter = read(&tree);
+        tokio::time::sleep(Duration::from_millis(20)).await; // it is waiting for the fetch
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(leader.await.unwrap().unwrap().as_ref(), &[1; 60]);
+        assert_eq!(counts.gets.load(SeqCst), 1, "the waiter that was cancelled fetched nothing");
 
         // The one that is fetching is cancelled: the next in turn fetches, and none of them is left waiting.
         store.cache = Arc::default();
         let tree = Arc::new(at(&store, &root));
         counts.gets.store(0, SeqCst);
-        counts.delay.store(200, SeqCst);
-        let first = tokio::spawn({
-            let (tree, item) = (tree.clone(), item.clone());
-            async move { tree.value(&item).await }
-        });
-        while counts.flight.load(SeqCst) == 0 {
+        let first = read(&tree);
+        while counts.gets.load(SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        let second = tokio::spawn({
-            let (tree, item) = (tree.clone(), item.clone());
-            async move { tree.value(&item).await.unwrap() }
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await; // it is waiting at the gate
+        let second = read(&tree);
+        tokio::time::sleep(Duration::from_millis(20)).await; // it is waiting for the fetch
         first.abort();
-        assert_eq!(second.await.unwrap().as_ref(), &[1; 60]);
+        assert_eq!(second.await.unwrap().unwrap().as_ref(), &[1; 60]);
         assert_eq!(counts.gets.load(SeqCst), 2, "the fetch that was cancelled, and the one that took its place");
-        assert!(store.cache.flights.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn a_read_that_is_cancelled_at_the_gate_leaves_no_gate_behind() {
-        let (mut store, counts) = counting();
-        let mut tree = at(&store, &Root::default());
-        set(&mut tree, "k/a", &[1; 60]).await;
-        let root = commit(&mut tree).await;
-        drop(tree);
-        store.cache = Arc::default();
-        let tree = Arc::new(at(&store, &root));
-        let item = tree.get("k/a").await.unwrap().unwrap();
-        let comers = || store.cache.flights.lock().unwrap().values().map(|gate| gate.comers).sum::<usize>();
-        let read = |tree: &Arc<Tree>| {
-            let (tree, item) = (tree.clone(), item.clone());
-            tokio::spawn(async move { tree.value(&item).await })
-        };
-
-        // The one that fetches has the value to itself, and the waiter that is cancelled while it does is counted out
-        // at once, and not when the one that fetches is done: its gate is there until then, and no later.
-        counts.delay.store(300, SeqCst);
-        let leader = read(&tree);
-        while comers() < 1 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        let waiter = read(&tree);
-        while comers() < 2 {
-            tokio::time::sleep(Duration::from_millis(1)).await; // it is waiting at the gate
-        }
-        waiter.abort();
-        assert!(waiter.await.unwrap_err().is_cancelled());
-        assert_eq!(comers(), 1, "the waiter went with its read");
-        assert_eq!(leader.await.unwrap().unwrap().as_ref(), &[1; 60]);
-        assert!(store.cache.flights.lock().unwrap().is_empty(), "nothing is left of the gate");
-        assert_eq!(counts.gets.load(SeqCst), 1, "the waiter that was cancelled fetched nothing");
-    }
-
-    #[tokio::test]
-    async fn reads_that_are_cancelled_at_any_moment_of_a_fetch_leave_no_gate_behind() {
+    async fn reads_that_are_cancelled_at_any_moment_of_a_fetch_leave_none_waiting() {
         let (store, counts) = counting();
         let mut tree = at(&store, &Root::default());
         set(&mut tree, "k/a", &[1; 60]).await;
         let root = commit(&mut tree).await;
         drop(tree);
-        // That includes when the one that fetches lets go of the gate and wakes the next in turn: whichever way the
-        // drops of the cancelled read and of what it waits on fall, none of them leaves a gate behind.
+        // That includes when the one that fetches lets go and wakes the next in turn: whichever way the drops of the
+        // cancelled read and of what it waits on fall, the reads that are not cancelled have the value, and so does
+        // one after them.
         for round in 0..4 {
             let store = Store { cache: Arc::default(), ..store.clone() };
             let tree = Arc::new(at(&store, &root));
@@ -2241,49 +1969,54 @@ mod tests {
                     read.abort();
                 }
             }
-            for read in reads {
-                if let Ok(got) = read.await {
-                    assert_eq!(got.unwrap().as_ref(), &[1; 60]);
+            let rest = async {
+                for read in reads {
+                    if let Ok(got) = read.await {
+                        assert_eq!(got.unwrap().as_ref(), &[1; 60]);
+                    }
                 }
-            }
-            assert!(store.cache.flights.lock().unwrap().is_empty(), "round {round}");
+                tree.value(&item).await.unwrap()
+            };
+            let last = tokio::time::timeout(Duration::from_secs(10), rest).await;
+            assert_eq!(last.expect("a read was left waiting").as_ref(), &[1; 60], "round {round}");
         }
     }
 
     #[test]
     fn a_cache_entry_is_for_one_path_version_and_hash() {
-        let mut lru = Lru::<u32>::new(100).into_inner().unwrap();
-        let key = |path: &str, version: Option<&str>| (Path::from(path), version.map(str::to_owned));
-        lru.put(key("t/n/x", Some("v1")), 7, "h1".into(), 10);
-        assert_eq!(lru.get(&key("t/n/x", Some("v1")), "h1"), Some(7));
-        for (path, version, hash, what) in [
-            ("t/n/x", Some("v2"), "h1", "another version"),
-            ("t/n/x", None, "h1", "no version"),
-            ("u/n/x", Some("v1"), "h1", "another prefix"),
-            ("t/m/x", Some("v1"), "h1", "another prefix that ends the same"),
-            ("t/n/y", Some("v1"), "h1", "another id"),
-            ("t/n/x", Some("v1"), "h2", "another hash"),
+        let store = memory();
+        let link = Link { id: "a".repeat(32), v: Some("v1".into()), h: "h1".into(), n: 3 };
+        let key = |prefix: &str, link: &Link| reader(&store, Path::from(prefix)).key(link);
+        store.cache.values.insert(key("t/n", &link), Bytes::from_static(b"abc"));
+        assert_eq!(store.cache.values.get(&key("t/n", &link)), Some(Bytes::from_static(b"abc")));
+        for (prefix, other, what) in [
+            ("t/n", Link { v: Some("v2".into()), ..link.clone() }, "another version"),
+            ("t/n", Link { v: None, ..link.clone() }, "no version"),
+            ("t/m", link.clone(), "another prefix"),
+            ("u/n", link.clone(), "another prefix that ends the same"),
+            ("t/n", Link { id: "b".repeat(32), ..link.clone() }, "another id"),
+            ("t/n", Link { h: "h2".into(), ..link.clone() }, "another hash"),
         ] {
-            assert_eq!(lru.get(&key(path, version), hash), None, "{what}");
+            assert_eq!(store.cache.values.get(&key(prefix, &other)), None, "{what}");
         }
     }
 
     #[test]
-    fn a_cache_forgets_what_it_used_least() {
-        let mut lru = Lru::<usize>::new(100).into_inner().unwrap();
-        let key = |i: usize| (Path::from(format!("x/{i}")), None);
-        for i in 0..10 {
-            lru.put(key(i), i, "h".into(), 10);
+    fn a_cache_keeps_to_its_bounds() {
+        let cache = Cache::new(1000, 1000);
+        let key = |i: usize| (Path::from(format!("t/n/{i}")), None, String::new());
+        for i in 0..100 {
+            cache.values.insert(key(i), Bytes::from(vec![0; 50]));
         }
-        assert_eq!(lru.bytes, 100);
-        assert_eq!(lru.get(&key(0), "h"), Some(0)); // used again, so the others go first
-        lru.put(key(10), 10, "h".into(), 10);
-        let kept: Vec<_> = (0..=10).filter(|i| lru.get(&key(*i), "h").is_some()).collect();
-        assert_eq!(kept, [0, 4, 5, 6, 7, 8, 9, 10], "down to seven eighths of the bound");
-        assert_eq!(lru.bytes, 80);
-        // An entry that is put again is not counted twice, and is the new one.
-        lru.put(key(0), 11, "h2".into(), 10);
-        assert_eq!(lru.bytes, 80);
-        assert_eq!((lru.get(&key(0), "h"), lru.get(&key(0), "h2")), (None, Some(11)));
+        assert!(cache.values.weight() <= 1000, "{} bytes", cache.values.weight());
+        // One pool, so an object of most of it is kept, and the rest give way.
+        cache.values.insert(key(100), Bytes::from(vec![0; 900]));
+        assert!(cache.values.get(&key(100)).is_some());
+        assert!(cache.values.weight() <= 1000, "{} bytes", cache.values.weight());
+        let node = Arc::new(Node::of(Body::Leaf(vec![])).unwrap());
+        for i in 0..100 {
+            cache.nodes.insert(key(i), node.clone());
+        }
+        assert!(cache.nodes.weight() <= 1000 && cache.nodes.weight() >= node.size as u64);
     }
 }
