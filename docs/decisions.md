@@ -123,8 +123,8 @@ reason.
   channel's sockets, which S3 matches against the request's prefix:
   [S3's `s3:prefix` condition](https://docs.aws.amazon.com/AmazonS3/latest/userguide/amazon-s3-policy-keys.html).
   The listing of `apps/` is the local router's cron. Locally the one policy is also the ceiling of an app's session,
-  so it lists `apps/*/values/*` and the versions of `apps/*/names/*` as well, for the sweep, which an app's session
-  may list only for its own app.
+  so it lists `apps/*/values/*` and `apps/*/names/*` as well, for the sweep, which an app's session may list only for
+  its own app.
 - **After the last try the router logs a warning** with the app and the commit, and deletes the object. Nothing is
   kept to replay: the record in the name's tree outlasts the window, but the event's bytes are gone.
 - **serve and the router run behind the Lambda Web Adapter,** as plain HTTP servers. Their package carries its own
@@ -447,37 +447,34 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "State: 
     stop at `SETTLE`.
 - **The sweep is built, last, and is the collector.** A commit deletes nothing (the bullet on that above), so what
   leaks is all that no head names any more: what a commit replaced, and what a turn made that did not land, whether
-  it trapped, timed out, lost its race or failed, or its host died. The sweep lists the app's names, and for each one
-  lists the versions of its head that the bucket keeps, reads them, marks what their trees reach, lists its objects,
-  and deletes those that are older than the grace period (an hour at least) and not marked. It is safe, as no version
-  kept, and no head put later, can name such an object (the bullets on the history and on the grace), and fails safe,
-  as it deletes nothing from a name unless each version listed was read or had expired, and each tree was marked
+  it trapped, timed out, lost its race or failed, or its host died. The sweep lists the app's heads and its names, and
+  for each name reads its head, marks what its tree reaches, lists its objects, and deletes those that are older than
+  the grace period (an hour at least) and not marked. It is safe, as no head put later can name such an object (the
+  bullet on the grace), and fails safe, as it deletes nothing from a name unless its head was read and its tree marked
   whole. It runs in serve with the app's own credentials, so it needs `s3:ListBucket` on `apps/<app>/values/*` and
-  `s3:ListBucketVersions` on `apps/<app>/names/*` and no more, each by an `s3:prefix` condition, in four places (the
-  router's policy in `src/route.rs`, `infra/aws/main.tf`, `docker/router-policy.json` and the module's test, with
-  assertions on the conditions and on the whole set of actions; and `isolates_apps` in `tests/e2e.rs` lists what an
-  app's credentials can and cannot list, of keys and of versions). It is triggered every `TRIC_SWEEP_EVERY` (a day by
-  default) for each app through the Scheduler, the router and serve, as a retry is, and never by an always-on
-  process. It is bounded in each invocation and resumable, and logs what it reclaimed. No check script exists to run
-  it from; its live path is the invocation in the bullet after the trigger, and `sweeps_the_names` in `tests/e2e.rs`
-  runs it that way against RustFS, over a name of two versions and a delete marker, which it lists as the owner to
-  check. That test cannot show a deletion, as nothing in it is an hour old; the unit tests in `src/sweep.rs`, which
-  pass the clock in, do.
-- **The sweep keeps a name's history.** It keeps what any version of a name's head names for as long as the lifecycle
-  keeps that version: the current head's, those it replaced, and those of a name whose head was deleted. So a name can
-  be put back as it was at any of them, a deleted one too, and that is the rollback window, whose length is the
-  lifecycle's `noncurrent_days`. Marking from the current heads alone would delete a replaced tree's objects an hour
-  after the commit, and leave the noncurrent versions of heads naming objects that are gone. Keeping them costs the
-  storage of what a name's commits replaced for `noncurrent_days` more, after which the sweep deletes it and the
-  lifecycle keeps it as long again, as it always did; and, each run, a listing of each name's versions and a read of
-  each. Nothing puts a version back yet, and the bullet on putting one back has what that must keep to.
-- **Keeping what any kept version names is how Lance and Icechunk collect.** The bullet on deleting nothing at a
-  commit has them: Lance's `cleanup_old_versions` deletes the versions older than a time and then the files that no
-  version it keeps names, and Icechunk's `expire_snapshots` drops snapshots older than a time and its
-  `garbage_collect` then deletes what only they named. Both keep a list of versions of their own and expire it
-  themselves. Here S3 keeps the list, as a head's noncurrent versions, and the lifecycle is the expiry, so the sweep
-  writes no list and expires nothing, and no app's credentials can shorten the history. Both also spare by age what a
-  writer under way may yet name, as the sweep's `GRACE` does.
+  `apps/<app>/names/*` and no more, by an `s3:prefix` condition, in four places (the router's policy in
+  `src/route.rs`, `infra/aws/main.tf`, `docker/router-policy.json` and the module's test, with assertions on the
+  conditions and on the whole set of actions; and `isolates_apps` in `tests/e2e.rs` lists what an app's credentials
+  can and cannot list). It is triggered every `TRIC_SWEEP_EVERY` (a day by default) for each app through the
+  Scheduler, the router and serve, as a retry is, and never by an always-on process. It is bounded in each invocation,
+  keeps what it deleted before its time was up, and logs what it reclaimed. Its live path is the invocation in the
+  bullet after the trigger: `infra/aws/check.sh late` asks for one on AWS an hour after the checks, and checks what it
+  took and what it kept, and `sweeps_the_names` in `tests/e2e.rs` runs one against RustFS, over a name whose head was
+  deleted, which RustFS then lists no more. That test cannot show a deletion, as nothing in it is an hour old; the
+  unit tests in `src/sweep.rs`, which pass the clock in, do.
+- **The sweep keeps only what each name's head names now, as the owner decided on 13 October 2026.** The head a name
+  has now is the only root: what a head it replaced named, and it does not, goes at the first run after the grace,
+  with what turns that did not land made. A delete is a delete marker, so a reader that holds an older head, for
+  `TOTAL` at most, reads on by version, and the lifecycle keeps what was deleted for `noncurrent_days` more. It is
+  Lance's `cleanup_old_versions` and Icechunk's `expire_snapshots` with only the latest version kept (the bullet on
+  deleting nothing at a commit has them), and like them it spares by age what a writer under way may yet name.
+  Before, it kept what any version of a head that the bucket kept named, its history, so that a name could be put back
+  as it was at any of them: that took a listing of each name's versions (ListObjectVersions, which `object_store` has
+  no call for, so a signed request and a parser of our own, with `quick-xml`'s `overlapped-lists`), a read of each,
+  one set and one bound over them all, a bound on the versions (`VERSIONS_MAX`), the grant of
+  `s3:ListBucketVersions`, and rules to tell a deleted head, a delete marker and a version that expired from an error.
+  Nothing ever put a version back. What it costs is what putting a head back would take, which the bullet on that
+  has: a head put back names what the sweep may have deleted, which must be brought back first. Not built.
 - **The sweep's trigger is a schedule per app, every `TRIC_SWEEP_EVERY`, in the cron group, and nothing else.** Deploy
   adds one schedule to an app's cron entries, named and reconciled with them (its name has the hash of its body, so a
   change is a new schedule made before the old one is deleted), with the input `{"app": "<app>", "sweep": true}` where a
@@ -532,155 +529,114 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "State: 
   passes `is_name` and `<id>` is 32 lowercase hex digits, and where the key is equal to the one `tree::object` builds
   for that name and id, the one place that builds a `values/` path: the tree reads and writes its objects at
   `tric_tree::object` under the prefix `tree::prefix` gives, and `tree::object` is that. A listed key of any other shape
-  (the `.sweep` cursor, a key with a deeper path, a name that no name could be, an id of the wrong length or case, a
-  differently escaped spelling) is not a candidate, and is never deleted, whatever its age. The unit tests
+  (a key with a deeper path, a name that no name could be, an id of the wrong length or case, a differently escaped
+  spelling) is not a candidate, and is never deleted, whatever its age. The unit tests
   `only_the_key_of_a_tree_object_is_a_candidate` and `deletes_only_keys_a_tree_could_have_made` put such keys in and
   check that they are all still there.
-- **A name's heads are the versions listed of its key, and a missing head is told from an error by that listing.**
-  The sweep lists the versions of `apps/<app>/names/<name>` with ListObjectVersions, signed by `aws::Aws` as STS and
-  Lambda are, since `object_store` has no call for it (`quick-xml`'s `overlapped-lists` reads its `Version` and
-  `DeleteMarker` elements, which S3 interleaves), and reads each by its id with `Store::version`, from the store and
-  never from a cache of heads: a stale head would not name what a commit since had added. The listing is of the key
-  as a prefix, so it has the keys that begin with it as well (`n2` after `n`), which `sweep::listed` drops, and it
-  stops at the first page that has one, as a listing is in key order. A delete marker is no root and is not read, as
-  S3 answers a read of one by id with 405. Only a 404 says that a version is gone: any other failure to list or read,
-  a 403 among them, fails the name, with a warning, and deletes nothing from it. `Aws::send` does not retry, so a
-  listing that fails once, as a 503 can, fails the name for that run, which the next run sweeps; the reads go through
-  `object_store`, which retries. A version that is gone is an error if it is the latest, which cannot expire within a
-  run (the lifecycle keeps what is noncurrent for a day at least), and no root if it is not: it expired after the
-  listing, and no commit writes over a version that is not current. A name whose latest version listed is no head
-  (there is none, or it is a delete marker), and whose head is there all the same, was missed by the listing or made
-  since: `Store::head` looks for it, and if it is there the name fails and waits for the next run. A GET or a HEAD of
-  a key that is missing is a 403 and not a 404 to a caller without `s3:ListBucket`
+- **Which names have a head is the listing of `names/`, and a head that is listed and cannot be read is an error.**
+  The sweep lists `apps/<app>/names/` once a run, after it takes the time, and reads the head of each name that the
+  listing has, from the store and never from a cache of heads: a stale head would not name what a commit since had
+  added. A GET or a HEAD of a key that is missing is a 403 and not a 404 to a caller without `s3:ListBucket`
   (<https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html>), and a grant by `s3:prefix` is not one for a
-  GET or a HEAD, which has no prefix; `store::found` reads that 403 as missing, and an app may get its own heads, so
-  the check is exact. A name with no version listed had no head put before the listing, and a head put later names
-  only objects younger than the grace. The grant widens an app's session by the history of its own heads, which are
-  names it already knows, and no other app's.
-- **Every version of a head that the bucket keeps is a root, and nothing else is.** What points into `values/` is a
-  head's tree, and nothing else does. A head also holds `commit`, the id of the commit that wrote it, which is no link.
-  The records of `Idempotency-Key`s and of delivery events are values in the tree, and no links either. The outbox and
-  retry objects hold an event's requests (under `outbox/`, and not under `values/`), and no link. A snapshot, which a
-  read holds, is a copy of a root read from a head and reads by version, which a delete marker does not hide, and for
-  at most `TOTAL`, so it needs no mark of its own. A link read from a head or a node is checked to name an object of its
-  own name, so a changed head cannot make the sweep mark, or keep, another's. If anything else were ever to point into
+  GET or a HEAD, which has no prefix; `store::found` reads that 403 as missing, and an app may get its own heads, so a
+  read cannot tell a missing head from a refused one. The listing can. A name that it has no head of names nothing:
+  S3's listings are strongly consistent (<https://aws.amazon.com/s3/consistency/>), so it had no head put before the
+  listing, and a head put since names only objects younger than the grace. A name whose head is listed and reads as
+  missing, refused or deleted since, fails, with a warning, and nothing is deleted from it, as does any other failure
+  to read it; the listing and the reads go through `object_store`, which retries. Before, a name's heads were the
+  versions listed of its key, and a name with none listed was checked again with a HEAD, for a head that the listing
+  had missed; one listing of the heads that S3 keeps consistent leaves nothing for that to find. The grant widens an
+  app's session by the keys of its own heads, which are names it already knows, and no other app's.
+- **The head a name has now is a root, and nothing else is.** What points into `values/` is a head's tree, and nothing
+  else does. A head also holds `commit`, the id of the commit that wrote it, which is no link. The records of
+  `Idempotency-Key`s and of delivery events are values in the tree, and no links either. The outbox and retry objects
+  hold an event's requests (under `outbox/`, and not under `values/`), and no link. A snapshot, which a read holds, is
+  a copy of a root read from a head and reads by version, which a delete marker does not hide, and for at most
+  `TOTAL`, so it needs no mark of its own. A link read from a head or a node is checked to name an object of its own
+  name, so a changed head cannot make the sweep mark, or keep, another's. If anything else were ever to point into
   `values/`, the sweep would have to mark through it as well, and `tree::object` is where to look for who builds those
   paths.
 - **The grace outlasts the longest turn, by construction.** A head is put by a commit, which lands only if its base is
   the head then (a conditional put on its ETag, so a turn from an older head never lands), and names what its base
-  named and what its turn made. The sweep takes `cutoff = now - GRACE` before it lists a name's versions, and reads
-  them after that. A head put after the listing is at the end of a chain of commits from the head that was current at
-  the listing, so it names what that head named, which is marked, and what the turns of the chain made. Each of those
-  turns landed after the listing, so after `now`, and began at most `TOTAL` (300 s) before it landed; in absolute
-  terms an invocation lasts 900 s at most (Lambda's limit), and the clocks of Lambda and of S3 may differ by 5 minutes
-  at most, which is set well above what AWS keeps. So what a later head names and no version listed does was made
-  after `now - 900 s - 300 s`, which is after the cutoff, and the age filter keeps it. So the versions listed are the
-  roots. The latest of them cannot expire within a run, as the lifecycle keeps a noncurrent version for a day at
-  least; a noncurrent one that expires between the listing and its read is no root, as no head put later descends
-  from it. `src/sweep.rs` states the grace as assertions that fail the build: `GRACE` is an hour at least,
+  named and what its turn made. The sweep takes `cutoff = now - GRACE` before it lists the heads, and reads each after
+  that. A head put after its name's was read is at the end of a chain of commits from the head read, so it names what
+  that head named, which is marked, and what the turns of the chain made; and a head put on a name that the listing
+  had none of is at the end of a chain from the commit that created it, and names only what the turns of the chain
+  made. Each of those turns landed after the listing, so after `now`, and began at most `TOTAL` (300 s) before it
+  landed; in absolute terms an invocation lasts 900 s at most (Lambda's limit), and the clocks of Lambda and of S3 may
+  differ by 5 minutes at most, which is set well above what AWS keeps. So what a later head names and no head read
+  does was made after `now - 900 s - 300 s`, which is after the cutoff, and the age filter keeps it. So the heads read
+  are the roots. `src/sweep.rs` states the grace as assertions that fail the build: `GRACE` is an hour at least,
   `TOTAL + SKEW < GRACE`, `LAMBDA_MAX + SKEW < GRACE`, and a run (`RUN`, 240 s) and 30 s more fit in `TOTAL`, so a
   limit raised past the grace cannot be built. A node the mark finds in the process cache was verified when it was
-  cached, and the cache's key is its path and version, so the mark uses what a read would. Only putting a version
-  back breaks the chain, as it descends from no current head: the next bullet has what it must keep to.
-- **Putting a version back is no commit, and must keep to three things.** Nothing in tric puts a version back; an
-  operator could, by copying a version of `names/<name>` over the key. Such a head names objects that may be older than
-  the grace and that the current head does not, and it is safe only because they are marked through the version itself,
-  which every run that listed before the put must then read whole. So a put back must be of a version that the lifecycle
-  keeps for an hour (`GRACE`) after the put at least, as a run lasts 900 s at most: S3 may expire a version from the
-  first midnight UTC that is `noncurrent_days` after its successor was put, and the version is not put back in the hour
-  before. And it must be a conditional put on the current head's ETag, as a commit is, so that it writes over no commit.
-  And it must carry a fresh `commit` id, as a commit does: the old version's bytes have the old version's `ETag` in the
-  bucket, so a commit sent over that version before could still land on the put back, after its delivery event was
-  dropped as never to land; and a client's `If-Match` with the old `ETag` would hold again. A tool that puts versions
-  back states all three in its own code, and tests them against a run under way. A version put back holds the records of
-  the commits up to it, and not of those after, so their delivery events not yet sent are dropped.
-- **A name's marks are bounded by their size together, and the valve is a last resort.** The versions of a name's head
-  are marked one after another into one set of `u128` (`Head::mark`, which is `Tree::mark`), each reading its tree's
-  nodes level by level, `IN_FLIGHT` (16) at once, each checked against its link, and passing over what the set holds.
-  So a node that several versions share is read once, and `NODES_MAX` bounds what they read together, not each. A
-  commit changes the nodes on the paths from the root to what it changed, so a version after the first reads a node
-  a level for each change, one level after another. These figures are estimates, not measurements: a GET of a node
-  takes about 25 ms from serve, so a mark reads about 640 nodes a second, and 100,000 nodes (`NODES_MAX`) take about
-  156 s of a run's 240. A name with 4 Mi entries of 250 bytes each (keys and links) has
-  16,000 to 32,000 nodes of 64 KiB, between full and half full, and takes 25 to 50 s. A name passes the valve only
-  with more than 100,000 nodes, which is 3 to 6 GiB of keys, links and inline values in its nodes; the structural
-  extreme, 16 GiB of 4 KiB inline values, is 262,000 to 524,000 nodes, which no run reads. The set of ids is about 24
-  bytes an id, and a name has 4 Mi ids at most in a tree, and a day or two of commits' more in its versions, so about
-  100 MB in serve's 1,024 MB; the nodes in flight are 16 of 64 KiB. The valve has three parts: a name with more than
-  `VERSIONS_MAX` versions is not read, a name whose marks would read more than `NODES_MAX` nodes stops marking, and a
-  name that is the first of a run and takes longer than the run is passed over, each with a warning that names the
-  app and the name, and each deleting nothing, as its marks did not complete. After a mark that stops or fails, the
-  set holds part of the trees, and is dropped with the name. Only the first is expected to fire, for a name that puts
-  its head all day, and a name that makes one of the others is at its limits.
-- **A name's versions are bounded, and a name that puts its head all day is not swept.** `VERSIONS_MAX` (10,000) is the
-  most versions of a head, delete markers among them, that a run lists and reads. The listing is 1,000 a request, ten in
-  sequence, and the reads are `IN_FLIGHT` at once, some 15 s at 25 ms; the marks after the first read what each commit
-  changed, a few nodes one level after another, so 10,000 versions of a deep tree could take longer than a run, and such
-  a name is passed over as the first of a run is. The lifecycle keeps a version from one day to two at the default, so a
-  name has more than 10,000 only if it commits more often than every 9 to 17 s all that time. Such a name is skipped,
-  with a warning, at every run while it is that busy, and its garbage stays until it is quieter: that costs space and
-  not data. The alternative is to read fewer versions: a name's versions from the oldest kept are a chain of commits, so
-  what any of them names is what the oldest and the current name and what was made since the oldest's `LastModified`
-  less the grace, and a sweep could mark those two and keep everything younger. That reads two heads where this reads
-  thousands, and keeps more, and rests on the chain, which a version put back breaks; it is not built, and is the choice
-  to make if a name is ever that busy.
-- **One rule expires what is noncurrent, after `noncurrent_days`, and that is the history.** The module's rule
-  `noncurrent` expires every noncurrent version after `noncurrent_days` (a variable, 1 by default, a whole number of 1
-  or more, validated) and removes a delete marker that is all that is left of a key. A head's noncurrent versions are
-  the sweep's history, so the variable is the rollback window; the rule also expires what the sweep deleted and what
-  a deploy replaced. S3 counts whole days from when a version became noncurrent, to the next midnight UTC, so 1 keeps
-  a version from 24 to 48 hours, and that day at least is why the latest version listed cannot expire within a run.
-  One rule serves both: heads kept longer than the rest would need a rule of their own, and a rule's filter is a
-  literal prefix, while each app's heads are under its own `apps/<app>/names/`. A rule for the heads alone needs a key
-  layout with every app's heads under one prefix, as `names/<app>/<name>`, which moves every head and every policy's
-  prefixes; that is not worth it while the two lengths are the same. Locally `docker/lifecycle.json` keeps 1 day.
+  cached, and the cache's key is its path and version, so the mark uses what a read would. Only putting a head back
+  breaks the chain, as it descends from no current head: the next bullet has what that would take.
+- **Putting a head back is no commit, and would first have to bring back what it names.** Nothing in tric puts a head
+  back; an operator could, by copying a version of `names/<name>` over the key. Such a head names objects that the
+  current head does not, and the sweep deletes those that are past the grace: some may be delete markers already over
+  versions that the lifecycle expires `noncurrent_days` after the delete, and a run under way may yet delete others. A
+  tool that puts a head back would check that every object the head names can still be read by its version; put the
+  head as a commit is put, conditional on the current head's ETag, so that it writes over no commit, and with a fresh
+  `commit` id, as the old bytes have the old `ETag` in the bucket, so a commit sent over that head before could land
+  on it, after its delivery event was dropped as never to land, and a client's `If-Match` with the old `ETag` would
+  hold again; wait out any run that read the head before the put (900 s); and then remove the delete marker over each
+  object the head names that has one, which makes the version that its link names the current one again (a copy would
+  make a new version, which no link names). That needs `s3:DeleteObjectVersion`, which only the bucket's owner has. A
+  head put back holds the records of the commits up to it, and not of those after, so their delivery events not yet
+  sent are dropped.
+- **A name's mark is bounded, and the valve is a last resort.** A name's head is marked into a set of `u128`
+  (`Head::mark`, which is `Tree::mark`), reading its tree's nodes level by level, `IN_FLIGHT` (16) at once, each
+  checked against its link. These figures are estimates, not measurements: a GET of a node takes about 25 ms from
+  serve, so a mark reads about 640 nodes a second, and 100,000 nodes (`NODES_MAX`) take about 156 s of a run's 240. A
+  name with 4 Mi entries of 250 bytes each (keys and links) has 16,000 to 32,000 nodes of 64 KiB, between full and
+  half full, and takes 25 to 50 s. A name passes the valve only with more than 100,000 nodes, which is 3 to 6 GiB of
+  keys, links and inline values in its nodes; the structural extreme, 16 GiB of 4 KiB inline values, is 262,000 to
+  524,000 nodes, which no run reads. The set of ids is about 24 bytes an id, and a name has 4 Mi ids at most in a
+  tree, so about 100 MB in serve's 1,024 MB; the nodes in flight are 16 of 64 KiB. A name whose mark would read more
+  than `NODES_MAX` nodes stops marking, with a warning that names the app and the name, and deletes nothing, as its
+  mark did not complete; the set holds part of the tree, and is dropped with the name. A name that its run's time
+  runs out in stops with the run, and keeps what it deleted before then.
+- **One rule expires what is noncurrent, after `noncurrent_days`.** The module's rule `noncurrent` expires every
+  noncurrent version after `noncurrent_days` (a variable, 1 by default, a whole number of 1 or more, validated) and
+  removes a delete marker that is all that is left of a key. It expires what the sweep deleted, which a reader that
+  holds an older head reads by version until then, the heads that commits replaced, and what a deploy replaced. S3
+  counts whole days from when a version became noncurrent, to the next midnight UTC, so 1 keeps a version from 24 to
+  48 hours, far more than the `TOTAL` that a reader holds a head. Locally `docker/lifecycle.json` keeps 1 day.
 - **The sweep's grant is the least that lists what it reads, and it deletes no version.** An app's session may list
-  `apps/<app>/values/*` (`s3:ListBucket`), for its names and their objects, and the versions of `apps/<app>/names/*`
-  (`s3:ListBucketVersions`), for each name's history, each by an `s3:prefix` condition. It lists no key of `names/`,
-  as the sweep no longer finds names there, and no version of `values/` or of anything else. It reads a version with
-  `s3:GetObjectVersion`, which it held already for links, and has no `s3:DeleteObjectVersion`: its delete is a delete
-  marker, and only the lifecycle removes a version, so no app's credentials, a sweep's or a guest's, can shorten the
-  history. The prefix of a listing of versions is matched as that of a listing of keys is, so one of
-  `apps/<app>/names/` or of a head's key is allowed, and one of `apps/<app>/`, of `values/`, of another app's or of
-  no prefix is refused; `isolates_apps` asks each of RustFS with an app's minted credentials. A listing of versions
-  also gives each version's owner, an account's canonical ID; serve reads only the key, the id, whether it is the
-  latest and whether it is a marker, and the listing never reaches the guest.
-- **A name's objects are listed in one go, and those of a large name sixteen ways.** S3 lists 1,000 keys a request, in
-  sequence. A name near `DATA_MAX` in values just over the 4 KiB inline limit has 4 Mi objects: 4,200 requests one
-  after another, some 5 minutes at 75 ms each, which is longer than a run, so such a name would be passed over every
-  run. But almost every name has a page of objects or fewer, and an idle app must cost nothing it need not, so
-  `sweep::unnamed` lists `values/<name>/` once, as before, and if the listing ends within `PAGE` (1,000) keys, those
-  are all of it and the name costs one request. If a 1,001st key arrives it drops that listing and lists by digit. An
-  id is 128 random bits in hex, so a name's objects are spread evenly over the 16 digits an id may begin with, and
-  `sweep::partition` lists each digit's on its own, all at once. The listing of a digit begins after `<before>g`,
-  where `before` is the digit before it (`list_with_offset`, which S3 does with `start-after`), and the stream is
-  dropped at the first key from `<digit>g`. An id has a hex digit second and `g` follows `f` in key order, so every id
-  of the digit lies between those keys and none of another digit does. Each listing is then 263 requests for the 4 Mi,
-  some 13 to 26 s at 50 to 100 ms, with 16 requests under way at a time. These figures are assumptions, not
-  measurements. The digit is also checked of each id, so that an id is in one listing and only one whichever way a
-  store treats the offset, and a key that is no id is passed over, as it was. A listing that errors fails its name,
-  and nothing is deleted from it.
-  The cost of the first listing is read from `object_store` 0.14.2: its listing is a stream of pages, and
-  `stream_paginated` (`client/pagination.rs`) asks for the next page only when the stream is polled past the one it
-  has, so a name of 1,000 keys or fewer never makes a second request, and stopping at the 1,001st key makes exactly
-  two. A name over a page then costs those two and a request or more for each digit: about 18 where it cost 2, and
-  for the largest name the same 4,200 requests, but sixteen at a time. The unit tests plant names of 0, 1, 1,000,
-  1,001 and 2,000 ids and count the listings begun (1, and 1 + 16 for the last two) and the keys read (the 1,000, and
-  for the larger the 1,001 of the first listing and no more than the keys there are and one past each range); and
-  put ids at both ends of every digit's range and in the middle, with keys that are no ids among them, to show that
-  each id is found once and that a run deletes each once.
-- **The number of names an app has bounds a run, and that is a known limit.** A sweep lists the app's `values/` for the
-  names that have objects (a delimiter listing, 1,000 prefixes a request, which `object_store` cannot begin part of
-  the way through), and holds them: about 65 bytes a name, so 1M names are 65 MB of serve's 1,024. At 75 ms a
-  request, which is an assumption, 1M names are 1,000 requests, some 75 s of a run's 240, and every run lists them
-  again; 3M names are a run, and leave no time to sweep. The sweep of a name is the nearer limit: the listing of its
-  versions, their reads, a node or more and its listing are four to six requests in sequence, some 150 to 200 ms, so
-  a run sweeps 1,200 to 1,500 names. An app with a thousand is swept every run; one with 100,000 is gone through in
-  some 70 runs, a pass at a time from the cursor; one with 1M in some 900, as a third of each run is its listing.
-  Nothing is lost by that, as what a sweep leaves is only space, and nothing is built for it, as no app is there. When
-  one is, the remedies are to sweep several names at once (the reads, the marks and the listing are concurrent
-  already; the loop over the names is not) and to list `values/` from the cursor, which needs a request of our own to
-  `ListObjectsV2` with `start-after` and a delimiter. `names/` is not listed: a name's heads are found by its own key.
+  `apps/<app>/values/*`, for its names and their objects, and `apps/<app>/names/*`, for which of them have a head
+  (`s3:ListBucket`), by an `s3:prefix` condition, and no version of anything: it has no `s3:ListBucketVersions`. A
+  listing of `apps/<app>/names/` or of `values/` is allowed, and one of `apps/<app>/`, of another app's or of no
+  prefix is refused; `isolates_apps` asks each of RustFS with an app's minted credentials. It reads a version with
+  `s3:GetObjectVersion`, which links need, and has no `s3:DeleteObjectVersion`: its delete is a delete marker, and
+  only the lifecycle removes a version, so no app's credentials, a sweep's or a guest's, can take what a reader that
+  holds an older head reads by version. Before, it listed the versions of `names/` and not its keys.
+- **A name's objects are listed in one go, and deleted a page at a time.** `Store::objects` lists `values/<name>/` as
+  a stream, which `object_store` fills a page of 1,000 keys a request as it is read (`stream_paginated`, in
+  `client/pagination.rs` of 0.14.2), and the sweep deletes what it may of it a page (`PAGE`, 1,000, S3's most for one
+  delete) at a time as it goes, so what a run deletes before its time is up stays deleted. Almost every name has a
+  page of objects or fewer, and costs one listing. A name near `DATA_MAX` in values just over the 4 KiB inline limit
+  has 4 Mi objects: 4,200 requests one after another, some 5 minutes at 75 ms each (an assumption, not a
+  measurement), which is longer than a run. A run that reaches such a name deletes what it may of what it lists in
+  the time it has, and does not reach the end; ids are random, so that is a share of the name's garbage spread over
+  it, and the rest stays, every run. That is a known limit, and costs space and not data. Before, a name of more than
+  a page was listed again as sixteen listings at once, one for each first digit of an id, which took the largest name
+  13 to 26 s. If a name ever has millions of objects, the remedy is a listing from a random id (`list_with_offset`,
+  which S3 does with `start-after`) that wraps around, so that each run sweeps another part, or the sixteen listings
+  again.
+- **The number of names an app has bounds a run, and that is a known limit.** A sweep lists the app's heads (1,000
+  keys a request) and the names that have objects (a delimiter listing of `values/`, 1,000 prefixes a request), and
+  holds both: about 65 bytes a name each, so 1M names are 130 MB of serve's 1,024. At 75 ms a request, which is an
+  assumption, 1M names are 2,000 requests, some 150 s of a run's 240, and every run lists them again; 1.5M names are a
+  run, and leave no time to sweep. The sweep of a name is the nearer limit: the read of its head, a node or more and
+  its listing are three to five requests in sequence, some 100 to 150 ms, so a run sweeps 1,600 to 2,400 names. A run
+  takes the names in an order of its own, with no cursor, so that a name that takes long holds up no other for good.
+  An app with a thousand names is swept whole every run; in one with 100,000, a run sweeps some 2%, so a name is swept
+  within 70 runs with a chance of about 75%, and within 230 of 99%. Nothing is lost by that, as what a sweep leaves is
+  only space, and nothing is built for it, as no app is there. When one is, the remedies are to sweep several names at
+  once (the reads and the mark of one name are concurrent already; the loop over the names is not), and a cursor again,
+  which the sweep had: a key under `values/` it wrote after each name and began the next run after, which cost a write
+  a name, a listing from it that `object_store` cannot make with a delimiter, and a rule to pass over a name that was
+  the first of a run and took longer than it.
 - **The sweep schedule lives and dies with an app's others.** `deploy::wanted` makes the schedules an app is to have,
   its cron entries and its sweep, and `deploy::changes` compares them with those that exist: it creates what is missing
   first and then deletes what is extra, so the first deploy makes the sweep and later ones leave it. There is no command
@@ -692,15 +648,14 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "State: 
   (`CRON_MAX`), so with its sweep it has 50 schedules, and one page of 100 reads them all.
 - **The sweep's tests pass the clock in.** `sweep::run` takes the time to measure ages from and the instant to stop
   at, so the unit tests use a time two grace periods on, and tokio's paused time (the dev-dependency feature
-  `test-util`) for a run that is out of time, with a store that counts its requests, and a bucket's versions
-  (`Kept`) that a test puts, deletes and expires, listed a few at a time with the delete markers first, as RustFS
-  lists them. They check that a tree's objects are kept, that a stray goes only when it is past the grace, to the
-  millisecond, and that a name whose marks fail loses nothing; and of the history, that what a noncurrent version
-  alone names is kept while the version is and goes once it has expired, that a deleted head's objects are kept while
-  its versions are, that a delete marker is no root and is not read, that the latest version gone is an error and a
-  noncurrent one gone is no root, that a refused read or a head the listing misses loses nothing, that a name's
-  versions are its own key's and not a longer one's, that the versions are marked into one set under one bound, and
-  that a name over either bound is passed over and logged.
+  `test-util`) for a run that is out of time, with a store in memory that keeps versions and refuses the reads and
+  listings that a test names, as S3 answers 403, or has a key that is listed not be there (`Refusing`). They check that
+  a tree's objects are kept, that a stray goes only when it is past the grace, to the millisecond, that a store that
+  keeps no versions loses nothing, that only a key a tree could have made goes, that a name with no head names nothing
+  and its head is read at each run, that what a replaced head alone named goes, that a listed head that is refused or
+  gone loses nothing and a listing that is refused fails the run, that a name whose tree cannot be read whole loses
+  nothing while the rest are swept, that a name over the bound is passed over and logged, that a run deletes a page at
+  a time and what it deleted stays deleted, and that runs that stop at their time reach every name.
 - **The node cache is per process,** byte-capped (16 MiB) and of immutable nodes, keyed by the object's full path, its
   version and its hash (app, name, id, version, hash), so it can never be stale and a hit is exactly the object that a
   read would fetch, and never one of another app's. A node a commit uploads is put in it, since the next request is the

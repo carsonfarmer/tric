@@ -6,7 +6,7 @@ use futures_util::{StreamExt, stream};
 use object_store::aws::{AmazonS3, AmazonS3Builder, AwsCredential};
 use object_store::client::{HttpClient, HttpConnector, ReqwestConnector};
 use object_store::{
-    Certificate, ClientOptions, GetOptions, ListResult, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, RetryConfig,
+    Certificate, ClientOptions, ListResult, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, RetryConfig,
     StaticCredentialProvider,
 };
 use object_store::{UpdateVersion, memory::InMemory, path::Path};
@@ -148,20 +148,6 @@ impl Store {
         Ok(Some((got.bytes().await?, version)))
     }
 
-    /// The object at `path` as it was at `version`, if the bucket keeps that version still; it must be `max` bytes or
-    /// less. Only a 404 says that the version is gone: a 403 is an error here, so that a caller refused the read does
-    /// not take the version for one that is gone.
-    pub async fn version(&self, path: &Path, version: &str, max: u64) -> Result<Option<Bytes>> {
-        let got =
-            match self.inner.get_opts(path, GetOptions { version: Some(version.into()), ..Default::default() }).await {
-                Ok(got) => got,
-                Err(object_store::Error::NotFound { .. }) => return Ok(None),
-                Err(e) => return Err(e.into()),
-            };
-        ensure!(got.meta.size <= max, "{path} at {version} is over {max} bytes");
-        Ok(Some(got.bytes().await?))
-    }
-
     pub async fn json<T: DeserializeOwned>(&self, path: &Path, max: u64) -> Result<Option<(T, UpdateVersion)>> {
         let Some((bytes, version)) = self.get(path, max).await? else { return Ok(None) };
         Ok(Some((serde_json::from_slice(&bytes).with_context(|| format!("{path}"))?, version)))
@@ -214,14 +200,9 @@ impl Store {
         deleted
     }
 
-    /// Every object under `prefix`, however deep, in key order: those after the key `after`, if there is one (the
-    /// listing then begins there, where S3 lists, and need not go through the keys before it).
-    pub fn objects(&self, prefix: &Path, after: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-        let listed = match after {
-            Some(after) => self.inner.list_with_offset(Some(prefix), after),
-            None => self.inner.list(Some(prefix)),
-        };
-        listed.map(|r| r.map_err(Into::into)).boxed()
+    /// Every object under `prefix`, however deep, in key order.
+    pub fn objects(&self, prefix: &Path) -> BoxStream<'static, Result<ObjectMeta>> {
+        self.inner.list(Some(prefix)).map(|r| r.map_err(Into::into)).boxed()
     }
 }
 
@@ -247,7 +228,7 @@ mod tests {
         assert_eq!(store.delete_many(vec![]).await, 0);
         assert_eq!(counts.deletes.load(SeqCst), 0, "nothing asked of the store for nothing");
         assert_eq!(store.delete_many(paths[..3].to_vec()).await, 3);
-        assert_eq!(store.objects(&app("a", &["values", "n"]), None).try_collect::<Vec<_>>().await.unwrap().len(), 2);
+        assert_eq!(store.objects(&app("a", &["values", "n"])).try_collect::<Vec<_>>().await.unwrap().len(), 2);
 
         // The memory store keeps no versions, so a snapshot may still read what it holds: it deletes nothing.
         let memory = Store::memory();

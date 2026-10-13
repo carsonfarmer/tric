@@ -121,23 +121,17 @@ run "module" {
         Effect    = "Allow"
         Action    = ["s3:ListBucket"]
         Resource  = [aws_s3_bucket.store.arn]
-        Condition = { StringLike = { "s3:prefix" = ["apps/*/values/*"] } }
-        }, {
-        Effect    = "Allow"
-        Action    = ["s3:ListBucketVersions"]
-        Resource  = [aws_s3_bucket.store.arn]
-        Condition = { StringLike = { "s3:prefix" = ["apps/*/names/*"] } }
+        Condition = { StringLike = { "s3:prefix" = ["apps/*/values/*", "apps/*/names/*"] } }
       }]
     )
-    error_message = "no app session can list more than its values and its names' versions, whatever the router gives it"
+    error_message = "no app session can list more than its values and its names, whatever the router gives it"
   }
   assert {
     condition = (
       toset(flatten([for s in jsondecode(aws_iam_role_policy.app.policy).Statement : s.Action]))
-      == toset(["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket",
-      "s3:ListBucketVersions"])
+      == toset(["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"])
     )
-    error_message = "no app session can delete a version, so the sweep's history is never the app's to lose"
+    error_message = "no app session can list or delete a version, which the lifecycle alone expires"
   }
   assert {
     condition = (

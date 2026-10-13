@@ -140,7 +140,7 @@ ws/channels/<app>/<channel>/<id> a socket's subscription to a channel (router on
     a turn that does not land made, is left for the sweep; see "Garbage". With versioning, a delete only adds a delete
     marker, so old heads still read objects by version id.
   - One lifecycle rule expires noncurrent versions after `noncurrent_days` (1 by default) and removes expired delete
-    markers. A head's noncurrent versions are its history, which the sweep keeps whole.
+    markers. What the sweep deletes is read by version until then.
 - **A 403 is read as not found.** S3 answers 403 for a missing key when the caller can't list.
 
 ### State: one tree per name
@@ -265,9 +265,8 @@ version, and a commit deletes nothing.
    commit whose answer is lost can't know which of its objects the head names, and a delete chosen then can remove a
    live node (`docs/decisions.md`).
 2. **The lifecycle rule,** which the bucket has: a deleted object is a noncurrent version, and goes a day or two
-   later (`noncurrent_days`, in whole days to midnight UTC). A replaced head is a noncurrent version too, and the
-   versions it keeps are a name's history.
-3. **The sweep,** last of the stages, and the only collector: it deletes what no head the bucket keeps names (below).
+   later (`noncurrent_days`, in whole days to midnight UTC).
+3. **The sweep,** last of the stages, and the only collector: it deletes what no name's head names now (below).
 
 *Why it is safe for readers.* A reader holds a head it read at most 300 s ago (`TOTAL`) and reads objects by version id.
 A delete adds a marker and leaves that version readable, and the lifecycle waits a day at least.
@@ -277,24 +276,25 @@ turn made that did not land, whether it trapped, timed out, lost its race or fai
 sweep.
 
 *The sweep* is a mark-and-sweep with a grace period, run by serve with the app's own credentials:
-- It lists the app's names, and for each lists the versions of its head that the bucket keeps (ListObjectVersions),
-  the current one, those it replaced and those of a deleted head, reads each by its id, and marks what their trees
-  name into one set, under one bound. It then lists `values/<name>/` (in one request, if it holds a page of objects or
-  fewer, and else as 16 listings at once, one for each first digit of an id, so that a name of millions of objects
-  takes less than a run), and deletes what is older than the grace period (an hour at least) and not marked. No later
-  head can refer to such an object, as it descends by commits from a head listed, and no attempt lasts an hour, which
-  the build asserts against the limits of a turn. Only a key a tree could have made is ever deleted, and a head is
-  read fresh. So a name can be put back as any version the lifecycle keeps, which is its rollback window; nothing
-  puts one back yet, and `docs/decisions.md` has what that must keep to.
-- It needs `s3:ListBucket` on the app's `values/*` and `s3:ListBucketVersions` on its `names/*` only, each by an
-  `s3:prefix` condition, in the router's policy (`src/route.rs`), `infra/aws/main.tf`, `docker/router-policy.json` and
-  the module's test, with assertions. The listing of a head's versions is also what tells a missing head from a
-  refused read, which a GET can't. It has no `s3:DeleteObjectVersion`, so only the lifecycle shortens the history.
+- It lists the app's heads, in one listing of `names/`, and then its names, those with objects, in an order of its
+  own. For each it reads the head, if the listing has one, and marks what its tree names, under a bound. It then lists
+  `values/<name>/`, and deletes what is older than the grace period (an hour at least) and not marked, a page at a
+  time. No later head can refer to such an object, as it descends by commits from the head read, or was created
+  since the listing and names only what is younger, and no attempt lasts an hour, which the build asserts against the
+  limits of a turn. Only a key a tree could have made is ever deleted, and a head is read fresh.
+- The head a name has now is the only root: what a head it replaced alone named goes with the rest, and is read by
+  version until the lifecycle expires it. So a name can't simply be put back as an older head; nothing puts one back,
+  and `docs/decisions.md` has what that would take.
+- It needs `s3:ListBucket` on the app's `values/*` and `names/*` only, by an `s3:prefix` condition, in the router's
+  policy (`src/route.rs`), `infra/aws/main.tf`, `docker/router-policy.json` and the module's test, with assertions.
+  The listing of the heads is also what tells a missing head from a refused read, which a GET can't: a head that is
+  listed and can't be read is an error, and its name is not swept. It has no `s3:DeleteObjectVersion`, so only the
+  lifecycle removes a version.
 - It runs every `TRIC_SWEEP_EVERY` (a day by default; hours that divide a day, or days) for each app, from the
   Scheduler through the router and into serve, as a retry does, and never always-on. It deletes nothing from a name
-  unless every version listed was read or had expired and every tree was marked whole. A run is bounded (240 s), and
-  resumes where the last stopped. It logs what it reclaimed. A request to the events function's `cron` alias, with
-  `{"app", "sweep": true}`, runs it on demand.
+  unless its head was read and its tree marked whole. A run is bounded (240 s); what it deleted stays deleted, and the
+  names it did not reach are for a run to come, which takes them in an order of its own. It logs what it reclaimed. A
+  request to the events function's `cron` alias, with `{"app", "sweep": true}`, runs it on demand.
 - The design of the trigger, and the arguments for its safety, are in `docs/decisions.md`.
 
 **Limits.** All are policy: the representation has none of its own.
@@ -316,8 +316,8 @@ budgets. A turn has no cap on its changes: it spills.
 - A guest names a key, never an object: keys live inside nodes. Objects are under `apps/<app>/values/<name>/`, written
   and read with the app's own credentials. The name passes `is_name`, so it holds no `/`, and an id is random: nothing
   the guest controls forms a key. A link read back is checked before it is used, so a changed head or node can't point
-  outside the prefix. The sweep's `ListBucket` on `values/` and `ListBucketVersions` on `names/` are the only IAM
-  change, and list no other prefix.
+  outside the prefix. The sweep's `ListBucket` on `values/` and `names/` is the only IAM change, and lists no other
+  prefix.
 - Reads are checked against the link's hash and length. A mismatch is an error, and the object, version and detail are
   logged and never given to the guest.
 - Nothing is content-addressed, so there is no deduplication, within an app or between apps, and no way to learn from a
@@ -333,12 +333,14 @@ budgets. A turn has no cap on its changes: it spills.
 |---|---|---|
 | `crates/tree` (was `src/tree.rs`) | nodes, links, edits, spill, merge, scans, the cache, the mark | 1,080 (built) |
 | `src/name.rs`, `src/tric.rs`, `src/store.rs` | the turn over the tree; reading the head back | +70 (built) |
-| `src/sweep.rs`, and the trigger | versions, mark, listing, delete, cursor; schedule, router, serve | 480 (built) |
+| `src/sweep.rs`, and the trigger | heads, mark, listing, delete; schedule, router, serve | 480 (built) |
 
 The tree came to 1,080 lines, against an estimate of 800, because spilling, merging, the cache and the log are in it.
 The sweep came to about 480 against 300, the walk and its cap, the shape of the keys it may delete, the listing by
 digit, the cursor, the router's and serve's part, and the reconciling of an app's schedules, which gave deploy its first
 tests, being the difference. The tree and `name.rs` came first and alone: the key tests' assertions hold on them.
+The sweep's listing by digit and its cursor, and the history it kept later, were taken out on 13 October 2026, when it
+came to keep only what each name's head names now; why is in `docs/decisions.md`.
 
 A file system over the same tree, `wasi:filesystem` with inodes, blocks and directories as keys, was built in stages
 too, with a core and a binding of about 1,700 lines of code (`src/fs.rs`, `src/fs/`) and the WebAssembly testsuite's
@@ -361,8 +363,8 @@ system, later removed; the sweep, with its trigger; and WASI 0.3 alone.
 the commit.
 
 **Decided,** by the choices behind the design (each with its reason in `docs/decisions.md`):
-1. **The sweep is built,** last, for the leaks above, and keeps a name's history: `s3:ListBucket` limited to the app's
-   `values/`, and `s3:ListBucketVersions` to its `names/`.
+1. **The sweep is built,** last, for the leaks above, and keeps what each name's head names now: `s3:ListBucket`
+   limited to the app's `values/` and its `names/`.
 2. **The numbers** above, to be revisited once measured.
 3. **No files.** An app keeps its state in keys; `wasi:filesystem` is linked with nothing preopened.
 4. **A turn edits the tree and spills at its budget,** with no cap on its changes.
@@ -555,8 +557,8 @@ the commit.
 - values too large to inline are kept, each an object of its own, and read back whole after the sweep;
 - racing turns each count once;
 - each app's sweep is in the cron group at its minute, every `TRIC_SWEEP_EVERY`, and one sweep, through the cron
-  alias, runs as the app's tenant: it keeps what a tree of any version kept names and what is under an hour old, and
-  reports what it did; nothing else can ask for one;
+  alias, runs as the app's tenant: it keeps what each name's head names and what is under an hour old, and reports
+  what it did; nothing else can ask for one;
 - the lifecycle rules, roles and environments are as the module says;
 - for decisions to come, the run keeps the heads' reads and writes in a mix of turns, and what each turn fetched and
   put;

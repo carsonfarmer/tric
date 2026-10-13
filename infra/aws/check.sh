@@ -68,19 +68,18 @@ ACCOUNT=$(aws sts get-caller-identity --query Account --output text) || die "no 
 FN="arn:aws:lambda:$AWS_REGION:$ACCOUNT:function"
 B3="arn:aws:s3:::$TRIC_BUCKET"
 
-# The session policy the router mints an app's credentials with: src/route.rs's `policy`. The last two statements are
-# the sweep's: a listing of the app's values, and of the versions of its names (its heads' history), and nothing else.
+# The session policy the router mints an app's credentials with: src/route.rs's `policy`. The last statement is the
+# sweep's: a listing of the app's values, and of its names' heads, and nothing else.
 session() {
   jq -cn --arg b "$B3" --arg a "$1" '{Version: "2012-10-17", Statement: [
     {Effect: "Allow", Action: ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject"],
      Resource: ["\($b)/apps/\($a)/names/*", "\($b)/apps/\($a)/values/*", "\($b)/native/\($a)/*"]},
     {Effect: "Allow", Action: ["s3:GetObject", "s3:GetObjectVersion"], Resource: ["\($b)/apps/\($a)/*"]},
     {Effect: "Allow", Action: ["s3:ListBucket"], Resource: [$b],
-     Condition: {StringLike: {"s3:prefix": ["apps/\($a)/values/*"]}}},
-    {Effect: "Allow", Action: ["s3:ListBucketVersions"], Resource: [$b],
-     Condition: {StringLike: {"s3:prefix": ["apps/\($a)/names/*"]}}}]}'
+     Condition: {StringLike: {"s3:prefix": ["apps/\($a)/values/*", "apps/\($a)/names/*"]}}}]}'
 }
-# What the run leaves for `late`: its nonce, the key of the stray it planted and when, and the objects of hist-RUN.
+# What the run leaves for `late`: its nonce, the key of the stray it planted and when, the objects of hist-RUN, and
+# those of them that its second write made.
 state=$live/late.env
 
 # The checks are of the code on main, which the package was built from: so the checkout has to be at main's HEAD.
@@ -230,11 +229,6 @@ sweepsof() {
 under() {
   aws s3api list-objects-v2 --bucket "$TRIC_BUCKET" --prefix "$1" --query 'Contents[].Key' --output text | listed | sort
 }
-# The number of versions (not delete markers) of the head of alpha's name $1.
-headversions() {
-  aws s3api list-object-versions --bucket "$TRIC_BUCKET" --prefix "apps/alpha/names/$1" \
-    --query "length(Versions[?Key == 'apps/alpha/names/$1'])" --output text
-}
 # Asks for alpha's sweep as Scheduler does, by the cron alias with {app, sweep}, and checks that the ask was taken.
 asksweep() {
   local o
@@ -257,19 +251,17 @@ if [ "${1:-}" = late ]; then
     is "CloudTrail's session policy for alpha is the code's" "$(jq -cS . <<<"$minted")" "$(session alpha | jq -cS .)"
   else fail "CloudTrail's session policy for alpha" "no AssumeRole for alpha in 3 hours, or no policy in it"; fi
 
-  echo "== sweep, an hour on (what is old, and what only an old version of a head names)"
-  # The run left hist-RUN written twice, so that its first tree is named by its head's old version alone, and a stray
-  # beside it that nothing names. An hour on, both are old enough to delete: a sweep must take the stray, and keep the
-  # first tree, which one that read only the current version of each head would take. So this is the sweep on S3 as it
-  # is: its listing of the heads' versions (ListObjectVersions, signed by src/aws.rs), and its deletes, with the app's
-  # credentials and their conditions on the prefix.
+  echo "== sweep, an hour on (what is old, and what only a replaced head names)"
+  # The run left hist-RUN written twice, so that what its first tree alone has is named by no head, and a stray beside
+  # it that nothing names. An hour on, all of it is old enough to delete: a sweep must take the stray, and keep the tree
+  # that the head names now whole. So this is the sweep on S3 as it is: its listing of the heads, its reads, and its
+  # deletes, with the app's credentials and their conditions on the prefix.
   [ -f "$state" ] || die "no $state: run the checks first, and this in 65 minutes to 3 hours"
-  aged='' at=0 hist=''
+  aged='' at=0 hist='' made=''
   # shellcheck source=/dev/null
-  . "$state" # run, aged, at, hist
+  . "$state" # run, aged, at, hist, made
   wait=$((at + 3900 - $(date +%s)))
   [ $wait -le 0 ] || die "too early: the stray is not an hour old to a sweep; again in $(((wait + 59) / 60)) minutes"
-  is "hist-$run's head still has two versions, the old one not expired" "$(headversions hist-$run)" 2
   is "hist-$run has its trees and the stray, as the run left them" "$(under apps/alpha/values/hist-$run/ | xargs)" \
     "$(printf '%s\n' $hist $aged | sort | xargs)"
   since=$(now)
@@ -282,9 +274,13 @@ if [ "${1:-}" = late ]; then
   else fail "serve reports alpha's sweep" "no 'swept' line in serve's log in 90 s"; fi
   is "and serve logged no warning of the sweep's" "$(sweeplines serve "$since")" 1
   is "the stray, an hour old and named by nothing, is deleted" "$(under "$aged" | grep -c .)" 0
-  is "every tree of hist-$run is kept, the one only the old version names too" \
-    "$(under apps/alpha/values/hist-$run/ | xargs)" "$(printf '%s\n' $hist | sort | xargs)"
-  is "hist-$run's key reads as it was last written" "$(value "$A" hist-$run k)" '"two"'
+  left=$(under apps/alpha/values/hist-$run/)
+  is "of hist-$run, what is left is what the run left, with all that its second write made" \
+    "$(comm -13 <(printf '%s\n' $hist | sort) <(echo "$left") | grep -c .)/$(comm -23 <(printf '%s\n' $made | sort) \
+    <(echo "$left") | grep -c .)" 0/0
+  note "of hist-$run's $(printf '%s\n' $hist | grep -c .) objects, $(echo "$left" | grep -c .) are left: what the \
+first write alone made is named by no head, and goes"
+  is "hist-$run's key reads as it was last written, from the tree its head names" "$(value "$A" hist-$run k)" '"two"'
   if [ "$(under "$aged" | grep -c .)" != 0 ]; then
     aws s3api delete-object --bucket "$TRIC_BUCKET" --key "$aged" >/dev/null || fail "delete $aged"
   fi
@@ -542,25 +538,20 @@ for c in "s3:GetObject apps/alpha/names/x" "s3:PutObject apps/alpha/names/x" "s3
   "s3:PutObject native/alpha/c/x"; do
   is "alpha's credentials allow $c" "$(s3sim $c)" allowed
 done
-# The sweep's listings (src/route.rs's `policy`, infra/aws/main.tf's app role): alpha's values, and the versions of its
-# names, its heads' history; and no other prefix, not the app's whole prefix, not a prefix that only begins like one,
-# not the other listing's, and not a bare listing.
-for p in apps/alpha/values/ apps/alpha/values/n-1/; do
+# The sweep's listings (src/route.rs's `policy`, infra/aws/main.tf's app role): alpha's values, and its names' heads;
+# and no other prefix, not the app's whole prefix, not a prefix that only begins like one, and not a bare listing; and
+# no listing of versions at all.
+for p in apps/alpha/values/ apps/alpha/values/n-1/ apps/alpha/names/ apps/alpha/names/n-1; do
   is "alpha's credentials allow listing $p" "$(s3list $p)" allowed
 done
-for p in apps/alpha/names/ apps/alpha/names/n-1 apps/beta/names/ apps/beta/values/ apps/alpha/ apps/alph apps/alpha \
-  apps/alpha/components/ apps/alpha/current apps/alphabet/values/ apps/ native/alpha/ outbox/alpha/ ws/channels/; do
+for p in apps/beta/names/ apps/beta/values/ apps/alpha/ apps/alph apps/alpha apps/alpha/components/ \
+  apps/alpha/current apps/alphabet/values/ apps/alphabet/names/ apps/ native/alpha/ outbox/alpha/ ws/channels/; do
   is "alpha's credentials deny listing $p" "$(s3list $p)" implicitDeny
 done
 is "alpha's credentials deny listing with no prefix" "$(s3list "")" implicitDeny
-for p in apps/alpha/names/ apps/alpha/names/n-1; do
-  is "alpha's credentials allow listing the versions under $p" "$(s3vers $p)" allowed
+for p in apps/alpha/names/ apps/alpha/values/ apps/alpha/ ""; do
+  is "alpha's credentials deny listing the versions under ${p:-the bucket}" "$(s3vers "$p")" implicitDeny
 done
-for p in apps/alpha/values/ apps/alpha/values/n-1/ apps/beta/names/ apps/alphabet/names/ apps/alpha/ apps/alph \
-  apps/alpha/components/ apps/alpha/current apps/ native/alpha/ outbox/alpha/ ws/channels/; do
-  is "alpha's credentials deny listing the versions under $p" "$(s3vers $p)" implicitDeny
-done
-is "alpha's credentials deny listing versions with no prefix" "$(s3vers "")" implicitDeny
 for c in "s3:GetObject apps/beta/names/x" "s3:GetObject apps/beta/values/x" "s3:GetObjectVersion apps/beta/names/x" \
   "s3:GetObject apps/beta/current" "s3:GetObject apps/beta/components/x" "s3:GetObject native/beta/c/x" \
   "s3:PutObject apps/beta/names/x" "s3:PutObject apps/beta/values/x" "s3:DeleteObject apps/beta/values/x" \
@@ -577,20 +568,15 @@ for c in "s3:PutObject apps/alpha/current" "s3:DeleteObject apps/alpha/current" 
   "s3:PutObject apps/alpha/components/x"; do
   is "$NAME-app itself denies $c" "$(rolesim $c)" implicitDeny
 done
-# The role alone lists any app's values, and the versions of any app's names, which is why the session narrows it to
-# one app's; and nothing else.
-for p in apps/alpha/values/ apps/beta/values/; do
+# The role alone lists any app's values and names, which is why the session narrows it to one app's; and nothing else.
+for p in apps/alpha/values/ apps/beta/values/ apps/alpha/names/ apps/beta/names/; do
   is "$NAME-app itself allows listing $p, which the session narrows to one app's" "$(rolesim s3:ListBucket "" $p)" \
     allowed
 done
-for p in apps/alpha/names/ apps/beta/names/; do
-  is "$NAME-app itself allows listing the versions under $p, which the session narrows to one app's" \
-    "$(rolesim s3:ListBucketVersions "" $p)" allowed
-done
-for p in apps/alpha/names/ apps/alpha/ apps/alpha/components/ native/alpha/ outbox/alpha/ ws/channels/; do
+for p in apps/alpha/ apps/alpha/components/ native/alpha/ outbox/alpha/ ws/channels/; do
   is "$NAME-app itself denies listing $p" "$(rolesim s3:ListBucket "" $p)" implicitDeny
 done
-for p in apps/alpha/values/ apps/alpha/ native/alpha/ outbox/alpha/; do
+for p in apps/alpha/names/ apps/alpha/values/ apps/alpha/ native/alpha/ outbox/alpha/; do
   is "$NAME-app itself denies listing the versions under $p" "$(rolesim s3:ListBucketVersions "" $p)" implicitDeny
 done
 is "$NAME-app itself denies listing with no prefix" "$(rolesim s3:ListBucket)" implicitDeny
@@ -665,8 +651,8 @@ is "the bucket blocks public access" "$(aws s3api get-public-access-block --buck
 is "the bucket is versioned" "$(aws s3api get-bucket-versioning --bucket "$TRIC_BUCKET" --query Status --output text)" \
   Enabled
 # The lifecycle rules of infra/aws/main.tf. The sweep deletes a version's key and leaves a delete marker and a version:
-# it is these rules that take them, so they are the sweep's other half; and a head's noncurrent versions, which are the
-# sweep's history, are kept the days of tofu's `noncurrent_days` (TF_VAR_noncurrent_days, 1 if unset). All is read.
+# it is these rules that take them, so they are the sweep's other half, and what is noncurrent is kept, to be read by
+# version, the days of tofu's `noncurrent_days` (TF_VAR_noncurrent_days, 1 if unset). All is read.
 lifecycle=$(aws s3api get-bucket-lifecycle-configuration --bucket "$TRIC_BUCKET" --output json)
 is "the bucket has the rules noncurrent, outbox and ws, and no more" "$(jq -r '[.Rules[].ID] | sort | join(" ")' \
   <<<"$lifecycle")" "noncurrent outbox ws"
@@ -918,15 +904,12 @@ echo "== sweep (the objects that no name refers to)"
 # `sweep`). It deletes an object only if no tree names it and it is an hour old at least (src/sweep.rs's GRACE), and
 # this run cannot wait an hour for one to be old enough. So what is checked here is what a sweep must never do (take
 # what is named, or what is young) and what it says it did; that it deletes what is old is for src/sweep.rs's tests.
-# The names alpha has values under, one to a line; the keys of apps/alpha/ that name this run; the cursor's, if any.
+# The names alpha has values under, one to a line; the keys of apps/alpha/ that name this run.
 valuenames() {
   aws s3api list-objects-v2 --bucket "$TRIC_BUCKET" --prefix apps/alpha/values/ --delimiter / \
     --query 'CommonPrefixes[].Prefix' --output text | listed
 }
 mine() { under apps/alpha/ | grep -F -- "-$run"; }
-cursors() {
-  aws s3api list-objects-v2 --bucket "$TRIC_BUCKET" --prefix apps/alpha/values/.sweep --query KeyCount --output text
-}
 # Puts an object at key $1, as this admin, and has the teardown delete it.
 plant() {
   planted="$planted $1"
@@ -938,20 +921,20 @@ s1=apps/alpha/values/big-$run/$(openssl rand -hex 16)
 s2=apps/alpha/values/stray-$run/$(openssl rand -hex 16)
 plant $s1
 plant $s2
-# For `late`, whose sweep is an hour on: hist-RUN, written twice, so that its first tree is named by its head's old
-# version alone; and a stray beside it that nothing names, which the run leaves for that sweep to delete.
+# For `late`, whose sweep is an hour on: hist-RUN, written twice, so that what its first tree alone has is named by no
+# head; and a stray beside it that nothing names, which the run leaves for that sweep to delete.
 post "$A/@hist-$run/kv?op=set&key=k&value=one" >/dev/null
 h1=$(under apps/alpha/values/hist-$run/)
 post "$A/@hist-$run/kv?op=set&key=k&value=two" >/dev/null
 h2=$(under apps/alpha/values/hist-$run/)
-is "hist-$run's head has a version for each write" "$(headversions hist-$run)" 2
 is "hist-$run's second write kept the first's objects, and added its own" \
   "${h1:+some}/$(comm -23 <(echo "$h1") <(echo "$h2") | grep -c .)/$([ "$h2" != "$h1" ] && echo more)" \
   some/0/more
 aged=apps/alpha/values/hist-$run/$(openssl rand -hex 16)
 printf '{}' | aws s3 cp - "s3://$TRIC_BUCKET/$aged" --only-show-errors || fail "plant $aged"
-printf 'run=%s\naged=%s\nat=%s\nhist="%s"\n' "$run" "$aged" "$(date +%s)" "${h2//$'\n'/ }" >"$state"
-is "no sweep of alpha is half done, and so none begins after its cursor" "$(cursors)" 0
+made=$(comm -13 <(echo "$h1") <(echo "$h2"))
+printf 'run=%s\naged=%s\nat=%s\nhist="%s"\nmade="%s"\n' "$run" "$aged" "$(date +%s)" "${h2//$'\n'/ }" \
+  "${made//$'\n'/ }" >"$state"
 names=$(valuenames | grep -c .)
 before=$(mine)
 is "the strays are in the bucket" "$(for k in $s1 $s2; do awscode aws s3api head-object --bucket "$TRIC_BUCKET" \
@@ -975,7 +958,6 @@ runs left and are an hour old; the report is $report"
 else fail "serve reports alpha's sweep" "no 'swept' line in serve's log"; fi
 is "one sweep, one line of the router's about it" "$(sweeplines events "$since")" 1
 is "and one of serve's, with no warning" "$(sweeplines serve "$since")" 1
-is "the cursor is forgotten, as it went through every name" "$(cursors)" 0
 is "nothing of this run's is deleted, or added" "$(mine)" "$before"
 for k in $s1 $s2; do
   is "the stray $k is kept, being younger than the hour's grace" "$(awscode aws s3api head-object \
@@ -1014,7 +996,6 @@ fi
 for f in route events serve; do
   is "the forged asks made no sweep ($NAME-$f's log)" "$(sweeplines $f "$since")" 0
 done
-is "and they left no cursor" "$(cursors)" 0
 is "and nothing of this run's is changed" "$(mine)" "$before"
 
 echo "== trees (what the turns of the run asked of the bucket)"

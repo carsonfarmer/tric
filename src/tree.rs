@@ -1,5 +1,5 @@
 //! A name's tree: the `tric-tree` crate, with tric's limits, under the name's own prefix in the app's bucket.
-pub use tric_tree::{Config, Error, Full, IN_FLIGHT, Root, Tree, number};
+pub use tric_tree::{Config, Error, Full, Root, Tree, number};
 
 use crate::store::{self, Store};
 use object_store::path::Path;

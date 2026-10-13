@@ -31,8 +31,8 @@ while idle: the only standing costs are the domain's Route 53 zone and what the 
   - `ws/…` holds sockets' records and subscriptions, for the router alone;
   - `outbox/<app>/<commit>` holds a delivery that is waiting for a retry, for the router alone;
   - the lifecycle rules expire noncurrent versions after `noncurrent_days`, 1 by default, `outbox/` after 2 days, and
-    `ws/` after a day. A head's noncurrent versions are its history, and the sweep keeps everything they name: with the
-    default, a name could be rolled back a day or more, even one that was deleted.
+    `ws/` after a day. The sweep keeps only what each name's head names now, and its deletes are delete markers, so
+    what it deleted can still be read by version until then.
 - **CloudFront and DNS.** CloudFront serves `*.<domain>` with a wildcard certificate from ACM, and Route 53 aliases
   point the domain at it.
 
@@ -41,9 +41,8 @@ while idle: the only standing costs are the domain's Route 53 zone and what the 
 - **An app** gets credentials from the router, and those credentials reach only its own data:
   - it can read and write its names, its values and `native/<app>/*`;
   - it can read the rest of `apps/<app>/*`;
-  - it can list its `values/`, and the versions of its `names/`, for the sweep that deletes the objects no name
-    refers to, and no other prefix: not the rest of its own, not another app's, not the bucket's root. It can delete
-    no version;
+  - it can list its `values/` and its `names/`, for the sweep that deletes the objects no name refers to, and no
+    other prefix: not the rest of its own, not another app's, not the bucket's root. It can list or delete no version;
   - it gets nothing at all outside its own app.
   - The app role caps every session: no app's credentials can write a release or a component, whatever the router asks.
 - **serve's own role** has no storage access. It can write its logs and invoke the router's `outbox` alias, and
@@ -134,7 +133,7 @@ week, but not both, because Scheduler can't express both. tric refuses it everyw
 
 `docker compose run --rm tofu test` checks the module's isolation properties, as `tests/module.tftest.hcl` lists them,
 against mock providers: it reaches nothing on AWS. Among them, that no app's session can list more than its values
-and the versions of its names.
+and its names.
 
 `bash infra/aws/check.sh` checks a live install end to end, in about 30 minutes: isolation between apps and from the
 host, the IAM policies by the policy simulator, turns, keys, delivery, WebSockets, schedules and the sweep, through

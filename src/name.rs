@@ -841,7 +841,7 @@ mod tests {
 
     /// How many objects the name's tree has in the store.
     async fn objects(store: &Store) -> usize {
-        store.objects(&store::app("a", &["values", "n"]), None).try_collect::<Vec<_>>().await.unwrap().len()
+        store.objects(&store::app("a", &["values", "n"])).try_collect::<Vec<_>>().await.unwrap().len()
     }
 
     /// The value at `key`, as a turn would read it now.
