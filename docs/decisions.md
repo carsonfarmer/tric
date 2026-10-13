@@ -134,8 +134,11 @@ reason.
   `InvokeComplete`'s error code.
 - **A header value that isn't UTF-8 is passed on lossily,** with U+FFFD for the bad bytes: a function-URL event is
   JSON, which holds text only. Refusing the request would fail a client over a header the app may never read.
-- **The event stream's CRCs go unchecked,** and its headers are read as strings only, the one type Lambda sends: TLS
-  already refuses a corrupted stream, and a header of any other type fails the answer.
+- **The event stream is read by `aws-smithy-eventstream`,** AWS's own reader, which checks each message's CRCs and
+  reads headers of every type; tric looks only at string ones, the one type Lambda sends. tric's own reader, some 40
+  lines that checked no CRC, is gone; the crate brings `aws-smithy-types` and 11 small crates with it (`time` among
+  them), all MIT or Apache-2.0, and none a second version of one tric has. tric still refuses a message over 16 MiB
+  from its length alone, before holding it, which the crate's own streaming decoder doesn't.
 - **The router's concurrency is capped,** at `route_concurrency`, 200 by default, reserved from the account's 1,000.
   Each router calls one serve, so a flood of client requests holds at most about 400 of the 1,000, and the rest stays
   for cron and the outbox; requests past 200 get 429. Reserved concurrency is free and keeps nothing warm, so scale
