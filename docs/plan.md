@@ -261,8 +261,8 @@ changed nothing puts nothing.
 **The read path:**
 1. The head is read as now: one GET, with its root node in it.
 2. A lookup descends from the root. A node not in memory is one GET, at its version, checked by its hash. Nodes read are
-   kept by the process in a cache of immutable nodes, byte-capped (16 MiB), keyed by the object's full path and its
-   version (app, name, id, version), so an entry is never stale and never crosses apps.
+   kept by the process in a cache of immutable nodes, byte-capped (16 MiB), keyed by the object's full path, its
+   version and its hash (app, name, id, version, hash), so an entry is never stale and never crosses apps.
 3. A file read fetches the blocks in range in parallel, whole, as their hash needs all of each.
 
 **Requests, and time.** AWS gives roughly 100 to 200 ms for a small object, which is not measured here, as no AWS calls

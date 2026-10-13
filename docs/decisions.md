@@ -788,11 +788,11 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   noncurrent one gone is no root, that a refused read or a head the listing misses loses nothing, that a name's
   versions are its own key's and not a longer one's, that the versions are marked into one set under one bound, and
   that a name over either bound is passed over and logged.
-- **The node cache is per process,** a byte-capped LRU (16 MiB, `CACHE_MAX`) of immutable nodes, keyed by the object's
-  full path and its version (app, name, id, version), so it can never be stale and a hit is exactly the object that
-  a read would fetch, and never one of another app's. A node a commit uploads is put in it, since the next request is
-  the one that will read it. It is not the cache of heads above, which waits for numbers: a head is the one mutable
-  thing, and the cache never holds it. Blocks are not cached; the files stage decides that with the numbers.
+- **The node cache is per process,** byte-capped (16 MiB) and of immutable nodes, keyed by the object's full path, its
+  version and its hash (app, name, id, version, hash), so it can never be stale and a hit is exactly the object that a
+  read would fetch, and never one of another app's. A node a commit uploads is put in it, since the next request is the
+  one that will read it. It is not the cache of heads above, which waits for numbers: a head is the one mutable thing,
+  and the cache never holds it. Blocks are not cached; the files stage decides that with the numbers.
 - **A turn logs its tree at debug,** next to the head's logs: the GETs and the PUTs, so that the cost model in the plan
   can be checked against a real run.
 - **The guest sees only what it can act on of a tree error.** A name that is over a budget is told which, with the
@@ -915,19 +915,14 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   uploads, renamed from `PUTS` as it serves both), and puts them in order.
   Measured with a counting store at 20 ms a GET: a read of 3 blocks is 3 GETs all under way together, 32 blocks are 32
   GETs with 16 under way, and a stream of 12 blocks is 12 GETs with at least 4 together.
-- **A block that is being fetched is waited for, not fetched again.** The first test of 0.3 read-ahead on a store
-  with a delay counted 19 GETs for a file of 12 blocks: a reader that is faster than the store catches up with its
-  own read-ahead and fetches what is under way. A block is now fetched by one reader at a time (`Flight`, in
-  `crates/tree`): one that comes to a block that is being fetched waits, and then looks in the cache, where the block
-  is checked against its hash again, so nothing is taken on trust from the one that fetched it. A fetch that is
-  cancelled lets the next in turn fetch, and the gate is gone when no one comes to it. The gate counts the flights
-  that come to it, under the map's lock, and a flight counts itself out when it is dropped, including one that is
-  cancelled while it waits. An earlier version told by the reference count of the gate when to remove it, which was
-  right only if a cancelled read dropped what it waited on before the flight, an order that nothing promises. Tests
-  cancel a waiter at the gate while the one that fetches is under way, and cancel reads at every moment of a fetch,
-  and the gate must be gone after them. This holds for any two reads of a block, whatever bound them. Nodes are not
-  gated: a descent that finds a node missing is rare next to reads of blocks, and a duplicate there costs one GET of
-  at most 64 KiB.
+- **A block that is being fetched is waited for, not fetched again.** The first test of 0.3 read-ahead on a store with a
+  delay counted 19 GETs for a file of 12 blocks: a reader that is faster than the store catches up with its own
+  read-ahead and fetches what is under way. An object is now fetched by one reader at a time: one that comes to an
+  object that is being fetched waits, and has what the fetch checked, as the cache's key holds the hash it was checked
+  against. A fetch that is cancelled lets the next in turn fetch. This holds for any two reads of an object, whatever
+  bound them, and nodes have it as blocks do. It is `quick_cache`'s `get_or_insert_async`, which replaced a gate of the
+  crate's own (see the tree crate, below). Tests cancel a waiter while the one that fetches is under way, cancel the one
+  that fetches, and cancel reads at every moment of a fetch, and no read may be left waiting after them.
 - **A read holds the tree to plan, and not to fetch.** The first version of `read_at` and the read-ahead held the tree
   shared while they fetched their blocks. The lock is fair, so a write waited behind every read in flight, the commit
   behind those, and new reads behind the commit: a stream that outlived the answer and read ahead held up the commit,
@@ -1211,6 +1206,18 @@ The tree is the crate `tric-tree`, in `crates/tree`, and the root is a workspace
 - **The cache is given, as an `Arc<Cache>`, and is not a static.** A store carries its cache: the S3 stores of a
   process share one, a static in `src/store.rs`, and a memory store has its own, as before. The crate's `Cache` keeps
   16 MiB of nodes and 32 MiB of values by default, the old sizes.
+- **The cache is `quick_cache`'s** (0.7, MIT), two of its weighted caches, of nodes and of values, and its
+  `get_or_insert_async` is how a read waits for a fetch of the same object that is under way. The crate had its own: an
+  LRU of each, by bytes, and a map of gates in which a read took its turn, counting itself in and out so that a
+  cancelled read left no gate behind: 70 lines of code more than this. The key is the full path, the version and the
+  hash the object was checked against, so a read that waits on another has what that one checked for the same link, and
+  a hit is what a fetch would give; only what a fetch checked, and what the tree uploaded itself, is put in. An entry
+  weighs its bytes (a node, the most it is thought to be as JSON), and at least one, as an entry that weighs nothing is
+  never forgotten. Each is one shard, as `quick_cache` splits its bound among its shards and keeps nothing larger than a
+  shard's share, and a lock per cache is what there was. Its default features are off: they bring its own hasher and
+  locks, and a second `foldhash` into the build; std's do here. Which entry it forgets is its own choice (S3-FIFO), no
+  longer the one used least, and nothing depended on that: the test of the order is now one of the bound. A mark only
+  peeks, so it neither keeps nor warms what it walks.
 - **The inode counter is a number kept with the root, `Tree::sequence`, whose meaning is the caller's.** A counter
   in the root is what keeps inode numbers from being reused across turns: it is in the root `finish` gives, and a
   `reset` gives back what a lost turn took. Keeping the number and dropping its meaning keeps that guarantee, and the
