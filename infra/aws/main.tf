@@ -59,7 +59,7 @@ variable "ws_burst" {
 }
 
 variable "noncurrent_days" {
-  description = "How many days a replaced or deleted version is kept: the history the sweep keeps, and so the rollback"
+  description = "How many days a replaced or deleted version is kept, to be read by version: what the sweep deleted too"
   type        = number
   default     = 1
   validation {
@@ -137,12 +137,11 @@ resource "aws_s3_bucket_versioning" "store" {
 resource "aws_s3_bucket_lifecycle_configuration" "store" {
   bucket     = aws_s3_bucket.store.id
   depends_on = [aws_s3_bucket_versioning.store]
-  # A head's noncurrent versions are the sweep's history: it keeps whatever any of them names, so a name, even one
-  # deleted, could be rolled back to any of them for as long as this rule keeps them. The rule also expires what the
-  # sweep deleted and what a deploy replaced, which a versioned bucket keeps as noncurrent versions. S3 counts whole
-  # days to the next midnight UTC, so a version is kept from `noncurrent_days` to a day more: 1 is 24 to 48 hours. One
-  # rule serves both: a filter is a literal prefix, and each app's heads are under its own, so heads kept longer than
-  # the rest need a key layout that puts every app's heads under one prefix.
+  # The sweep's other half. A delete is a delete marker, so what the sweep deleted, what a deploy replaced and the
+  # versions of a head that commits replaced are noncurrent versions, which this rule expires. Until then a reader that
+  # holds an older tree reads its objects by version, though the sweep keeps only what each name's head names now. S3
+  # counts whole days to the next midnight UTC, so a version is kept from `noncurrent_days` to a day more: 1 is 24 to
+  # 48 hours.
   rule {
     id     = "noncurrent"
     status = "Enabled"
@@ -253,19 +252,13 @@ resource "aws_iam_role_policy" "app" {
         Action   = ["s3:PutObject", "s3:DeleteObject"]
         Resource = ["${local.bucket}/apps/*/names/*", "${local.bucket}/apps/*/values/*", "${local.bucket}/native/*"]
       },
-      # For the sweep, and no more: it lists its values, and the versions of its names, which are their history. A list
-      # shows the keys under its prefix; no version is ever the app's to delete.
+      # For the sweep, and no more: it lists its values, and its names' heads. A list shows the keys under its prefix;
+      # no version is ever the app's to delete.
       {
         Effect    = "Allow"
         Action    = ["s3:ListBucket"]
         Resource  = [local.bucket]
-        Condition = { StringLike = { "s3:prefix" = ["apps/*/values/*"] } }
-      },
-      {
-        Effect    = "Allow"
-        Action    = ["s3:ListBucketVersions"]
-        Resource  = [local.bucket]
-        Condition = { StringLike = { "s3:prefix" = ["apps/*/names/*"] } }
+        Condition = { StringLike = { "s3:prefix" = ["apps/*/values/*", "apps/*/names/*"] } }
       },
     ]
   })

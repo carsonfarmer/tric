@@ -373,10 +373,10 @@ pub(crate) async fn body<T: DeserializeOwned>(req: hyper::Request<Incoming>) -> 
 }
 
 /// The session policy of `app`'s credentials: its names, values and native code to read and write, the rest of its
-/// objects to read, to list its values, and the versions of its names, and nothing else of the bucket: a list names
-/// the keys under its prefix, which here are `app`'s own. The sweep lists, and that is all it lists for: the names it
-/// sweeps, from `values/`, and the versions of each one's head, from `names/`, which nothing lists otherwise. Nor can a
-/// version be deleted: a delete is a delete marker, and the lifecycle alone expires what is noncurrent.
+/// objects to read, to list its values and its names, and nothing else of the bucket: a list names the keys under its
+/// prefix, which here are `app`'s own. The sweep lists, and that is all it lists for: the names it sweeps, from
+/// `values/`, and which of them have a head, from `names/`, which nothing lists otherwise. Nor can a version be
+/// deleted: a delete is a delete marker, and the lifecycle alone expires what is noncurrent.
 fn policy(bucket: &str, app: &str) -> String {
     let arn = |p: &str| format!("arn:aws:s3:::{bucket}/{p}");
     let rw = ["apps/{app}/names/*", "apps/{app}/values/*", "native/{app}/*"].map(|p| arn(&p.replace("{app}", app)));
@@ -398,13 +398,7 @@ fn policy(bucket: &str, app: &str) -> String {
                 "Effect": "Allow",
                 "Action": ["s3:ListBucket"],
                 "Resource": [format!("arn:aws:s3:::{bucket}")],
-                "Condition": { "StringLike": { "s3:prefix": [values] } },
-            },
-            {
-                "Effect": "Allow",
-                "Action": ["s3:ListBucketVersions"],
-                "Resource": [format!("arn:aws:s3:::{bucket}")],
-                "Condition": { "StringLike": { "s3:prefix": [names] } },
+                "Condition": { "StringLike": { "s3:prefix": [values, names] } },
             },
         ],
     })
@@ -438,21 +432,19 @@ mod tests {
     }
 
     #[test]
-    fn credentials_list_the_apps_own_values_and_the_versions_of_its_names_and_nothing_else() {
+    fn credentials_list_the_apps_own_values_and_names_and_nothing_else() {
         let policy: Value = serde_json::from_str(&policy("b", "shop")).unwrap();
         let statements = policy["Statement"].as_array().unwrap();
         let lists = |s: &&Value| s["Action"].as_array().unwrap().iter().any(|a| a.as_str().unwrap().contains("List"));
         let listing: Vec<_> = statements.iter().filter(lists).collect();
-        // Exactly two statements list, each one action on the bucket, for one prefix only: the objects of its values,
-        // and the versions of its names.
-        let want = [("s3:ListBucket", "apps/shop/values/*"), ("s3:ListBucketVersions", "apps/shop/names/*")];
-        assert_eq!(listing.len(), want.len());
-        for (statement, (action, prefix)) in listing.iter().zip(want) {
-            assert_eq!(statement["Effect"], "Allow");
-            assert_eq!(statement["Action"], serde_json::json!([action]));
-            assert_eq!(statement["Resource"], serde_json::json!(["arn:aws:s3:::b"]));
-            assert_eq!(statement["Condition"], serde_json::json!({ "StringLike": { "s3:prefix": [prefix] } }));
-        }
+        // Exactly one statement lists, one action on the bucket, for two prefixes only: the objects of its values, and
+        // its names' heads.
+        let [statement] = listing[..] else { panic!("{listing:?}") };
+        assert_eq!(statement["Effect"], "Allow");
+        assert_eq!(statement["Action"], serde_json::json!(["s3:ListBucket"]));
+        assert_eq!(statement["Resource"], serde_json::json!(["arn:aws:s3:::b"]));
+        let prefixes = serde_json::json!(["apps/shop/values/*", "apps/shop/names/*"]);
+        assert_eq!(statement["Condition"], serde_json::json!({ "StringLike": { "s3:prefix": prefixes } }));
         // The statements that read and write are as they were: objects of the app, no list, and no version deleted.
         for s in statements.iter().filter(|s| !lists(s)) {
             assert!(s["Condition"].is_null());
