@@ -1,5 +1,4 @@
 //! Names: each name's state is one object, its head, which a turn changes with a compare-and-swap when it commits.
-use crate::fs;
 use crate::kv::{Error, KeyResponse, other};
 use crate::outbox::{Event, Held, Sink};
 use crate::store::{self, Store};
@@ -243,8 +242,7 @@ struct State {
 /// A request that may write one name: its writes are in its tree, which is committed or discarded once it answers. A
 /// snapshot is a turn that has answered: it reads the name as it was, and writes nothing.
 ///
-/// The locks are taken in the order the file system's gate (which a commit takes and lets go of at once), `tree`,
-/// `state`; `state` is never held across an await.
+/// The locks are taken in the order `tree`, `state`; `state` is never held across an await.
 pub struct Turn {
     store: Store,
     app: String,
@@ -252,8 +250,6 @@ pub struct Turn {
     path: Path,
     state: Mutex<State>,
     tree: RwLock<Tree>,
-    /// What the file system keeps: the descriptors open on it, and the gate its changes pass.
-    pub fs: fs::State,
     settled: watch::Sender<Option<bool>>, // whether it committed, once it is known
     once: Option<Idempotency>,
 }
@@ -337,7 +333,7 @@ impl Turn {
         let tree = RwLock::new(tree::open(store, app, name, &head.tree, tree::config())?);
         let state = Mutex::new(State { head, base, answered, ..Default::default() });
         let (app, name, path, settled) = (app.into(), name.into(), path(app, name), watch::Sender::new(None));
-        Ok(Arc::new(Self { store: store.clone(), app, name, path, state, tree, fs: Default::default(), settled, once }))
+        Ok(Arc::new(Self { store: store.clone(), app, name, path, state, tree, settled, once }))
     }
 
     /// A snapshot of `name`: as it is now.
@@ -408,11 +404,6 @@ impl Turn {
 
     pub fn is_open(&self) -> bool {
         !self.state().answered
-    }
-
-    /// The tree, which the file system reads and changes by its own rules.
-    pub fn tree(&self) -> &RwLock<Tree> {
-        &self.tree
     }
 
     /// Holds `held` for the outbox, unless the turn is answered or holds too much.
@@ -532,17 +523,12 @@ impl Turn {
             s.answered = true;
             (s.head.clone(), s.base.clone(), std::mem::take(&mut s.held))
         };
-        self.fs.drain().await; // so the file system's changes that were admitted land first
         let mut tree = self.tree.write().await; // after the writes that were in flight
         if !tree.edited() && held.is_empty() && self.once.is_none() {
             return Ok(Committed::Done(self.etag()));
         }
         let (commit, was) = (store::random(), base.is_some().then(|| head.commit.clone()));
         let ready = async {
-            let mut kept = None;
-            if tree.edited() {
-                kept = self.fs.settle(&mut tree).await?;
-            }
             // An `Idempotency-Key`'s record is read until the day after its own; a delivery event's until two days
             // after, past the window its delivery is tried in.
             let today = now() / DAY;
@@ -581,25 +567,17 @@ impl Turn {
             if let Some(event) = event {
                 sink(event).await?; // before the head is put, so a commit that lands has handed it over
             }
-            Ok::<_, wasmtime::Error>(kept)
+            Ok::<_, wasmtime::Error>(())
         };
-        let kept = match ready.await {
-            Ok(kept) => kept,
-            // Nothing landed, so the client may try again, unless it would fail again.
-            Err(e) => {
-                tree.reset();
-                let again = e.downcast_ref::<Failed>().is_none(); // so not `TooLarge`
-                return Err(if again { e.context(Failed::Unsent) } else { e });
-            }
-        };
+        // Nothing landed, so the client may try again, unless it would fail again.
+        if let Err(e) = ready.await {
+            tree.reset();
+            let again = e.downcast_ref::<Failed>().is_none(); // so not `TooLarge`
+            return Err(if again { e.context(Failed::Unsent) } else { e });
+        }
         let landed = self.land(&head, base, was.as_deref()).await;
-        match &landed {
-            Ok(Committed::Done(_)) => {
-                if let Some(kept) = kept {
-                    self.fs.keep(kept); // under the write lock, so a read sees it from the first
-                }
-            }
-            _ => tree.reset(),
+        if !matches!(landed, Ok(Committed::Done(_))) {
+            tree.reset();
         }
         landed
     }
@@ -649,7 +627,6 @@ impl Turn {
             s.answered = true;
             s.held.clear();
         }
-        self.fs.drain().await;
         self.tree.write().await.reset();
         self.settled.send_replace(Some(false));
     }
@@ -1227,7 +1204,7 @@ mod tests {
         put(&store, &path("a", "n"), &head, None).await.unwrap().unwrap();
         commit(&writes(&store, "k").await.unwrap()).await.unwrap();
         let snap = Turn::snap(&store, "a", "n").await.unwrap();
-        let tree = snap.tree().read().await;
+        let tree = snap.tree.read().await;
         assert_eq!(tree.scan("i/", None, 10).await.unwrap(), [record_key(today - 1, "k")]);
         assert_eq!(tree.scan("o/", None, 10).await.unwrap(), [event_key(today - 2, "e")]);
     }

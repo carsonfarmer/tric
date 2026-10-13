@@ -4,7 +4,6 @@ mod cron;
 mod deploy;
 mod dev;
 mod engine;
-mod fs;
 mod kv;
 mod lambda;
 mod manifest;

@@ -1,6 +1,5 @@
 //! The Wasmtime engine, and apps on it: one `wasi:http/handler@0.3` component each, a fresh instance per request, under
 //! hard limits, with nothing granted but what tric provides.
-use crate::fs;
 use crate::kv::Imports;
 use crate::tric::{Ctx, Outbound, Request, Response};
 use sha2::{Digest, Sha256};
@@ -13,8 +12,6 @@ use tokio::time::timeout;
 use tracing::Instrument;
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Config, Result, Store, StoreLimits, StoreLimitsBuilder, bail};
-#[cfg(test)]
-use wasmtime_wasi::{I32Exit, p3::bindings::Command};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView, p2::pipe::MemoryOutputPipe};
 use wasmtime_wasi_http::p3::bindings::{Service, ServicePre};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView, p3};
@@ -61,14 +58,10 @@ impl Engine {
             }
         });
         let mut linker = Linker::new(&engine);
-        // The stock interfaces but the file system, which is tric's own. They are linked one by one, as no stock
-        // function leaves one out.
-        wasmtime_wasi::p3::cli::add_to_linker(&mut linker)?;
-        wasmtime_wasi::p3::clocks::add_to_linker(&mut linker)?;
-        wasmtime_wasi::p3::random::add_to_linker(&mut linker)?;
-        wasmtime_wasi::p3::sockets::add_to_linker(&mut linker)?;
+        // The stock interfaces, the file system among them so that a guest whose language imports it instantiates.
+        // No directory is preopened for it (`WasiCtx::builder` gives none), so it has no file to reach.
+        wasmtime_wasi::p3::add_to_linker(&mut linker)?;
         p3::add_to_linker(&mut linker)?;
-        fs::p3::add_to_linker(&mut linker)?;
         Imports::add_to_linker::<Host, HasSelf<Host>>(&mut linker, |h| h)?; // `wasi:keyvalue`
         Ok(Self { engine, linker })
     }
@@ -108,36 +101,6 @@ impl Engine {
         let pre = ServicePre::new(self.linker.instantiate_pre(component)?)?;
         let (env, permits) = (env.into(), Arc::new(Semaphore::new(IN_FLIGHT)));
         Ok(App { engine: self.engine.clone(), pre, env, permits })
-    }
-}
-
-#[cfg(test)]
-impl Engine {
-    /// Runs the `wasi:cli/command` component `command` to its end, as an app would run, under `ctx`; and returns its
-    /// exit code, and what it wrote to stdout and to stderr. For the tests of the file system, whose conformance tests
-    /// are commands.
-    pub async fn run_command(
-        &self,
-        command: &Component,
-        ctx: Arc<Ctx>,
-        args: &[String],
-        env: &[(String, String)],
-    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
-        let (out, err) = (MemoryOutputPipe::new(LOG_MAX), MemoryOutputPipe::new(LOG_MAX));
-        let wasi = WasiCtx::builder().stdout(out.clone()).stderr(err.clone()).args(args).envs(env).build();
-        let mut store = store(&self.engine, wasi, ctx);
-        let instance = self.linker.instantiate_async(&mut store, command).await?;
-        let guest = Command::new(&mut store, &instance)?;
-        let ran = store.run_concurrent(async |accessor| guest.wasi_cli_run().call_run(accessor).await).await;
-        let code = match ran.and_then(|ran| ran) {
-            Ok(Ok(())) => 0,
-            Ok(Err(())) => 1,
-            Err(e) => match e.downcast_ref::<I32Exit>() {
-                Some(&I32Exit(code)) => code,
-                None => return Err(e.context(format!("stderr: {}", String::from_utf8_lossy(&err.contents())))),
-            },
-        };
-        Ok((code, out.contents().to_vec(), err.contents().to_vec()))
     }
 }
 
@@ -289,7 +252,7 @@ mod tests {
             sink: Arc::new(|_| Box::pin(async { Ok(()) })),
         });
         let turn = Turn::open(&tric.store, "a", "n", &Default::default(), None).await.unwrap().unwrap();
-        let mut store = store(&engine.engine, WasiCtx::builder().build(), Ctx::of_command(tric, turn, "n"));
+        let mut store = store(&engine.engine, WasiCtx::builder().build(), Ctx::of_test(tric, turn));
         let guest = app.pre.instantiate_async(&mut store).await.unwrap();
 
         let uris = ["http://a.localhost/echo?sleep=200", "http://a.localhost/echo?sleep=50"];
