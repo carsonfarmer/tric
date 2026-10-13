@@ -511,9 +511,74 @@ the commit.
      preference.
    - Without a commit there is nothing in the sender's head to check, so such an event could be forged.
 
+## Next: per-app owners
+
+Today one principal, the install's AWS credentials, deploys and recovers every app. These steps give an app an owner
+who can deploy and recover that app and nothing else. No new service or account system is needed: an owner is an AWS
+principal, scoped by a tag that the operator sets.
+
+**Security, up front:**
+- **An owner reaches its own app and nothing else.** It may write the app's components, `current`, names and values,
+  read anything under `apps/<app>/`, and list the versions there. It gets no `native/`, `outbox/` or `ws/`, and no
+  Scheduler, Lambda, IAM or logs.
+- **`native/` stays out of an owner's reach.** serve loads native code as machine code, trusting it by its path, so
+  whoever could write it could run anything in serve. Only serve writes it, with the credentials the router minted
+  for that one app.
+- **The tag is the operator's.** The app a principal may touch is its `tric-app` tag. The operator sets it on an IAM
+  user or role, or as an Identity Center attribute. Owners get no `iam:Tag*` or `sts:TagSession`, so they can't change
+  it. A principal without the tag matches no statement.
+  - Tagging is how an app's name is handed out: the first deploy under a tag makes the app.
+  - Principals that share a tag share the app, which is all a team is here.
+- **A release becomes untrusted input.** An owner can write any bytes as `current`, not only what `tric deploy` makes.
+  serve already refuses a release over `RELEASE_MAX` or with unknown fields, caps the component at 64 MiB and checks
+  its digest. The router's schedule sync must check what deploy checks: at most `CRON_MAX` jobs, each with a valid
+  expression and path. A bad release breaks only its own app.
+- **Still shared:** the cost of what owners do. An owner who deploys in a loop runs the router's sync each time, and
+  budgets and per-app limits stay out of this build.
+
+**The steps:**
+1. **One owner policy.** The module adds a managed policy keyed on `${aws:PrincipalTag/tric-app}` and outputs its ARN
+   as `TRIC_OWNER_POLICY`. The operator attaches it to each owner's principal and tags the principal. Every resource
+   puts a `/` after the tag, so `alpha` never reaches `alpha2`, and a tag can't hold `*` or `?`. The grants:
+   - `s3:PutObject` on `apps/<tag>/components/*`, `apps/<tag>/current`, `apps/<tag>/names/*` and `apps/<tag>/values/*`;
+   - `s3:GetObject` and `s3:GetObjectVersion` on `apps/<tag>/*`;
+   - `s3:ListBucket` and `s3:ListBucketVersions` on the bucket, for an `s3:prefix` under `apps/<tag>/`.
+2. **An app's schedules follow its `current`, and the router syncs them.** Today deploy syncs them with Scheduler
+   itself, and an owner can't be given that. A schedule's input names its app freely, so whoever can create a schedule
+   in the cron group can fire any app's cron or sweep. Schedules are also named by the app's hash, which IAM can't
+   match.
+   - The bucket notifies a new `deploy` alias of the events function of `ObjectCreated` and `ObjectRemoved` under the
+     prefix `apps/`, with the suffix `/current`. Only S3, from this bucket and account, may invoke the alias, which has
+     the same async config as `outbox`.
+   - The router takes the app from a key that is exactly `apps/<label>/current`, and ignores any other. A name called
+     `current` ends the same way, as `apps/<app>/names/current`.
+   - The router reads `current` itself and never trusts the event's content. It makes the app's schedules match the
+     release, and deletes them all if there is none. If `current`'s ETag changed while it worked, it goes again, so
+     syncs that overlap or arrive out of order end at the latest release.
+   - The code is deploy's `schedule`, moved. The router's role gains creating, deleting and listing schedules in the
+     cron group, and passing the cron role. `sweep_every` becomes the router's setting on AWS, as it is locally.
+   - A deploy's cron starts once the sync has run, usually seconds later. A sync that fails three times is logged, and
+     deploying again syncs again.
+3. **deploy writes to S3 only.** It loses `--scheduler-*` and `--sweep-every`, and the module's outputs lose
+   `TRIC_SCHEDULER_*` and `TRIC_SWEEP_EVERY`. An owner needs only `TRIC_BUCKET`, the region and its own credentials.
+4. **recover needs nothing new.** It already uses only S3 under the app, and the version listing lets an owner find
+   `VERSION`.
+5. **Locally nothing changes:** the router there reads each app's cron from its release as it ticks.
+6. **The tests:**
+   - a tofu test that every grant of the owner policy is under `apps/${aws:PrincipalTag/tric-app}/`, and that the
+     notification sends `apps/…/current` to `events:deploy`;
+   - unit tests of the router's key check: `apps/alpha/current` syncs, and `apps/alpha/names/current`,
+     `apps/a/b/current` and `apps/Alpha/current` don't;
+   - in check.sh, a short-lived role tagged `tric-app=alpha`, with the policy, which:
+     - deploys alpha, whose cron schedule then appears;
+     - recovers a name of alpha;
+     - is denied beta's `current` and names, and `native/alpha/`.
+
+     An untagged role with the same policy is denied alpha. check.sh deletes both roles at the end.
+
 ## Not in this build
 
-- teams and per-team publishing;
+- owners of more than one app per principal;
 - budgets and per-app limits;
 - `tric logs`;
 - release history commands;

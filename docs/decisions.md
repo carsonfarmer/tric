@@ -595,8 +595,9 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "State: 
   ETag, so one that timed out, and may have landed, is run again to learn whether it did.
 - **A recovery is the install's, as a deploy is.** One principal holds the install's AWS credentials, and deploys,
   recovers and reads the bucket: tric has no owners of apps distinct from it. A recovery needs only to read versions
-  and put objects under `apps/<app>/`, which an app-scoped role could be given if apps get owners of their own; it is a
-  command of the CLI, beside `deploy`, and not a route of the router, which would need a principal to check.
+  and put objects under `apps/<app>/`, which is why the plan's per-app owners can recover their own apps with the
+  owner policy alone. It is a command of the CLI, beside `deploy`, and not a route of the router, which would need a
+  principal to check.
 - **A name's mark is bounded, and the valve is a last resort.** A name's head is marked into a set of `u128`
   (`Head::mark`, which is `Tree::mark`), reading its tree's nodes level by level, `IN_FLIGHT` (16) at once, each
   checked against its link. These figures are estimates, not measurements: a GET of a node takes about 25 ms from
