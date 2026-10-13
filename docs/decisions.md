@@ -91,6 +91,11 @@ reason.
   having created the schedule, Scheduler's 409 says it is made, and that is taken as done. It names the app, so one
   app's can't be another's. A schedule deletes itself once it has run (`ActionAfterCompletion: DELETE`), because a
   completed one counts against the quota until it does.
+- **A create or a delete of a schedule carries a random client token.** Scheduler refuses a create without one (400,
+  "ClientToken cannot be empty"), though its reference calls it optional, and the SDKs always send one, so a delete
+  carries one too. The name already makes a request sent twice one change. A token derived from the name or body would
+  repeat when a schedule that was deleted is made again, as a deploy that changes the sweep's interval and back does,
+  and Scheduler might take that create for one it had done.
 - **The retries have a Scheduler group and a role of their own.** The retry role may invoke `events:retry` only, and
   the cron role `events:cron` only. The router may create a schedule in the retry group only, and pass only the retry
   role to Scheduler, so it can't make a schedule that runs as `cron`. serve may invoke `outbox` only, so it can make

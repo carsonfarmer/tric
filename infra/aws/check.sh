@@ -114,6 +114,8 @@ B=https://beta.$DOMAIN
 get() { curl -4 -sS --max-time 70 "$@"; }
 post() { curl -4 -sS --max-time 70 -X POST "$@"; }
 code() { curl -4 -sS -o /dev/null -w '%{http_code}' --max-time 70 "$@"; }
+# A value too big to inline in its tree, which is an object of its own.
+big=$(head -c 5000 /dev/zero | tr '\0' b)
 # The value of key $3 in name $2 of app $1, as JSON; "ERR" when the answer isn't {"ok": ...}.
 value() {
   local r
@@ -145,10 +147,11 @@ status() { grep -aoE '"statusCode": ?[0-9]+' | head -1 | grep -oE '[0-9]+$'; }
 now() { echo $(($(date +%s) * 1000)); }
 # The items of a list that the AWS CLI printed as text, one to a line: none for an empty list, which it prints as None.
 listed() { tr '\t' '\n' | grep -v '^None$' | grep .; }
-# The number of events in function $1's log since $2 (ms) that match $3.
+# The number of events in function $1's log since $2 (ms) that match $3. A count is asked for as JSON: as text, the CLI
+# counts each page of a listing apart, and prints a number for each.
 nlogs() {
   aws logs filter-log-events --log-group-name "/aws/lambda/$NAME-$1" --start-time "$2" --filter-pattern "$3" \
-    --query 'length(events)' --output text
+    --query 'length(events)' --output json
 }
 # Waits up to $4 seconds for function $1's log since $2 to have $5 lines (one, by default) that match filter pattern $3.
 awaitpat() {
@@ -280,7 +283,8 @@ if [ "${1:-}" = late ]; then
     <(echo "$left") | grep -c .)" 0/0
   note "of hist-$run's $(printf '%s\n' $hist | grep -c .) objects, $(echo "$left" | grep -c .) are left: what the \
 first write alone made is named by no head, and goes"
-  is "hist-$run's key reads as it was last written, from the tree its head names" "$(value "$A" hist-$run k)" '"two"'
+  is "hist-$run's key reads as it was last written, from the tree its head names" \
+    "$(value "$A" hist-$run k | jq --arg v "two$big" '. == $v')" true
   if [ "$(under "$aged" | grep -c .)" != 0 ]; then
     aws s3api delete-object --bucket "$TRIC_BUCKET" --key "$aged" >/dev/null || fail "delete $aged"
   fi
@@ -331,7 +335,7 @@ unschedule() {
       aws scheduler delete-schedule --group-name $NAME-retry --name "$n" >/dev/null || fail "delete a retry"
     done
     is "no retry of the run's delivery is left" "$(aws scheduler list-schedules --group-name $NAME-retry \
-      --name-prefix "$prefix" --query 'length(Schedules)' --output text)" 0
+      --name-prefix "$prefix" --query 'length(Schedules)' --output json)" 0
   fi
 }
 planted= # the keys of the objects the run put in the bucket, each after a space
@@ -344,8 +348,7 @@ teardown() {
   unschedule
   for k in $planted; do
     aws s3api delete-object --bucket "$TRIC_BUCKET" --key "$k" >/dev/null || fail "delete $k"
-    is "the planted $k is deleted" "$(aws s3api list-objects-v2 --bucket "$TRIC_BUCKET" --prefix "$k" \
-      --query KeyCount --output text)" 0
+    is "the planted $k is deleted" "$(under "$k" | grep -c .)" 0
   done
 }
 toml alpha "$(printf '\n[cron]\n"* * * * *" = "/@ticks-%s/echo"\n' "$run")"
@@ -515,8 +518,8 @@ fi
 
 echo "== credentials (IAM's policy simulator)"
 is "$NAME-app has one inline policy and none attached" "$(aws iam list-role-policies --role-name $NAME-app \
-  --query 'length(PolicyNames)' --output text)/$(aws iam list-attached-role-policies --role-name $NAME-app \
-  --query 'length(AttachedPolicies)' --output text)" 1/0
+  --query 'length(PolicyNames)' --output json)/$(aws iam list-attached-role-policies --role-name $NAME-app \
+  --query 'length(AttachedPolicies)' --output json)" 1/0
 role=$(aws iam get-role-policy --role-name $NAME-app --policy-name "$(aws iam list-role-policies --role-name $NAME-app \
   --query 'PolicyNames[0]' --output text)" --query PolicyDocument --output json)
 # What the role's policy allows of action $1 on resource $2 of the bucket (the bucket itself, if $2 is empty), narrowed
@@ -637,8 +640,8 @@ is "the app role trusts only the router's role" "$(aws iam get-role --role-name 
   --query 'Role.AssumeRolePolicyDocument.Statement[].Principal.AWS' --output text)" \
   "arn:aws:iam::$ACCOUNT:role/$NAME-route"
 is "$NAME-serve has one inline policy and none attached" "$(aws iam list-role-policies --role-name $NAME-serve \
-  --query 'length(PolicyNames)' --output text)/$(aws iam list-attached-role-policies --role-name $NAME-serve \
-  --query 'length(AttachedPolicies)' --output text)" 1/0
+  --query 'length(PolicyNames)' --output json)/$(aws iam list-attached-role-policies --role-name $NAME-serve \
+  --query 'length(AttachedPolicies)' --output json)" 1/0
 for q in outbox retry; do
   is "the $q alias retries twice, keeps an event 6 h, and has no destination" \
     "$(aws lambda get-function-event-invoke-config --function-name $NAME-events --qualifier $q \
@@ -684,7 +687,7 @@ is "only the router's functions hold the origin secret, which CloudFront sends b
   "$(for f in route events serve; do envs $f | grep -qx TRIC_ORIGIN && echo $f; done | xargs)" "route events"
 for f in route events serve; do
   is "$NAME-$f has no provisioned concurrency" "$(aws lambda list-provisioned-concurrency-configs \
-    --function-name $NAME-$f --query 'length(ProvisionedConcurrencyConfigs)' --output text)" 0
+    --function-name $NAME-$f --query 'length(ProvisionedConcurrencyConfigs)' --output json)" 0
 done
 
 echo "== outbound and the guest"
@@ -712,7 +715,6 @@ is "which leaves its name no head" "$(under apps/alpha/names/fs-$run | grep -c .
 
 echo "== values too big to inline (each an object of its own)"
 t_trees=$(now)
-big=$(head -c 5000 /dev/zero | tr '\0' b)
 # Whether keys a to d of name big-RUN of alpha each hold $big.
 bigs() { get "$A/@big-$run/kv?op=get-many&keys=a,b,c,d" | jq -r --arg v "$big" '[.ok[][1] == $v] | all' 2>/dev/null; }
 is "a turn keeps four values too big to inline" "$(post "$A/@big-$run/kv?op=set-many&keys=a,b,c,d&value=$big")" \
@@ -793,7 +795,7 @@ else fail "a delivery that fails waits in outbox/alpha/" "no object there names 
 if [ -n "$commit" ]; then
   prefix=$(sha "alpha/$commit" 32)
   is "and a schedule in $NAME-retry is for it" "$(aws scheduler list-schedules --group-name $NAME-retry \
-    --name-prefix "$prefix" --query 'length(Schedules)' --output text)" 1
+    --name-prefix "$prefix" --query 'length(Schedules)' --output json)" 1
 fi
 # serve's 503 to each try, in the router's log: the first try, and two that Scheduler made.
 tries="{ \$.fields.app = \"alpha\" && \$.fields.message = \"outbox: serve answered 503 Service Unavailable\" }"
@@ -812,8 +814,7 @@ if [ -n "$commit" ]; then
     '{app: "alpha", commit: $c, tries: 9, deadline: $d}')" --qualifier retry >/dev/null || fail "invoke the retry alias"
   if awaitlog events "$since" "failed every try" 30; then pass "a delivery past its window is lost, with a warning"
   else fail "a delivery past its window is lost, with a warning"; fi
-  is "and its object is deleted" "$(aws s3api list-objects-v2 --bucket "$TRIC_BUCKET" --prefix "outbox/alpha/$commit" \
-    --query KeyCount --output text)" 0
+  is "and its object is deleted" "$(under "outbox/alpha/$commit" | grep -c .)" 0
 fi
 
 echo "== schedules (the run's are deleted, so that no daily sweep falls among the checks that follow)"
@@ -838,8 +839,9 @@ else
   ok=$(grep -c '^200$' "$codes")
   [ "$ok" = 40 ] || note "of the writers' 40 increments, $((40 - ok)) were refused: $(sort "$codes" | uniq -c | xargs)"
   rm -f "$codes"
-  is "the increments that answered 200 are the ones that landed" \
-    "$(for w in 1 2 3 4; do value "$A" $h w$w; done | jq -s 'map(tonumber? // 0) | add')" "$ok"
+  # A counter is held as eight bytes, the least significant first; each here is under 128, so each byte a character.
+  is "the increments that answered 200 are the ones that landed" "$(for w in 1 2 3 4; do value "$A" $h w$w; done |
+    jq -s 'map(explode? // [] | reverse | reduce .[] as $b (0; . * 256 + $b)) | add')" "$ok"
   sleep 30
   aws logs filter-log-events --log-group-name /aws/lambda/$NAME-serve --start-time "$t" --filter-pattern "\"$h\"" \
     --output json >"$live/heads-$run.json"
@@ -921,11 +923,12 @@ s1=apps/alpha/values/big-$run/$(openssl rand -hex 16)
 s2=apps/alpha/values/stray-$run/$(openssl rand -hex 16)
 plant $s1
 plant $s2
-# For `late`, whose sweep is an hour on: hist-RUN, written twice, so that what its first tree alone has is named by no
-# head; and a stray beside it that nothing names, which the run leaves for that sweep to delete.
-post "$A/@hist-$run/kv?op=set&key=k&value=one" >/dev/null
+# For `late`, whose sweep is an hour on: hist-RUN, its key written twice with a value too big to inline, so that the
+# first value's object is named by no head; and a stray beside it that nothing names, which the run leaves for that
+# sweep to delete.
+post "$A/@hist-$run/kv?op=set&key=k&value=one$big" >/dev/null
 h1=$(under apps/alpha/values/hist-$run/)
-post "$A/@hist-$run/kv?op=set&key=k&value=two" >/dev/null
+post "$A/@hist-$run/kv?op=set&key=k&value=two$big" >/dev/null
 h2=$(under apps/alpha/values/hist-$run/)
 is "hist-$run's second write kept the first's objects, and added its own" \
   "${h1:+some}/$(comm -23 <(echo "$h1") <(echo "$h2") | grep -c .)/$([ "$h2" != "$h1" ] && echo more)" \

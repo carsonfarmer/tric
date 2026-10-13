@@ -11,11 +11,11 @@ use crate::store;
 use crate::tric::{Response, label, status};
 use bytes::Bytes;
 use chrono::{DateTime, Datelike, Timelike};
-use http::{Method, StatusCode};
+use http::StatusCode;
 use hyper::body::Incoming;
 use object_store::{PutMode, path::Path};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 use wasmtime::{Result, error::Context};
 
@@ -53,7 +53,7 @@ fn unix() -> u64 {
 
 /// The schedule that has `w` tried again at `at`, in Unix seconds, with its name. The name is for the app, the commit
 /// and the try, so one app's cannot be another's, and making it twice makes it once.
-fn schedule(retries: &Scheduler, w: &Waiting, at: u64) -> Result<(String, Vec<u8>)> {
+fn schedule(retries: &Scheduler, w: &Waiting, at: u64) -> Result<(String, Value)> {
     let t = DateTime::from_timestamp(at as i64, 0).context("a time out of range")?;
     let at =
         format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", t.year(), t.month(), t.day(), t.hour(), t.minute(), t.second());
@@ -65,7 +65,7 @@ fn schedule(retries: &Scheduler, w: &Waiting, at: u64) -> Result<(String, Vec<u8
         "ActionAfterCompletion": "DELETE",
         "Target": { "Arn": retries.target, "RoleArn": retries.role, "Input": serde_json::to_string(w)? },
     });
-    Ok((name, serde_json::to_vec(&body)?))
+    Ok((name, body))
 }
 
 impl Route {
@@ -120,8 +120,7 @@ impl Route {
             return self.store.delete(&w.key()).await;
         }
         let (name, body) = schedule(retries, &w, at)?;
-        deploy::scheduler(&self.aws, Method::POST, &format!("/schedules/{name}"), body, StatusCode::CONFLICT).await?;
-        Ok(())
+        deploy::create(&self.aws, &name, &body).await
     }
 
     /// The answer to an invocation, by how `done` says it went: 204, once the messages it published are sent; else 503,
@@ -176,7 +175,6 @@ mod tests {
             schedule(&retries, &Waiting { tries: 4, ..waiting("app", &w.commit) }, 0).unwrap().0,
             "per try"
         );
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["ScheduleExpression"], "at(2023-11-14T22:13:20)");
         assert_eq!(body["ActionAfterCompletion"], "DELETE");
         assert_eq!(body["FlexibleTimeWindow"]["Mode"], "OFF");

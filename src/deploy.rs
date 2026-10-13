@@ -98,10 +98,11 @@ async fn schedule(aws: &Aws, app: &str, cron: &BTreeMap<String, String>, s: &Sch
     let have: BTreeSet<&str> = have.iter().filter_map(|s| s["Name"].as_str()).collect();
     let (make, delete) = changes(&have, &want);
     for (name, body) in make {
-        scheduler(aws, Method::POST, &format!("/schedules/{name}"), body.to_vec(), StatusCode::CONFLICT).await?;
+        create(aws, name, body).await?;
     }
     for name in delete {
-        let path = format!("/schedules/{name}?groupName={}", query(&s.group));
+        // Scheduler wants a client token of a delete, as of a create.
+        let path = format!("/schedules/{name}?groupName={}&clientToken={}", query(&s.group), store::random());
         scheduler(aws, Method::DELETE, &path, vec![], StatusCode::NOT_FOUND).await?;
     }
     Ok(())
@@ -110,24 +111,19 @@ async fn schedule(aws: &Aws, app: &str, cron: &BTreeMap<String, String>, s: &Sch
 /// The schedules the app is to have, by name, with the body that makes each: one for each of its cron jobs, and its
 /// sweep `every` so often, which is there whatever its cron is. A name is the app's hash, which the listing of its
 /// schedules goes by, and the body's, so no schedule of another app is one of this.
-fn wanted(
-    app: &str,
-    cron: &BTreeMap<String, String>,
-    s: &Scheduler,
-    every: Every,
-) -> Result<BTreeMap<String, Vec<u8>>> {
+fn wanted(app: &str, cron: &BTreeMap<String, String>, s: &Scheduler, every: Every) -> Result<BTreeMap<String, Value>> {
     let prefix = &store::hash(app.as_bytes())[..24];
     let jobs = cron.iter().map(|(expr, path)| (expr.clone(), json!({ "app": app, "path": path })));
     let sweep = (sweep::schedule(app, every), json!({ "app": app, "sweep": true }));
     let mut want = BTreeMap::new();
     for (expr, input) in jobs.chain([sweep]) {
-        let body = serde_json::to_vec(&json!({
+        let body = json!({
             "GroupName": s.group,
             "ScheduleExpression": Cron::parse(&expr)?.eventbridge(),
             "FlexibleTimeWindow": { "Mode": "OFF" },
             "Target": { "Arn": s.target, "RoleArn": s.role, "Input": input.to_string() },
-        }))?;
-        want.insert(format!("{prefix}-{}", &store::hash(&body)[..39]), body);
+        });
+        want.insert(format!("{prefix}-{}", &store::hash(&serde_json::to_vec(&body)?)[..39]), body);
     }
     Ok(want)
 }
@@ -136,15 +132,30 @@ fn wanted(
 /// extras. Nothing wanted, as when an app is removed, deletes them all.
 fn changes<'a>(
     have: &BTreeSet<&'a str>,
-    want: &'a BTreeMap<String, Vec<u8>>,
-) -> (Vec<(&'a str, &'a [u8])>, Vec<&'a str>) {
+    want: &'a BTreeMap<String, Value>,
+) -> (Vec<(&'a str, &'a Value)>, Vec<&'a str>) {
     let make = want.iter().filter(|(name, _)| !have.contains(name.as_str()));
     let delete = have.iter().copied().filter(|name| !want.contains_key(*name));
-    (make.map(|(name, body)| (name.as_str(), body.as_slice())).collect(), delete.collect())
+    (make.map(|(name, body)| (name.as_str(), body)).collect(), delete.collect())
+}
+
+/// Makes the schedule `name` of `body`, which is done if Scheduler has it already.
+pub(crate) async fn create(aws: &Aws, name: &str, body: &Value) -> Result<()> {
+    scheduler(aws, Method::POST, &format!("/schedules/{name}"), tokened(body)?, StatusCode::CONFLICT).await?;
+    Ok(())
+}
+
+/// `body`, with the client token that Scheduler wants of a create. It is random, as the SDKs make it: the name already
+/// makes a create sent twice one schedule, and a token that the name or body gave would be one Scheduler may have seen
+/// when a schedule that was deleted is made again, which it might then not make.
+fn tokened(body: &Value) -> Result<Vec<u8>> {
+    let mut body = body.clone();
+    body["ClientToken"] = store::random().into();
+    Ok(serde_json::to_vec(&body)?)
 }
 
 /// Calls EventBridge Scheduler, for which `done`, besides a success, means it's done already.
-pub(crate) async fn scheduler(aws: &Aws, method: Method, path: &str, body: Vec<u8>, done: StatusCode) -> Result<Bytes> {
+async fn scheduler(aws: &Aws, method: Method, path: &str, body: Vec<u8>, done: StatusCode) -> Result<Bytes> {
     let json = [(CONTENT_TYPE.as_str(), "application/json")];
     Ok(aws.send("scheduler", method, path, &json, body, Some(done)).await?.into_body().bytes().await?)
 }
@@ -167,11 +178,8 @@ mod tests {
         jobs.iter().map(|(expr, path)| (expr.to_string(), path.to_string())).collect()
     }
 
-    fn inputs(want: &BTreeMap<String, Vec<u8>>) -> Vec<Value> {
-        let input = |body: &Vec<u8>| {
-            let body: Value = serde_json::from_slice(body).unwrap();
-            serde_json::from_str(body["Target"]["Input"].as_str().unwrap()).unwrap()
-        };
+    fn inputs(want: &BTreeMap<String, Value>) -> Vec<Value> {
+        let input = |body: &Value| serde_json::from_str(body["Target"]["Input"].as_str().unwrap()).unwrap();
         let mut inputs: Vec<Value> = want.values().map(input).collect();
         inputs.sort_by_key(Value::to_string);
         inputs
@@ -181,7 +189,7 @@ mod tests {
     fn an_app_with_no_cron_has_its_sweep() {
         let want = wanted("shop", &cron(&[]), &scheduler(), DAILY).unwrap();
         assert_eq!(inputs(&want), [json!({ "app": "shop", "sweep": true })]);
-        let body: Value = serde_json::from_slice(want.values().next().unwrap()).unwrap();
+        let body = want.values().next().unwrap();
         // Once a day, at a minute that is the app's, as the expression the router runs locally says.
         let at = Cron::parse(&sweep::schedule("shop", DAILY)).unwrap().eventbridge();
         assert_eq!(body["ScheduleExpression"], at);
@@ -232,7 +240,6 @@ mod tests {
         assert!(make.is_empty());
         assert_eq!(delete.len(), 1);
         let gone = &before[delete[0]];
-        let gone: Value = serde_json::from_slice(gone).unwrap();
         assert_eq!(gone["Target"]["Input"], json!({ "app": "shop", "path": "/run" }).to_string());
     }
 
@@ -244,9 +251,8 @@ mod tests {
         let have: BTreeSet<&str> = before.keys().map(String::as_str).collect();
         let (make, delete) = changes(&have, &after);
         assert_eq!((make.len(), delete.len()), (1, 1));
-        let made: Value = serde_json::from_slice(make[0].1).unwrap();
-        let gone: Value = serde_json::from_slice(&before[delete[0]]).unwrap();
-        for body in [&made, &gone] {
+        let (made, gone) = (make[0].1, &before[delete[0]]);
+        for body in [made, gone] {
             assert_eq!(body["Target"]["Input"], json!({ "app": "shop", "sweep": true }).to_string());
         }
         let six = Cron::parse(&sweep::schedule("shop", Every::Hours(6))).unwrap().eventbridge();
@@ -268,6 +274,23 @@ mod tests {
         delete.sort();
         assert_eq!(delete, have.iter().copied().collect::<Vec<_>>());
         assert_eq!(delete.len(), 2, "its cron job and its sweep");
+    }
+
+    #[test]
+    fn a_create_carries_a_client_token_of_its_own() {
+        let want = wanted("shop", &cron(&[]), &scheduler(), DAILY).unwrap();
+        let body = want.values().next().unwrap();
+        let (first, again) = (tokened(body).unwrap(), tokened(body).unwrap());
+        let (mut first, again): (Value, Value) =
+            (serde_json::from_slice(&first).unwrap(), serde_json::from_slice(&again).unwrap());
+        let token = first["ClientToken"].as_str().unwrap().to_owned();
+        // As Scheduler takes it: 1 to 64 of letters, digits, `-` and `_`.
+        assert!(
+            (1..=64).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        );
+        assert_ne!(first["ClientToken"], again["ClientToken"]);
+        first.as_object_mut().unwrap().remove("ClientToken");
+        assert_eq!(&first, body, "and is otherwise the body");
     }
 
     #[test]
