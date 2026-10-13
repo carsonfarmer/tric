@@ -751,14 +751,16 @@ invoke $NAME-events "$forged" --qualifier outbox >/dev/null || fail "invoke the 
 if awaitlog serve "$since" "no commit recorded it" 60; then pass "a forged delivery is dropped for its digest"
 else fail "a forged delivery is dropped for its digest" "no 'no commit recorded it' in serve's log"; fi
 is "and stores nothing" "$(value "$B" j-$run echo)" null
+# These two are of commits of 32 hex digits, as a commit's id is: the router refuses an event of any other.
 since=$(now)
-invoke $NAME-events "$(jq -cn --arg n "ghost-$run" '{app: $n, host: "x", name: "g", day: 0, commit: "c",
-  requests: []}')" --qualifier outbox >/dev/null
+invoke $NAME-events "$(jq -cn --arg n "ghost-$run" --arg c "$(openssl rand -hex 16)" '{app: $n, host: "x", name: "g",
+  day: 0, commit: $c, requests: []}')" --qualifier outbox >/dev/null
 if awaitlog events "$since" "has no release" 60; then pass "a delivery for an app with no release is dropped"
 else fail "a delivery for an app with no release is dropped"; fi
 since=$(now)
-invoke $NAME-events "$(jq -cn --arg h "beta.$DOMAIN" --arg n "nohead-$run" '{app: "beta", host: $h, name: $n,
-  day: (now / 86400 | floor), base: "forged", commit: "forged", requests: []}')" --qualifier outbox >/dev/null
+invoke $NAME-events "$(jq -cn --arg h "beta.$DOMAIN" --arg n "nohead-$run" --arg c "$(openssl rand -hex 16)" '{app:
+  "beta", host: $h, name: $n, day: (now / 86400 | floor), base: $c, commit: $c, requests: []}')" --qualifier outbox \
+  >/dev/null
 if awaitlog serve "$since" "no commit recorded it" 20; then pass "a delivery over a head its name never had is dropped"
 else fail "a delivery over a head its name never had is dropped"; fi
 invoke $NAME-events "{\"app\":\"beta\",\"path\":\"/@forged-$run/echo\"}" --qualifier outbox >/dev/null
