@@ -531,15 +531,17 @@ principal, scoped by a tag that the operator sets.
   - Principals that share a tag share the app, which is all a team is here.
 - **A release becomes untrusted input.** An owner can write any bytes as `current`, not only what `tric deploy` makes.
   serve already refuses a release over `RELEASE_MAX` or with unknown fields, caps the component at 64 MiB and checks
-  its digest. The router's schedule sync must check what deploy checks: at most `CRON_MAX` jobs, each with a valid
-  expression and path. A bad release breaks only its own app.
+  its digest. The checks that `manifest::read` makes of `tric.toml`'s cron move to the release, so that the router's
+  sync makes them too: at most `CRON_MAX` jobs, each with a valid expression and a path. A bad release breaks only its
+  own app.
 - **Still shared:** the cost of what owners do. An owner who deploys in a loop runs the router's sync each time, and
   budgets and per-app limits stay out of this build.
 
 **The steps:**
 1. **One owner policy.** The module adds a managed policy keyed on `${aws:PrincipalTag/tric-app}` and outputs its ARN
    as `TRIC_OWNER_POLICY`. The operator attaches it to each owner's principal and tags the principal. Every resource
-   puts a `/` after the tag, so `alpha` never reaches `alpha2`, and a tag can't hold `*` or `?`. The grants:
+   puts a `/` after the tag, so `alpha` never reaches `alpha2`. A tag can't hold `*` or `?`, but it can hold `/`, and
+   `beta/names` would reach beta's names, so every grant also requires the tag to have no `/`. The grants:
    - `s3:PutObject` on `apps/<tag>/components/*`, `apps/<tag>/current`, `apps/<tag>/names/*` and `apps/<tag>/values/*`;
    - `s3:GetObject` and `s3:GetObjectVersion` on `apps/<tag>/*`;
    - `s3:ListBucket` and `s3:ListBucketVersions` on the bucket, for an `s3:prefix` under `apps/<tag>/`.
@@ -565,10 +567,12 @@ principal, scoped by a tag that the operator sets.
    `VERSION`.
 5. **Locally nothing changes:** the router there reads each app's cron from its release as it ticks.
 6. **The tests:**
-   - a tofu test that every grant of the owner policy is under `apps/${aws:PrincipalTag/tric-app}/`, and that the
-     notification sends `apps/…/current` to `events:deploy`;
+   - a tofu test that every grant of the owner policy is under `apps/${aws:PrincipalTag/tric-app}/` and requires a
+     tag without `/`, and that the notification sends `apps/…/current` to `events:deploy`;
    - unit tests of the router's key check: `apps/alpha/current` syncs, and `apps/alpha/names/current`,
      `apps/a/b/current` and `apps/Alpha/current` don't;
+   - check.sh waits for the router's sync where it now expects deploy's, and finds the cron group by the install's
+     name rather than by a deploy setting;
    - in check.sh, a short-lived role tagged `tric-app=alpha`, with the policy, which:
      - deploys alpha, whose cron schedule then appears;
      - recovers a name of alpha;
