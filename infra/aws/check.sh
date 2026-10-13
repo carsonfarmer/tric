@@ -24,13 +24,19 @@ P=$(docker compose config --format json 2>/dev/null | jq -r .name) && [ -n "$P" 
 live=$PWD/target/live
 work=$live/apps
 mkdir -p "$work"
-fails=0 checks=0
+fails=0 checks=0 skips=0
 pass() { checks=$((checks + 1)); printf 'PASS  %s\n' "$1"; }
 fail() { checks=$((checks + 1)); fails=$((fails + 1)); printf 'FAIL  %s%s\n' "$1" "${2:+: $2}"; }
 note() { printf 'NOTE  %s\n' "$*"; }
+# A check that can't hold on this install, as serve has no tenancy: $1, and why.
+skip() { skips=$((skips + 1)); printf 'SKIP  %s: %s\n' "$1" "$2"; }
 die() { printf 'FAIL  %s\n' "$*"; exit 2; }
 is() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1" "got [$2], want [$3]"; fi; }
-summary() { echo; echo "$checks checks, $fails failed"; }
+summary() {
+  echo
+  echo "$checks checks, $fails failed"
+  [ $skips = 0 ] || echo "SKIPPED $skips checks: serve has no tenancy, so this install keeps no app's environment apart"
+}
 # What `aws ...` answered: OK, its error code, or "CLI: <text>" if it never reached AWS.
 awscode() {
   local e
@@ -40,12 +46,23 @@ awscode() {
 
 echo "== preflight"
 out() { docker compose -p $P run --rm -T tofu output -raw "$1" </dev/null 2>/dev/null; }
-for k in TRIC_BUCKET TRIC_SCHEDULES TRIC_EVENTS TRIC_SCHEDULER_ROLE TRIC_SWEEP_EVERY AWS_REGION; do
+for k in TRIC_BUCKET TRIC_SCHEDULER_GROUP TRIC_SCHEDULER_TARGET TRIC_SCHEDULER_ROLE TRIC_SWEEP_EVERY AWS_REGION; do
   v=$(out $k) && [ -n "$v" ] || die "tofu output $k is empty: is the install applied, and TF_VAR_domain set?"
   export "$k=$v"
 done
 # The prefix of every name the install made, `tric` unless it was applied with another.
 NAME=$(out name) && [ -n "$NAME" ] || die "tofu output name is empty: is the install applied?"
+# Whether serve has tenancy, as tofu's `tenancy` says. Without it, for a test account that can't make PER_TENANT
+# functions, serve's execution environments are shared across apps: the checks of Lambda's tenancy are skipped, each
+# with a SKIP line, and the rest run.
+case $(out tenancy) in
+  true) tenancy=yes ;;
+  false)
+    tenancy=
+    printf 'SKIP  %s\n' "!!! serve has NO TENANCY (tofu's tenancy = false): apps share its execution environments." \
+      "!!! This is a test install. The checks that need Lambda's tenancy are skipped, each with a SKIP line." ;;
+  *) die "tofu output tenancy is empty: is the install applied?" ;;
+esac
 DOMAIN=${TF_VAR_domain:?set TF_VAR_domain}
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text) || die "no AWS credentials in the environment"
 FN="arn:aws:lambda:$AWS_REGION:$ACCOUNT:function"
@@ -69,7 +86,7 @@ state=$live/late.env
 # The checks are of the code on main, which the package was built from: so the checkout has to be at main's HEAD.
 [ "$(git rev-parse HEAD)" = "$(git rev-parse main)" ] ||
   die "this checkout is not at main's HEAD ($(git rev-parse --short main)): git checkout --detach main"
-aws lambda invoke --generate-cli-skeleton input 2>/dev/null | jq -e 'has("TenantId")' >/dev/null ||
+[ -z "$tenancy" ] || aws lambda invoke --generate-cli-skeleton input 2>/dev/null | jq -e 'has("TenantId")' >/dev/null ||
   die "this AWS CLI has no --tenant-id"
 ip=$(curl -4 -fsS --max-time 10 https://checkip.amazonaws.com) || die "no public IPv4 address"
 [ -f tests/fixtures/app.wasm ] || die "no tests/fixtures/app.wasm: docker compose -p $P run --rm fixtures"
@@ -197,11 +214,11 @@ sweepexpr() {
 }
 # The names of app $1's schedules in the cron group, which all begin with the hash of its name (src/deploy.rs).
 schedules() {
-  aws scheduler list-schedules --group-name "$TRIC_SCHEDULES" --name-prefix "$(sha "$1" 24)-" \
+  aws scheduler list-schedules --group-name "$TRIC_SCHEDULER_GROUP" --name-prefix "$(sha "$1" 24)-" \
     --query 'Schedules[].Name' --output text | listed
 }
 # Schedule $1 of the cron group, as JSON.
-schedule() { aws scheduler get-schedule --group-name "$TRIC_SCHEDULES" --name "$1" --output json; }
+schedule() { aws scheduler get-schedule --group-name "$TRIC_SCHEDULER_GROUP" --name "$1" --output json; }
 # The names of the schedules of app $1 that are its sweep: those whose input is {"app", "sweep": true}.
 sweepsof() {
   local n
@@ -283,7 +300,7 @@ toml() {
 deploy() {
   if docker run --rm -v "$PWD:/src" -v ${P}_cargo:/opt/cargo/registry -v ${P}_target:/src/target -v "$work:/work" \
     -w /src -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN -e AWS_REGION \
-    -e TRIC_BUCKET -e TRIC_SCHEDULES -e TRIC_EVENTS -e TRIC_SCHEDULER_ROLE -e TRIC_SWEEP_EVERY \
+    -e TRIC_BUCKET -e TRIC_SCHEDULER_GROUP -e TRIC_SCHEDULER_TARGET -e TRIC_SCHEDULER_ROLE -e TRIC_SWEEP_EVERY \
     $P-build cargo run --locked --release -q -- deploy "/work/$1" </dev/null; then pass "deploy $1"
   else fail "deploy $1"; fi
 }
@@ -307,7 +324,8 @@ unschedule() {
   local a n
   for a in alpha beta gamma delta; do
     for n in $(schedules $a); do
-      aws scheduler delete-schedule --group-name "$TRIC_SCHEDULES" --name "$n" >/dev/null || fail "delete $a's schedule"
+      aws scheduler delete-schedule --group-name "$TRIC_SCHEDULER_GROUP" --name "$n" >/dev/null \
+        || fail "delete $a's schedule"
     done
     is "no schedule of $a is left" "$(schedules $a | grep -c .)" 0
   done
@@ -345,7 +363,7 @@ trap teardown EXIT
 deploy beta
 deploy gamma
 deploy delta
-note "schedules: $(aws scheduler list-schedules --group-name "$TRIC_SCHEDULES" --query 'Schedules[].Name' \
+note "schedules: $(aws scheduler list-schedules --group-name "$TRIC_SCHEDULER_GROUP" --query 'Schedules[].Name' \
   --output text)"
 
 echo "== sweep schedules (each app's, in the cron group)"
@@ -364,7 +382,7 @@ for a in alpha beta gamma delta; do
     is "$a's sweep is in UTC, in no flexible window, and on" "$(jq -r '[.ScheduleExpressionTimezone // "UTC",
       .FlexibleTimeWindow.Mode, .State] | join(" ")' <<<"$sched")" "UTC OFF ENABLED"
     is "$a's sweep is in the cron group, and runs the cron alias as Scheduler's role" "$(jq -r \
-      --arg g "$TRIC_SCHEDULES" --arg t "$TRIC_EVENTS" --arg r "$TRIC_SCHEDULER_ROLE" \
+      --arg g "$TRIC_SCHEDULER_GROUP" --arg t "$TRIC_SCHEDULER_TARGET" --arg r "$TRIC_SCHEDULER_ROLE" \
       '.GroupName == $g and .Target.Arn == $t and .Target.RoleArn == $r' <<<"$sched")" true
   else fail "$a's sweep schedule can be read"; fi
 done
@@ -433,8 +451,15 @@ is "the router's resource policy invokes only through its URL" "$(aws lambda get
 invoke $NAME-route "{\"app\":\"beta\",\"path\":\"/@forged-$run/echo\"}" >/dev/null
 
 echo "== tenants"
-is "serve is per tenant" "$(aws lambda get-function-configuration --function-name $NAME-serve \
-  --query TenancyConfig.TenantIsolationMode --output text)" PER_TENANT
+# Without tenancy, the router names no Lambda tenant, and serve's check of the tenant header the router wrote is what
+# remains: the checks of that header run either way, and those of Lambda's own tenants are skipped.
+mode=$(aws lambda get-function-configuration --function-name $NAME-serve --query TenancyConfig.TenantIsolationMode \
+  --output text)
+if [ -n "$tenancy" ]; then is "serve is per tenant" "$mode" PER_TENANT
+else
+  is "serve has no tenancy, as tofu's tenancy says" "$mode" None
+  skip "serve is per tenant" "serve has no tenancy"
+fi
 # A function-URL event, as the router sends serve: Host $1, tenant header $2, and $3 as more headers.
 event() {
   local more=${3:-}
@@ -446,19 +471,24 @@ event() {
 }
 fake=$(jq -cn '{"x-tric-credentials": ({Version: 1, AccessKeyId: "ASIAXXXXXXXXXXXXXXXX", SecretAccessKey: "x",
   SessionToken: "x", Expiration: "2030-01-01T00:00:00Z"} | tojson)}')
-# serve's status for Host $1, tenant header $2, more headers $3, in Lambda tenant $4.
-st() { invoke $NAME-serve "$(event "$1" "$2" "$3")" --tenant-id "$4" | status; }
+# serve's status for Host $1, tenant header $2, more headers $3, in Lambda tenant $4 if serve has tenancy.
+st() { invoke $NAME-serve "$(event "$1" "$2" "$3")" ${tenancy:+--tenant-id "$4"} | status; }
 s=$(st "alpha.$DOMAIN" alpha "$fake" alpha)
 if [ -n "$s" ] && [ "$s" != 403 ]; then pass "made-up credentials in alpha's own tenant get past serve's gate ($s)"
 else fail "made-up credentials in alpha's own tenant get past serve's gate" "status [$s]"; fi
 is "serve refuses another app's Host in alpha's tenant" "$(st "beta.$DOMAIN" alpha "$fake" alpha)" 403
 is "serve refuses a tenant header that isn't the Host's app" "$(st "alpha.$DOMAIN" beta "$fake" alpha)" 403
-is "serve refuses alpha's request in beta's tenant" "$(st "alpha.$DOMAIN" alpha "$fake" beta)" 403
 is "serve refuses a request without credentials" "$(st "alpha.$DOMAIN" alpha "" alpha)" 403
-e=$(aws lambda invoke --function-name $NAME-serve --cli-binary-format raw-in-base64-out \
-  --payload "$(event "alpha.$DOMAIN" alpha)" /dev/null 2>&1 >/dev/null)
-if grep -qi tenant <<<"$e"; then pass "serve can't be invoked without a tenant"
-else fail "serve can't be invoked without a tenant" "$(head -c 160 <<<"${e:-it ran}")"; fi
+if [ -n "$tenancy" ]; then
+  is "serve refuses alpha's request in beta's tenant" "$(st "alpha.$DOMAIN" alpha "$fake" beta)" 403
+  e=$(aws lambda invoke --function-name $NAME-serve --cli-binary-format raw-in-base64-out \
+    --payload "$(event "alpha.$DOMAIN" alpha)" /dev/null 2>&1 >/dev/null)
+  if grep -qi tenant <<<"$e"; then pass "serve can't be invoked without a tenant"
+  else fail "serve can't be invoked without a tenant" "$(head -c 160 <<<"${e:-it ran}")"; fi
+else
+  skip "serve refuses alpha's request in beta's tenant" "serve has no Lambda tenants"
+  skip "serve can't be invoked without a tenant" "serve has no tenancy, so it is invoked without one"
+fi
 post "$A/@n-$run/kv?op=set&key=k&value=alpha" >/dev/null
 post "$B/@n-$run/kv?op=set&key=k&value=beta" >/dev/null
 post "$A/@n-$run/kv?op=set&key=only-alpha&value=1" >/dev/null
@@ -475,12 +505,16 @@ streams() {
   aws logs filter-log-events --log-group-name /aws/lambda/$NAME-serve --start-time "$1" \
     --filter-pattern '"probe-stdout"' --query 'events[].logStreamName' --output text | tr '\t' '\n' | grep . | sort -u
 }
-t=$(now); get "$A/print" >/dev/null; sleep 20; sa=$(streams "$t")
-t=$(now); get "$B/print" >/dev/null; sleep 20; sb=$(streams "$t")
-if [ -n "$sa" ] && [ -n "$sb" ] && [ -z "$(comm -12 <(echo "$sa") <(echo "$sb"))" ]; then
-  pass "alpha and beta ran in different execution environments"
+if [ -z "$tenancy" ]; then
+  skip "alpha and beta ran in different execution environments" "without tenancy, apps share serve's environments"
 else
-  fail "alpha and beta ran in different execution environments" "alpha [$(xargs <<<"$sa")] beta [$(xargs <<<"$sb")]"
+  t=$(now); get "$A/print" >/dev/null; sleep 20; sa=$(streams "$t")
+  t=$(now); get "$B/print" >/dev/null; sleep 20; sb=$(streams "$t")
+  if [ -n "$sa" ] && [ -n "$sb" ] && [ -z "$(comm -12 <(echo "$sa") <(echo "$sb"))" ]; then
+    pass "alpha and beta ran in different execution environments"
+  else
+    fail "alpha and beta ran in different execution environments" "alpha [$(xargs <<<"$sa")] beta [$(xargs <<<"$sb")]"
+  fi
 fi
 
 echo "== credentials (IAM's policy simulator)"
@@ -587,8 +621,8 @@ for p in apps/alpha/values/ apps/alpha/names/ apps/alpha/ outbox/; do
 done
 for t in "lambda:InvokeFunction $FN:$NAME-events" "lambda:InvokeFunction $FN:$NAME-events:outbox" \
   "s3:GetObject $B3/apps/alpha/names/x" "s3:PutObject $B3/apps/alpha/names/x" "s3:PutObject $B3/x" \
-  "s3:ListBucket $B3" "s3:DeleteObject $B3/apps/alpha/current" "scheduler:CreateSchedule $SCHED/$TRIC_SCHEDULES/x" \
-  "iam:PassRole arn:aws:iam::$ACCOUNT:role/$NAME-cron"; do
+  "s3:ListBucket $B3" "s3:DeleteObject $B3/apps/alpha/current" \
+  "scheduler:CreateSchedule $SCHED/$TRIC_SCHEDULER_GROUP/x" "iam:PassRole arn:aws:iam::$ACCOUNT:role/$NAME-cron"; do
   is "the router's role is denied $t" "$(psim $NAME-route $t)" implicitDeny
 done
 is "serve may invoke the outbox alias" "$(psim $NAME-serve lambda:InvokeFunction "$FN:$NAME-events:outbox")" allowed
@@ -660,8 +694,8 @@ envs() {
   aws lambda get-function-configuration --function-name "$NAME-$1" --query 'Environment.Variables | keys(@)' \
     --output text | tr '\t' '\n'
 }
-is "only $NAME-route holds the origin secret" \
-  "$(for f in route events serve; do envs $f | grep -qx TRIC_ORIGIN && echo $f; done)" route
+is "only the router's functions hold the origin secret, which CloudFront sends both" \
+  "$(for f in route events serve; do envs $f | grep -qx TRIC_ORIGIN && echo $f; done | xargs)" "route events"
 for f in route events serve; do
   is "$NAME-$f has no provisioned concurrency" "$(aws lambda list-provisioned-concurrency-configs \
     --function-name $NAME-$f --query 'length(ProvisionedConcurrencyConfigs)' --output text)" 0
@@ -684,137 +718,20 @@ r=$(get "$D/fetch?url=http://169.254.169.254/latest/meta-data/")
 if [[ $r != 200* ]]; then pass "link-local is refused even when listed"
 else fail "link-local is refused even when listed" "$r"; fi
 is "the guest sees no environment" "$(get "$A/env" | jq -c .env)" '{}'
-# A request on no name has no files: the root is none of the host's, and no name's tree is there for it. Under "files"
-# below, a name has its own.
-is "a request on no name sees no files" "$(get "$A/fs" | jq -c '[.[] | has("err")] | all')" true
+# The guest has no files: no directory is preopened for it, so every read and write fails, and a turn that tries
+# writes nothing.
+is "the guest sees no files" "$(get "$A/fs" | jq -c '[.[] | has("err")] | all')" true
+is "nor does a turn" "$(post "$A/@fs-$run/fs" | jq -c '[.[] | has("err")] | all')" true
+is "which leaves its name no head" "$(under apps/alpha/names/fs-$run | grep -c .)" 0
 
-echo "== files (wasi:filesystem, on a copy-on-write tree in S3)"
-t_files=$(now)
-# The answer on stdin as compact JSON; or, if it was not JSON, what it began with.
-fjson() {
-  local r
-  r=$(cat)
-  jq -c . <<<"$r" 2>/dev/null || echo "[not JSON: $(head -c 80 <<<"$r")]"
-}
-# The fixture's route to its files by $1, and how it says the errors that are checked. By std it is /std-files
-# (tests/components/rust/src/std_files.rs), std::fs over wasi-libc, and an error is the io::ErrorKind that std makes of
-# it; by the binding it is /files (files.rs), the same ops through wasi:filesystem's own streams, and an error is the
-# Debug of the error-code. The names of a route's checks begin with $X, and $I is its place in a list.
-by() {
-  V=$1
-  case $1 in
-    std) R=std-files X='' I=0 NOENT=NotFound RO=ReadOnlyFilesystem PERM=PermissionDenied ;;
-    binding) R=files X=p3- I=1 NOENT=ErrorCode::NoEntry RO=ErrorCode::ReadOnly PERM=ErrorCode::NotPermitted ;;
-  esac
-}
-# What the route answers to ?$3 of name $2 of app $1: {"ok": v} or {"err": "<kind>: <message>"}, or {"err": "<kind>"}.
-# A GET reads the name's files as they are, and is refused if it writes; a POST is a turn on them.
-fget() { get "$1/@$2/$R?$3" | fjson; }
-fpost() { post "$1/@$2/$R?$3" | fjson; }
-# The kind of an answer on stdin: its error's (what comes before ": ", if anything does), or ok, or ? if it is neither.
-errkind() {
-  jq -r 'if type == "object" and has("err") then (.err | split(": ")[0]) elif type == "object" and has("ok") then "ok"
-    else "?" end' 2>/dev/null || echo "?"
-}
-# The fixture's `sum` of file $3 of name $2 of app $1, with its keys in order.
-fsum() { fget "$1" "$2" "op=sum&path=$3" | jq -cS .ok 2>/dev/null; }
-# What `sum` answers for the fixture's pattern of $1 bytes (byte i is i % 251), with the string $3 written at the offset
-# $2, and then cut or lengthened with zeros to $4 bytes, if that is given: its length, and its FNV-1a in decimal.
-patsum() {
-  python3 -I -c '
-import json, sys
-n, at, data = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3].encode()
-cut = int(sys.argv[4]) if len(sys.argv) > 4 else n
-b = bytearray(i % 251 for i in range(n))
-b[at:at + len(data)] = data
-b = b[:cut] + bytes(max(0, cut - len(b)))
-h = 0xCBF29CE484222325
-for x in b:
-    h = ((h ^ x) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-print(json.dumps({"fnv": str(h), "len": len(b)}, sort_keys=True, separators=(",", ":")))' \
-    "$1" "${2:-0}" "${3:-}" ${4:+"$4"}
-}
-
-raced=()
-for V in std binding; do
-  by $V
-  # A turn's files commit with its keys, whole or not at all (a 5xx discards the turn; any other status commits it).
-  f=${X}files-$run
-  w="op=write&path=/hello.txt&key=k"
-  is "$V: a turn writes a file, and a key" "$(fpost "$A" $f "$w&data=hi&value=v")" '{"ok":null}'
-  is "$V: a later request reads the file back" "$(fget "$A" $f 'op=read&path=/hello.txt')" '{"ok":"hi"}'
-  is "$V: and the key set in the turn that wrote it" "$(value "$A" $f k)" '"v"'
-  is "$V: a turn that answers 500 is answered so" \
-    "$(code -X POST "$A/@$f/$R?$w&data=gone&value=gone&status=500")" 500
-  is "$V: and its file is as it was" "$(fget "$A" $f 'op=read&path=/hello.txt')" '{"ok":"hi"}'
-  is "$V: and so is its key" "$(value "$A" $f k)" '"v"'
-  fpost "$A" $f 'op=mkdirs&path=/x/y/z&status=500' >/dev/null
-  is "$V: a directory made in a turn that answers 500 is none" "$(fget "$A" $f 'op=stat&path=/x' | errkind)" $NOENT
-  is "$V: a turn that answers 409 is answered so" \
-    "$(code -X POST "$A/@$f/$R?$w&data=kept&value=kept&status=409")" 409
-  is "$V: and its file is written" "$(fget "$A" $f 'op=read&path=/hello.txt')" '{"ok":"kept"}'
-  is "$V: and its key" "$(value "$A" $f k)" '"kept"'
-
-  # Outside a turn on it, a name's files are read-only; they are the name's and the app's, and a request on no name has
-  # none of them.
-  is "$V: a GET that writes is refused" "$(fget "$A" $f 'op=write&path=/x&data=1' | errkind)" $RO
-  is "$V: and writes nothing" "$(fget "$A" $f 'op=stat&path=/x' | errkind)" $NOENT
-  is "$V: beta, at the same name, has none of alpha's files" \
-    "$(fget "$B" $f 'op=read&path=/hello.txt' | errkind)" $NOENT
-  is "$V: a request on no name has no file of alpha's" "$(get "$A/$R?op=read&path=/hello.txt" | fjson | errkind)" $NOENT
-
-  # A file of blocks (src/fs/ops.rs's BLOCK is 256 KiB, so these 1,000,000 bytes are four), a few bytes in the middle
-  # of it written across the end of the first, and a cut: each answered by the length and the hash of what the pattern
-  # makes.
-  b=${X}big-$run
-  is "$V: a turn writes a file of four blocks" "$(fpost "$A" $b 'op=big&path=/big&n=1000000')" '{"ok":1000000}'
-  is "$V: a later request sums it as the pattern has it" "$(fsum "$A" $b /big)" "$(patsum 1000000)"
-  is "$V: 4 bytes across the end of its first block are written in place" \
-    "$(fpost "$A" $b 'op=patch&path=/big&at=262142&data=XYZW')" '{"ok":null}'
-  is "$V: and the sum is the pattern's with them" "$(fsum "$A" $b /big)" "$(patsum 1000000 262142 XYZW)"
-  is "$V: and 8 bytes across that end are read as they were written" \
-    "$(fget "$A" $b 'op=slice&path=/big&at=262140&n=8' | jq -c .ok)" \
-    "$(jq -cn '[range(262140; 262148) | if . >= 262142 and . < 262146 then ("XYZW" | explode)[. - 262142]
-      else . % 251 end]')"
-  is "$V: a patch in a turn that answers 500 is answered so" \
-    "$(code -X POST "$A/@$b/$R?op=patch&path=/big&at=5&data=!!&status=500")" 500
-  is "$V: and the file is as it was" "$(fsum "$A" $b /big)" "$(patsum 1000000 262142 XYZW)"
-  is "$V: a cut to 300,000 bytes is made" "$(fpost "$A" $b 'op=trunc&path=/big&n=300000')" '{"ok":null}'
-  is "$V: and the sum is the pattern's, cut" "$(fsum "$A" $b /big)" "$(patsum 1000000 262142 XYZW 300000)"
-
-  # Paths lead down from the root of the name's tree, and nowhere else: not up out of it, nor along a link out of it.
-  e=${X}esc-$run
-  is "$V: a link to an absolute path is refused" "$(fpost "$A" $e 'op=symlink&path=/abs&to=/etc/passwd' | errkind)" \
-    $PERM
-  is "$V: a link up and out is made, being only text" "$(fpost "$A" $e 'op=symlink&path=/up&to=../..')" '{"ok":null}'
-  for q in 'op=ls&path=/up' 'op=read&path=/up/etc/passwd' 'op=read&path=/../etc/passwd'; do
-    is "$V: the files of a name do not reach ${q#op=}" "$(fget "$A" $e "$q" | errkind)" $PERM
-  done
-  is "$V: and /etc/passwd is none in the name's own tree" "$(fget "$A" $e 'op=read&path=/etc/passwd' | errkind)" $NOENT
-
-  # Turns at one name race: each that answered 200 counted once, and no other did (the rest are refused, with a 503).
-  codes=$(mktemp)
-  for _ in 1 2 3 4; do
-    (for _ in 1 2 3 4 5; do code -X POST "$A/@${X}race-$run/$R?op=incr&path=/n"; echo; done) >>"$codes" &
-  done
-  wait
-  ok=$(grep -c '^200$' "$codes")
-  note "$V: the statuses of 20 racing turns on one file: $(sort "$codes" | grep . | uniq -c | xargs)"
-  rm -f "$codes"
-  is "$V: every racing turn that answered 200 counted once, and no other" \
-    "$(fget "$A" ${X}race-$run 'op=read&path=/n' | jq -r '.ok // "ERR"')" "$ok"
-  raced[I]=$ok # read back after the sweep
-done
-
-# The two routes are one filesystem: what a turn writes through one, the other reads, in place.
-by binding
-is "binding writes a file of three blocks" "$(fpost "$A" one-$run 'op=big&path=/big&n=600000')" '{"ok":600000}'
-by std
-is "std sums it as the pattern has it" "$(fsum "$A" one-$run /big)" "$(patsum 600000)"
-is "std writes 4 bytes across the end of its first block" \
-  "$(fpost "$A" one-$run 'op=patch&path=/big&at=262142&data=XYZW')" '{"ok":null}'
-by binding
-is "binding sums it with them" "$(fsum "$A" one-$run /big)" "$(patsum 600000 262142 XYZW)"
+echo "== values too big to inline (each an object of its own)"
+t_trees=$(now)
+big=$(head -c 5000 /dev/zero | tr '\0' b)
+# Whether keys a to d of name big-RUN of alpha each hold $big.
+bigs() { get "$A/@big-$run/kv?op=get-many&keys=a,b,c,d" | jq -r --arg v "$big" '[.ok[][1] == $v] | all' 2>/dev/null; }
+is "a turn keeps four values too big to inline" "$(post "$A/@big-$run/kv?op=set-many&keys=a,b,c,d&value=$big")" \
+  '{"ok":null}'
+is "a later request reads them back" "$(bigs)" true
 
 echo "== outbox"
 # One to fail: it waits in outbox/ and is tried again by Scheduler, a minute on and then two. Checked at the end.
@@ -1017,7 +934,7 @@ plant() {
 }
 # What a turn that died after it uploaded would leave: an object at the key of a tree's, with an id of 32 hex digits
 # that no tree names; at a name that has a head, and at one that has none.
-s1=apps/alpha/values/files-$run/$(openssl rand -hex 16)
+s1=apps/alpha/values/big-$run/$(openssl rand -hex 16)
 s2=apps/alpha/values/stray-$run/$(openssl rand -hex 16)
 plant $s1
 plant $s2
@@ -1064,15 +981,8 @@ for k in $s1 $s2; do
   is "the stray $k is kept, being younger than the hour's grace" "$(awscode aws s3api head-object \
     --bucket "$TRIC_BUCKET" --key $k)" OK
 done
-for V in std binding; do
-  by $V
-  is "$V: a key is read as it was" "$(value "$A" ${X}files-$run k)" '"kept"'
-  is "$V: a file is read as it was" "$(fget "$A" ${X}files-$run 'op=read&path=/hello.txt')" '{"ok":"kept"}'
-  is "$V: the file of blocks is as it was" "$(fsum "$A" ${X}big-$run /big)" "$(patsum 1000000 262142 XYZW 300000)"
-  is "$V: and the count of the racing turns" "$(fget "$A" ${X}race-$run 'op=read&path=/n' | jq -r '.ok // "ERR"')" \
-    "${raced[I]}"
-done
-is "the file both routes wrote is as it was" "$(fsum "$A" one-$run /big)" "$(patsum 600000 262142 XYZW)"
+is "a key is read as it was" "$(value "$A" n-$run k)" '"alpha"'
+is "and the values too big to inline" "$(bigs)" true
 
 # Nothing else may ask for a sweep. Serve takes the router's `Forwarded: for=_sweep` for the ask, and only the cron
 # alias's {app, sweep: true}, which only Scheduler may invoke, makes the router write it (src/route.rs's `job`,
@@ -1117,9 +1027,9 @@ if [ $debug != yes ]; then
 else
   sleep 15
   raw=$(mktemp) swp=$(mktemp)
-  aws logs filter-log-events --log-group-name /aws/lambda/$NAME-serve --start-time "$t_files" \
+  aws logs filter-log-events --log-group-name /aws/lambda/$NAME-serve --start-time "$t_trees" \
     --filter-pattern '{ $.fields.message = "tree" }' --output json >"$raw"
-  aws logs filter-log-events --log-group-name /aws/lambda/$NAME-serve --start-time "$t_files" \
+  aws logs filter-log-events --log-group-name /aws/lambda/$NAME-serve --start-time "$t_trees" \
     --filter-pattern '{ $.fields.message = "swept" && $.fields.app = "alpha" }' --output json >"$swp"
   if python3 -I - "$raw" "$swp" "$live/tree-$run.json" $run $swept_from $((swept_to + 2000)) <<'PY'
 import json, sys
@@ -1161,17 +1071,14 @@ for name in sorted({r["name"] for r in turns}):
 show("the sweep's walks", walks)
 for s in sweeps:
     note("trees: a sweep reported", ", ".join(f"{k} {s[k]}" for k in sorted(s) if k not in ("app", "at")))
-ok = True
-for prefix in ("", "p3-"):
-    big = [r for r in turns if r["name"] == prefix + "big-" + run]
-    most = max(big, key=lambda r: r["puts"]) if big else {"puts": "?", "gets": "?"}
-    note(f"trees: the commits of {prefix}big, a file of four blocks: the largest took", most["puts"], "puts, and",
-         most["gets"], "gets")
-    ok = ok and bool(big) and most["puts"] >= 4
-sys.exit(0 if ok else 1)
+big = [r for r in turns if r["name"] == "big-" + run]
+most = max(big, key=lambda r: r["puts"]) if big else {"puts": "?", "gets": "?"}
+note("trees: the commit of big, four values too big to inline: it took", most["puts"], "puts, and", most["gets"],
+     "gets")
+sys.exit(0 if big and most["puts"] >= 4 else 1)
 PY
-  then pass "a commit of the file of four blocks uploads four objects at least, through each route"
-  else fail "a commit of the file of four blocks uploads four objects at least, through each route" \
+  then pass "a commit of four values too big to inline uploads four objects at least"
+  else fail "a commit of four values too big to inline uploads four objects at least" \
     "see $live/tree-$run.json"; fi
   rm -f "$raw" "$swp"
 fi
@@ -1193,8 +1100,8 @@ for f in route events serve; do is "$NAME-$f didn't run in 3 idle minutes" "$(re
 echo "== cleanup (the strays, and the schedules of the run's apps, if any are left)"
 teardown
 # The strays are deleted with a delete marker each, which the bucket's lifecycle rules take with the version in a day.
-note "left by the run: the releases of alpha, beta, gamma and delta (no command removes an app), the keys and files \
-under the names that end in -$run, the delete markers of the strays, and ${aged:-no stray}, for the late sweep"
+note "left by the run: the releases of alpha, beta, gamma and delta (no command removes an app), the keys under the \
+names that end in -$run, the delete markers of the strays, and ${aged:-no stray}, for the late sweep"
 
 summary
 echo "In 65 minutes to 3 hours: bash $0 late"

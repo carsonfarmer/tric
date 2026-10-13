@@ -2,9 +2,11 @@
 //! app's tenant, and the answer read from the event stream, as a function URL reads it: a prelude, eight NULs, then the
 //! body.
 use crate::aws::{Aws, query};
-use crate::tric::{Request, Response, status};
+use crate::tric::{BODY_MAX, Request, Response, status};
+use aws_smithy_eventstream::frame::read_message_from;
+use aws_smithy_types::event_stream::Message;
 use base64::{Engine as _, prelude::BASE64_STANDARD as B64};
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use futures_util::stream::{self, BoxStream, StreamExt};
 use http::header::{COOKIE, SET_COOKIE};
 use http::{Method, StatusCode};
@@ -21,8 +23,6 @@ use wasmtime_wasi_http::Error;
 const MESSAGE_MAX: usize = 16 << 20;
 /// The most a response's prelude may be.
 const PRELUDE_MAX: usize = 1 << 20;
-/// The most a request's body may be: Lambda takes events of up to 6 MB, and the body goes in base64.
-const BODY_MAX: usize = 4 << 20;
 
 /// The start of a function URL's answer: what goes before the eight NULs.
 #[derive(Deserialize)]
@@ -43,11 +43,14 @@ struct Complete {
     error_details: Option<String>,
 }
 
-/// Sends `req` to the function `function`, as the tenant `tenant`, and streams back its answer.
-pub async fn invoke(aws: &Aws, function: &str, tenant: &str, req: Request) -> Result<Response> {
+/// Sends `req` to the function `function`, as the tenant `tenant` if it has tenancy, and streams back its answer.
+/// Lambda refuses an invocation that names a tenant of a function without tenancy, as it does one that names none of
+/// a function with it.
+pub async fn invoke(aws: &Aws, function: &str, tenant: Option<&str>, req: Request) -> Result<Response> {
     let Some(event) = event(req).await? else { return Ok(status(StatusCode::PAYLOAD_TOO_LARGE)) };
     let path = format!("/2021-11-15/functions/{}/response-streaming-invocations", query(function));
-    let res = aws.send("lambda", Method::POST, &path, &[("x-amz-tenant-id", tenant)], event, None).await?;
+    let tenant = tenant.map(|t| ("x-amz-tenant-id", t));
+    let res = aws.send("lambda", Method::POST, &path, tenant.as_slice(), event, None).await?;
     answer(res.into_body().bytes_stream()).await
 }
 
@@ -120,17 +123,17 @@ impl Chunks {
     async fn next(&mut self) -> Result<Option<Bytes>> {
         loop {
             while let Some(m) = message(&mut self.buf)? {
-                match (m.header(":message-type"), m.header(":event-type")) {
-                    (Some("event"), Some("PayloadChunk")) => return Ok(Some(m.payload)),
+                match (header(&m, ":message-type"), header(&m, ":event-type")) {
+                    (Some("event"), Some("PayloadChunk")) => return Ok(Some(m.payload().clone())),
                     (Some("event"), Some("InvokeComplete")) => {
-                        let done: Complete = serde_json::from_slice(&m.payload)?;
+                        let done: Complete = serde_json::from_slice(m.payload())?;
                         let Some(code) = done.error_code else { return Ok(None) };
                         bail!("the function failed: {code}: {}", done.error_details.unwrap_or_default());
                     }
                     (Some("event"), _) => {}
                     _ => {
-                        let kind = m.header(":exception-type").or(m.header(":error-code")).unwrap_or("an error");
-                        bail!("Lambda answered {kind}: {}", String::from_utf8_lossy(&m.payload));
+                        let kind = header(&m, ":exception-type").or(header(&m, ":error-code")).unwrap_or("an error");
+                        bail!("Lambda answered {kind}: {}", String::from_utf8_lossy(m.payload()));
                     }
                 }
             }
@@ -142,79 +145,41 @@ impl Chunks {
     }
 }
 
-/// One message of an event stream (`application/vnd.amazon.eventstream`): its headers, which Lambda sends as strings
-/// only, and its payload.
-#[derive(Debug, PartialEq)]
-struct Message {
-    headers: Vec<(String, String)>,
-    payload: Bytes,
-}
-
-impl Message {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
-    }
-}
-
-/// Takes the first message off `buf`, if `buf` holds all of it: a prelude of its length, its headers' length and a
-/// CRC of those, then the headers, the payload and a CRC of it all. The CRCs go unchecked: TLS refuses corruption.
+/// Takes the first message of an event stream (`application/vnd.amazon.eventstream`) off `buf`, if `buf` holds all of
+/// it, with its CRCs checked; an error if it is over `MESSAGE_MAX`, which is refused before it is held.
 fn message(buf: &mut BytesMut) -> Result<Option<Message>> {
-    let word = |b: &[u8], at: usize| u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
-    if buf.len() < 12 {
-        return Ok(None);
-    }
-    let (len, headers_len) = (word(buf, 0) as usize, word(buf, 4) as usize);
-    ensure!((16 + headers_len..=MESSAGE_MAX).contains(&len), "an event stream message of {len} bytes");
+    let Some(len) = buf.first_chunk().map(|n| u32::from_be_bytes(*n) as usize) else { return Ok(None) };
+    ensure!(len <= MESSAGE_MAX, "an event stream message of {len} bytes");
     if buf.len() < len {
         return Ok(None);
     }
-    let mut m = buf.split_to(len).freeze();
-    m.advance(12);
-    let (mut h, payload) = (m.split_to(headers_len), m.slice(..len - 16 - headers_len));
-    let mut headers = vec![];
-    while !h.is_empty() {
-        let n = take(&mut h, 1)?[0] as usize;
-        let (name, kind) = (take(&mut h, n)?, take(&mut h, 1)?[0]);
-        ensure!(kind == 7, "an event stream header of type {kind}, not a string");
-        let len = take(&mut h, 2).map(|n| u16::from_be_bytes([n[0], n[1]]) as usize)?;
-        let value = take(&mut h, len)?;
-        headers.push((String::from_utf8(name.into())?, String::from_utf8(value.into())?));
-    }
-    Ok(Some(Message { headers, payload }))
+    Ok(Some(read_message_from(buf.split_to(len))?))
 }
 
-/// The first `n` bytes of a message's headers, taken off them.
-fn take(h: &mut Bytes, n: usize) -> Result<Bytes> {
-    ensure!(h.len() >= n, "an event stream header is cut short");
-    Ok(h.split_to(n))
+/// The value of `m`'s header `name`, if it has one and it is a string, the one type Lambda sends.
+fn header<'a>(m: &'a Message, name: &str) -> Option<&'a str> {
+    let header = m.headers().iter().find(|h| h.name().as_str() == name)?;
+    header.value().as_string().ok().map(|v| v.as_str())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_smithy_eventstream::frame::write_message_to;
+    use aws_smithy_types::event_stream::{Header, HeaderValue};
 
-    /// A message as AWS frames it, its headers strings, but with no CRCs, which go unchecked.
-    fn frame(headers: &[(&str, &[u8])], payload: &[u8]) -> Vec<u8> {
-        let mut h = vec![];
-        for (name, value) in headers {
-            h.extend([name.len() as u8]);
-            h.extend(name.as_bytes());
-            h.extend([7]);
-            h.extend((value.len() as u16).to_be_bytes());
-            h.extend(*value);
-        }
-        let mut m = ((16 + h.len() + payload.len()) as u32).to_be_bytes().to_vec();
-        m.extend((h.len() as u32).to_be_bytes());
-        m.extend([0; 4]);
-        m.extend(h);
-        m.extend(payload);
-        m.extend([0; 4]);
+    /// A message as AWS frames it, its headers strings.
+    fn frame(headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
+        let headers =
+            headers.iter().map(|(k, v)| Header::new(k.to_string(), HeaderValue::String(v.to_string().into())));
+        let mut m = vec![];
+        write_message_to(&Message::new_from_parts(headers.collect(), Bytes::copy_from_slice(payload)), &mut m).unwrap();
         m
     }
 
     /// An answer's event stream, cut into pieces of `n` bytes.
     fn stream(payloads: &[&[u8]], complete: &str, n: usize) -> BoxStream<'static, Result<Bytes, HttpError>> {
-        let event = |kind: &str, p: &[u8]| frame(&[(":event-type", kind.as_bytes()), (":message-type", b"event")], p);
+        let event = |kind: &str, p: &[u8]| frame(&[(":event-type", kind), (":message-type", "event")], p);
         let mut all: Vec<u8> = payloads.iter().flat_map(|p| event("PayloadChunk", p)).collect();
         all.extend(event("InvokeComplete", complete.as_bytes()));
         stream::iter(all.chunks(n).map(|c| Ok(Bytes::copy_from_slice(c))).collect::<Vec<_>>()).boxed()
@@ -243,9 +208,12 @@ mod tests {
         assert!(answer(stream(&[], failed, 3)).await.is_err());
         let res = answer(stream(&[br#"{"statusCode":200}"#, &[0; 8], b"part"], failed, 3)).await.unwrap();
         assert!(res.into_body().collect().await.is_err());
-        // A header that is not a string, which Lambda never sends, is refused, not skipped.
-        let mut bad = frame(&[("n", b"1")], b"");
-        bad[14] = 4; // the header's type: a 32-bit integer
+        // A message whose CRC is wrong is refused, as is one over the limit, before it is held.
+        let mut bad = frame(&[(":message-type", "event")], b"hi");
+        let last = bad.len() - 5;
+        bad[last] ^= 1; // the payload's last byte
         assert!(message(&mut BytesMut::from(&bad[..])).is_err());
+        let long = ((MESSAGE_MAX + 1) as u32).to_be_bytes();
+        assert!(message(&mut BytesMut::from(&long[..])).is_err());
     }
 }

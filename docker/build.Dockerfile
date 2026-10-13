@@ -64,33 +64,7 @@ RUN set -eu; mkdir /rt && cd /rt \
       --package componentize-qjs-runtime --no-default-features --features component-model-async \
  && cp target/wasm32-wasip3/release/componentize_qjs_runtime.wasm /runtime.wasm
 
-# The WASI conformance tests of the file system (docs/decisions.md): the wasi-testsuite's sources at one commit,
-# fetched by hash, and those of its tests that name a directory to preopen, built for WASI 0.3: those in C by the SDK's
-# clang, and those in Rust by the fixture toolchain, with the manifest and lockfile in conformance/. A stage of its own,
-# so that the toolchain image gains the tests alone.
-FROM base AS conformance
-COPY --from=sdk /sdk /sdk
-COPY conformance/Cargo.toml conformance/Cargo.lock /build/
-RUN set -eu; mkdir /suite && cd /suite \
- && curl -fsSL -o suite.tar.gz https://github.com/WebAssembly/wasi-testsuite/archive/5ea11d8fe958beb60fb871d6852ae020e45c0433.tar.gz \
- && echo "e480fefa26ced9a5a8c61293ab26f358dcbdbab52789dcffeac78308b530a9ce  suite.tar.gz" | sha256sum -c - \
- && tar xzf suite.tar.gz --strip-components=1 --wildcards '*/tests/c/src' '*/tests/rust/wasm32-wasip3/src/bin' \
-      '*/tests/rust/wasm32-wasip3/wit' && rm suite.tar.gz \
- && mkdir -p /conformance/c /conformance/rust \
- && cd /suite/tests/c/src && cp -R fs-tests.dir /conformance/c/ \
- && for json in *.json; do test=${json%.json}; cp "$json" /conformance/c/ \
-      && /sdk/bin/clang --target=wasm32-wasip3 -o "/conformance/c/$test.wasm" "$test.c" || exit 1; done \
- && cd /suite/tests/rust/wasm32-wasip3 && cp /build/Cargo.toml /build/Cargo.lock . \
- && cargo "+$TRIC_FIXTURE_TOOLCHAIN" build --release --locked --target wasm32-wasip3 --examples \
- && cp -R src/bin/fs-tests.dir /conformance/rust/ \
- && for json in src/bin/filesystem-*.json; do test=$(basename "$json" .json); cp "$json" /conformance/rust/ \
-      && cp "target/wasm32-wasip3/release/examples/$(echo "$test" | tr - _).wasm" "/conformance/rust/$test.wasm" \
-      || exit 1; done \
- && cd / && rm -rf /suite
-
 FROM base
 COPY --from=qjs /qjs/cli/target/release/componentize-qjs /usr/local/bin/componentize-qjs
 COPY --from=qjs-runtime /runtime.wasm /usr/local/lib/componentize-qjs-runtime.wasm
 ENV TRIC_QJS_RUNTIME=/usr/local/lib/componentize-qjs-runtime.wasm
-COPY --from=conformance /conformance /opt/conformance
-ENV TRIC_CONFORMANCE=/opt/conformance
