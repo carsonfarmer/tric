@@ -61,8 +61,10 @@
   - After the answer, writes fail, and the body streams on, read-only.
 - **Turns are optimistic.**
   - If another turn commits first, the instance is discarded and the request re-runs, which no one can observe.
-  - It re-runs until its deadline, 5 s after it began, and only while it is repeatable: while tric holds all its
-    body, which is 6 MiB or less, and it has sent no unsafe outbound request.
+  - tric holds its body whole, so that it can re-run. The body is 4 MiB at most, as on Lambda any request's is, else
+    413.
+  - It re-runs until its deadline, 5 s after it began, and only while it is repeatable: while it has sent no unsafe
+    outbound request.
   - A turn that loses a race and may not re-run lands nothing, and answers 503 with `Retry-After`. What it sent stays
     sent.
 - **The `ETag` is the name's last commit.** It is the id of the commit that last wrote the name, and `If-Match` is
@@ -73,7 +75,7 @@
     (method, path and query, body), its status and its `Location`, for at least a day.
   - The same request with the same key is then answered with that status and `Location`, `Idempotent-Replayed: true`
     and no body, without running or waiting; another request with the key gets 422.
-  - A turn that answers 5xx records nothing. A keyed body too large to keep is 413.
+  - A turn that answers 5xx records nothing.
   - Safe methods, and requests without a name, ignore the header.
 - **Calls are fetches.**
   - A `fetch` to the app's own origin runs in-process, as a request with `Forwarded: for=_tric`.

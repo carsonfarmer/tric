@@ -237,16 +237,13 @@ impl App {
 /// until the guest has nothing left to do.
 async fn run(store: &mut Store<Host>, guest: Service, req: Request, tx: oneshot::Sender<Answer>) -> Result<()> {
     let (req, io) = p3::Request::from_http(store.data_mut().http().hooks, req);
-    let req = store.data_mut().table.push(req)?;
-    let call = guest.wasi_http_handler().func_handle().start_call_concurrent(&mut *store, (req,))?;
     store
         .run_concurrent(async move |accessor| {
             let answered = async {
-                let res = guest.wasi_http_handler().func_handle().finish_call_concurrent(accessor, call).await?.0;
+                let res = guest.handle(accessor, req).await?;
                 let res = res.map_err(|e| wasmtime::format_err!("the guest answered {e:?}"))?;
                 accessor.with(|mut store| {
                     store.get().ctx.answered();
-                    let res = store.get().table.delete(res)?;
                     res.into_http(&mut store, io)
                 })
             };
@@ -295,19 +292,14 @@ mod tests {
         let uris = ["http://a.localhost/echo?sleep=200", "http://a.localhost/echo?sleep=50"];
         let [first, second] = uris.map(|uri| {
             let req: Request = http::Request::get(uri).body(Default::default()).unwrap();
-            let (req, io) = p3::Request::from_http(store.data_mut().http().hooks, req);
-            let req = store.data_mut().table.push(req).unwrap();
-            (guest.wasi_http_handler().func_handle().start_call_concurrent(&mut store, (req,)).unwrap(), io)
+            p3::Request::from_http(store.data_mut().http().hooks, req)
         });
         let answers = store
             .run_concurrent(async move |accessor| {
-                let answer = async |(call, io)| -> Result<(serde_json::Value, Instant)> {
-                    let res = guest.wasi_http_handler().func_handle().finish_call_concurrent(accessor, call).await?.0;
+                let answer = async |(req, io)| -> Result<(serde_json::Value, Instant)> {
+                    let res = guest.handle(accessor, req).await?;
                     let res = res.map_err(|e| wasmtime::format_err!("the guest answered {e:?}"))?;
-                    let res = accessor.with(|mut store| {
-                        let res = store.get().table.delete(res)?;
-                        res.into_http(&mut store, io)
-                    })?;
+                    let res = accessor.with(|mut store| res.into_http(&mut store, io))?;
                     let body = res.into_body().collect().await.map_err(|e| wasmtime::format_err!("{e:?}"))?;
                     Ok((serde_json::from_slice(&body.to_bytes())?, Instant::now()))
                 };
