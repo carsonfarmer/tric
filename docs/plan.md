@@ -24,8 +24,8 @@
 - **An app has no files.** `wasi:filesystem` is linked so that a guest whose language imports it instantiates, but no
   directory is preopened, so no path reaches anything. An app's state is its names' keys: every object stays under
   `apps/<app>/` with the app's own credentials, and is read by version and checked against its hash.
-- **`Forwarded` is the only internal marker.** The router replaces it on every request. `for=_cron`, `for=_tric` and
-  `for=_ws` can come only from tric.
+- **`Forwarded` is the only internal marker.** The router replaces it on every request. `for=_cron`, `for=_tric`,
+  `for=_ws` and `for=_sweep` can come only from tric.
 - **Middleware runs with all of the app's capabilities.** A middleware component is pinned by `sha256:` digest.
 - **Background requests are stored until delivered, headers included.** They sit in Lambda's queue and, once a delivery
   has failed, in `outbox/` in the bucket, which only the router writes, until it is delivered or 24 h are over.
@@ -86,6 +86,11 @@
   - is delivered at least once, in order within its turn.
 
   A turn's held requests total at most 1 MB.
+
+  Outside a turn, as in a request without a name, or after its answer, there is no commit to hold a request for, so
+  `Prefer: respond-async` is not applied, as RFC 7240 lets a server ignore a preference. The request goes out at once,
+  as an ordinary fetch, with no `Preference-Applied`. A delivery event without a commit would have nothing in the
+  sender's head to be checked against, so it could be forged.
 - **Cron.** `[cron]` in `tric.toml` maps POSIX crontab fields to a path. That path gets a `POST` with
   `Forwarded: for=_cron`.
 - **`Forwarded`.** Every request carries exactly one `Forwarded` header, set by tric:
@@ -103,12 +108,12 @@
 
 ### `tric.toml`
 
-The file is optional. `tric dev app.wasm` works with no file at all, and the app is named after the file, or after the
-directory when a file is used. It has four optional keys:
-- `component`;
-- `allowed_outbound_hosts`;
-- `middleware`;
-- `[cron]`.
+The file is optional. `tric dev app.wasm` works with no file at all, and the app is named after the component's file,
+without its extension. A directory with a `tric.toml` is named after the directory. Its keys, and no others:
+- `component`, required: the component's path, relative to the file;
+- `allowed_outbound_hosts`, optional;
+- `middleware`, optional;
+- `[cron]`, optional: at most 49 jobs (`CRON_MAX`), each valid crontab fields and a path that starts with `/`.
 
 `--allow <host>` (repeatable) on `dev` and `deploy` adds to `allowed_outbound_hosts`.
 
@@ -141,6 +146,7 @@ ws/channels/<app>/<channel>/<id> a socket's subscription to a channel (router on
     marker, so old heads still read objects by version id.
   - One lifecycle rule expires noncurrent versions after `noncurrent_days` (1 by default) and removes expired delete
     markers. What the sweep deletes is read by version until then.
+- **A socket's `<id>` under `ws/`** is its connection id, in base64url.
 - **A 403 is read as not found.** S3 answers 403 for a missing key when the caller can't list.
 
 ### State: one tree per name
@@ -163,9 +169,8 @@ or fails everything a turn did.
 - One compare-and-swap commits a turn's keys and its records (of its `Idempotency-Key`, and of its delivery events)
   together, or neither. Two trees would need two heads, which S3 can't change together.
 - The cost: a name whose tree is larger than one node (64 KiB) reads its keys through the tree, one more GET per level
-  when cold, and its commits need one more PUT round per level. A tree that is a root alone, the common case, costs
-  what a name costs today. The flat map this replaces held up to 1 MiB in the head and rewrote all of it at each
-  commit.
+  when cold, and its commits need one more PUT round per level. A tree that is a root alone, the common case, has
+  no node to read or write but its head.
 
 **The format.** Keys are UTF-8 strings, ordered bytewise:
 
@@ -224,25 +229,26 @@ or the commit does.
 1. Merge what is thin, and drop what is empty, from the leaves up.
 2. Upload every node still in memory and every held value, bottom-up with at most 16 in flight, so that each branch
    embeds the links of its children.
-3. Put the head, with the new root inline and the new budgets, by compare-and-swap, as now.
+3. Put the head, with the new root inline and the new budgets, by compare-and-swap.
 
-A tree that is a root alone has no node rounds: a commit is its large values, as today, and the head. A turn that
-changed nothing puts nothing.
+A tree that is a root alone has no node rounds: a commit is its large values and the head. A turn that changed
+nothing puts nothing.
 
 **The read path:**
-1. The head is read as now: one GET, with its root node in it.
+1. The head is read: one GET, with its root node in it.
 2. A lookup descends from the root. A node not in memory is one GET, at its version, checked by its hash. Nodes read are
    kept by the process in a cache of immutable nodes, byte-capped (16 MiB), keyed by the object's full path, its
    version and its hash (app, name, id, version, hash), so an entry is never stale and never crosses apps.
 3. A large value is one GET more, whole, as its hash needs all of it, and is kept in the cache of values (32 MiB), keyed
    the same way.
 
-**Requests, and time.** AWS gives roughly 100 to 200 ms for a small object, which is not measured here, as no AWS calls
-were made. A round is one such trip, and S3 bills per request, not by size. D is the tree's depth, a root alone being 1.
+**Requests, and time.** S3 takes roughly 100 to 200 ms for a small object, an estimate: check.sh notes the times of
+the heads' reads and writes on AWS, which are the figures to go by. A round is one such trip, and S3 bills per request,
+not by size. D is the tree's depth, a root alone being 1.
 
 | What | S3 requests |
 |---|---|
-| A turn starts | 1 GET, the head, as now |
+| A turn starts | 1 GET, the head |
 | A lookup in a root-only tree | none more |
 | A lookup below the root | 1 GET per node not cached, D - 1 at most, in sequence |
 | A value of 4 KiB or less | none more: it is inline in its leaf |
@@ -251,9 +257,9 @@ were made. A round is one such trip, and S3 bills per request, not by size. D is
 | A commit | PUTs of held values (parallel), D - 1 rounds of node PUTs, 1 PUT of the head |
 
 So a cold read of a large value takes D + 1 trips (3 or 4 in a big name), and a warm one the head's alone. A commit of
-a changed large value takes D + 1 (the values, a round per level, then the head). A name under 64 KiB takes what it
-takes today. A write of one key to a name of 1 GiB puts its value if that is large, a leaf of at most 64 KiB, the
-branches above it and the head, and not the 1 GiB.
+a changed large value takes D + 1 (the values, a round per level, then the head). A tree that fits in its root, D
+being 1, takes two trips at most for either. A write of one key to a name of 1 GiB puts its value if that is large, a
+leaf of at most 64 KiB, the branches above it and the head, and not the 1 GiB.
 
 **Seeing it.** At debug, each turn logs its tree next to the head: the objects it fetched (GETs) and uploaded (PUTs).
 
@@ -285,11 +291,14 @@ sweep.
 - The head a name has now is the only root: what a head it replaced alone named goes with the rest, and is read by
   version until the lifecycle expires it. So a name is not put back as an older head: `tric recover` commits the keys
   an old head held over the head it has now, as `docs/decisions.md` has.
-- It needs `s3:ListBucket` on the app's `values/*` and `names/*` only, by an `s3:prefix` condition, in the router's
-  policy (`src/route.rs`), `infra/aws/main.tf`, `docker/router-policy.json` and the module's test, with assertions.
-  The listing of the heads is also what tells a missing head from a refused read, which a GET can't: a head that is
-  listed and can't be read is an error, and its name is not swept. It has no `s3:DeleteObjectVersion`, so only the
-  lifecycle removes a version.
+- It needs `s3:ListBucket` on the app's `values/*` and `names/*` only, by an `s3:prefix` condition. The session policy
+  the router mints (`src/route.rs`) grants that. The app role in `infra/aws/main.tf`, its ceiling, lists every app's
+  `values/*` and `names/*` and no other prefix, as the module's test asserts. Locally the `router` user is both the
+  router and the ceiling of an app's session, so `docker/router-policy.json` lists `apps/*/values/*` and
+  `apps/*/names/*` for the sweep, `apps/` for the cron tick, and `ws/channels/*` for a channel's sockets. The listing of
+  the heads is also what tells a missing head from a refused read, which a GET can't: a head that is listed and can't be
+  read is an error, and its name is not swept. It has no `s3:DeleteObjectVersion`, so only the lifecycle removes a
+  version.
 - It runs every `TRIC_SWEEP_EVERY` (a day by default; hours that divide a day, or days) for each app, from the
   Scheduler through the router and into serve, as a retry does, and never always-on. It deletes nothing from a name
   unless its head was read and its tree marked whole. A run is bounded (240 s); what it deleted stays deleted, and the
@@ -303,8 +312,8 @@ sweep.
 |---|---|---|
 | Node | 64 KiB | the root is in the head, which every turn reads; a write rewrites one leaf |
 | Inline | 4 KiB | a value this small costs no request of its own |
-| A key | 256 bytes | as now (`KEY_MAX`); it sits in its leaf |
-| A key's value | 1 MiB | as now (`VALUE_MAX`); one object, read whole |
+| A key | 256 bytes | `KEY_MAX`; it sits in its leaf |
+| A key's value | 1 MiB | `VALUE_MAX`; one object, read whole |
 | A name's data | 16 GiB | `DATA_MAX`: 16 Ki values of 1 MiB |
 | A name's entries | 4 Mi | three levels, or four of values near 4 KiB |
 | Held and copied, per turn | 8 MiB | memory, per turn: spilled when passed |
@@ -316,8 +325,7 @@ budgets. A turn has no cap on its changes: it spills.
 - A guest names a key, never an object: keys live inside nodes. Objects are under `apps/<app>/values/<name>/`, written
   and read with the app's own credentials. The name passes `is_name`, so it holds no `/`, and an id is random: nothing
   the guest controls forms a key. A link read back is checked before it is used, so a changed head or node can't point
-  outside the prefix. The sweep's `ListBucket` on `values/` and `names/` is the only IAM change, and lists no other
-  prefix.
+  outside the prefix. An app's session lists only its own `values/` and `names/`, for the sweep, and no other prefix.
 - Reads are checked against the link's hash and length. A mismatch is an error, and the object, version and detail are
   logged and never given to the guest.
 - Nothing is content-addressed, so there is no deduplication, within an app or between apps, and no way to learn from a
@@ -327,57 +335,27 @@ budgets. A turn has no cap on its changes: it spills.
 - A snapshot is read-only, and every size above is capped, so a guest can't take the host's memory or requests beyond a
   turn's limits.
 
-**Structure and size.**
-
-| File | What | Lines |
-|---|---|---|
-| `crates/tree` (was `src/tree.rs`) | nodes, links, edits, spill, merge, scans, the cache, the mark | 1,080 (built) |
-| `src/name.rs`, `src/tric.rs`, `src/store.rs` | the turn over the tree; reading the head back | +70 (built) |
-| `src/sweep.rs`, and the trigger | heads, mark, listing, delete; schedule, router, serve | 480 (built) |
-
-The tree came to 1,080 lines, against an estimate of 800, because spilling, merging, the cache and the log are in it.
-The sweep came to about 480 against 300, the walk and its cap, the shape of the keys it may delete, the listing by
-digit, the cursor, the router's and serve's part, and the reconciling of an app's schedules, which gave deploy its first
-tests, being the difference. The tree and `name.rs` came first and alone: the key tests' assertions hold on them.
-The sweep's listing by digit and its cursor, and the history it kept later, were taken out on 13 October 2026, when it
-came to keep only what each name's head names now; why is in `docs/decisions.md`.
-
-A file system over the same tree, `wasi:filesystem` with inodes, blocks and directories as keys, was built in stages
-too, with a core and a binding of about 1,700 lines of code (`src/fs.rs`, `src/fs/`) and the WebAssembly testsuite's
-file system tests passing. It was removed on 13 October 2026; why is in `docs/decisions.md`.
-
-**Stages.** Each was committed on its own and passed the whole gate: the tree, with `wasi:keyvalue` on it; the file
-system, later removed; the sweep, with its trigger; and WASI 0.3 alone.
-
 **Tests:**
 - **Our own:** the tree against a `BTreeMap`, over random operations with tiny nodes so that it splits, merges and
   collapses, and grows to four levels, with what is in the store checked against what the tree names after every round;
   request counts with a counting `ObjectStore`, to show that a write puts only what it changed, and that a failed
   upload leaves nothing; a tampered object; links that try to leave the prefix.
-- **e2e, on RustFS:** a 5xx discards and anything else commits; turns on one name serialise, and one that may not
-  re-run answers 503; outside a turn on it, a name is read-only; a value too large to inline is kept as it was by a
-  discarded turn, and whole through the sweep; and a guest that opens a file fails, and leaves its name no head and no
-  object. Each test runs on `tric dev` and on a stack.
+- **e2e:** a 5xx discards and anything else commits; turns on one name serialise, and one that may not re-run answers
+  503; outside a turn on it, a name is read-only; a value too large to inline is kept as it was by a discarded turn.
+  These run on `tric dev`, with its state in memory, and on a stack, on RustFS, each with the Rust app and the
+  JavaScript one.
+  - A guest that opens a file fails, and leaves its name no head and no object: with the Rust app alone, as only it
+    has files to try.
+  - A value too large to inline is whole through the sweep: on a stack alone, with the Rust app.
 
 **Alternatives, rejected** (reasons and sources in `docs/decisions.md`): SlateDB; prolly trees; an overlay applied at
 the commit.
 
-**Decided,** by the choices behind the design (each with its reason in `docs/decisions.md`):
-1. **The sweep is built,** last, for the leaks above, and keeps what each name's head names now: `s3:ListBucket`
-   limited to the app's `values/` and its `names/`.
-2. **The numbers** above, to be revisited once measured.
-3. **No files.** An app keeps its state in keys; `wasi:filesystem` is linked with nothing preopened.
-4. **A turn edits the tree and spills at its budget,** with no cap on its changes.
-5. **Thin nodes merge,** as bbolt's do.
-6. **JSON nodes,** not a binary codec, which would be a new crate.
-7. **Nothing is deleted at a commit,** and the sweep is the only collector, so a lost answer cannot lose data.
-8. **A name over 64 KiB reads its keys through the tree,** a GET more per level when cold, and not from its head.
-9. **WASI 0.3 alone,** since 8 October 2026. 0.2 came first and 0.3 after, by stage, and 0.2 was then removed.
-
 ### `tric route`: the router (trusted, runs no app code)
 
 **For each client request:**
-1. Take the app from the first label of the Host, strictly: a DNS label, followed by exactly `.<domain>`.
+1. Take the app from the first label of the Host, strictly: a DNS label of 2 characters at least, followed by exactly
+   `.<domain>`.
 2. HEAD `apps/<app>/current`, cached for a few seconds, misses included. An unknown app gets 404, and no tenant is ever
    created for it.
 3. Mint credentials with STS `AssumeRole` on the one app role:
@@ -385,20 +363,28 @@ the commit.
    - the session policy grants:
      - `apps/<app>/{names,values}/*`: read and write;
      - the rest of `apps/<app>/*`: read;
-     - `native/<app>/*`: read and write.
+     - `native/<app>/*`: read and write;
+     - a listing of the bucket, by an `s3:prefix` condition, of `apps/<app>/values/*` and `apps/<app>/names/*` only,
+       for the sweep.
 
    They are cached per app until 15 minutes before they expire.
-4. Remove the client's `Forwarded`, `X-Forwarded-*`, `X-Amz*` and `X-Tric-*`. Then:
+4. Remove the client's `Forwarded`, `X-Forwarded-*`, `X-Amz*` and `X-Tric-*`, and what marks a socket's event,
+   with the feature `ws` or without it: `Connection-Id`, `Grip-*`, `Meta-*` and a `Content-Type` of
+   `websocket-events`. A name matches with `_` for its dashes too. Then:
    - set `Forwarded: for=<client>;host=<host>;proto=<proto>`;
    - set `X-Tric-Credentials`, holding the credentials in AWS's `credential_process` JSON format;
    - set the tenant id to the app.
 5. Send it to serve and stream the answer back. Log the app, the status and the milliseconds.
 
 **Events:**
-- **Cron.** Scheduler invokes the router with `{app, path}`. The router sends serve `POST <path>` with
-  `Forwarded: for=_cron`.
-- **Outbox.** serve invokes the router's `outbox` alias with a delivery event. The router sends it to serve as `POST`
-  with `Forwarded: for=_tric`.
+- **Cron, and the sweep.** Scheduler invokes the events function's `cron` alias with one of:
+  - `{app, path}`, a cron job: the router sends serve `POST <path>` with `Forwarded: for=_cron`;
+  - `{app, sweep: true}`, the app's sweep: the router sends serve `POST /` with `Forwarded: for=_sweep`.
+
+  A body that is neither is 400, and a job for an app with no release gets 404.
+- **Outbox.** serve can't mint credentials or name a tenant, so it invokes the router's `outbox` alias with a delivery
+  event, and the router sends it to serve as the app's tenant, with the app's credentials, as `POST` with
+  `Forwarded: for=_tric`.
 - **Retries.** On AWS the router tries a delivery once, in the `outbox` invocation. If that fails with a 5xx, a 429 or a
   failed exchange, it keeps the event in the bucket as `outbox/<app>/<commit>` and creates a one-time EventBridge
   Scheduler schedule, in a group of its own, which invokes the router's `retry` alias with a reference to it: the app,
@@ -410,9 +396,9 @@ the commit.
   - After the window, the router logs a warning with the app and the commit, and deletes the object. The record in
     the name's tree expires as the others do.
   - Locally, `outbox::relay` follows the same backoff and window in the router's memory, and a restart loses them.
-- **The three inputs are kept apart.**
-  - The router accepts outbox events only when invoked as `outbox`, retries only as `retry`, and cron events only
-    otherwise.
+- **The inputs are kept apart.**
+  - Each alias takes only its own: `outbox` delivery events, `cron` cron jobs and sweeps, `retry` retries, and `ws`,
+    with the feature, sockets' events. Any other alias, or none, gets 403.
   - serve may invoke only `outbox`, so a compromised app can't forge cron or a retry, and only the retry group's role
     may invoke `retry`.
 
@@ -430,6 +416,9 @@ the commit.
   - a request without credentials.
 - **It removes `X-Tric-Credentials`** before the app sees anything, and makes every storage call with those
   credentials.
+- **It takes a `POST` carrying `Forwarded: for=_sweep` as the ask for a sweep,** which only the router sends. It is
+  taken after the checks above and before the app loads: serve runs the sweep with the app's credentials, reads no
+  release and runs no guest, and answers 204, or 503 if the sweep failed.
 - **It loads the app:**
   1. read `current`;
   2. load `native/<app>/<compat>/<sha>` if present;
@@ -454,25 +443,30 @@ the commit.
 
 ### Local
 
-- **`tric dev [path] [--allow host]… [-e K=V]…`** runs one app in one process:
+- **`tric dev [path] [--allow host]… [-e K=V]… [--listen addr]`** runs one app in one process, at
+  `127.0.0.1:3000` by default:
   - state in memory;
   - `Forwarded` set from the socket's peer;
   - cron ticking in-process;
   - background requests through an in-process relay that backs off and honours `Retry-After`, for 24 h.
-- **compose** has three services:
-  - `route` on `<app>.localhost:3000`, with the HTTP backend; it ticks cron itself and relays outbox events with the
-    same backoff;
+- **compose's local stack** is four services:
+  - `route` on `<app>.localhost:3000`, with the HTTP backend, as the `router` user; it ticks cron itself, sweeps each
+    app at its minute every `TRIC_SWEEP_EVERY`, and relays outbox events with the same backoff;
   - `serve`, with no storage credentials of its own;
-  - RustFS, with versioning and STS through a `router` user.
-- **`tric deploy [path] [--allow host]… [-e K=V]…`:**
+  - `s3`, RustFS, with STS through the `router` user;
+  - `setup`, which runs once, before `serve` starts, and makes the bucket, versioned and with its lifecycle rules, and
+    the `router` user with its policy.
+- **`tric deploy [path] [--allow host]… [-e K=V]…`,** to `--bucket` (`TRIC_BUCKET`):
   1. plug in the middleware;
   2. compile, to check the component;
   3. write `components/<sha>`, then `current`;
-  4. on AWS, sync the app's schedules.
-- **`tric recover APP NAME VERSION`** puts back the keys a name held at an old head, `VERSION` being the bucket's id
-  of that head's version, with a commit over the head it has now. The head keeps its records of `Idempotency-Key`s and
-  delivery events, the values go back as new objects, and it reaches back `noncurrent_days`, as the old head and what
-  only it named expire then.
+  4. on AWS, sync the app's schedules: its cron jobs, and its sweep every `--sweep-every` (`TRIC_SWEEP_EVERY`, a day
+     by default). The schedules are in `--scheduler-group`, and invoke `--scheduler-target` as `--scheduler-role`
+     (`TRIC_SCHEDULER_*`). The install's outputs give each of these as its variable.
+- **`tric recover APP NAME VERSION`,** in `--bucket` (`TRIC_BUCKET`), puts back the keys a name held at an old head,
+  `VERSION` being the bucket's id of that head's version, with a commit over the head it has now, and prints the new
+  head's `ETag`. The head keeps its records of `Idempotency-Key`s and delivery events, the values go back as new
+  objects, and it reaches back `noncurrent_days`, as the old head and what only it named expire then.
 
 ### AWS (OpenTofu)
 
@@ -484,7 +478,7 @@ the commit.
     router itself fails on one of them, Lambda tries twice more and then drops the event.
 - **serve:** per tenant (`PER_TENANT`), with no URL. Only the router may invoke it. `tenancy = false`, for a test
   account only, installs it without tenancy, and apps then share its execution environments.
-- **Sockets:** API Gateway WebSocket, which CloudFront sends a request with `Sec-WebSocket-Key`. It invokes
+- **Sockets:** API Gateway WebSocket, to which CloudFront sends a request with `Sec-WebSocket-Key`. It invokes
   `events:ws`, buffered, with no route response, behind a stage throttle.
 - **The roles:**
   - the app role, which trusts only the router's role;
@@ -494,22 +488,9 @@ the commit.
   - serve's role, with its logs and `events:outbox` only;
   - the cron role, which can invoke `events:cron` only;
   - the retry role, which can invoke `events:retry` only.
-- **The bucket:** versioning, the lifecycle rules (noncurrent versions, delete markers, `outbox/`, `ws/`), and short
-  log retention.
+- **The bucket:** versioning, the lifecycle rules (noncurrent versions, delete markers, unfinished uploads, `outbox/`,
+  `ws/`), and short log retention.
 - One `tofu apply` installs it all into a fresh account. The apply waits for the user's go-ahead.
-
-## Changes the isolation forces on the approved design
-
-1. **Outbox events go through the router.** serve can't mint credentials, so "invoke our own function" becomes
-   "invoke the router's `outbox` alias". The router then invokes serve with the tenant id.
-2. **The event's digest in the sender's tree.** Without it, an app that learnt another app's commit id (from an
-   `Idempotency-Key` sent to it) could forge that app's deliveries. An event sent again byte for byte is the commit's
-   own, and is delivered again, as any delivery may be.
-3. **`Prefer: respond-async` with no commit is not applied.** This covers a request without a name, or one sent after
-   the answer.
-   - The request goes out at once, as an ordinary fetch, with no `Preference-Applied`. RFC 7240 lets a server ignore a
-     preference.
-   - Without a commit there is nothing in the sender's head to check, so such an event could be forged.
 
 ## Next: per-app owners
 
@@ -535,7 +516,7 @@ principal, scoped by a tag that the operator sets.
   sync makes them too: at most `CRON_MAX` jobs, each with a valid expression and a path. A bad release breaks only its
   own app.
 - **Still shared:** the cost of what owners do. An owner who deploys in a loop runs the router's sync each time, and
-  budgets and per-app limits stay out of this build.
+  cost budgets and per-app limits stay out of this build.
 
 **The steps:**
 1. **One owner policy.** The module adds a managed policy keyed on `${aws:PrincipalTag/tric-app}` and outputs its ARN
@@ -583,7 +564,7 @@ principal, scoped by a tag that the operator sets.
 ## Not in this build
 
 - owners of more than one app per principal;
-- budgets and per-app limits;
+- cost budgets and per-app limits;
 - `tric logs`;
 - release history commands;
 - previews and forks;
@@ -609,15 +590,42 @@ principal, scoped by a tag that the operator sets.
 7. **Native code** is written under `native/<app>/…` with the app's credentials.
 8. **The app semantics** pass through `route` → `serve`: names, turns, `Idempotency-Key`, the outbox, self-fetch,
    middleware and outbound.
+9. **The sweep,** asked for through the `cron` alias, goes through every name, with a head or without, keeps what a
+   head names and what is under an hour old, and writes nothing. Run as if an hour on, it deletes what no head names,
+   and keeps whole the trees the heads name. Nothing else asks for one: a client's `Forwarded: for=_sweep` reaches the
+   app as an ordinary request, another alias or an outbox event asking for a sweep is refused, and so is a request to
+   serve without the router's tenant and credentials.
+10. **Guest confinement.** The guest has no files, so every open fails, and a turn that tries leaves its name no head
+    and no objects. A guest that takes more than 256 MiB of memory, or has not begun its answer within 10 s, gets 500,
+    and the app answers the next request.
+11. **WebSockets,** with `ws`, on `tric dev`, and through `route` as API Gateway invokes its `ws` alias:
+    - a socket opens only at a name, and only where the app accepts it; through the router, only with the origin
+      secret, and at an app with a release;
+    - a message is a turn, and what it says reaches every socket subscribed to its channel once it commits; a turn
+      that fails is neither committed nor said, and closes its socket;
+    - a binary message closes its socket with 1003;
+    - the app is told once how a socket ended;
+    - a client can't pose as a socket's event, choose a socket's id or publish as the app;
+    - `tric dev` holds 256 sockets, and refuses the next with 503.
+12. **`tric recover`** puts back the keys a name held at an old head, with a commit over the head it has now, keeps the
+    head's records, and prints the new head's `ETag`. Run again, it changes nothing.
+13. **Deploy's schedule sync** makes an app's schedules its cron jobs and its sweep, which it has whatever its cron is,
+    and shares none with another app:
+    - a deploy again changes none of them;
+    - a cron job removed is deleted, and the sweep stays;
+    - a new interval is a new sweep, made before the old one is deleted;
+    - with nothing wanted, every schedule goes, the sweep too;
+    - each create and delete carries a client token of its own.
 
 **`tofu validate`** passes, and the module shows:
 - serve is per tenant, with no URL;
 - serve's role has no S3 access;
 - the app role trusts only the router;
 - the outbox and retry aliases carry the async config and no destination;
-- the router's S3 access is `ws/`, `outbox/` and a listing of `ws/channels/`, and it creates schedules in the retry
-  group only, passing only the retry role, which can invoke `events:retry` only;
-- lifecycle expires noncurrent versions and `outbox/`.
+- the router's S3 access is a read of each app's `current`, the objects under `ws/` and `outbox/`, and a listing of
+  `ws/channels/`, and it creates schedules in the retry group only, passing only the retry role, which can invoke
+  `events:retry` only;
+- lifecycle expires noncurrent versions, delete markers, `outbox/` and `ws/`.
 
 **The remote test, after the user says go:**
 - an app answers through CloudFront, and streams, and `for=` is the viewer's address;
@@ -632,7 +640,13 @@ principal, scoped by a tag that the operator sets.
 - each app's sweep is in the cron group at its minute, every `TRIC_SWEEP_EVERY`, and one sweep, through the cron
   alias, runs as the app's tenant: it keeps what each name's head names and what is under an hour old, and reports
   what it did; nothing else can ask for one;
+- a deploy again leaves an app's schedules as they were, and a deploy without its cron job deletes that job and keeps
+  the sweep;
+- `tric recover` puts back a name's keys from an old head, and run again changes nothing;
 - the lifecycle rules, roles and environments are as the module says;
 - for decisions to come, the run keeps the heads' reads and writes in a mix of turns, and what each turn fetched and
   put;
-- the run deletes what it made, and a later pass finds the minted policy in CloudTrail.
+- the run deletes the schedules it made and the objects it planted, but for a stray it leaves for the sweep, and
+  leaves its apps' releases and names, as no command removes an app;
+- a later pass finds the minted policy in CloudTrail, and a sweep, once the run's objects are an hour old, deletes the
+  stray and what only a replaced head names, and keeps whole the tree the head names now.

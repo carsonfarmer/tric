@@ -9,7 +9,7 @@ reason.
   function URL. `tric-events` has none, and takes only events, each source's by an alias that only it may invoke:
   - `outbox`, delivery events, from serve;
   - `retry`, a failed delivery's next try, from Scheduler, in a group of its own;
-  - `cron`, cron jobs, from Scheduler, for an app with a release only;
+  - `cron`, cron jobs and sweeps, from Scheduler, for an app with a release only;
   - `ws`, sockets' events, from API Gateway.
 
   An invocation of no alias, or of another, gets 403. Both have the origin secret: `events` checks it when a socket
