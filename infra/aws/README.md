@@ -25,8 +25,8 @@ while idle: the only standing costs are the domain's Route 53 zone and what the 
 - **WebSockets**, an API Gateway WebSocket API. CloudFront sends it a request that opens a socket, at the app's own
   URL. Its stage is throttled to `ws_rate` requests a second, 100 by default, with a burst of `ws_burst`, 200.
 - **One bucket**, versioned:
-  - `apps/<app>/…` holds the releases, components and state: a name's head is `names/<name>`, and its keys and files
-    are the objects of a tree under `values/<name>/`;
+  - `apps/<app>/…` holds the releases, components and state: a name's head is `names/<name>`, and its keys are the
+    objects of a tree under `values/<name>/`;
   - `native/<app>/…` holds the compiled code;
   - `ws/…` holds sockets' records and subscriptions, for the router alone;
   - `outbox/<app>/<commit>` holds a delivery that is waiting for a retry, for the router alone;
@@ -137,7 +137,7 @@ against mock providers: it reaches nothing on AWS. Among them, that no app's ses
 and the versions of its names.
 
 `bash infra/aws/check.sh` checks a live install end to end, in about 30 minutes: isolation between apps and from the
-host, the IAM policies by the policy simulator, turns, files, delivery, WebSockets, schedules and the sweep, through
+host, the IAM policies by the policy simulator, turns, keys, delivery, WebSockets, schedules and the sweep, through
 CloudFront. Run it in the checkout that applied the install, at `main`'s HEAD, with the account's credentials,
 `TF_VAR_domain`, the applied package in `dist/tric.zip`, the fixtures built, and the functions logging at
 `-var log=warn,tric=debug`. It deploys four apps and removes what it made, except one object that it leaves for

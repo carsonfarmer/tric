@@ -21,10 +21,9 @@
   `outbox` alias.
 - **Outbound requests default to none.** An app reaches only the hosts it lists. Private ranges and metadata
   endpoints are always blocked.
-- **An app's files are its name's tree, and nothing else.** A descriptor is an inode number in that tree, never a host
-  path or file descriptor. A path walk can't leave the tree: `..` stops at the directory the walk began at, and
-  absolute paths and symlink targets are refused. Every object stays under `apps/<app>/` with the app's own
-  credentials, and is read by version and checked against its hash.
+- **An app has no files.** `wasi:filesystem` is linked so that a guest whose language imports it instantiates, but no
+  directory is preopened, so no path reaches anything. An app's state is its names' keys: every object stays under
+  `apps/<app>/` with the app's own credentials, and is read by version and checked against its hash.
 - **`Forwarded` is the only internal marker.** The router replaces it on every request. `for=_cron`, `for=_tric` and
   `for=_ws` can come only from tric.
 - **Middleware runs with all of the app's capabilities.** A middleware component is pinned by `sha256:` digest.
@@ -44,17 +43,15 @@
   - A request without a name can read any name and write none.
 - **State.** The import is `wasi:keyvalue`, where `open(name)` opens a name:
   - the turn's own name is writable;
-  - any other name opens as a read-only snapshot.
-- **Files.** The import is `wasi:filesystem` 0.3, a real writable file system as Rust's `std::fs` and wasi-libc
-  expect one:
-  - the turn's own name is the one preopen, `/`; a snapshot is mounted read-only; a request without a name has none;
-  - it is the same tree as the keys, so a turn's file writes and key writes commit or fail together;
-  - sizes are bounded by stated limits, not by memory: a turn reads only the blocks it touches and writes only the
-    blocks it changes (see "Files and state", below).
+  - any other name opens as a read-only snapshot;
+  - a key is 1 to 256 bytes, and its value up to 1 MiB; a name holds up to 16 GiB of values in up to 4 Mi keys (see
+    "State", below).
+- **No files.** `wasi:filesystem` 0.3 is linked, so that a language whose standard library imports it instantiates, but
+  nothing is preopened: every open fails, and a turn's state is its keys.
 - **Turns commit at the answer.**
   - A turn sees the name's last commit plus its own writes.
-  - Writes, of keys and of files, are held until the handler returns its Response: small ones in memory, and a large
-    file's blocks in objects that nothing refers to until the commit.
+  - Writes are held until the handler returns its Response: small ones in memory, and large values in objects that
+    nothing refers to until the commit.
   - Any status except 5xx commits the writes and the held background requests together, before a single header
     leaves.
   - A 5xx, a trap or an error discards both.
@@ -123,7 +120,7 @@ There is one bucket. Versioning is on from the start.
 apps/<app>/current               the release: component digest, allowed hosts, cron, env; deploy writes it
 apps/<app>/components/<sha256>   the component, after middleware; deploy writes it
 apps/<app>/names/<name>          a head: the tree's root and the budgets; changed only by If-Match / If-None-Match: *
-apps/<app>/values/<name>/<id>    a node, block or large value of that name; written once, read by version id
+apps/<app>/values/<name>/<id>    a node or large value of that name; written once, read by version id
 native/<app>/<compat>/<sha256>   compiled code, written by the app's own tenant on a miss
 outbox/<app>/<commit>            a delivery event that failed, waiting for its retry (router only)
 ws/connections/<id>              a socket's record: its app, URL and handshake headers (router only)
@@ -132,13 +129,12 @@ ws/channels/<app>/<channel>/<id> a socket's subscription to a channel (router on
 
 - **A head** is plain JSON with these parts:
   - `tree`, which is absent while the name is empty, and holds:
-    - `root`: the name's tree, its top node held inline (see "Files and state");
+    - `root`: the name's tree, its top node held inline (see "State");
     - `bytes` and `entries`: the name's budgets, exact at each commit;
-    - `seq`: the last inode number given out, which no inode is given again (absent until a file is made);
   - `commit`: the random id of the commit that wrote it, new to each, so that no head's bytes, and so no head's `ETag`
     in the bucket, are ever another's, and a commit whose answer was lost can read the head to learn whether it
     landed. It is the name's `ETag` to clients.
-- **Objects.** Each node, block or large value is immutable, named by a random id under its name, and read by the
+- **Objects.** Each node or large value is immutable, named by a random id under its name, and read by the
   version id in the link that points to it, and checked against that link's SHA-256 and length.
   - A turn deletes nothing, whether it lands, loses its race, fails or is discarded: what a commit replaces, and what
     a turn that does not land made, is left for the sweep; see "Garbage". With versioning, a delete only adds a delete
@@ -147,82 +143,82 @@ ws/channels/<app>/<channel>/<id> a socket's subscription to a channel (router on
     markers. A head's noncurrent versions are its history, which the sweep keeps whole.
 - **A 403 is read as not found.** S3 answers 403 for a missing key when the caller can't list.
 
-### Files and state: one tree per name
+### State: one tree per name
 
-A name's state, keys and files together, is one copy-on-write B+tree: ordered keys in immutable objects, with the root
-inline in the head. `wasi:keyvalue` and `wasi:filesystem` are two views of it. The turn model is unchanged, and the
-head's one compare-and-swap commits or fails everything a turn did.
+A name's state is one copy-on-write B+tree: ordered keys in immutable objects, with the root inline in the head.
+`wasi:keyvalue` is the view of it an app has. The turn model is unchanged, and the head's one compare-and-swap commits
+or fails everything a turn did.
 
-**Why one tree, and not one for keys and one for files:**
-- One compare-and-swap commits a turn's keys and files together, or neither. Two trees would need two heads, which S3
-  can't change together, or one head holding both roots, which is this design.
-- It is one tree to edit, one commit and one budget. A second tree would copy the hardest code.
-- Key prefixes keep the two apart, so a key write rewrites no file leaf, only the branches above its own.
+**What a key holds.** An app keeps its state in keys, within these bounds:
+- A key is 1 to 256 bytes (`KEY_MAX`), and its value up to 1 MiB (`VALUE_MAX`, and the tree's `Config::blob`).
+- A value of 4 KiB or less sits inline in its leaf, and costs no request of its own. A larger one is an object of its
+  own, written once, read whole at its version and checked against its hash, and kept in the process's cache of values
+  (32 MiB).
+- A name holds up to 16 GiB of values (`DATA_MAX`) in up to 4 Mi keys (`ENTRIES_MAX`), the records below included.
+- A `get-many` answers with up to 16 MiB of values (`BATCH_MAX`), reading up to 32 large ones at once.
+- A turn holds up to 8 MiB of its writes, and spills the rest to the store (below), so it can write as much as the name
+  holds.
+
+**Why a tree, and why one:**
+- One compare-and-swap commits a turn's keys and its records (of its `Idempotency-Key`, and of its delivery events)
+  together, or neither. Two trees would need two heads, which S3 can't change together.
 - The cost: a name whose tree is larger than one node (64 KiB) reads its keys through the tree, one more GET per level
   when cold, and its commits need one more PUT round per level. A tree that is a root alone, the common case, costs
   what a name costs today. The flat map this replaces held up to 1 MiB in the head and rewrote all of it at each
   commit.
-- An app that never opens a file makes no request for the file system, and a name with no files has no `f/` or `d/`
-  keys.
 
 **The format.** Keys are UTF-8 strings, ordered bytewise:
 
 ```
 k/<key>              a key of `wasi:keyvalue`: its value
-f/<ino>              an inode: kind, link count, size, times; a symlink's target; a directory's parent
-f/<ino>/<block>      a block of a file's data
-d/<dir>/<name>       a directory entry: the inode it names, and that inode's kind
 i/<day>/<key>        the record of an `Idempotency-Key`: the request's fingerprint, the status, `Location`
 o/<day>/<digest>     the record of a delivery event, which is empty
 ```
 
-- `<ino>` and `<dir>` are decimal and `<block>` is 16 hex digits, so the blocks of a file sort as numbers. (Nothing
-  depends on the order of inode numbers: a prefix ends in its `/`.) Inode 1 is the root directory, empty until written.
-  New inodes count up from the head's `seq` and are never reused, so a number names one file for the life of the name,
-  which `is-same-object` and a stale descriptor both rely on. A name emptied by deletes keeps its `seq`, so its tree
-  is `{"seq": N}`, not empty.
 - `<day>` is the Unix day a record was made, six decimal digits, `<key>` the key's SHA-256 in hex, and `<digest>` the
   SHA-256 of the event's JSON, whose `day` is the record's. A lookup of a key reads yesterday's, today's and tomorrow's,
   so clocks may differ by a day. A commit that puts a head first deletes up to 1,000 records of keys made before
   yesterday, and as many of events made two days or more before, from the oldest, so a key's record lasts one to two
   days, and an event's two to three, past the window its delivery is tried in. Records count against the name's budgets,
   and a name too full for one fails the commit with 500.
-- An inode sits next to its blocks, and a directory's entries sit together, so an `open` and the first reads of a small
-  file touch one leaf, and a `readdir` is a range scan. A guest's file names live inside leaves, never in object keys.
 - A **leaf** is a sorted list of (key, item), and a **branch** a sorted list of (separator, link) to its children: the
   separator of a child is at most every key in it and above every key in the child before; the first child's is not
   looked at. Each node is JSON of at most 64 KiB (`Config::node`). An item is data (base64, inline up to 4 KiB) or a
-  link; an inode and a dirent are JSON, so inline.
+  link.
 - A **link** is `{id, v, h, n}`: a random 128-bit id (the object is `values/<name>/<id>`), the S3 version id (none in
   the local memory store), and the SHA-256 and length of the bytes. An object is read at its version and checked for
-  both, so the head pins every node and block below it by hash. A link read from a head or a node is checked before it
+  both, so the head pins every node and value below it by hash. A link read from a head or a node is checked before it
   is used: the id is 32 lowercase hex digits, so it can't name another prefix, and the version is short and plain.
-- A **head** is `{tree: {root, bytes, entries, seq}, commit}`. The root node is inline, so the top of every lookup
-  costs no request. `bytes` counts the data in values and blocks, and `entries` the keys, both exact: a commit lands
-  only over the head it read, so the deltas it counts while editing are the totals.
+- A **head** is `{tree: {root, bytes, entries}, commit}`. The root node is inline, so the top of every lookup costs no
+  request. `bytes` counts the data in values, and `entries` the keys, both exact: a commit lands only over the head it
+  read, so the deltas it counts while editing are the totals.
 - A turn's size estimates a link at its longest (208 bytes), so a node never encodes to more than the size it was
-  split by. A branch holds about 300 links, and a leaf several hundred entries (a directory entry is about 60 bytes, a
-  block's link 230), so 4 Mi entries need three levels at the most, the root included.
+  split by. A branch holds about 300 links, and a leaf several hundred small entries (a large value's link is about
+  230 bytes) but only a dozen or so values near the inline limit. So 4 Mi keys need three levels, the root included,
+  or four when most of them hold values near 4 KiB.
 
 **Editing.** A turn edits the tree itself, as LMDB and bbolt do in a write transaction. There is no overlay:
 - A write descends from the root. Each node on the path is loaded (a GET if it is not cached, unless it is already in
   memory), copied, and changed. Nodes it did not touch stay links.
-- Reads, `readdir` and `list-keys` use the same tree, so they see the turn's own writes and nothing more. A blind write
-  descends at the write, so a GET per uncached level is paid there, not at the commit.
+- Reads and `list-keys` use the same tree, so they see the turn's own writes and nothing more. A blind write descends
+  at the write, so a GET per uncached level is paid there, not at the commit.
 - An overfull node splits in halves by size, up to the root, which grows the tree by a level.
 - At the commit, and when a spill uploads nodes, a changed node under a quarter full merges with a neighbour (and the
   two are split again if they do not fit in one), and an emptied node is dropped, as bbolt does. A root with one child
   is replaced by it. So the tree shrinks as it is emptied, and a name that is mostly deleted does not stay sparse.
+- After the answer, a write fails with `access-denied`, and so does any write to a snapshot. A write fails early when
+  the name's data or entries pass their budgets, counted exactly from the tree and the turn's edits. A batch over a
+  budget changes nothing.
 
-**Spilling.** The copies in memory, and file data and large values held for upload, count against one budget of 8 MiB
+**Spilling.** The copies in memory, and large values held for upload, count against one budget of 8 MiB
 (`Config::budget`), checked after each write. Past it, as LMDB spills dirty pages:
-1. The held blocks and values upload, up to 16 at once, and the writer waits. Each item becomes a link.
+1. The held values upload, up to 16 at once, and the writer waits. Each item becomes a link.
 2. If the copies still pass the budget, what is thin merges and what is empty is dropped, as at the commit, and the
    changed nodes upload bottom-up and become links, so each parent is changed, and in memory, in its turn.
 
 What a turn uploaded and then replaced stays in the store, for the sweep. So a turn's memory stays about its budget
-plus one write, however much it writes. A key's value over 4 KiB is held like a block, and uploaded when the budget
-spills it or the commit does.
+plus one write, however much it writes. A key's value over 4 KiB is held whole, and uploaded when the budget spills it
+or the commit does.
 
 **The commit,** at the answer:
 1. Merge what is thin, and drop what is empty, from the leaves up.
@@ -233,39 +229,13 @@ spills it or the commit does.
 A tree that is a root alone has no node rounds: a commit is its large values, as today, and the head. A turn that
 changed nothing puts nothing.
 
-**What the file system does:**
-- A descriptor is an inode number and its open flags. A path walk goes component by component from the descriptor it
-  starts at, with a stack of the directories entered: `..` pops, and popping past the start is `not-permitted`, as the
-  WASI path-resolution rules say. Symlinks are followed up to 40 deep, then `loop`; an absolute target is
-  `not-permitted`. A directory keeps its `parent` only so that `rename` can refuse to move it into itself.
-- File data is in fixed blocks of 256 KiB (`BLOCK`). A hole is an absent block and reads as zeros, and a short block
-  is zero-padded to the file's size. So growing a file rewrites nothing, and truncating rewrites the one block at the
-  new end and drops those beyond it. A write of a whole block reads nothing; a partial one reads its block first.
-- Hard links join files (and symlinks) only, within the one tree, with a link count. A directory reports a link count
-  of 1, as btrfs does. `is-same-object` and `metadata-hash` come from the inode number. Times are the host's clock:
-  an inode has a creation, modification and change time, and the access time is the creation's unless `set-times`
-  set it, as a read changes nothing. `sync`, `sync-data` and `advise` succeed and do nothing: the commit is the
-  durability.
-- **A file unlinked while open** is as on Linux. Its inode stays in the tree at a link count of 0, and is read and
-  written through the descriptors that hold it. The last close in the turn removes it. The commit leaves out an inode
-  still at 0.
-- **A descriptor still open on such a file at the answer** keeps reading it. The commit forks its tree (a root and
-  the shared objects, nothing copied) before it removes the orphans, and, once the head has landed, those descriptors
-  read through the fork. So there is no copy of the file and no cap on links. The fork reads blocks by version, which a
-  delete marker does not hide, so it is exact in a versioned bucket; the memory store, which deletes nothing, reads
-  anyway. If the turn is discarded, or loses its race, what the turn made is gone and they get `io`.
-- After the answer, a write fails with `read-only`, and so does any write to a snapshot. A change that was admitted
-  before the answer lands before the commit does; one after it fails. A stream's write is admitted when the guest
-  makes it.
-- A write fails early with `insufficient-space` when the name's data or entries pass their budgets, counted exactly
-  from the tree and the turn's edits. A batch over a budget changes nothing.
-
 **The read path:**
 1. The head is read as now: one GET, with its root node in it.
 2. A lookup descends from the root. A node not in memory is one GET, at its version, checked by its hash. Nodes read are
    kept by the process in a cache of immutable nodes, byte-capped (16 MiB), keyed by the object's full path and its
    version (app, name, id, version), so an entry is never stale and never crosses apps.
-3. A file read fetches the blocks in range in parallel, whole, as their hash needs all of each.
+3. A large value is one GET more, whole, as its hash needs all of it, and is kept in the cache of values (32 MiB), keyed
+   the same way.
 
 **Requests, and time.** AWS gives roughly 100 to 200 ms for a small object, which is not measured here, as no AWS calls
 were made. A round is one such trip, and S3 bills per request, not by size. D is the tree's depth, a root alone being 1.
@@ -275,16 +245,15 @@ were made. A round is one such trip, and S3 bills per request, not by size. D is
 | A turn starts | 1 GET, the head, as now |
 | A lookup in a root-only tree | none more |
 | A lookup below the root | 1 GET per node not cached, D - 1 at most, in sequence |
-| A file of 4 KiB or less | none more: it is inline in its leaf |
-| A read of N blocks | N GETs, in parallel |
-| A partial-block write | 1 GET of that block, unless cached or held |
+| A value of 4 KiB or less | none more: it is inline in its leaf |
+| A larger value | 1 GET, unless cached |
 | A write below the root | the GETs of its path, D - 1 at most, unless cached or already copied |
-| A commit | PUTs of held blocks (parallel), D - 1 rounds of node PUTs, 1 PUT of the head |
+| A commit | PUTs of held values (parallel), D - 1 rounds of node PUTs, 1 PUT of the head |
 
-So a cold read of a byte in a big file takes D + 1 trips (3 or 4), and a warm one the head's and the block's. A commit
-of a changed block takes D + 1 (the blocks, a round per level, then the head). A name under 64 KiB, of keys or not,
-takes what it takes today. A 1-byte write to a 10 MiB file puts one 256 KiB block, a leaf of at most 64 KiB, the
-branches above it and the head, and not the 10 MiB.
+So a cold read of a large value takes D + 1 trips (3 or 4 in a big name), and a warm one the head's alone. A commit of
+a changed large value takes D + 1 (the values, a round per level, then the head). A name under 64 KiB takes what it
+takes today. A write of one key to a name of 1 GiB puts its value if that is large, a leaf of at most 64 KiB, the
+branches above it and the head, and not the 1 GiB.
 
 **Seeing it.** At debug, each turn logs its tree next to the head: GETs, PUTs, cache hits, depth, and the bytes read and
 written, with the splits, merges and collapses of the root.
@@ -333,101 +302,70 @@ sweep.
 
 | Limit | Value | Why |
 |---|---|---|
-| Block | 256 KiB | a request costs the same at any size, so large; but a write rewrites one |
 | Node | 64 KiB | the root is in the head, which every turn reads; a write rewrites one leaf |
-| Inline | 4 KiB | a value or file this small costs no request of its own |
-| A key's value | 1 MiB | as now (`VALUE_MAX`); one object |
-| A file | 16 GiB | as much as the name holds (`DATA_MAX`); reads and writes stream |
-| A name's data | 16 GiB | 64 Ki blocks, in under a thousand leaves |
-| A name's entries | 4 Mi | three levels |
-| Name, path, target | 255, 4,096, 4,096 bytes | POSIX's `NAME_MAX` and `PATH_MAX` |
-| Symlink follows | 40 | Linux's |
+| Inline | 4 KiB | a value this small costs no request of its own |
+| A key | 256 bytes | as now (`KEY_MAX`); it sits in its leaf |
+| A key's value | 1 MiB | as now (`VALUE_MAX`); one object, read whole |
+| A name's data | 16 GiB | `DATA_MAX`: 16 Ki values of 1 MiB |
+| A name's entries | 4 Mi | three levels, or four of values near 4 KiB |
 | Held and copied, per turn | 8 MiB | memory, per turn: spilled when passed |
-| Descriptors | 256 | the engine's `RESOURCES`; one more is `insufficient-memory` |
 
-These two are the numbers to revisit once they are measured: the block, node and inline sizes, and the 16 GiB and 4 Mi
+These are the numbers to revisit once they are measured: the node, inline and value sizes, and the 16 GiB and 4 Mi
 budgets. A turn has no cap on its changes: it spills.
 
 **Security:**
-- A descriptor is an inode number in the name's tree. No host path, file descriptor or object key is the guest's.
-  Names are validated (UTF-8, no `/` or NUL, not `.` or `..`, at most 255 bytes), and live inside nodes.
-- Path walks can't leave the tree (above), and a hard link can't cross trees, as there is one.
-- Objects are under `apps/<app>/values/<name>/`, written and read with the app's own credentials. The name passes
-  `is_name`, so it holds no `/`, and an id is random: nothing the guest controls forms a key. A link read back is
-  checked before it is used, so a changed head or node can't point outside the prefix. The sweep's `ListBucket` on
-  `values/` and `ListBucketVersions` on `names/` are the only IAM change, and list no other prefix.
+- A guest names a key, never an object: keys live inside nodes. Objects are under `apps/<app>/values/<name>/`, written
+  and read with the app's own credentials. The name passes `is_name`, so it holds no `/`, and an id is random: nothing
+  the guest controls forms a key. A link read back is checked before it is used, so a changed head or node can't point
+  outside the prefix. The sweep's `ListBucket` on `values/` and `ListBucketVersions` on `names/` are the only IAM
+  change, and list no other prefix.
 - Reads are checked against the link's hash and length. A mismatch is an error, and the object, version and detail are
   logged and never given to the guest.
 - Nothing is content-addressed, so there is no deduplication, within an app or between apps, and no way to learn from a
-  write's speed that another tenant holds the same file.
-- The guest sees the stock interfaces except the file system, linked by name one at a time, with no shadowing: a
-  component can only reach our file system, never wasmtime-wasi's, and never the host's.
+  write's speed that another tenant holds the same value.
+- The guest sees wasmtime-wasi's stock interfaces, its file system among them, with no directory preopened: a path has
+  nothing to resolve against, so it reaches neither the host's files nor the tree.
 - A snapshot is read-only, and every size above is capped, so a guest can't take the host's memory or requests beyond a
   turn's limits.
 
-**Structure and size.** A core, and a binding with its own `bindgen!`: wasmtime-wasi's `Descriptor` wraps an OS file
-through cap-std, and its generated host traits fix that type. The WIT is vendored verbatim from wasmtime-wasi 49.0.2
-(`wit/filesystem-p3`, 0.3.0). tric links WASI 0.3 alone, and the stock interfaces one at a time, without the file
-system: `cli`, `clocks`, `random` and `sockets` `add_to_linker`.
+**Structure and size.**
 
 | File | What | Lines |
 |---|---|---|
 | `crates/tree` (was `src/tree.rs`) | nodes, links, edits, spill, merge, scans, the cache, the mark | 1,080 (built) |
 | `src/name.rs`, `src/tric.rs`, `src/store.rs` | the turn over the tree; reading the head back | +70 (built) |
-| `src/fs.rs` | the core: descriptors, the gate, orphans, read-ahead, and the paths over the operations | 730 (built) |
-| `src/fs/ops.rs` | inodes, blocks, directories, rename, errors, on the tree | 820 (built) |
-| `src/fs/p3.rs` | 0.3: the descriptor's methods, preopens, `stream` and `future` | 630 (built) |
 | `src/sweep.rs`, and the trigger | versions, mark, listing, delete, cursor; schedule, router, serve | 480 (built) |
 
 The tree came to 1,080 lines, against an estimate of 800, because spilling, merging, the cache and the log are in it.
-The core and the 0.2 binding came to 2,200 against 1,250: the gate that keeps a stream's write from being lost to the
-answer, the orphans, a mapping of every failure to an errno, read-ahead, and the streams that outlive their calls are
-most of the difference. The 0.3 binding came to 650 against 600, its `stream` and `future` plumbing (a producer for a
-read, one for a directory listing and a consumer for a write) being about a third of it. The sweep came to about 480
-against 300, the walk and its cap, the shape of the keys it may delete, the listing by digit, the cursor, the router's
-and serve's part, and the reconciling of an app's schedules, which gave deploy its first tests, being the difference.
-The whole is about 4,400 lines of runtime code, on the 4,289 in `src` at the start. Tests come to well over two thousand
-more. The tree and `name.rs` came first and alone: the key tests' assertions hold on them, which tests the tree before
-any file exists. The 0.2 binding was removed later, when tric came to serve WASI 0.3 alone.
+The sweep came to about 480 against 300, the walk and its cap, the shape of the keys it may delete, the listing by
+digit, the cursor, the router's and serve's part, and the reconciling of an app's schedules, which gave deploy its first
+tests, being the difference. The tree and `name.rs` came first and alone: the key tests' assertions hold on them.
 
-**Stages.** Each is committed on its own and passes the whole gate:
-- (a) the tree, with `wasi:keyvalue` on it (done);
-- (b) the file system core and the 0.2 binding, with the testsuite's wasip1 modules and the end-to-end file cases
-  (done);
-- (c) the 0.3 binding, with its 14 components (done);
-- (d) the sweep, with its trigger (done);
-- (e) WASI 0.3 alone: the 0.2 binding removed, and the testsuite's tests built for 0.3 (done).
+A file system over the same tree, `wasi:filesystem` with inodes, blocks and directories as keys, was built in stages
+too, with a core and a binding of about 1,700 lines of code (`src/fs.rs`, `src/fs/`) and the WebAssembly testsuite's
+file system tests passing. It was removed on 13 October 2026; why is in `docs/decisions.md`.
 
-**Conformance:**
-- **The WebAssembly testsuite** (`wasi-testsuite`, pinned by commit). The toolchain image fetches its sources as a
-  tarball checked by sha256 (`docker/build.Dockerfile`), not as a Cargo dependency, and builds those of its tests that
-  name a directory to preopen for wasm32-wasip3: 7 in C, by wasi-sdk 34's clang, and 14 in Rust, by the fixtures'
-  toolchain. All 21 pass.
-- **The harness** is a `#[cfg(test)]` module in the binary (`src/fs/conformance.rs`), using the production linker, host
-  and limits, and a turn over the memory store, which holds the test's own `fs-tests.dir`; the turn is committed
-  after the test. Wasmtime's runner expects every one of these to pass on Linux, and so does the harness: one that
-  fails fails the run. It is skipped without `TRIC_CONFORMANCE`, the directory of the fetched files.
-- **Our own tests:** the tree against a `BTreeMap`, over random operations with tiny nodes so that it splits, merges and
+**Stages.** Each was committed on its own and passed the whole gate: the tree, with `wasi:keyvalue` on it; the file
+system, later removed; the sweep, with its trigger; and WASI 0.3 alone.
+
+**Tests:**
+- **Our own:** the tree against a `BTreeMap`, over random operations with tiny nodes so that it splits, merges and
   collapses, and grows to four levels, with what is in the store checked against what the tree names after every round;
   request counts with a counting `ObjectStore`, to show that a write puts only what it changed, and that a failed
-  upload leaves nothing; a tampered object; links that try to leave the prefix; paths that try to escape.
-- **e2e, on RustFS:** writes held until the answer; a 5xx discards; a lost race re-runs; a write after the answer
-  fails; a snapshot is read-only; keys and files commit together; a file of several blocks updated in place; a
-  directory of thousands of files. The Rust fixture does each through the 0.3 binding, with its streams (`/files`),
-  and expects the exact `error-code` (`ErrorCode::NoEntry`); and again through Rust's `std::fs`, which is wasi-libc
-  over that binding (`/std-files`), and expects the `io::ErrorKind` (`NotFound`). Each test runs on `tric dev` and on
-  a stack.
+  upload leaves nothing; a tampered object; links that try to leave the prefix.
+- **e2e, on RustFS:** a 5xx discards and anything else commits; turns on one name serialise, and one that may not
+  re-run answers 503; outside a turn on it, a name is read-only; a value too large to inline is kept as it was by a
+  discarded turn, and whole through the sweep; and a guest that opens a file fails, and leaves its name no head and no
+  object. Each test runs on `tric dev` and on a stack.
 
-**Alternatives, rejected** (reasons and sources in `docs/decisions.md`): Git's objects through `gix`; IPFS UnixFS with
-sharded directories; JuiceFS; content-defined chunking; SlateDB and ZeroFS; a Lambda `/tmp` served by the stock
-wasmtime-wasi; prolly trees; a file system component over `wasi:keyvalue`; separate trees for keys and files; an
-overlay applied at the commit.
+**Alternatives, rejected** (reasons and sources in `docs/decisions.md`): SlateDB; prolly trees; an overlay applied at
+the commit.
 
 **Decided,** by the choices behind the design (each with its reason in `docs/decisions.md`):
 1. **The sweep is built,** last, for the leaks above, and keeps a name's history: `s3:ListBucket` limited to the app's
    `values/`, and `s3:ListBucketVersions` to its `names/`.
 2. **The numbers** above, to be revisited once measured.
-3. **Only a turn's own name is mounted.** Mounting other names would need a path convention.
+3. **No files.** An app keeps its state in keys; `wasi:filesystem` is linked with nothing preopened.
 4. **A turn edits the tree and spills at its budget,** with no cap on its changes.
 5. **Thin nodes merge,** as bbolt's do.
 6. **JSON nodes,** not a binary codec, which would be a new crate.
@@ -576,7 +514,7 @@ overlay applied at the commit.
 - release history commands;
 - previews and forks;
 - `Accept-Datetime`;
-- mounting any name but the turn's own;
+- a file system;
 - S3 Express;
 - head caches;
 - GCP and Azure.
@@ -597,15 +535,6 @@ overlay applied at the commit.
 7. **Native code** is written under `native/<app>/…` with the app's credentials.
 8. **The app semantics** pass through `route` → `serve`: names, turns, `Idempotency-Key`, the outbox, self-fetch,
    middleware and outbound.
-9. **Files**, through `wasi:filesystem` 0.3:
-   - the WebAssembly testsuite's file system tests pass, bar a skip-list that gives a reason for each;
-   - a write is held until the answer; a 5xx, a trap or a lost race leaves nothing visible; a write after the answer
-     fails;
-   - keys and files commit together or not at all;
-   - a path can't leave the tree by `..`, an absolute path or a symlink, and an altered object is `io`;
-   - a write puts only the blocks and nodes it changes, and a read fetches only those it touches, as a counting store
-     shows;
-   - a name that never opens a file makes no request for one.
 
 **`tofu validate`** passes, and the module shows:
 - serve is per tenant, with no URL;
@@ -623,12 +552,9 @@ overlay applied at the commit.
 - a direct call to the router can't forge `_cron`, `_tric`, `_sweep` or credentials;
 - a keyed turn sent twice applies once, and the second answer is marked `Idempotent-Replayed: true`;
 - the outbox, its retries and cron work;
-- files, through `wasi:filesystem` 0.3, on S3:
-  - keys and files commit together or not at all;
-  - outside a turn on it, a name's files are read-only, and no other name has them;
-  - a file of several blocks, written across a block's end and cut short, reads back by its hash;
-  - a path can't leave the tree;
-  - racing turns each count once;
+- the guest has no files, and a turn that tries to write one leaves its name no head;
+- values too large to inline are kept, each an object of its own, and read back whole after the sweep;
+- racing turns each count once;
 - each app's sweep is in the cron group at its minute, every `TRIC_SWEEP_EVERY`, and one sweep, through the cron
   alias, runs as the app's tenant: it keeps what a tree of any version kept names and what is under an hour old, and
   reports what it did; nothing else can ask for one;

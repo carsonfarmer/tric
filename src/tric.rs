@@ -54,7 +54,6 @@ pub struct Tric {
 pub struct Ctx {
     tric: Arc<Tric>,
     pub turn: Option<Arc<Turn>>,
-    name: Option<String>, // the name the request addresses, whose files it sees
     snaps: Mutex<HashMap<String, Arc<Turn>>>,
     host: String,
     chain: Vec<String>, // the names of the turns it is inside
@@ -184,8 +183,8 @@ impl Tric {
     async fn dispatch(self: &Arc<Self>, req: Request, host: &str, chain: Vec<String>, depth: usize) -> Response {
         let named = name::of(req.uri().path()).map(str::to_owned);
         let ctx = |turn, chain| {
-            let (tric, name, snaps, host) = (self.clone(), named.clone(), Mutex::default(), host.into());
-            Arc::new(Ctx { tric, turn, name, snaps, host, chain, depth })
+            let (tric, snaps, host) = (self.clone(), Mutex::default(), host.into());
+            Arc::new(Ctx { tric, turn, snaps, host, chain, depth })
         };
         let Some(name) = named.clone() else {
             return self.call(req, ctx(None, chain)).await;
@@ -283,10 +282,10 @@ impl Tric {
 
 #[cfg(test)]
 impl Ctx {
-    /// The state of a command, which is not a request, and runs in `turn`, which is on the name `name` of `tric`.
-    pub fn of_command(tric: Arc<Tric>, turn: Arc<Turn>, name: &str) -> Arc<Self> {
-        let (name, snaps, host) = (Some(name.into()), Mutex::default(), String::new());
-        Arc::new(Self { tric, turn: Some(turn), name, snaps, host, chain: vec![], depth: 0 })
+    /// The state of an instance that a test runs outside a request, in `turn`, a turn of `tric`.
+    pub fn of_test(tric: Arc<Tric>, turn: Arc<Turn>) -> Arc<Self> {
+        let (snaps, host) = (Mutex::default(), String::new());
+        Arc::new(Self { tric, turn: Some(turn), snaps, host, chain: vec![], depth: 0 })
     }
 }
 
@@ -300,16 +299,6 @@ impl Ctx {
         let snap = Turn::snap(&self.tric.store, &self.tric.app, name).await?;
         snaps.insert(name.into(), snap.clone());
         Ok(snap)
-    }
-
-    /// The turn whose tree the guest sees as files: the request's own if it is one, else a snapshot of the name it
-    /// addresses, and none if it addresses none.
-    pub async fn mount(&self) -> wasmtime::Result<Option<Arc<Turn>>> {
-        match (&self.turn, &self.name) {
-            (Some(turn), _) => Ok(Some(turn.clone())),
-            (None, Some(name)) => self.snap(name).await.map(Some),
-            (None, None) => Ok(None),
-        }
     }
 
     /// The instance answered: its turn may write no more.

@@ -718,137 +718,20 @@ r=$(get "$D/fetch?url=http://169.254.169.254/latest/meta-data/")
 if [[ $r != 200* ]]; then pass "link-local is refused even when listed"
 else fail "link-local is refused even when listed" "$r"; fi
 is "the guest sees no environment" "$(get "$A/env" | jq -c .env)" '{}'
-# A request on no name has no files: the root is none of the host's, and no name's tree is there for it. Under "files"
-# below, a name has its own.
-is "a request on no name sees no files" "$(get "$A/fs" | jq -c '[.[] | has("err")] | all')" true
+# The guest has no files: no directory is preopened for it, so every read and write fails, and a turn that tries
+# writes nothing.
+is "the guest sees no files" "$(get "$A/fs" | jq -c '[.[] | has("err")] | all')" true
+is "nor does a turn" "$(post "$A/@fs-$run/fs" | jq -c '[.[] | has("err")] | all')" true
+is "which leaves its name no head" "$(under apps/alpha/names/fs-$run | grep -c .)" 0
 
-echo "== files (wasi:filesystem, on a copy-on-write tree in S3)"
-t_files=$(now)
-# The answer on stdin as compact JSON; or, if it was not JSON, what it began with.
-fjson() {
-  local r
-  r=$(cat)
-  jq -c . <<<"$r" 2>/dev/null || echo "[not JSON: $(head -c 80 <<<"$r")]"
-}
-# The fixture's route to its files by $1, and how it says the errors that are checked. By std it is /std-files
-# (tests/components/rust/src/std_files.rs), std::fs over wasi-libc, and an error is the io::ErrorKind that std makes of
-# it; by the binding it is /files (files.rs), the same ops through wasi:filesystem's own streams, and an error is the
-# Debug of the error-code. The names of a route's checks begin with $X, and $I is its place in a list.
-by() {
-  V=$1
-  case $1 in
-    std) R=std-files X='' I=0 NOENT=NotFound RO=ReadOnlyFilesystem PERM=PermissionDenied ;;
-    binding) R=files X=p3- I=1 NOENT=ErrorCode::NoEntry RO=ErrorCode::ReadOnly PERM=ErrorCode::NotPermitted ;;
-  esac
-}
-# What the route answers to ?$3 of name $2 of app $1: {"ok": v} or {"err": "<kind>: <message>"}, or {"err": "<kind>"}.
-# A GET reads the name's files as they are, and is refused if it writes; a POST is a turn on them.
-fget() { get "$1/@$2/$R?$3" | fjson; }
-fpost() { post "$1/@$2/$R?$3" | fjson; }
-# The kind of an answer on stdin: its error's (what comes before ": ", if anything does), or ok, or ? if it is neither.
-errkind() {
-  jq -r 'if type == "object" and has("err") then (.err | split(": ")[0]) elif type == "object" and has("ok") then "ok"
-    else "?" end' 2>/dev/null || echo "?"
-}
-# The fixture's `sum` of file $3 of name $2 of app $1, with its keys in order.
-fsum() { fget "$1" "$2" "op=sum&path=$3" | jq -cS .ok 2>/dev/null; }
-# What `sum` answers for the fixture's pattern of $1 bytes (byte i is i % 251), with the string $3 written at the offset
-# $2, and then cut or lengthened with zeros to $4 bytes, if that is given: its length, and its FNV-1a in decimal.
-patsum() {
-  python3 -I -c '
-import json, sys
-n, at, data = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3].encode()
-cut = int(sys.argv[4]) if len(sys.argv) > 4 else n
-b = bytearray(i % 251 for i in range(n))
-b[at:at + len(data)] = data
-b = b[:cut] + bytes(max(0, cut - len(b)))
-h = 0xCBF29CE484222325
-for x in b:
-    h = ((h ^ x) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-print(json.dumps({"fnv": str(h), "len": len(b)}, sort_keys=True, separators=(",", ":")))' \
-    "$1" "${2:-0}" "${3:-}" ${4:+"$4"}
-}
-
-raced=()
-for V in std binding; do
-  by $V
-  # A turn's files commit with its keys, whole or not at all (a 5xx discards the turn; any other status commits it).
-  f=${X}files-$run
-  w="op=write&path=/hello.txt&key=k"
-  is "$V: a turn writes a file, and a key" "$(fpost "$A" $f "$w&data=hi&value=v")" '{"ok":null}'
-  is "$V: a later request reads the file back" "$(fget "$A" $f 'op=read&path=/hello.txt')" '{"ok":"hi"}'
-  is "$V: and the key set in the turn that wrote it" "$(value "$A" $f k)" '"v"'
-  is "$V: a turn that answers 500 is answered so" \
-    "$(code -X POST "$A/@$f/$R?$w&data=gone&value=gone&status=500")" 500
-  is "$V: and its file is as it was" "$(fget "$A" $f 'op=read&path=/hello.txt')" '{"ok":"hi"}'
-  is "$V: and so is its key" "$(value "$A" $f k)" '"v"'
-  fpost "$A" $f 'op=mkdirs&path=/x/y/z&status=500' >/dev/null
-  is "$V: a directory made in a turn that answers 500 is none" "$(fget "$A" $f 'op=stat&path=/x' | errkind)" $NOENT
-  is "$V: a turn that answers 409 is answered so" \
-    "$(code -X POST "$A/@$f/$R?$w&data=kept&value=kept&status=409")" 409
-  is "$V: and its file is written" "$(fget "$A" $f 'op=read&path=/hello.txt')" '{"ok":"kept"}'
-  is "$V: and its key" "$(value "$A" $f k)" '"kept"'
-
-  # Outside a turn on it, a name's files are read-only; they are the name's and the app's, and a request on no name has
-  # none of them.
-  is "$V: a GET that writes is refused" "$(fget "$A" $f 'op=write&path=/x&data=1' | errkind)" $RO
-  is "$V: and writes nothing" "$(fget "$A" $f 'op=stat&path=/x' | errkind)" $NOENT
-  is "$V: beta, at the same name, has none of alpha's files" \
-    "$(fget "$B" $f 'op=read&path=/hello.txt' | errkind)" $NOENT
-  is "$V: a request on no name has no file of alpha's" "$(get "$A/$R?op=read&path=/hello.txt" | fjson | errkind)" $NOENT
-
-  # A file of blocks (src/fs/ops.rs's BLOCK is 256 KiB, so these 1,000,000 bytes are four), a few bytes in the middle
-  # of it written across the end of the first, and a cut: each answered by the length and the hash of what the pattern
-  # makes.
-  b=${X}big-$run
-  is "$V: a turn writes a file of four blocks" "$(fpost "$A" $b 'op=big&path=/big&n=1000000')" '{"ok":1000000}'
-  is "$V: a later request sums it as the pattern has it" "$(fsum "$A" $b /big)" "$(patsum 1000000)"
-  is "$V: 4 bytes across the end of its first block are written in place" \
-    "$(fpost "$A" $b 'op=patch&path=/big&at=262142&data=XYZW')" '{"ok":null}'
-  is "$V: and the sum is the pattern's with them" "$(fsum "$A" $b /big)" "$(patsum 1000000 262142 XYZW)"
-  is "$V: and 8 bytes across that end are read as they were written" \
-    "$(fget "$A" $b 'op=slice&path=/big&at=262140&n=8' | jq -c .ok)" \
-    "$(jq -cn '[range(262140; 262148) | if . >= 262142 and . < 262146 then ("XYZW" | explode)[. - 262142]
-      else . % 251 end]')"
-  is "$V: a patch in a turn that answers 500 is answered so" \
-    "$(code -X POST "$A/@$b/$R?op=patch&path=/big&at=5&data=!!&status=500")" 500
-  is "$V: and the file is as it was" "$(fsum "$A" $b /big)" "$(patsum 1000000 262142 XYZW)"
-  is "$V: a cut to 300,000 bytes is made" "$(fpost "$A" $b 'op=trunc&path=/big&n=300000')" '{"ok":null}'
-  is "$V: and the sum is the pattern's, cut" "$(fsum "$A" $b /big)" "$(patsum 1000000 262142 XYZW 300000)"
-
-  # Paths lead down from the root of the name's tree, and nowhere else: not up out of it, nor along a link out of it.
-  e=${X}esc-$run
-  is "$V: a link to an absolute path is refused" "$(fpost "$A" $e 'op=symlink&path=/abs&to=/etc/passwd' | errkind)" \
-    $PERM
-  is "$V: a link up and out is made, being only text" "$(fpost "$A" $e 'op=symlink&path=/up&to=../..')" '{"ok":null}'
-  for q in 'op=ls&path=/up' 'op=read&path=/up/etc/passwd' 'op=read&path=/../etc/passwd'; do
-    is "$V: the files of a name do not reach ${q#op=}" "$(fget "$A" $e "$q" | errkind)" $PERM
-  done
-  is "$V: and /etc/passwd is none in the name's own tree" "$(fget "$A" $e 'op=read&path=/etc/passwd' | errkind)" $NOENT
-
-  # Turns at one name race: each that answered 200 counted once, and no other did (the rest are refused, with a 503).
-  codes=$(mktemp)
-  for _ in 1 2 3 4; do
-    (for _ in 1 2 3 4 5; do code -X POST "$A/@${X}race-$run/$R?op=incr&path=/n"; echo; done) >>"$codes" &
-  done
-  wait
-  ok=$(grep -c '^200$' "$codes")
-  note "$V: the statuses of 20 racing turns on one file: $(sort "$codes" | grep . | uniq -c | xargs)"
-  rm -f "$codes"
-  is "$V: every racing turn that answered 200 counted once, and no other" \
-    "$(fget "$A" ${X}race-$run 'op=read&path=/n' | jq -r '.ok // "ERR"')" "$ok"
-  raced[I]=$ok # read back after the sweep
-done
-
-# The two routes are one filesystem: what a turn writes through one, the other reads, in place.
-by binding
-is "binding writes a file of three blocks" "$(fpost "$A" one-$run 'op=big&path=/big&n=600000')" '{"ok":600000}'
-by std
-is "std sums it as the pattern has it" "$(fsum "$A" one-$run /big)" "$(patsum 600000)"
-is "std writes 4 bytes across the end of its first block" \
-  "$(fpost "$A" one-$run 'op=patch&path=/big&at=262142&data=XYZW')" '{"ok":null}'
-by binding
-is "binding sums it with them" "$(fsum "$A" one-$run /big)" "$(patsum 600000 262142 XYZW)"
+echo "== values too big to inline (each an object of its own)"
+t_trees=$(now)
+big=$(head -c 5000 /dev/zero | tr '\0' b)
+# Whether keys a to d of name big-RUN of alpha each hold $big.
+bigs() { get "$A/@big-$run/kv?op=get-many&keys=a,b,c,d" | jq -r --arg v "$big" '[.ok[][1] == $v] | all' 2>/dev/null; }
+is "a turn keeps four values too big to inline" "$(post "$A/@big-$run/kv?op=set-many&keys=a,b,c,d&value=$big")" \
+  '{"ok":null}'
+is "a later request reads them back" "$(bigs)" true
 
 echo "== outbox"
 # One to fail: it waits in outbox/ and is tried again by Scheduler, a minute on and then two. Checked at the end.
@@ -1051,7 +934,7 @@ plant() {
 }
 # What a turn that died after it uploaded would leave: an object at the key of a tree's, with an id of 32 hex digits
 # that no tree names; at a name that has a head, and at one that has none.
-s1=apps/alpha/values/files-$run/$(openssl rand -hex 16)
+s1=apps/alpha/values/big-$run/$(openssl rand -hex 16)
 s2=apps/alpha/values/stray-$run/$(openssl rand -hex 16)
 plant $s1
 plant $s2
@@ -1098,15 +981,8 @@ for k in $s1 $s2; do
   is "the stray $k is kept, being younger than the hour's grace" "$(awscode aws s3api head-object \
     --bucket "$TRIC_BUCKET" --key $k)" OK
 done
-for V in std binding; do
-  by $V
-  is "$V: a key is read as it was" "$(value "$A" ${X}files-$run k)" '"kept"'
-  is "$V: a file is read as it was" "$(fget "$A" ${X}files-$run 'op=read&path=/hello.txt')" '{"ok":"kept"}'
-  is "$V: the file of blocks is as it was" "$(fsum "$A" ${X}big-$run /big)" "$(patsum 1000000 262142 XYZW 300000)"
-  is "$V: and the count of the racing turns" "$(fget "$A" ${X}race-$run 'op=read&path=/n' | jq -r '.ok // "ERR"')" \
-    "${raced[I]}"
-done
-is "the file both routes wrote is as it was" "$(fsum "$A" one-$run /big)" "$(patsum 600000 262142 XYZW)"
+is "a key is read as it was" "$(value "$A" n-$run k)" '"alpha"'
+is "and the values too big to inline" "$(bigs)" true
 
 # Nothing else may ask for a sweep. Serve takes the router's `Forwarded: for=_sweep` for the ask, and only the cron
 # alias's {app, sweep: true}, which only Scheduler may invoke, makes the router write it (src/route.rs's `job`,
@@ -1152,9 +1028,9 @@ if [ $debug != yes ]; then
 else
   sleep 15
   raw=$(mktemp) swp=$(mktemp)
-  aws logs filter-log-events --log-group-name /aws/lambda/$NAME-serve --start-time "$t_files" \
+  aws logs filter-log-events --log-group-name /aws/lambda/$NAME-serve --start-time "$t_trees" \
     --filter-pattern '{ $.fields.message = "tree" }' --output json >"$raw"
-  aws logs filter-log-events --log-group-name /aws/lambda/$NAME-serve --start-time "$t_files" \
+  aws logs filter-log-events --log-group-name /aws/lambda/$NAME-serve --start-time "$t_trees" \
     --filter-pattern '{ $.fields.message = "swept" && $.fields.app = "alpha" }' --output json >"$swp"
   if python3 -I - "$raw" "$swp" "$live/tree-$run.json" $run $swept_from $((swept_to + 2000)) <<'PY'
 import json, sys
@@ -1197,17 +1073,14 @@ for name in sorted({r["name"] for r in turns}):
 show("the sweep's walks", walks)
 for s in sweeps:
     note("trees: a sweep reported", ", ".join(f"{k} {s[k]}" for k in sorted(s) if k not in ("app", "at")))
-ok = True
-for prefix in ("", "p3-"):
-    big = [r for r in turns if r["name"] == prefix + "big-" + run]
-    most = max(big, key=lambda r: r["puts"]) if big else {"puts": "?", "gets": "?"}
-    note(f"trees: the commits of {prefix}big, a file of four blocks: the largest took", most["puts"], "puts, and",
-         most["gets"], "gets")
-    ok = ok and bool(big) and most["puts"] >= 4
-sys.exit(0 if ok else 1)
+big = [r for r in turns if r["name"] == "big-" + run]
+most = max(big, key=lambda r: r["puts"]) if big else {"puts": "?", "gets": "?"}
+note("trees: the commit of big, four values too big to inline: it took", most["puts"], "puts, and", most["gets"],
+     "gets")
+sys.exit(0 if big and most["puts"] >= 4 else 1)
 PY
-  then pass "a commit of the file of four blocks uploads four objects at least, through each route"
-  else fail "a commit of the file of four blocks uploads four objects at least, through each route" \
+  then pass "a commit of four values too big to inline uploads four objects at least"
+  else fail "a commit of four values too big to inline uploads four objects at least" \
     "see $live/tree-$run.json"; fi
   rm -f "$raw" "$swp"
 fi
@@ -1229,8 +1102,8 @@ for f in route events serve; do is "$NAME-$f didn't run in 3 idle minutes" "$(re
 echo "== cleanup (the strays, and the schedules of the run's apps, if any are left)"
 teardown
 # The strays are deleted with a delete marker each, which the bucket's lifecycle rules take with the version in a day.
-note "left by the run: the releases of alpha, beta, gamma and delta (no command removes an app), the keys and files \
-under the names that end in -$run, the delete markers of the strays, and ${aged:-no stray}, for the late sweep"
+note "left by the run: the releases of alpha, beta, gamma and delta (no command removes an app), the keys under the \
+names that end in -$run, the delete markers of the strays, and ${aged:-no stray}, for the late sweep"
 
 summary
 echo "In 65 minutes to 3 hours: bash $0 late"

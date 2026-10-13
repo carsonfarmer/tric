@@ -223,10 +223,9 @@ reason.
 - **`deploy` writes with the owner's credentials,** from the environment, not with an app's.
 - **A name over its budgets fails at the write that takes it over,** and the write changes nothing. The budgets are the
   data (16 GiB) and the entries (4 Mi) of its tree, counted exactly from the head and the turn's own edits, and the
-  guest is told which it passed, which is the one tree error it sees whole. A file write will fail as
-  `insufficient-space`. A head is read up to 1 MiB (`HEAD_MAX`), which is only a sanity cap: a head is its root node,
-  at most 64 KiB, and a commit's id. `TooLarge` (a 500, as for a trap, with the held requests not sent) is a tree too
-  full for the commit's own records.
+  guest is told which it passed, which is the one tree error it sees whole. A head is read up to 1 MiB (`HEAD_MAX`),
+  which is only a sanity cap: a head is its root node, at most 64 KiB, and a commit's id. `TooLarge` (a 500, as for a
+  trap, with the held requests not sent) is a tree too full for the commit's own records.
 - **A snapshot is a turn that has answered.** Both read the name as it was, and neither writes, so one type serves
   both. A write after the answer now fails with `access-denied`, the same as a write to a snapshot, where it used to
   fail with `other`. `wasi:keyvalue` names `access-denied` for exactly this.
@@ -236,159 +235,71 @@ reason.
   debug, its `ETag`, size and time; the live run turns that on with `-var log=warn,tric=debug`, and counts, in each
   environment, the reads a cache would have spared and the runs it would have wasted.
 
-## Files
+## State
 
-What was weighed, and from what. The design is in `docs/plan.md`, under "Files and state".
+What was weighed, and from what. The design is in `docs/plan.md`, under "State: one tree per name".
 
-- **State and files are one tree.** A turn commits by one compare-and-swap of one head, and two trees would need two
+- **tric gives apps no file system, and keeps their state in keys,** as decided on 13 October 2026. An app keeps its
+  state in its names' keys (`wasi:keyvalue`), in the same tree and under the same commit as before. `wasi:filesystem`
+  0.3 is still linked, with wasmtime-wasi's stock host and no directory preopened, so a guest whose language imports it
+  (Rust's standard library on `wasm32-wasip3` does, and so does the JavaScript runtime) instantiates, and every open
+  fails, as a path has nothing to resolve against. tric had a file system of its own over a name's tree, with inodes,
+  blocks and directories as keys: a core and its 0.3 binding (`src/fs.rs`, `src/fs/ops.rs`, `src/fs/p3.rs`), 1,708
+  lines of code, and a harness for the WebAssembly testsuite (`src/fs/conformance.rs`), 128 more, together 28% of the
+  runtime's code. It went for two reasons:
+  - its size, against the owner's target of 5,000 lines of code for the runtime;
+  - its attack surface, the largest in the runtime: a path walk of tric's own over guest input, with `..`, symlinks
+    and their limits, a table of descriptors, and streams that outlived the call that made them.
+
+  It could come back as an opt-in crate over the tree, as `tric-tree` is, and the tree's format would not change for
+  it: its prefixes, `f/` and `d/`, are free. What it was built on, what was rejected for it and how it was tested are
+  in this file's history before that date. Where a decision below was shaped by it, a line says so.
+- **Keys and records are one tree.** A turn commits by one compare-and-swap of one head, and two trees would need two
   heads, which S3 can't change together. One tree is one edit path, one commit and one budget, where two would copy the
-  hardest code. The key prefixes (`k/`, `f/`, `d/`) keep the two apart, so a key write doesn't rewrite a file's leaves,
-  and `i/` keeps the records of `Idempotency-Key`s apart from both.
-  The cost is that a name larger than one node (64 KiB) reads its keys through the tree, and under that it is a head
+  hardest code; it held the file system's inodes and directories too, under `f/` and `d/`. The prefixes keep apart the
+  keys of `wasi:keyvalue` (`k/`), the records of `Idempotency-Key`s (`i/`) and those of delivery events (`o/`). The
+  cost is that a name larger than one node (64 KiB) reads its keys through the tree, and under that it is a head
   alone, as before.
 - **The tree is a copy-on-write B+tree,** as LMDB, bbolt and btrfs have it (from general knowledge: LMDB's page
   wouldn't load). A change writes a new copy of the path from a leaf to the root and edits no object, so readers on
   older roots are undisturbed, and the root is in the head, so the commit stays the head's compare-and-swap.
 - **Nothing is addressed by content.** Git, IPFS and Dolt's prolly trees name an object by its hash, which gives
-  deduplication and a shape that depends on content alone. tric wants neither:
-  - POSIX can overwrite but not insert, so equal content doesn't move;
-  - a file's identity is its inode, which hard links and `is-same-object` need, and a content address can't give;
-  - deduplication between tenants would let one app learn, from a write's speed, that another holds a file.
+  deduplication and a shape that depends on content alone. tric wants neither: deduplication between tenants would let
+  one app learn, from a write's speed, that another holds the same value. The file system had two reasons more: POSIX
+  can overwrite but not insert, so equal content doesn't move, and a file's identity is its inode, which a content
+  address can't give.
 
   A link carries a hash to check an object against, not to name it by.
-- **Git's object model, through `gix`, is rejected.** Source: the Git book's "Git Objects",
-  <https://git-scm.com/book/en/v2/Git-Internals-Git-Objects>. A blob is a whole file, so a byte written to a 10 MiB
-  file writes 10 MiB; a tree object is one object for a directory, so a large directory is one large object; names are
-  SHA-1 hashes; and packing, which mends the first, is a collector to run.
-- **IPFS UnixFS and its sharded directories are rejected.** Source: <https://specs.ipfs.tech/unixfs/>. A file is a DAG
-  of chunks and a large directory a HAMT, both named by content. A file's identity is then its content, so there are
-  no hard links and `is-same-object` is true of every pair of equal files. The HAMT needs a hash (murmur3) and a CID
-  library, which are new crates. A write rewrites the chain of nodes up to the root, as ours does, so nothing is
-  saved for that.
-- **JuiceFS is rejected, and its blocks are kept.** Source: <https://juicefs.com/docs/community/architecture/>. It cuts
-  a file into chunks, slices and blocks in object storage, and keeps the tree in a metadata engine (Redis, a database
-  or TiKV) that is always on, which scale to zero forbids. Slices from overlapping writes need compacting. What tric
-  takes is the data layout: fixed blocks in the object store, never rewritten in place, holes absent.
-- **Blocks are a fixed 256 KiB, as ZFS's records are fixed,** and not cut by content. OpenZFS's `recordsize` defaults to
-  128 KiB (<https://openzfs.github.io/openzfs-docs/Performance%20and%20Tuning/Workload%20Tuning.html>). FastCDC cuts at
-  content-defined boundaries so that an insertion doesn't move the chunks after it, for deduplication
-  (<https://www.usenix.org/conference/atc16/technical-sessions/presentation/xia>). A POSIX write overwrites, so
-  boundaries don't move, and without deduplication there is nothing to gain. The size: S3 bills per request, and a
-  small object takes AWS's "roughly 100–200 milliseconds" whatever its size, up to a few hundred KiB
-  (<https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-guidelines.html>), so larger is fewer
-  requests; but a write rewrites a block whole, and a read fetches one whole for its hash, so not much larger.
-- **SlateDB is rejected, for state and for files.** Sources: <https://github.com/slatedb/slatedb> and
+- **SlateDB is rejected for state.** Sources: <https://github.com/slatedb/slatedb> and
   <https://docs.rs/slatedb/0.15.0/slatedb/>. It is a log-structured merge tree on object storage with one writer at a
   time, fenced through its manifest, and its compactor and collector run as background tasks. tric has many
   optimistic writers to a name, serialised by one compare-and-swap, and nothing that runs between requests. Moving
   state onto SlateDB would replace that model and not use it. 0.15.0 depends on `object_store` 0.14, as tric does, so
   it would link, with a large tree of dependencies.
-- **ZeroFS is rejected.** Source: <https://github.com/Barre/ZeroFS>. It is a daemon that serves NFS, 9P and NBD over
-  SlateDB, under AGPL-3.0 or a commercial licence: a server to run, not a library to implement WIT traits with.
-- **A Lambda `/tmp` under the stock wasmtime-wasi is rejected,** though it gives `wasi:filesystem` and cap-std
-  confinement for nothing. Source: <https://docs.aws.amazon.com/lambda/latest/dg/configuration-ephemeral-storage.html>.
-  - `/tmp` belongs to one execution environment (512 MB to 10,240 MB), and a name's files must be seen by all of them.
-  - Lambda has no FUSE (general knowledge, not fetched), so a file can't be fetched on first touch. A name's files
-    would be copied in at every cold start, in proportion to their size, whether read or not.
-  - Concurrent requests of one environment share a directory, so turns would see each other's writes, and a discarded
-    attempt would need the directory copied first to roll back to.
-  - A commit would need a diff and hash of the directory, and then upload changed files whole.
-
-  It is the least code, and fails laziness, per-attempt rollback and isolation between turns.
-- **Amazon S3 Files is rejected,** though Lambda mounts it over NFS and it keeps each file as an object of the same key.
-  Sources: <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-files-synchronization.html> and
-  <https://docs.aws.amazon.com/lambda/latest/dg/configuration-filesystem-s3files.html>.
-  - A turn can't be discarded. A write lands on the shared file system at once, where every environment sees it, and
-    reaches the bucket a file at a time, after 60 seconds without writes to it. Nothing commits several files, or a file
-    and a key, together, so a 5xx can't discard a turn and a lost race can't re-run one.
-  - A conflict goes to the bucket, and the file system's version to a lost-and-found directory, where tric's
-    compare-and-swap re-runs the turn.
-  - The mount is the function's: one access point, mounted with the execution role's `s3files:ClientMount`. Every app
-    runs in the serve function, and tenancy doesn't change what it mounts, so a guest that broke out of Wasmtime would
-    have every app's files. The router's session policy scopes S3 requests, not an NFS mount.
-  - The function must be in a VPC with a mount target in each of its subnets. It then reaches the internet only
-    through a NAT gateway, which bills by the hour while idle ($0.045 in us-west-2, from AWS's price list,
-    <https://b0.p.awsstatic.com/pricing/2.0/meteredUnitMaps/ec2/USD/current/natgateway.json>), or over IPv6 alone.
-    Scale to zero forbids the first, and an app's `wasi:http` requests go to hosts that may have no IPv6 address.
-  - It is AWS's alone, so `tric dev` and the RustFS stack couldn't run it.
 - **Prolly trees and the AT Protocol's MST are rejected.** Sources:
   <https://docs.dolthub.com/architecture/storage-engine/prolly-tree> and <https://atproto.com/specs/repository>.
   Their shape depends on their contents alone, so replicas converge and diff cheaply. tric has one writer at a time to
   a name and no diffs, and a plain B+tree is simpler to reason about.
-- **A file system as a component over `wasi:keyvalue` is rejected.** It would run in the app's own memory, with no
-  ranges and nowhere to spill, and the host couldn't commit its writes with the app's keys.
-- **The binding is our own `bindgen!` over vendored WIT.** wasmtime-wasi's `Descriptor` is an enum of cap-std files
-  and directories, and the host traits it generates fix that resource type, so no file system of ours can sit behind
-  them. So tric implements the 0.3 traits itself, over the WIT copied verbatim from wasmtime-wasi 49.0.2
-  (`wit/filesystem-p3`, 0.3.0), with `wasi:clocks` shared with wasmtime-wasi's bindings through `with:`. The rules are
-  in the core, `src/fs.rs`, and the binding, `src/fs/p3.rs`, converts types and errors.
-- **The stock interfaces are linked one at a time, without the file system, and nothing is shadowed.** Wasmtime's
-  `add_to_linker` adds every interface, the file system among them, and a second definition of one is an error unless
-  shadowing is allowed, which would also let a mistake of ours hide behind the stock file system without a sign. So the
-  linker takes `cli`, `clocks`, `random` and `sockets` (`add_to_linker` in each, wasmtime-wasi's `src/p3/mod.rs`). A
-  new stock interface that appears in a Wasmtime upgrade then isn't linked until someone adds it, which fails loudly at
-  instantiation and not quietly in an app.
+- **The stock interfaces are linked together, the file system among them, by wasmtime-wasi's `p3::add_to_linker`.**
+  It links `cli`, `clocks`, `filesystem`, `random` and `sockets` (`add_to_linker_with_options` in wasmtime-wasi's
+  `src/p3/mod.rs`), and the guest's `WasiCtx` is built with no preopen, so the file system has nothing to open. They
+  were linked one at a time while tric had a file system of its own, as the stock one could only have been replaced by
+  shadowing, which would also have let a mistake of ours hide behind it. A stock interface that a Wasmtime upgrade adds
+  is now linked with the rest, where it would have failed at instantiation; Wasmtime is pinned (`=49.0.2`), so an
+  upgrade is where to look for one.
 - **tric serves WASI 0.3 alone,** as decided on 8 October 2026. Rust's standard library imports 0.3 alone on
   `wasm32-wasip3`, stable from Rust 1.100 (due 12 November 2026), and the JavaScript runtime is built for that target
   too (below). An app built for 0.2, for `wasm32-wasip2` or by StarlingMonkey or ComponentizeJS, is not served: it
   fails at load (`instantiate_pre`), with an error that names the import the linker lacks, such as
   `wasi:cli/environment@0.2.6` (checked with `tric dev`). One version is one binding and one linker. 0.2 was served
-  first, and 0.3 beside it from one core, until then; the 0.2 binding (`src/fs/p2.rs`, `wit/filesystem-p2`) and its
-  tests were removed with this decision.
-- **A standard suite tests it, as well as our own tests.** The WebAssembly `wasi-testsuite`
-  (<https://github.com/WebAssembly/wasi-testsuite>) is pinned at `5ea11d8fe958beb60fb871d6852ae020e45c0433` (1 October
-  2026, its newest commit on 10 October). Its tests that name a directory to preopen and can be built for 0.3 are 7 in
-  C and the 14 `filesystem-*` tests in Rust (`tests/rust/wasm32-wasip3`). It has no binaries at that commit, and the
-  prebuilt 0.3 tests of the last pin, `e0aa527`, import `wasi:io/poll@0.2.9`, so they are built from source. The
-  toolchain image fetches the sources as a tarball checked by sha256, not as a Cargo dependency, and builds them in a
-  `conformance` stage (`docker/build.Dockerfile`): the C by wasi-sdk 34's clang for `wasm32-wasip3`, and the Rust by
-  the fixture toolchain, with a manifest and lockfile of ours (`docker/conformance`).
-  - Each Rust test is built as a library (a `cdylib` example) and not as the program it is written as: on
-    `wasm32-wasip3` a program's `main` exports `wasi:cli/run`, and the test's own `export!` would be a second, on which
-    `wit-component` fails.
-  - wit-bindgen is 0.62.0, not the suite's 0.58.0, which keeps a task's state in the component's context slot 0. On
-    `wasm32-wasip3` wasi-libc keeps that slot for the task's stack, and 0.58.0 traps
-    (`assertion failed: context_get().is_null()`). 0.62.0 keeps the state in a thread-local.
-
-  The harness is a `#[cfg(test)]` module in the binary (`src/fs/conformance.rs`), because only the binary holds the
-  production linker. Without `TRIC_CONFORMANCE`, the directory of the built tests, the test is skipped, so a build
-  outside the image is not broken by it. The host needs an `App` to be a `Tric`, so it takes the built fixture.
-- **The conformance run is Wasmtime's own configuration:** the directory as `/`, no environment beyond the test's and
-  no skip-list. All 21 pass, and one that fails fails the run. A list of tests allowed to fail, with a rule that a
-  listed test that passes fails the run, was kept empty, and went: a test that fails is fixed, not listed. `TESTS`
-  pins the count, so a change of commit is noticed.
-  The harness was shown to be able to fail: with `get-flags` made to report `mutate-directory` for any descriptor
-  opened to read, `rust/filesystem-flags-and-type` failed, at its check that `open(".")` with no flags reads `READ`.
-- **Wasmtime's own 0.3 file system programs are not a second suite.** Wasmtime 49.0.2 has 8, in its `test-programs`
-  crate, which depends on its 0.1 and 0.2 bindings and on the workspace and its lock, and is built for `wasm32-wasip1`;
-  its runner links 0.2 beside them. Built for `wasm32-wasip3`, each would export `wasi:cli/run` twice, as above, and
-  those named `_across_perms` need preopens with permissions of their own, which tric does not have.
-- **What serving 0.3 alone no longer tests.** The gate ran 103 unit tests, 66 end-to-end and 63 conformance tests (in
-  one of the unit tests) at `a01aa52`, and 99, 52 and 21 at `4011167`, which removed 0.2 (with `ws`, 106 and 73, and
-  102 and 59). The end-to-end file tests through Rust's `std::fs` went with 0.2, and are back on 0.3 (below). Gone
-  with 0.2, and not brought back, are:
-  - the suite's 49 0.1 modules (42 in Rust and 7 in C), which were made components with Wasmtime's preview 1 adapter
-    and served through 0.2. The 7 C tests are now built for 0.3. The 42 Rust ones cannot be, and the suite's Rust
-    tests for 0.3 are the 14 above;
-  - `files_are_one_filesystem`, which checked that 0.2 and 0.3 saw one tree. Both routes to the files now go through
-    the one binding, so there are not two to compare;
-  - the unit tests of the 0.2 binding.
-- **The end-to-end file tests run through `std::fs` as well as the binding.** The Rust fixture's `/std-files` has the
-  ops of `/files` through Rust's `std::fs`, which on `wasm32-wasip3` is wasi-libc's over the 0.3 binding, and each of
-  the six file tests runs through both routes, on `tric dev` and on a stack. `/files` uses the binding as its WIT has
-  it, with its streams, and `/std-files` as most Rust apps do: wasi-libc chooses the flags (`MUTATE_DIRECTORY` only
-  with `O_WRONLY`, below), keeps the offset, and makes an errno of each `error-code`, of which `std` makes an
-  `io::ErrorKind` (`ErrorCode::NoEntry` is `NotFound`). The two catch different faults, so both are kept. `std::fs`
-  with Rust 1.100.0-beta.4 does all that the tests of 0.2 did, with the same kinds of error, and nothing in them was
-  left out or worked around.
+  first, and 0.3 beside it, until then; the file system's 0.2 binding and its tests were removed with this decision.
 - **Objects are put at a random id, over any object there.** A put that is retried would get 412 on its own object
   under create-if-absent, and 128 random bits won't collide. The link's version id and hash would catch it if they did.
 - **A link pins a version and a hash.** The version means a reader gets the object it was pointed at, however the key
   has changed since, and survives the delete marker the sweep adds. The hash means a head vouches for everything under
   it, so a corrupted or swapped object is `io` and not a guest's data. Neither costs a request.
-- **A value or file up to 4 KiB is inline,** in its leaf. It rides on a request the leaf needed anyway, and 4 KiB is
-  a page. Larger ones are objects of their own: a key's up to 1 MiB, a file's in blocks. (It was 1 KiB in the flat
-  head, which had no leaf to ride on.)
+- **A value up to 4 KiB is inline,** in its leaf. It rides on a request the leaf needed anyway, and 4 KiB is a page.
+  Larger ones are objects of their own, up to 1 MiB. (It was 1 KiB in the flat head, which had no leaf to ride on.)
 - **A node is at most 64 KiB, the root's limit too.** The root is in the head, which every turn reads, so the head is
   small however large the name. A write rewrites one leaf of at most 64 KiB.
 - **A thin node merges at the commit, as bbolt's does.** A changed node under a quarter of the node limit joins a
@@ -406,47 +317,21 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   test checks every separator against the keys below it.
 - **Nodes are JSON,** as the head is: `serde_json` is linked, and a node can be read with `curl`. A binary codec is a
   new crate for smaller objects, and the format is one function to change.
-- **`..` is lexical.** A walk keeps a stack of the directories it entered, `..` pops it, and popping past the
-  descriptor the walk began at is `not-permitted`, as the WASI path-resolution rules say
-  (<https://github.com/WebAssembly/wasi-filesystem/blob/main/path-resolution.md>). It needs no `parent` and can't be
-  confused by a rename. A directory's `parent` is kept only for `rename` to refuse to move it into itself.
-- **A directory reports a link count of 1,** as btrfs does. Counting subdirectories means updating the parent for
-  every `mkdir`, and nothing in a standard suite or in Rust's standard library reads it. If a test does, it is a
-  line to change.
-- **Inode numbers are never reused.** `is-same-object` and a descriptor held across an unlink would otherwise name a
-  new file. A counter in the head costs nothing, and a `u64` can't run out.
-- **A file's access time is set when it is made, and by `set-times`: never by a read.** Updating an access time on
-  every read would turn a read into a write, and a snapshot can't write. An inode has a creation, a modification and
-  a change time, in Unix nanoseconds, and a time that does not fit one is `overflow`. **`sync`, `sync-data` and
-  `advise` do nothing,** as durability is the commit's. For the same reason `open-at` with a `*-sync` flag is
-  `unsupported`: that a write be durable when it returns is a promise only a commit keeps.
-- **A file unlinked while open is as on Linux.** Its inode stays in the tree at a link count of 0, and is read and
-  written through the descriptors that hold it, as Linux does. The last close in the turn removes it. The commit leaves
-  out an inode still at 0, so it and its blocks are garbage, for the sweep. A descriptor that outlives the answer (a
-  body that streams a file after it) keeps reading through a fork: a copy of the tree's root that shares its reader and
-  its objects, made by the commit before it purges the orphans from the tree, and used once the head has landed. The
-  fork reads blocks by version, which a delete marker doesn't hide. So there is no copy of the file, no cap on how many
-  links it can hold and no `io` for a large file, and a temporary file unlinked at once works. A fork, like any tree,
-  deletes nothing when dropped. This relies on the bucket being versioned, as the sweep and the lifecycle rule do: a
-  non-versioned store, the memory store of `tric dev` and the tests, never deletes an object, so it reads anyway. If the
-  turn is discarded or loses its race, the descriptors read the tree as it was, which does not hold what the turn made,
-  so they get `io`.
 - **A turn edits the tree directly, as LMDB and bbolt do,** and has no overlay and no cap on its changes. An overlay
-  applied at the commit would be a second structure that every read and `readdir` had to merge with the tree, and
-  would need a cap to stay in memory, which the guest would hit as an error that no file system gives. Here the nodes
-  a write touches are copied in memory and the rest stay links. Reads, `readdir` and `list-keys` use the one tree. A
-  blind write descends at the write, so a GET for each level not cached is paid there and not at the commit.
-- **Past its memory budget a turn spills, as LMDB does a dirty page.** The copies, and the blocks and large values held
-  for upload, count against one budget of 8 MiB (`Config::budget`), checked after each write. Past it, the held values
-  and blocks upload first, up to 16 at once while the writer waits, and each becomes a link; if the copies are still
-  over the budget, what is thin merges, as at the commit, and the changed nodes upload bottom-up and become links too,
-  which dirties their parents in turn. Nothing refers to an uploaded object until the commit, so a discard changes
-  nothing that a head names. What the turn uploaded, and what it uploaded and then replaced, is left for the sweep. The
-  turn holds about its budget and one write however much it writes.
-- **A key's value over 4 KiB is held like a block,** uploaded when the budget spills it or the commit does, and
-  counted against the same budget. This reads "upload eagerly, as blocks do" as "dirty against the shared budget and
-  spilled by the same rule": a value is not uploaded at the write, since a value written twice in a turn would then
-  put an object for each. The files stage adds the blocks to the same rule.
+  applied at the commit would be a second structure that every read and `list-keys` had to merge with the tree, and
+  would need a cap to stay in memory, a limit the guest would meet that nothing else explains. Here the nodes a write
+  touches are copied in memory and the rest stay links. Reads and `list-keys` use the one tree. A blind write descends
+  at the write, so a GET for each level not cached is paid there and not at the commit.
+- **Past its memory budget a turn spills, as LMDB does a dirty page.** The copies, and the large values held for
+  upload, count against one budget of 8 MiB (`Config::budget`), checked after each write. Past it, the held values
+  upload first, up to 16 at once while the writer waits, and each becomes a link; if the copies are still over the
+  budget, what is thin merges, as at the commit, and the changed nodes upload bottom-up and become links too, which
+  dirties their parents in turn. Nothing refers to an uploaded object until the commit, so a discard changes nothing
+  that a head names. What the turn uploaded, and what it uploaded and then replaced, is left for the sweep. The turn
+  holds about its budget and one write however much it writes.
+- **A key's value over 4 KiB is held whole,** uploaded when the budget spills it or the commit does, and counted
+  against the same budget, as the file system's blocks were. A value is not uploaded at the write, since a value
+  written twice in a turn would then put an object for each.
 - **Nothing is deleted at a commit, and the sweep is the only collector.** A turn deletes nothing, whether it lands,
   loses its race, is discarded, traps or times out. What its edits replace, and what it uploaded for a head that did not
   land, is left for the sweep. Lance does the same: a write leaves the files of older versions in place, and
@@ -545,9 +430,9 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   `Failed` already, so `TooLarge` never is, and `tric::failed` answers 503 for `Unsent` and 500 for any other.
   `Lapsed`, for a claimed turn that lost its claim, went with the claims.
 - **A commit that does not land resets the tree itself, under its write lock.** `discard`, which a failed commit
-  calls, resets the tree too, so the commit's reset looks redundant; but between the two the lock is free, and a
-  descriptor that reads after the answer would see writes that never landed, where the file system promises the tree
-  as the commit left it or as it was.
+  calls, resets the tree too, so the commit's reset looks redundant; but between the two the lock is free, and a read
+  of a key after the answer, by a body that streams after it, would see writes that never landed, where it is promised
+  the tree as the commit left it or as it was. A file descriptor's read was the first to need this.
 - **What a lost answer still costs.**
   - A commit that cannot learn whether it landed answers 500. If the client runs the turn again all the same, and the
     first put did land, the turn has run twice. That takes S3 failing for `SETTLE`, another commit landing over the
@@ -606,7 +491,7 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   answers 204 whatever serve says, as for a cron entry: a sweep that fails is logged and is the next one's, not a retry.
   An app with no release is answered 404 and not swept. Serve dispatches `for=_sweep` after the credentials and the
   tenant are checked and before the app is loaded: a sweep needs the store and none of the app's code, so it reads no
-  release, compiles nothing and runs no guest, and an app that never touches a file or a key costs one cold invocation
+  release, compiles nothing and runs no guest, and an app that never writes a key costs one cold invocation
   an interval that lists an empty prefix and writes nothing.
 - **The interval is the operator's: hours that divide a day, or whole days.** `TRIC_SWEEP_EVERY` (`--sweep-every` of
   `deploy` and `route`) is `<n>h` for 1, 2, 3, 4, 6, 8, 12 or 24 hours, or `<n>d` for 1 to 31 days, and `1d` by default;
@@ -675,12 +560,12 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
 - **Every version of a head that the bucket keeps is a root, and nothing else is.** What points into `values/` is a
   head's tree, and nothing else does. A head also holds `commit`, the id of the commit that wrote it, which is no link.
   The records of `Idempotency-Key`s and of delivery events are values in the tree, and no links either. The outbox and
-  retry objects hold an event's requests (under `outbox/`, and not under `values/`), and no link. A snapshot or a fork,
-  which a read or a descriptor that outlives the answer holds, is a copy of a root read from a head and reads by
-  version, which a delete marker does not hide, and for at most `TOTAL`, so it needs no mark of its own. A link read
-  from a head or a node is checked to name an object of its own name, so a changed head cannot make the sweep mark, or
-  keep, another's. If anything else were ever to point into `values/`, the sweep would have to mark through it as well,
-  and `tree::object` is where to look for who builds those paths.
+  retry objects hold an event's requests (under `outbox/`, and not under `values/`), and no link. A snapshot, which a
+  read holds, is a copy of a root read from a head and reads by version, which a delete marker does not hide, and for
+  at most `TOTAL`, so it needs no mark of its own. A link read from a head or a node is checked to name an object of its
+  own name, so a changed head cannot make the sweep mark, or keep, another's. If anything else were ever to point into
+  `values/`, the sweep would have to mark through it as well, and `tree::object` is where to look for who builds those
+  paths.
 - **The grace outlasts the longest turn, by construction.** A head is put by a commit, which lands only if its base is
   the head then (a conditional put on its ETag, so a turn from an older head never lands), and names what its base
   named and what its turn made. The sweep takes `cutoff = now - GRACE` before it lists a name's versions, and reads
@@ -716,7 +601,7 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   commit changes the nodes on the paths from the root to what it changed, so a version after the first reads a node
   a level for each change, one level after another. These figures are estimates, not measurements: a GET of a node
   takes about 25 ms from serve, so a mark reads about 640 nodes a second, and 100,000 nodes (`NODES_MAX`) take about
-  156 s of a run's 240. A name with 4 Mi entries of 250 bytes each (keys and links, which is what files are) has
+  156 s of a run's 240. A name with 4 Mi entries of 250 bytes each (keys and links) has
   16,000 to 32,000 nodes of 64 KiB, between full and half full, and takes 25 to 50 s. A name passes the valve only
   with more than 100,000 nodes, which is 3 to 6 GiB of keys, links and inline values in its nodes; the structural
   extreme, 16 GiB of 4 KiB inline values, is 262,000 to 524,000 nodes, which no run reads. The set of ids is about 24
@@ -820,7 +705,7 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   full path and its version (app, name, id, version), so it can never be stale and a hit is exactly the object that
   a read would fetch, and never one of another app's. A node a commit uploads is put in it, since the next request is
   the one that will read it. It is not the cache of heads above, which waits for numbers: a head is the one mutable
-  thing, and the cache never holds it. Blocks are not cached; the files stage decides that with the numbers.
+  thing, and the cache never holds it. Large values are cached too, 32 MiB of them, keyed the same way.
 - **A turn logs its tree at debug,** next to the head's logs: the GETs, the PUTs, the cache hits, the depth reached and
   the bytes read and written, with the splits, merges and root collapses, so that the cost model in the plan can be
   checked against a real run.
@@ -836,147 +721,29 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   bytes, 8 bytes inline) are what let the same code be run through splits, merges and collapses on a four-level tree
   against a `BTreeMap` of the same operations, and the store checked after every round against what the tree names, so
   that a lost or deleted object fails the test. A mutation (a skipped separator fix) was shown to fail it.
-- **A change is admitted through a gate, so the answer cannot lose one.** Every change to the tree takes a permit from
-  an `RwLock` (held shared while the change is made) and only then checks that the turn has not answered. The commit
-  marks the turn answered, and then waits for the lock exclusively before it reads the tree. A change that saw the
-  turn open therefore holds a permit the commit waits for, so it is in the commit, and one that comes later fails with
-  `read-only`: none falls between. A stream's write is admitted when the guest makes it, not when
-  it is later flushed to the tree, and the task that applies it is detached and never aborted, as an abort could leave
-  half a write. Lock order, to avoid a deadlock: the gate, the tree, the turn's state.
-- **A directory is as mutable as its mount, and `MUTATE_DIRECTORY` is only what `get-flags` says.** The preopen is
-  opened to change its entries, and a directory opened by `open-at` reports the flag if it was asked for, and only
-  while the turn can still change anything. The turn decides what is allowed, not the descriptor: a change fails when
-  the turn is a snapshot or has answered (`read-only`), and not otherwise, and asking for the flag from a turn that
-  has answered is `read-only` too, as asking for `write` is, once the path is found: a path that is not there is
-  `no-entry` first. Enforcing it per descriptor would break wasi-libc, which asks for it only with
-  `O_WRONLY`, which no directory is opened with, and still changes the entries of the directories it opens, and
-  Wasmtime's own host reports it from the open mode without enforcing it. The `wasi-testsuite` checks the report
-  (`open(".")` with no flags reads `READ`, not `READ | MUTATE_DIRECTORY`), which is how this was found. The descriptor
-  flags a guest passes to `open-at` narrow what that descriptor can do (a read without `read` is `bad-descriptor`) and
-  never widen it.
-- **Every failure is an errno, and the detail is in the log.** A tree error maps to the nearest errno (over a budget is
-  `insufficient-space`, a name that cannot be read `io`, a lost inode after a discard `io`), and the app's storage
-  details, the bucket and the key, are logged and never returned. Of the errnos the WIT names, `busy` is used for
-  `rename` of `.` or `..`, `overflow` for a time that does not fit, `insufficient-memory` for a full descriptor
-  table, and `bad-descriptor` for a read or write on a descriptor that was opened without the right to.
-- **Paths cannot leave the mount.** A walk is lexical (above), a leading `/` is refused, a symlink's target may not be
-  absolute (refused at creation with `not-permitted`, which is the only place to refuse it that does not depend on
-  where the link is read from), a relative target is followed at most 40 times and at most 1 KiB long, and a name is at
-  most 255 bytes and a path 4,096. `..` past the handle the walk began at is `not-permitted`. A test builds handles
-  at several depths with symlinks that try to climb out, and was shown to fail when the check was removed.
-- **Hard links join files and symlinks, not directories.** A link made with `symlink-follow` is `invalid`, since a
-  link to what a symlink points at would need a second resolution at the link.
-- **A path is resolved once, in `ops`, by the operation that uses it.** `ops::mkdir`, `symlink`, `readlink`, `remove`,
-  `rename`, `link` and `open` each take the path and read its entry once, with the tree held, and decide from that
-  entry; the descriptor only checks that it is a directory and takes the tree. An earlier version resolved the path in
-  `src/fs.rs` and then had `ops` read the entry again, and check the name and the parent's kind again, which could not
-  fail: `locate` yields only a name that is not empty, `.` or `..`, at most 255 bytes and without `/` or NUL, and a
-  parent from its own stack of directories. `unlink-file-at` and `remove-directory-at` are one `remove`, told which by
-  a flag. Two answers now follow Linux where they did not: `link-at` to an entry that exists, written with a trailing
-  slash, is `exist`, as `symlink-at` already was, and `readlink-at` of a file written with a trailing slash is
-  `not-directory`, as `readlinkat` has it.
-- **`open-at` is two calls on one decision.** `ops::open` reads a view, for an open that neither creates nor
-  truncates, and `ops::open_mut` edits the tree, for one that does; both decide what the path leads to the same way.
-  The descriptor keeps the two checks that are not about the path, in the order they were: a directory opened to
-  create, be exclusive or truncate is `invalid` before the tree is taken, and a write, or a change to a directory's
-  entries, in a turn that has answered is `read-only` once the path is found. So `locate`, its answer, a directory
-  entry and `create` are private to `ops`, and nothing outside it can make an entry under a name that `locate` did not
-  check and find free. A test that needs a damaged tree, with an absolute symlink in it, makes one with a helper in
-  `ops`'s tests. Opening to truncate no longer checks that it found a file: only a file is found by an open that
-  changes it, and `set_size` refuses anything else.
-- **A file is as large as the name: `FILE_MAX = DATA_MAX`** (16 GiB). A smaller cap would be a second limit to explain,
-  and the name's own budget, which is exact, already stops a write.
-- **An operation is one atomic batch of tree edits,** so that a failure leaves the tree as it was, with two exceptions:
-  a `write` longer than 4 MiB (`WRITE_MAX`) is done in chunks and returns the short count if a later chunk fails, and
-  the purge of a removed file's blocks and the drop of a truncated file's blocks are done a page (1,000) at a time. A
-  tree edit that fails for any reason but a budget, or whose caller goes away half way, poisons the tree: every later
-  change fails and the turn cannot be committed, as the tree may be half-edited. A budget error (`Full`) changes
-  nothing and does not.
-- **Streams outlive the call that made them.** A stream from `read-via-stream` reads ahead 64 KiB and from
-  `write-via-stream` has 256 KiB of capacity (a `write` of more traps, as the WIT says), and a read is at most 1 MiB
-  (`READ_MAX`). They hold their own handle on the inode and the turn, not a borrow of the descriptor, so closing a
-  descriptor does not break a stream made from it. The `read` call's `end-of-stream` is true when fewer than
-  `min(len, READ_MAX)` bytes came back. Locking is described in the module documentation of `src/fs.rs`. A test's
-  `write` is `write_task` awaited, and its walk of a directory takes pages with `more` and `fill` as a stream does, so
-  the tests run the code a component runs, admission included.
-- **After a discard, a descriptor on an inode that is gone gets `io`.** A directory can be an orphan, as on Linux, and
-  making a name inside a directory with no links is `no-entry`. A full descriptor table is `insufficient-memory`, and
-  `get-directories` on a full table traps, as its WIT type has no error to say it with.
-- **A name emptied by deletes keeps its `seq`,** so its tree is `{"seq": N}` and not empty. An inode number is
-  never given twice (above), and an empty tree would start the count again.
-- **A request with no name has no preopens,** and the preopen of a request that has one is the turn's own name
-  (`Ctx::mount()`), which for a safe method reuses the snapshot that was read, so a GET that touches a file costs no
-  second read of the head.
-- **Blocks are verified and cached like nodes.** They go through the same fetch (the hash is checked against the link,
-  the version is pinned) and the same cache, keyed by the full path and version, so an unchanged file read again, in
-  a later request of the same environment, costs no GET. The cache can
-  hide an object that was lost until the process ends, so the tests that check for lost objects use a handle with no
-  cache.
-- **Writing 4 KiB to a large file rewrites a block.** A 256 KiB block is put whole, so a program that writes a
-  large file in 4 KiB pieces puts a block each time it moves on from one, which is up to 64 times the bytes if the
-  pieces are not merged. A turn holds a dirty block until the budget spills it or the commit uploads it, so pieces
-  that land in the same block in one turn put one object, and the measurement bears this out (release build, memory
-  store, 64 MiB written in one turn: 4 KiB pieces 333 ms, 64 KiB 173 ms, 1 MiB 166 ms; a 5-byte patch in a 64 MiB file
-  4 ms). The latency of S3 PUTs, 256 of them for 64 MiB, is not in these; it will be measured on a live run.
-- **The binding's error type, `Fault`, is in the core:** an errno or a trap, as the core's helpers (`fd`, `writer`,
-  `add`) return one or the other. The binding converts an errno to its `ErrorCode`, and a trap stays one.
-  `wasmtime-wasi-io`, through which the 0.2 binding shared its streams, was removed with that binding.
-  The tree's counting store, for tests, is behind the `testing` feature of `tric-tree`, which tric's tests turn on.
-- **The end-to-end file cases run on the Rust app,** as the JavaScript app has no file routes: the QuickJS bindings
-  are by hand and the files are the subject of the tests, not the language.
-- **Only a turn's own name is mounted,** as `/`. A snapshot is mounted read-only, and a request without a name has no
-  preopens, with no request made. Mounting others would need a path convention, and an app can read another name's
-  keys already.
-- **A stream is a producer or a consumer over a handle of its own.** `read-via-stream` and `read-directory` are
-  `StreamProducer`s, `write-via-stream` and `append-via-stream` are `StreamConsumer`s, and each holds its own pin on
-  the inode and the turn, so it outlives the call and the descriptor. Each also owns the `future` that the
-  WIT returns with it, which is sent exactly once, as a future whose sender is dropped would trap the guest. What
-  closing does differs by the stream. A read stream drops its fetch, as it is only a read and nothing then holds the
-  tree, and aborts its read-ahead. A write that was admitted is allowed to finish, in a task of its own, which tells
-  the future how it ended, as an abort could leave half a write (the rule of the gate, above). A write stream takes at
-  most 256 KiB (`WRITE_CAP`) from the guest at a time and takes no more until that has landed, which is its
-  backpressure. The 0.3 binding came to 650 lines against an estimate of 600.
-- **A stream that reads on reads ahead, to a megabyte, through the same verified path.** When a read begins where the
-  last one ended, the stream is reading on, and a task fetches the blocks up to 1 MiB past it (`AHEAD`) for the cache,
-  as a read does: checked against their links, with the version pinned. The task is aborted with the stream, and a
-  file of which only the start is read has nothing fetched that was not asked for. It is `Ahead`, in `src/fs.rs`.
-  Independently, a read (`Plan::read`) fetches its blocks together, up to `IN_FLIGHT` (16; the tree's bound on
-  uploads, renamed from `PUTS` as it serves both), and puts them in order.
-  Measured with a counting store at 20 ms a GET: a read of 3 blocks is 3 GETs all under way together, 32 blocks are 32
-  GETs with 16 under way, and a stream of 12 blocks is 12 GETs with at least 4 together.
-- **A block that is being fetched is waited for, not fetched again.** The first test of 0.3 read-ahead on a store
-  with a delay counted 19 GETs for a file of 12 blocks: a reader that is faster than the store catches up with its
-  own read-ahead and fetches what is under way. A block is now fetched by one reader at a time (`Flight`, in
-  `crates/tree`): one that comes to a block that is being fetched waits, and then looks in the cache, where the block
-  is checked against its hash again, so nothing is taken on trust from the one that fetched it. A fetch that is
-  cancelled lets the next in turn fetch, and the gate is gone when no one comes to it. The gate counts the flights
-  that come to it, under the map's lock, and a flight counts itself out when it is dropped, including one that is
-  cancelled while it waits. An earlier version told by the reference count of the gate when to remove it, which was
-  right only if a cancelled read dropped what it waited on before the flight, an order that nothing promises. Tests
-  cancel a waiter at the gate while the one that fetches is under way, and cancel reads at every moment of a fetch,
-  and the gate must be gone after them. This holds for any two reads of a block, whatever bound them. Nodes are not
-  gated: a descent that finds a node missing is rare next to reads of blocks, and a duplicate there costs one GET of
-  at most 64 KiB.
-- **A read holds the tree to plan, and not to fetch.** The first version of `read_at` and the read-ahead held the tree
-  shared while they fetched their blocks. The lock is fair, so a write waited behind every read in flight, the commit
-  behind those, and new reads behind the commit: a stream that outlived the answer and read ahead held up the commit,
-  and the turn behind it, by a GET round trip a time. A read is now planned with the tree held (`ops::plan`: the
-  inode, and the item of each block, which is the walk of the tree's nodes) and fetched after the tree is let go
-  (`Plan::read`, `Plan::warm`), through `Values`, a reader of items that holds the name's reader and not the tree. That
-  is safe because an item is a value in memory, or names an object that is never changed, by its version, and a fetch
-  checks the hash. The sweep's deletes leave a marker and not a gap in a bucket that keeps versions, and a store that
-  does not keep them does not delete. Whether a view is the live tree or a kept copy is still decided with the
-  tree held. A test holds a read of four blocks in flight on a store that takes a second a GET, and a write and the
-  commit go through while it is, for the read and for the read-ahead alike; it fails if either holds the tree.
-- **An offset is signed, and a time is not.** A `read` from an offset past `i64::MAX` is `invalid`, as `pread` has it,
-  and not an end of file. A 0.3 instant before 1970 is `overflow` for `set-times`, as the tree cannot hold it.
-- **The conformance tests are run as Wasmtime's own runner does:** each is a `wasi:cli/run` command, called by
-  `run_command`, and the directory of the test is `/`. The suite's other tests (7 in C, and the Rust ones of cli,
-  http, sockets, clocks and random) name no directory and are not built. A trap in a test carries the test's stderr in
-  its error, which is where its assertion message is, and how a failure is read.
-- **Wasmtime's `component-model-bytes` feature is named in `Cargo.toml`,** as the 0.3 streams hand `Bytes` to the
-  guest. It was already on, through the `p3` feature of `wasmtime-wasi`, so the lock file does not change and no
-  crate is added.
+- **A write is admitted under the tree's write lock, so the answer cannot lose one.** `Turn::writable` checks that the
+  turn has not answered, takes the tree's write lock, and checks again; the commit marks the turn answered, and then
+  takes the lock before it reads the tree. A write that saw the turn open with the lock held is in the commit, and one
+  that comes later fails with `access-denied`: none falls between. Lock order, to avoid a deadlock: the tree, then the
+  turn's state. This was a gate of its own, an `RwLock` whose permit every change held while it was made, for the file
+  system's write streams, which were admitted when the guest made a write and applied by a task of their own later;
+  with them gone, the tree's lock is the gate.
+- **A `wasi:keyvalue` write is one atomic batch of tree edits,** so that a failure leaves the tree as it was. A tree
+  edit that fails for any reason but a budget, or whose caller goes away half way, poisons the tree: every later change
+  fails and the turn cannot be committed, as the tree may be half-edited. A budget error (`Full`) changes nothing and
+  does not.
+- **A large value that is being fetched is waited for, not fetched again.** A value is fetched by one reader at a time
+  (`Flight`, in `crates/tree`): one that comes to a value that is being fetched waits, and then looks in the cache,
+  where the value is checked against its hash again, so nothing is taken on trust from the one that fetched it. It was
+  built for the file system's read-ahead, where a reader faster than the store caught up with its own fetches (19 GETs
+  for a file of 12 blocks), and serves now when two reads want one value at once, as a `get-many` that names a key
+  twice, or two turns on a name, can. A fetch that is cancelled lets the next in turn fetch, and the gate is gone when
+  no one comes to it. The gate counts the flights that come to it, under the map's lock, and a flight counts itself
+  out when it is dropped, including one that is cancelled while it waits. An earlier version told by the reference
+  count of the gate when to remove it, which was right only if a cancelled read dropped what it waited on before the
+  flight, an order that nothing promises. Tests cancel a waiter at the gate while the one that fetches is under way,
+  and cancel reads at every moment of a fetch, and the gate must be gone after them. Nodes are not gated: a node
+  fetched twice costs one GET of at most 64 KiB.
 
 ## Idempotency keys
 
@@ -1102,7 +869,8 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   A unit test runs two requests at once on one instance of the JavaScript fixture (the first waits 200 ms, and the
   second answers while it waits), and each gets its own answer, so each task's state is kept apart.
 - **There is no shim for `fetch`, `Request` or `URL`.** They are not WASI, and tric invents nothing.
-- **The JavaScript fixture skips `/print` and `/fs`,** which try tric's own stdio and files: QuickJS has neither.
+- **The JavaScript fixture skips `/print` and `/fs`,** which try stdio and a file system with nothing preopened:
+  QuickJS has neither.
 - **A JavaScript component imports WASI 0.3 alone,** as a Rust one does, and exports an `init` that tric never
   calls.
 
@@ -1225,14 +993,14 @@ The tree is the crate `tric-tree`, in `crates/tree`, and the root is a workspace
 - **Errors are the crate's `Error`, which a caller matches.** `Full` (with `Full::Entries` or `Full::Data` and the
   limit), `TooLarge`, `Corrupt`, `Store` (an `object_store` error) and `Poisoned`; it is a `std::error::Error`, so `?`
   makes it a `wasmtime::Error` in tric. `Full` is only what a write would have gone over, and not an error of its own:
-  the `Error` that holds it says so. tric's two `fail`s, of keys and of files, match `Full` where they used to downcast,
-  and tell the guest the name's limit in the words they used before.
+  the `Error` that holds it says so. tric's `fail` matches `Full` where it used to downcast, and tells the guest the
+  name's limit in the words it used before. (There were two, of keys and of files.)
 - **The limits are one `Config`, with defaults.** The node (64 KiB), inline (4 KiB), budget (8 MiB) and blob (1 MiB)
   defaults are the old constants. Entries and data are unbounded by default, as they are policy: tric's `tree::config()`
-  sets 4 Mi and 16 GiB (`ENTRIES_MAX`, `DATA_MAX`), and `DATA_MAX` and the file system's other limits stay in tric. How
-  much is under way at once is not a limit, and is the crate's constant `IN_FLIGHT` (16), the uploads of a flush and the
-  reads of a mark: it was a field of the config, which only ever held 16 and had to be guarded against 0. tric reads its
-  blocks and heads that many at a time too, and takes the number from the crate.
+  sets 4 Mi and 16 GiB (`ENTRIES_MAX`, `DATA_MAX`), and both stay in tric. How much is under way at once is not a
+  limit, and is the crate's constant `IN_FLIGHT` (16), the uploads of a flush and the reads of a mark: it was a field
+  of the config, which only ever held 16 and had to be guarded against 0. tric's sweep reads heads that many at a time
+  too, and takes the number from the crate (the file system read its blocks so).
 - **A path is the caller's prefix and an id.** `tric_tree::object(prefix, id)` is where an object is, directly under
   the prefix, and `tric_tree::number` reads an id back, for a collector that lists the prefix. tric's `tree::prefix`
   is `apps/<app>/values/<name>`, as before.
@@ -1244,7 +1012,8 @@ The tree is the crate `tric-tree`, in `crates/tree`, and the root is a workspace
   `reset` gives back what a lost turn took. Keeping the number and dropping its meaning keeps that guarantee, and the
   JSON of every head written so far (`seq`), while the rule is the file system's own (`fs::ops::alloc`: one after the
   last, and after the root's 1). A key in the tree would have changed what heads hold, and an inode allocator in the
-  crate would have been a tric concept. A caller with no use for it never sees it, as 0 is not written.
+  crate would have been a tric concept. A caller with no use for it never sees it, as 0 is not written. The file
+  system was its only caller, so tric now sets no `seq`, and the heads it writes hold none.
 - **The hash and the random ids are private helpers of the crate,** the same SHA-256 in hex and 128 random bits in
   hex as `store::hash` and `store::random`, which stay in tric for its heads and commits.
 - **A commit deletes nothing, and the crate offers the collector a mark, and nothing to delete with.** The sweep is
@@ -1256,7 +1025,8 @@ The tree is the crate `tric-tree`, in `crates/tree`, and the root is a workspace
 - **One tree type, and a walk of its own for the mark.** A snapshot is a tree that is not written, and `Tree::fork`
   is the copy that outlives a turn, so a snapshot type would only repeat the reads. The mark does not share the
   scans' walk: it reads level by level, unordered and up to `IN_FLIGHT` at once, and keeps nothing in the cache,
-  where a scan reads in key order, to a limit, through the cache.
+  where a scan reads in key order, to a limit, through the cache. `Tree::fork` was for a file descriptor that outlived
+  the answer, and tric calls it no more, nor `Tree::values` and its `Values` or `Tree::entries`, the file system's too.
 - **A spill of nodes merges first, as the commit does.** Both are one `flush`: what is thin merges and what is empty
   is dropped (`fix`), a root of one child gives way to it, and then the nodes upload. A spill used to upload the nodes
   as they were, so its upload dropped the empty ones itself and put right a root it had emptied: a second path for
@@ -1265,9 +1035,9 @@ The tree is the crate `tric-tree`, in `crates/tree`, and the root is a workspace
 - **The tests moved with the tree,** the model test against a `BTreeMap` among them, and its counting store is
   `tric_tree::testing`, behind the `testing` feature, which tric's dev-dependency turns on; tric's tests take it as a
   `Store` from `tree::counting`. Of the tree's 21 tests, 19 are the crate's as they were, and one is renamed for the
-  root (`an_empty_tree_is_an_empty_root`, which was `an_empty_tree_is_not_in_the_head`). The test of inode numbers is
+  root (`an_empty_tree_is_an_empty_root`, which was `an_empty_tree_is_not_in_the_head`). The test of inode numbers was
   two: the crate's `a_sequence_is_kept_in_the_root`, and the file system's
-  `inode_numbers_count_up_from_the_root_and_go_on_from_a_committed_tree`. The crate adds
+  `inode_numbers_count_up_from_the_root_and_go_on_from_a_committed_tree`, which went with it. The crate adds
   `a_mark_shares_what_it_has_seen_across_roots`, and a doctest on the memory store.
 - **The gate covers the crate:** `fmt` of the workspace, `clippy` of the crate with all its features as well as of
   tric's two feature sets, the crate's tests and doctest, and `cargo publish --workspace --dry-run`, which packages
@@ -1292,7 +1062,7 @@ The tree is the crate `tric-tree`, in `crates/tree`, and the root is a workspace
     pauses;
   - `tric dev` needing an S3 endpoint, as the SDK has no store in memory.
 - **The host and the fixtures have a toolchain each, until 12 November 2026.** The host is built by Rust 1.99.0, and
-  the fixtures and the conformance tests by 1.100.0-beta.4 (`TRIC_FIXTURE_TOOLCHAIN` in `docker/build.Dockerfile`), as
+  the fixtures by 1.100.0-beta.4 (`TRIC_FIXTURE_TOOLCHAIN` in `docker/build.Dockerfile`), as
   `wasm32-wasip3` is stable from 1.100. Both move to 1.100.0 when it is stable, on 12 November 2026. Serving 0.3 alone
   switched nothing on in the engine: its component-model async was already callbacks only, with no stackful async and
   no extra builtins.
