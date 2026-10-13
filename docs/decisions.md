@@ -1015,13 +1015,9 @@ The tree is the crate `tric-tree`, in `crates/tree`, and the root is a workspace
   locks, and a second `foldhash` into the build; std's do here. Which entry it forgets is its own choice (S3-FIFO), no
   longer the one used least, and nothing depended on that: the test of the order is now one of the bound. A mark only
   peeks, so it neither keeps nor warms what it walks.
-- **The inode counter is a number kept with the root, `Tree::sequence`, whose meaning is the caller's.** A counter
-  in the root is what keeps inode numbers from being reused across turns: it is in the root `finish` gives, and a
-  `reset` gives back what a lost turn took. Keeping the number and dropping its meaning keeps that guarantee, and the
-  JSON of every head written so far (`seq`), while the rule is the file system's own (`fs::ops::alloc`: one after the
-  last, and after the root's 1). A key in the tree would have changed what heads hold, and an inode allocator in the
-  crate would have been a tric concept. A caller with no use for it never sees it, as 0 is not written. The file
-  system was its only caller, so tric now sets no `seq`, and the heads it writes hold none.
+- **A root holds the tree and its totals, and no number of the caller's.** It held one, `seq`, with
+  `Tree::sequence` and `Tree::set_sequence`, for the file system's inode numbers, which were never to be given twice;
+  it went with the file system, and a root that holds `seq` is now refused as malformed, as any unknown field is.
 - **The hash and the random ids are private helpers of the crate,** the same SHA-256 in hex and 128 random bits in
   hex as `store::hash` and `store::random`, which stay in tric for its heads and commits.
 - **A commit deletes nothing, and the crate offers the collector a mark, and nothing to delete with.** The sweep is
@@ -1030,11 +1026,16 @@ The tree is the crate `tric-tree`, in `crates/tree`, and the root is a workspace
   adds to a set it is given, and passes over what the set holds, so the marks of several roots share one set and read
   each object once. A mark from an empty set, `Tree::reachable`, was public too, and only the crate's tests called it,
   so it is one of their helpers now.
-- **One tree type, and a walk of its own for the mark.** A snapshot is a tree that is not written, and `Tree::fork`
-  is the copy that outlives a turn, so a snapshot type would only repeat the reads. The mark does not share the
-  scans' walk: it reads level by level, unordered and up to `IN_FLIGHT` at once, and keeps nothing in the cache,
-  where a scan reads in key order, to a limit, through the cache. `Tree::fork` was for a file descriptor that outlived
-  the answer, and tric calls it no more, nor `Tree::values` and its `Values` or `Tree::entries`, the file system's too.
+- **One tree type, and a walk of its own for the mark.** A snapshot is a tree that is not written, so a snapshot
+  type would only repeat the reads. The mark does not share the scans' walk: it reads level by level, unordered and
+  up to `IN_FLIGHT` at once, and keeps nothing in the cache, where a scan reads in key order, to a limit, through the
+  cache.
+- **What only the file system used went with it.** `Tree::fork`, a copy for a file descriptor that outlived the
+  answer; `Tree::values` and its `Values`, which read a file's blocks without holding the tree; and `Tree::entries`,
+  a scan that gave the items with the keys. With no fork or `Values` to share it, a tree holds its reader itself, and
+  not in an `Arc`, and a scan's walk gathers keys alone, where it took a function to pick what to gather. The reader's
+  fetch of a large value was `block`, after the file system's blocks, and is `large_value`. Two tests went with them,
+  `a_fork_is_a_tree_of_its_own` and `a_sequence_is_kept_in_the_root`, and a scan's test no longer reads its entries.
 - **A spill of nodes merges first, as the commit does.** Both are one `flush`: what is thin merges and what is empty
   is dropped (`fix`), a root of one child gives way to it, and then the nodes upload. A spill used to upload the nodes
   as they were, so its upload dropped the empty ones itself and put right a root it had emptied: a second path for
@@ -1048,11 +1049,11 @@ The tree is the crate `tric-tree`, in `crates/tree`, and the root is a workspace
   `inode_numbers_count_up_from_the_root_and_go_on_from_a_committed_tree`, which went with it. The crate adds
   `a_mark_shares_what_it_has_seen_across_roots`, and a doctest on the memory store.
 - **A tree counts only what it fetched and uploaded.** The live check reads the GETs and PUTs of each turn's "tree"
-  line, and passes when a commit of a file of four blocks put four objects at least; those two counters on the reader
-  are all it needs. The tree also counted cache hits, the depth reached, the bytes read and written, and its splits,
-  merges and root collapses: nothing but the check's notes and three tests read them, and the depth was a parameter of
-  every walk and edit. The tests see what those counted in the store instead: the model test asserts that the tree
-  grew four levels deep and that a root gave up a level (a committed tree shallower than one before it), and
+  line, and passes when a commit of four values too big to inline put four objects at least; those two counters on the
+  reader are all it needs. The tree also counted cache hits, the depth reached, the bytes read and written, and its
+  splits, merges and root collapses: nothing but the check's notes and three tests read them, and the depth was a
+  parameter of every walk and edit. The tests see what those counted in the store instead: the model test asserts that
+  the tree grew four levels deep and that a root gave up a level (a committed tree shallower than one before it), and
   `shrinks_as_it_is_emptied` that thinned leaves merge into fewer nodes and that a tree emptied to one key is a leaf.
 - **The gate covers the crate:** `fmt` of the workspace, `clippy` of the crate with all its features as well as of
   tric's two feature sets, the crate's tests and doctest, and `cargo publish --workspace --dry-run`, which packages
