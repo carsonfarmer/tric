@@ -897,7 +897,7 @@ mod tests {
         lossy.plan(Put::Lands, false);
         let turn = writes(&store, "k").await.unwrap();
         let done = commit(&turn).await.unwrap();
-        assert_eq!(lossy.tries.load(SeqCst), 2, "tried again, and refused as it had landed");
+        assert_eq!(lossy.tries.load(SeqCst), 1, "not put again, as the head says it landed");
         assert_eq!(done, done_now(&store).await, "not a conflict, so the turn does not run again");
         assert_eq!(value(&store, "k").await, Some(Bytes::from(vec![7; 5000])));
         assert_eq!(objects(&store).await, 2, "the base's and the turn's");
@@ -907,22 +907,22 @@ mod tests {
     async fn a_commit_that_did_not_land_is_put_again() {
         // Nothing else changed the name, so it is put again, and lands.
         let (store, lossy) = based().await;
-        for _ in 0..store::TRIES {
+        for _ in 0..3 {
             lossy.plan(Put::Fails, false);
         }
         let turn = writes(&store, "k").await.unwrap();
         assert_eq!(commit(&turn).await.unwrap(), done_now(&store).await);
-        assert_eq!((lossy.tries.load(SeqCst), objects(&store).await), (store::TRIES as usize + 1, 2));
+        assert_eq!((lossy.tries.load(SeqCst), objects(&store).await), (4, 2));
 
         // A try landed after all, as it was put again, so that was refused: the head says it landed.
         let (store, lossy) = based().await;
-        for _ in 0..store::TRIES {
+        for _ in 0..3 {
             lossy.plan(Put::Fails, false);
         }
         lossy.plan(Put::Late, false);
         let turn = writes(&store, "k").await.unwrap();
         assert_eq!(commit(&turn).await.unwrap(), done_now(&store).await);
-        assert_eq!(lossy.tries.load(SeqCst), store::TRIES as usize + 1);
+        assert_eq!(lossy.tries.load(SeqCst), 4);
         assert_eq!(value(&store, "k").await, Some(Bytes::from(vec![7; 5000])));
     }
 
@@ -932,15 +932,15 @@ mod tests {
         lossy.plan(Put::Lands, false);
         let turn = writes(&store, "k").await.unwrap();
         assert_eq!(commit(&turn).await.unwrap(), done_now(&store).await);
-        assert_eq!(lossy.tries.load(SeqCst), 2);
+        assert_eq!(lossy.tries.load(SeqCst), 1);
 
         let (store, lossy) = fresh();
-        for _ in 0..store::TRIES {
+        for _ in 0..3 {
             lossy.plan(Put::Fails, false);
         }
         let turn = writes(&store, "k").await.unwrap();
         assert_eq!(commit(&turn).await.unwrap(), done_now(&store).await);
-        assert_eq!(lossy.tries.load(SeqCst), store::TRIES as usize + 1);
+        assert_eq!(lossy.tries.load(SeqCst), 4);
     }
 
     #[tokio::test]

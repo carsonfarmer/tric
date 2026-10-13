@@ -453,15 +453,19 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   (<https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html>), and says to retry a 503 Slow Down with
   exponential backoff
   (<https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-design-patterns.html>).
-- **tric tries a conditional put again itself, so it knows what a refusal follows.** Conditional puts go through a
-  client with object_store's retries off (`max_retries: 0`), which shares its credentials and connections with the one
-  for everything else. A store on S3 holds both, and `Store::put` sends a conditional put by the one that does not
-  retry (`Store::once`); the memory store, which loses no answer, has the one. It was an `ObjectStore` that wrapped the
-  two and passed every other call on, eight methods and a `Display` for one choice that only `Store::put` makes. An
-  overwrite, which is idempotent, keeps object_store's retries. `Store::put` tries a conditional put again, as it was,
-  after an error that is not a refusal, up to `TRIES` (4) times, from 50 to 100 ms apart and twice as long each time. A
-  refusal at the first try is a conflict, as before, and the turn runs again at once. A refusal after a try that may
-  have landed is an error, and the caller reads the head to learn what landed.
+- **tric sends a conditional put once, so a refusal is of that send.** Conditional puts go through a client with
+  object_store's retries off (`max_retries: 0`), which shares its credentials and connections with the one for
+  everything else. A store on S3 holds both, and `Store::put` sends a conditional put by the one that does not retry
+  (`Store::once`); the memory store, which loses no answer, has the one. It was an `ObjectStore` that wrapped the two
+  and passed every other call on, eight methods and a `Display` for one choice that only `Store::put` makes. An
+  overwrite, which is idempotent, keeps object_store's retries. A refusal (412, 409, or 404 on `If-Match`) is a
+  conflict, and the turn runs again at once. Any other error, as a 5xx, a 429 or a lost connection, may have landed, and
+  the commit reads the head to learn what did (below), and puts itself again only while the head is still its base.
+  - `Store::put` tried a conditional put again itself, up to `TRIES` (4) times, from 50 to 100 ms apart and twice as
+    long each time, and a refusal after a try that may have landed was an error, on which the commit read the head.
+    That was a second loop of tries, with its own rule for what a refusal means, before `Turn::land`'s, which does the
+    same job and puts again only once a read says that nothing has landed. The cost is a GET of the head before each
+    put again, and waits from 100 ms where they were from 50 ms, on an error that S3 rarely gives.
 - **A head names the commit that wrote it, and that id is the name's `ETag`.** A head holds `commit`, the id of the
   commit that wrote it, 128 random bits in hex, which every commit draws afresh. So no head's bytes are ever another's,
   and no head's `ETag` in the bucket is either: S3's `ETag` changes only with an object's contents, and for an object

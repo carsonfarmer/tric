@@ -14,7 +14,6 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
 use tric_tree::Cache;
 use wasmtime::{Result, ensure, error::Context};
 use webpki_root_certs::TLS_SERVER_ROOT_CERTS;
@@ -46,9 +45,6 @@ pub fn random() -> String {
     format!("{:032x}", rand::random::<u128>())
 }
 
-/// How many times [`Store::put`] tries a conditional put, while it fails for a reason that is not its condition.
-pub(crate) const TRIES: u32 = 4;
-
 /// The bucket `bucket` on S3, as the environment's `AWS_*` variables configure it, with `creds` if given, and else
 /// the environment's.
 pub fn s3(bucket: &str, creds: Option<AwsCredential>) -> Result<S3> {
@@ -62,8 +58,8 @@ pub fn s3(bucket: &str, creds: Option<AwsCredential>) -> Result<S3> {
 /// A bucket on S3, with a second client for its conditional puts, which sends each once; the rest go as object_store
 /// sends them, retries and all. object_store tries a put again after a 5xx, a 429, a 408 or a connection that failed,
 /// and a conditional put that landed but whose answer was lost then fails its own condition: the 412 would read as
-/// another's write. So [`Store::put`] tries those again itself, and knows which failure came after a try that may have
-/// landed.
+/// another's write. Sent once, a refusal is only ever of that send, and a put with no sure answer is for the caller to
+/// settle, by reading what landed.
 pub struct S3 {
     s3: AmazonS3,
     once: AmazonS3, // with no retries, and the same credentials and connections
@@ -172,38 +168,22 @@ impl Store {
     }
 
     /// Writes `bytes` at `path` as `mode` allows, and returns the new version, or `None` if `mode`'s condition failed,
-    /// or another conditional write was under way (a 409), and nothing was written. A conditional put that fails
-    /// otherwise, as on a 5xx, may have landed: it is tried again, as it was, up to `TRIES` times. Once a try may have
-    /// landed, a later one that is refused may have been refused for that try's write, so that is an error too, and
-    /// what the put did is for the caller to read.
+    /// or another conditional write was under way (a 409), and nothing was written. A conditional put is sent once (see
+    /// [`S3`]), so one that fails otherwise, as on a 5xx, may have landed, or may yet: what it did is for the caller to
+    /// read.
     pub async fn put(&self, path: &Path, bytes: Bytes, mode: PutMode) -> Result<Option<UpdateVersion>> {
-        let (client, tries): (&dyn ObjectStore, _) = match (&mode, &self.once) {
-            (PutMode::Overwrite, _) => (&*self.inner, 1),
-            (_, Some(once)) => (once, TRIES),
-            (_, None) => (&*self.inner, TRIES),
+        let client: &dyn ObjectStore = match (&mode, &self.once) {
+            (PutMode::Create | PutMode::Update(_), Some(once)) => once,
+            _ => &*self.inner,
         };
-        let mut tried = 0;
-        loop {
-            tried += 1;
-            match client.put_opts(path, bytes.clone().into(), mode.clone().into()).await {
-                Ok(r) => return Ok(Some(UpdateVersion { e_tag: r.e_tag, version: r.version })),
-                Err(
-                    e @ (object_store::Error::Precondition { .. }
-                    | object_store::Error::AlreadyExists { .. }
-                    | object_store::Error::NotFound { .. }),
-                ) => {
-                    return match tried {
-                        1 => Ok(None),
-                        _ => Err(e).with_context(|| format!("{path}: try {tried}, after one that may have landed")),
-                    };
-                }
-                Err(e @ object_store::Error::Generic { .. }) if tried < tries => {
-                    tracing::warn!(%path, tried, "put: {e}");
-                    let ms = rand::random_range(50..=100) << (tried - 1); // 50 to 100 ms, then twice as long each time
-                    tokio::time::sleep(Duration::from_millis(ms)).await;
-                }
-                Err(e) => return Err(e.into()),
-            }
+        match client.put_opts(path, bytes.into(), mode.into()).await {
+            Ok(r) => Ok(Some(UpdateVersion { e_tag: r.e_tag, version: r.version })),
+            Err(
+                object_store::Error::Precondition { .. }
+                | object_store::Error::AlreadyExists { .. }
+                | object_store::Error::NotFound { .. },
+            ) => Ok(None),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -300,17 +280,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_conditional_put_refused_after_a_try_that_may_have_landed_is_an_error_not_a_conflict() {
+    async fn a_conditional_put_is_sent_once_and_only_a_refusal_is_a_conflict() {
         let update = PutMode::Update(UpdateVersion { e_tag: Some("\"old\"".into()), version: None });
-        let tries = TRIES as usize;
         // What the put came to: whether it landed, if that is known, and how many puts S3 had.
-        let cases: [(&[u16], PutMode, Option<bool>, usize); 6] = [
+        let cases: [(&[u16], PutMode, Option<bool>, usize); 5] = [
             (&[412], update.clone(), Some(false), 1), // another write landed first
             (&[409], update.clone(), Some(false), 1), // another write was under way
-            (&[500, 412], update.clone(), None, 2),   // the first may have landed, and the second failed on it
-            (&[500, 200], update.clone(), Some(true), 2),
-            (&[503; TRIES as usize], update, None, tries),
-            (&[500, 200], PutMode::Overwrite, Some(true), 2), // tried again by object_store, as before
+            (&[500, 200], update, None, 1),           // it may have landed, or may yet: the caller reads which
+            (&[503, 200], PutMode::Create, None, 1),
+            (&[500, 200], PutMode::Overwrite, Some(true), 2), // tried again by object_store, as an overwrite may be
         ];
         let (mut got, mut want) = (vec![], vec![]);
         for (plan, mode, landed, puts) in cases {
