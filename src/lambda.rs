@@ -45,11 +45,14 @@ struct Complete {
     error_details: Option<String>,
 }
 
-/// Sends `req` to the function `function`, as the tenant `tenant`, and streams back its answer.
-pub async fn invoke(aws: &Aws, function: &str, tenant: &str, req: Request) -> Result<Response> {
+/// Sends `req` to the function `function`, as the tenant `tenant` if it has tenancy, and streams back its answer.
+/// Lambda refuses an invocation that names a tenant of a function without tenancy, as it does one that names none of
+/// a function with it.
+pub async fn invoke(aws: &Aws, function: &str, tenant: Option<&str>, req: Request) -> Result<Response> {
     let Some(event) = event(req).await? else { return Ok(status(StatusCode::PAYLOAD_TOO_LARGE)) };
     let path = format!("/2021-11-15/functions/{}/response-streaming-invocations", query(function));
-    let res = aws.send("lambda", Method::POST, &path, &[("x-amz-tenant-id", tenant)], event, None).await?;
+    let tenant = tenant.map(|t| ("x-amz-tenant-id", t));
+    let res = aws.send("lambda", Method::POST, &path, tenant.as_slice(), event, None).await?;
     answer(res.into_body().bytes_stream()).await
 }
 

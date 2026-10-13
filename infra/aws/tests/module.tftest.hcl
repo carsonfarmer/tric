@@ -70,8 +70,14 @@ variables {
 
 run "module" {
   assert {
-    condition     = aws_lambda_function.function["serve"].tenancy_config[0].tenant_isolation_mode == "PER_TENANT"
-    error_message = "serve runs a Lambda tenant per app"
+    condition = (
+      aws_lambda_function.function["serve"].tenancy_config[0].tenant_isolation_mode == "PER_TENANT"
+      && alltrue([for f in ["route", "events"] : (
+        aws_lambda_function.function[f].environment[0].variables.TRIC_TENANCY == "true"
+      )])
+      && output.tenancy
+    )
+    error_message = "serve runs a Lambda tenant per app, and the router names the app as the tenant"
   }
   assert {
     condition     = [for f in aws_lambda_function.function : f.reserved_concurrent_executions] == [-1, 200, -1]
@@ -269,6 +275,23 @@ run "module" {
       && length(aws_s3_bucket_lifecycle_configuration.store.rule) == 3
     )
     error_message = "versioned; lifecycle expires noncurrent versions, delete markers, waiting deliveries and sockets"
+  }
+}
+
+# Without tenancy, for a test account that can't make PER_TENANT functions, serve has no tenancy config, and the router
+# names no tenant when it invokes serve.
+run "no_tenancy" {
+  command = plan
+  variables { tenancy = false }
+  assert {
+    condition = (
+      length(aws_lambda_function.function["serve"].tenancy_config) == 0
+      && alltrue([for f in ["route", "events"] : (
+        aws_lambda_function.function[f].environment[0].variables.TRIC_TENANCY == "false"
+      )])
+      && !output.tenancy
+    )
+    error_message = "without tenancy, serve has no tenancy config, and the router knows it"
   }
 }
 

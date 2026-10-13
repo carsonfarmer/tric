@@ -26,6 +26,15 @@ reason.
   that header in the event. serve answers 403 when the header differs from the Host's app, and when credentials are
   missing. It checks what the router wrote, so it guards against the router's mistakes; Lambda's tenancy is what keeps
   apps apart.
+- **Tenancy can be turned off, for a test account only.** An account that can't yet make a `PER_TENANT` function
+  installs with `tenancy = false`. serve then has no tenancy, and its execution environments are shared across apps, so
+  an escape from one app's sandbox could reach another's memory, `/tmp` and credentials. The router, told so by
+  `TRIC_TENANCY`, then names no tenant when it invokes serve: Lambda refuses a tenant id for a function without tenancy
+  (`InvalidParameterValueException`), as it refuses none for a function with it. serve's check is the same either way.
+  The router writes the tenant header in the event, and the adapter (1.0 on) replaces it with the invocation's tenant id
+  only when there is one. `check.sh` reads the setting from tofu's output `tenancy`, and skips, with a SKIP line each,
+  the checks of Lambda's own tenants: serve's mode, a request in another app's tenant, an invocation without a tenant,
+  and apps in separate environments. Tenancy is on by default, and nothing that must keep apps apart runs without it.
 - **The STS session name is the app.** STS allows 2 to 64 characters, which leaves no room for a prefix on top of a
   63-character label, so an app's name is 2 characters at least.
 - **Credentials last an hour,** the most for a role assumed by a role. The router uses them for 45 minutes after it

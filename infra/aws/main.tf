@@ -78,6 +78,16 @@ variable "sweep_every" {
   }
 }
 
+variable "tenancy" {
+  description = <<-EOT
+    Whether serve runs each app in tenants of its own (PER_TENANT), so an execution environment never runs two apps.
+    Off, serve's execution environments are shared across apps: for test accounts that can't make PER_TENANT functions
+    only, never for apps that must be kept apart.
+  EOT
+  type        = bool
+  default     = true
+}
+
 provider "aws" {
   region = var.region
   default_tags { tags = { app = var.name } }
@@ -343,6 +353,8 @@ locals {
     TRIC_SERVE  = local.serve
     TRIC_ROLE   = aws_iam_role.app.arn
     TRIC_ORIGIN = random_password.origin.result
+    # Whether serve has tenancy, so that the router names the app as Lambda's tenant when it invokes serve, or not.
+    TRIC_TENANCY = tostring(var.tenancy)
     # Where a delivery that fails waits for its next try: the group the router schedules in, and what it schedules.
     TRIC_SCHEDULER_GROUP  = local.retries
     TRIC_SCHEDULER_TARGET = local.retry
@@ -403,9 +415,10 @@ resource "aws_lambda_function" "function" {
   # concurrency stays for cron and the outbox. Reserving keeps nothing warm: it costs nothing while idle.
   reserved_concurrent_executions = each.key == "route" ? var.route_concurrency : -1
   environment { variables = merge(each.value.env, { AWS_LWA_PORT = "3000", RUST_LOG = var.log }) }
-  # An app per tenant: a Lambda execution environment never runs two apps.
+  # An app per tenant: a Lambda execution environment never runs two apps. Without tenancy, for test accounts only,
+  # serve's execution environments are shared across apps.
   dynamic "tenancy_config" {
-    for_each = each.key == "serve" ? [1] : []
+    for_each = each.key == "serve" && var.tenancy ? [1] : []
     content { tenant_isolation_mode = "PER_TENANT" }
   }
   depends_on = [aws_cloudwatch_log_group.function, aws_iam_role_policy.route, aws_iam_role_policy.serve]
@@ -619,7 +632,11 @@ output "AWS_REGION" {
   value = var.region
 }
 
-# The checks' (check.sh): the prefix of every name.
+# The checks' (check.sh): the prefix of every name, and whether serve has tenancy.
 output "name" {
   value = var.name
+}
+
+output "tenancy" {
+  value = var.tenancy
 }
