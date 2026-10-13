@@ -24,13 +24,19 @@ P=$(docker compose config --format json 2>/dev/null | jq -r .name) && [ -n "$P" 
 live=$PWD/target/live
 work=$live/apps
 mkdir -p "$work"
-fails=0 checks=0
+fails=0 checks=0 skips=0
 pass() { checks=$((checks + 1)); printf 'PASS  %s\n' "$1"; }
 fail() { checks=$((checks + 1)); fails=$((fails + 1)); printf 'FAIL  %s%s\n' "$1" "${2:+: $2}"; }
 note() { printf 'NOTE  %s\n' "$*"; }
+# A check that can't hold on this install, as serve has no tenancy: $1, and why.
+skip() { skips=$((skips + 1)); printf 'SKIP  %s: %s\n' "$1" "$2"; }
 die() { printf 'FAIL  %s\n' "$*"; exit 2; }
 is() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1" "got [$2], want [$3]"; fi; }
-summary() { echo; echo "$checks checks, $fails failed"; }
+summary() {
+  echo
+  echo "$checks checks, $fails failed"
+  [ $skips = 0 ] || echo "SKIPPED $skips checks: serve has no tenancy, so this install keeps no app's environment apart"
+}
 # What `aws ...` answered: OK, its error code, or "CLI: <text>" if it never reached AWS.
 awscode() {
   local e
@@ -40,12 +46,23 @@ awscode() {
 
 echo "== preflight"
 out() { docker compose -p $P run --rm -T tofu output -raw "$1" </dev/null 2>/dev/null; }
-for k in TRIC_BUCKET TRIC_SCHEDULES TRIC_EVENTS TRIC_SCHEDULER_ROLE TRIC_SWEEP_EVERY AWS_REGION; do
+for k in TRIC_BUCKET TRIC_SCHEDULER_GROUP TRIC_SCHEDULER_TARGET TRIC_SCHEDULER_ROLE TRIC_SWEEP_EVERY AWS_REGION; do
   v=$(out $k) && [ -n "$v" ] || die "tofu output $k is empty: is the install applied, and TF_VAR_domain set?"
   export "$k=$v"
 done
 # The prefix of every name the install made, `tric` unless it was applied with another.
 NAME=$(out name) && [ -n "$NAME" ] || die "tofu output name is empty: is the install applied?"
+# Whether serve has tenancy, as tofu's `tenancy` says. Without it, for a test account that can't make PER_TENANT
+# functions, serve's execution environments are shared across apps: the checks of Lambda's tenancy are skipped, each
+# with a SKIP line, and the rest run.
+case $(out tenancy) in
+  true) tenancy=yes ;;
+  false)
+    tenancy=
+    printf 'SKIP  %s\n' "!!! serve has NO TENANCY (tofu's tenancy = false): apps share its execution environments." \
+      "!!! This is a test install. The checks that need Lambda's tenancy are skipped, each with a SKIP line." ;;
+  *) die "tofu output tenancy is empty: is the install applied?" ;;
+esac
 DOMAIN=${TF_VAR_domain:?set TF_VAR_domain}
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text) || die "no AWS credentials in the environment"
 FN="arn:aws:lambda:$AWS_REGION:$ACCOUNT:function"
@@ -69,7 +86,7 @@ state=$live/late.env
 # The checks are of the code on main, which the package was built from: so the checkout has to be at main's HEAD.
 [ "$(git rev-parse HEAD)" = "$(git rev-parse main)" ] ||
   die "this checkout is not at main's HEAD ($(git rev-parse --short main)): git checkout --detach main"
-aws lambda invoke --generate-cli-skeleton input 2>/dev/null | jq -e 'has("TenantId")' >/dev/null ||
+[ -z "$tenancy" ] || aws lambda invoke --generate-cli-skeleton input 2>/dev/null | jq -e 'has("TenantId")' >/dev/null ||
   die "this AWS CLI has no --tenant-id"
 ip=$(curl -4 -fsS --max-time 10 https://checkip.amazonaws.com) || die "no public IPv4 address"
 [ -f tests/fixtures/app.wasm ] || die "no tests/fixtures/app.wasm: docker compose -p $P run --rm fixtures"
@@ -197,11 +214,11 @@ sweepexpr() {
 }
 # The names of app $1's schedules in the cron group, which all begin with the hash of its name (src/deploy.rs).
 schedules() {
-  aws scheduler list-schedules --group-name "$TRIC_SCHEDULES" --name-prefix "$(sha "$1" 24)-" \
+  aws scheduler list-schedules --group-name "$TRIC_SCHEDULER_GROUP" --name-prefix "$(sha "$1" 24)-" \
     --query 'Schedules[].Name' --output text | listed
 }
 # Schedule $1 of the cron group, as JSON.
-schedule() { aws scheduler get-schedule --group-name "$TRIC_SCHEDULES" --name "$1" --output json; }
+schedule() { aws scheduler get-schedule --group-name "$TRIC_SCHEDULER_GROUP" --name "$1" --output json; }
 # The names of the schedules of app $1 that are its sweep: those whose input is {"app", "sweep": true}.
 sweepsof() {
   local n
@@ -283,7 +300,7 @@ toml() {
 deploy() {
   if docker run --rm -v "$PWD:/src" -v ${P}_cargo:/opt/cargo/registry -v ${P}_target:/src/target -v "$work:/work" \
     -w /src -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN -e AWS_REGION \
-    -e TRIC_BUCKET -e TRIC_SCHEDULES -e TRIC_EVENTS -e TRIC_SCHEDULER_ROLE -e TRIC_SWEEP_EVERY \
+    -e TRIC_BUCKET -e TRIC_SCHEDULER_GROUP -e TRIC_SCHEDULER_TARGET -e TRIC_SCHEDULER_ROLE -e TRIC_SWEEP_EVERY \
     $P-build cargo run --locked --release -q -- deploy "/work/$1" </dev/null; then pass "deploy $1"
   else fail "deploy $1"; fi
 }
@@ -307,7 +324,8 @@ unschedule() {
   local a n
   for a in alpha beta gamma delta; do
     for n in $(schedules $a); do
-      aws scheduler delete-schedule --group-name "$TRIC_SCHEDULES" --name "$n" >/dev/null || fail "delete $a's schedule"
+      aws scheduler delete-schedule --group-name "$TRIC_SCHEDULER_GROUP" --name "$n" >/dev/null \
+        || fail "delete $a's schedule"
     done
     is "no schedule of $a is left" "$(schedules $a | grep -c .)" 0
   done
@@ -345,7 +363,7 @@ trap teardown EXIT
 deploy beta
 deploy gamma
 deploy delta
-note "schedules: $(aws scheduler list-schedules --group-name "$TRIC_SCHEDULES" --query 'Schedules[].Name' \
+note "schedules: $(aws scheduler list-schedules --group-name "$TRIC_SCHEDULER_GROUP" --query 'Schedules[].Name' \
   --output text)"
 
 echo "== sweep schedules (each app's, in the cron group)"
@@ -364,7 +382,7 @@ for a in alpha beta gamma delta; do
     is "$a's sweep is in UTC, in no flexible window, and on" "$(jq -r '[.ScheduleExpressionTimezone // "UTC",
       .FlexibleTimeWindow.Mode, .State] | join(" ")' <<<"$sched")" "UTC OFF ENABLED"
     is "$a's sweep is in the cron group, and runs the cron alias as Scheduler's role" "$(jq -r \
-      --arg g "$TRIC_SCHEDULES" --arg t "$TRIC_EVENTS" --arg r "$TRIC_SCHEDULER_ROLE" \
+      --arg g "$TRIC_SCHEDULER_GROUP" --arg t "$TRIC_SCHEDULER_TARGET" --arg r "$TRIC_SCHEDULER_ROLE" \
       '.GroupName == $g and .Target.Arn == $t and .Target.RoleArn == $r' <<<"$sched")" true
   else fail "$a's sweep schedule can be read"; fi
 done
@@ -433,8 +451,15 @@ is "the router's resource policy invokes only through its URL" "$(aws lambda get
 invoke $NAME-route "{\"app\":\"beta\",\"path\":\"/@forged-$run/echo\"}" >/dev/null
 
 echo "== tenants"
-is "serve is per tenant" "$(aws lambda get-function-configuration --function-name $NAME-serve \
-  --query TenancyConfig.TenantIsolationMode --output text)" PER_TENANT
+# Without tenancy, the router names no Lambda tenant, and serve's check of the tenant header the router wrote is what
+# remains: the checks of that header run either way, and those of Lambda's own tenants are skipped.
+mode=$(aws lambda get-function-configuration --function-name $NAME-serve --query TenancyConfig.TenantIsolationMode \
+  --output text)
+if [ -n "$tenancy" ]; then is "serve is per tenant" "$mode" PER_TENANT
+else
+  is "serve has no tenancy, as tofu's tenancy says" "$mode" None
+  skip "serve is per tenant" "serve has no tenancy"
+fi
 # A function-URL event, as the router sends serve: Host $1, tenant header $2, and $3 as more headers.
 event() {
   local more=${3:-}
@@ -446,19 +471,24 @@ event() {
 }
 fake=$(jq -cn '{"x-tric-credentials": ({Version: 1, AccessKeyId: "ASIAXXXXXXXXXXXXXXXX", SecretAccessKey: "x",
   SessionToken: "x", Expiration: "2030-01-01T00:00:00Z"} | tojson)}')
-# serve's status for Host $1, tenant header $2, more headers $3, in Lambda tenant $4.
-st() { invoke $NAME-serve "$(event "$1" "$2" "$3")" --tenant-id "$4" | status; }
+# serve's status for Host $1, tenant header $2, more headers $3, in Lambda tenant $4 if serve has tenancy.
+st() { invoke $NAME-serve "$(event "$1" "$2" "$3")" ${tenancy:+--tenant-id "$4"} | status; }
 s=$(st "alpha.$DOMAIN" alpha "$fake" alpha)
 if [ -n "$s" ] && [ "$s" != 403 ]; then pass "made-up credentials in alpha's own tenant get past serve's gate ($s)"
 else fail "made-up credentials in alpha's own tenant get past serve's gate" "status [$s]"; fi
 is "serve refuses another app's Host in alpha's tenant" "$(st "beta.$DOMAIN" alpha "$fake" alpha)" 403
 is "serve refuses a tenant header that isn't the Host's app" "$(st "alpha.$DOMAIN" beta "$fake" alpha)" 403
-is "serve refuses alpha's request in beta's tenant" "$(st "alpha.$DOMAIN" alpha "$fake" beta)" 403
 is "serve refuses a request without credentials" "$(st "alpha.$DOMAIN" alpha "" alpha)" 403
-e=$(aws lambda invoke --function-name $NAME-serve --cli-binary-format raw-in-base64-out \
-  --payload "$(event "alpha.$DOMAIN" alpha)" /dev/null 2>&1 >/dev/null)
-if grep -qi tenant <<<"$e"; then pass "serve can't be invoked without a tenant"
-else fail "serve can't be invoked without a tenant" "$(head -c 160 <<<"${e:-it ran}")"; fi
+if [ -n "$tenancy" ]; then
+  is "serve refuses alpha's request in beta's tenant" "$(st "alpha.$DOMAIN" alpha "$fake" beta)" 403
+  e=$(aws lambda invoke --function-name $NAME-serve --cli-binary-format raw-in-base64-out \
+    --payload "$(event "alpha.$DOMAIN" alpha)" /dev/null 2>&1 >/dev/null)
+  if grep -qi tenant <<<"$e"; then pass "serve can't be invoked without a tenant"
+  else fail "serve can't be invoked without a tenant" "$(head -c 160 <<<"${e:-it ran}")"; fi
+else
+  skip "serve refuses alpha's request in beta's tenant" "serve has no Lambda tenants"
+  skip "serve can't be invoked without a tenant" "serve has no tenancy, so it is invoked without one"
+fi
 post "$A/@n-$run/kv?op=set&key=k&value=alpha" >/dev/null
 post "$B/@n-$run/kv?op=set&key=k&value=beta" >/dev/null
 post "$A/@n-$run/kv?op=set&key=only-alpha&value=1" >/dev/null
@@ -475,12 +505,16 @@ streams() {
   aws logs filter-log-events --log-group-name /aws/lambda/$NAME-serve --start-time "$1" \
     --filter-pattern '"probe-stdout"' --query 'events[].logStreamName' --output text | tr '\t' '\n' | grep . | sort -u
 }
-t=$(now); get "$A/print" >/dev/null; sleep 20; sa=$(streams "$t")
-t=$(now); get "$B/print" >/dev/null; sleep 20; sb=$(streams "$t")
-if [ -n "$sa" ] && [ -n "$sb" ] && [ -z "$(comm -12 <(echo "$sa") <(echo "$sb"))" ]; then
-  pass "alpha and beta ran in different execution environments"
+if [ -z "$tenancy" ]; then
+  skip "alpha and beta ran in different execution environments" "without tenancy, apps share serve's environments"
 else
-  fail "alpha and beta ran in different execution environments" "alpha [$(xargs <<<"$sa")] beta [$(xargs <<<"$sb")]"
+  t=$(now); get "$A/print" >/dev/null; sleep 20; sa=$(streams "$t")
+  t=$(now); get "$B/print" >/dev/null; sleep 20; sb=$(streams "$t")
+  if [ -n "$sa" ] && [ -n "$sb" ] && [ -z "$(comm -12 <(echo "$sa") <(echo "$sb"))" ]; then
+    pass "alpha and beta ran in different execution environments"
+  else
+    fail "alpha and beta ran in different execution environments" "alpha [$(xargs <<<"$sa")] beta [$(xargs <<<"$sb")]"
+  fi
 fi
 
 echo "== credentials (IAM's policy simulator)"
@@ -587,8 +621,8 @@ for p in apps/alpha/values/ apps/alpha/names/ apps/alpha/ outbox/; do
 done
 for t in "lambda:InvokeFunction $FN:$NAME-events" "lambda:InvokeFunction $FN:$NAME-events:outbox" \
   "s3:GetObject $B3/apps/alpha/names/x" "s3:PutObject $B3/apps/alpha/names/x" "s3:PutObject $B3/x" \
-  "s3:ListBucket $B3" "s3:DeleteObject $B3/apps/alpha/current" "scheduler:CreateSchedule $SCHED/$TRIC_SCHEDULES/x" \
-  "iam:PassRole arn:aws:iam::$ACCOUNT:role/$NAME-cron"; do
+  "s3:ListBucket $B3" "s3:DeleteObject $B3/apps/alpha/current" \
+  "scheduler:CreateSchedule $SCHED/$TRIC_SCHEDULER_GROUP/x" "iam:PassRole arn:aws:iam::$ACCOUNT:role/$NAME-cron"; do
   is "the router's role is denied $t" "$(psim $NAME-route $t)" implicitDeny
 done
 is "serve may invoke the outbox alias" "$(psim $NAME-serve lambda:InvokeFunction "$FN:$NAME-events:outbox")" allowed

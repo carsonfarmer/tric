@@ -539,7 +539,8 @@ overlay applied at the commit.
   - `events`, which takes only events, each source's by its own alias: `cron`, `outbox`, `retry` and `ws`. The `outbox`
     and `retry` aliases carry the async config: two retries and a 6 h maximum event age, and no destination. If the
     router itself fails on one of them, Lambda tries twice more and then drops the event.
-- **serve:** per tenant (`PER_TENANT`), with no URL. Only the router may invoke it.
+- **serve:** per tenant (`PER_TENANT`), with no URL. Only the router may invoke it. `tenancy = false`, for a test
+  account only, installs it without tenancy, and apps then share its execution environments.
 - **Sockets:** API Gateway WebSocket, which CloudFront sends a request with `Sec-WebSocket-Key`. It invokes
   `events:ws`, buffered, with no route response, behind a stage throttle.
 - **The roles:**

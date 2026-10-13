@@ -26,6 +26,15 @@ reason.
   that header in the event. serve answers 403 when the header differs from the Host's app, and when credentials are
   missing. It checks what the router wrote, so it guards against the router's mistakes; Lambda's tenancy is what keeps
   apps apart.
+- **Tenancy can be turned off, for a test account only.** An account that can't yet make a `PER_TENANT` function
+  installs with `tenancy = false`. serve then has no tenancy, and its execution environments are shared across apps, so
+  an escape from one app's sandbox could reach another's memory, `/tmp` and credentials. The router, told so by
+  `TRIC_TENANCY`, then names no tenant when it invokes serve: Lambda refuses a tenant id for a function without tenancy
+  (`InvalidParameterValueException`), as it refuses none for a function with it. serve's check is the same either way.
+  The router writes the tenant header in the event, and the adapter (1.0 on) replaces it with the invocation's tenant id
+  only when there is one. `check.sh` reads the setting from tofu's output `tenancy`, and skips, with a SKIP line each,
+  the checks of Lambda's own tenants: serve's mode, a request in another app's tenant, an invocation without a tenant,
+  and apps in separate environments. Tenancy is on by default, and nothing that must keep apps apart runs without it.
 - **The STS session name is the app.** STS allows 2 to 64 characters, which leaves no room for a prefix on top of a
   63-character label, so an app's name is 2 characters at least.
 - **Credentials last an hour,** the most for a role assumed by a role. The router uses them for 45 minutes after it
@@ -89,6 +98,11 @@ reason.
   schedule can assume it. The module makes the two alike, a group and a role for each alias, named `<name>-cron` and
   `<name>-retry`. The router's two functions share its role, so `route` holds these grants as well; it takes no event,
   and the grants are narrow.
+- **deploy and the router are told where schedules go by the same three settings,** `TRIC_SCHEDULER_GROUP`,
+  `TRIC_SCHEDULER_TARGET` and `TRIC_SCHEDULER_ROLE`, or `--scheduler-*`: deploy is given the cron group's, and the
+  router the retry group's. One clap group parses them for both, and each is required once any is given, so a scheduler
+  set by half fails at start, naming what it lacks. Before, each had three names of its own, which `main` zipped into
+  one by hand.
 - **A delivery event's record is kept two to three days.** serve sends an event's requests only if the name's head holds
   the record its commit made of it, so a record must outlast the last try: Lambda's queue holds an event 6 hours at
   most, the window is 24 hours from the first failure, and Scheduler's minute and Lambda's own two retries of a try add
@@ -129,8 +143,11 @@ reason.
   `InvokeComplete`'s error code.
 - **A header value that isn't UTF-8 is passed on lossily,** with U+FFFD for the bad bytes: a function-URL event is
   JSON, which holds text only. Refusing the request would fail a client over a header the app may never read.
-- **The event stream's CRCs go unchecked,** and its headers are read as strings only, the one type Lambda sends: TLS
-  already refuses a corrupted stream, and a header of any other type fails the answer.
+- **The event stream is read by `aws-smithy-eventstream`,** AWS's own reader, which checks each message's CRCs and
+  reads headers of every type; tric looks only at string ones, the one type Lambda sends. tric's own reader, some 40
+  lines that checked no CRC, is gone; the crate brings `aws-smithy-types` and 11 small crates with it (`time` among
+  them), all MIT or Apache-2.0, and none a second version of one tric has. tric still refuses a message over 16 MiB
+  from its length alone, before holding it, which the crate's own streaming decoder doesn't.
 - **The router's concurrency is capped,** at `route_concurrency`, 200 by default, reserved from the account's 1,000.
   Each router calls one serve, so a flood of client requests holds at most about 400 of the 1,000, and the rest stays
   for cron and the outbox; requests past 200 get 429. Reserved concurrency is free and keeps nothing warm, so scale
@@ -460,15 +477,19 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   (<https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html>), and says to retry a 503 Slow Down with
   exponential backoff
   (<https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-design-patterns.html>).
-- **tric tries a conditional put again itself, so it knows what a refusal follows.** Conditional puts go through a
-  client with object_store's retries off (`max_retries: 0`), which shares its credentials and connections with the one
-  for everything else. A store on S3 holds both, and `Store::put` sends a conditional put by the one that does not
-  retry (`Store::once`); the memory store, which loses no answer, has the one. It was an `ObjectStore` that wrapped the
-  two and passed every other call on, eight methods and a `Display` for one choice that only `Store::put` makes. An
-  overwrite, which is idempotent, keeps object_store's retries. `Store::put` tries a conditional put again, as it was,
-  after an error that is not a refusal, up to `TRIES` (4) times, from 50 to 100 ms apart and twice as long each time. A
-  refusal at the first try is a conflict, as before, and the turn runs again at once. A refusal after a try that may
-  have landed is an error, and the caller reads the head to learn what landed.
+- **tric sends a conditional put once, so a refusal is of that send.** Conditional puts go through a client with
+  object_store's retries off (`max_retries: 0`), which shares its credentials and connections with the one for
+  everything else. A store on S3 holds both, and `Store::put` sends a conditional put by the one that does not retry
+  (`Store::once`); the memory store, which loses no answer, has the one. It was an `ObjectStore` that wrapped the two
+  and passed every other call on, eight methods and a `Display` for one choice that only `Store::put` makes. An
+  overwrite, which is idempotent, keeps object_store's retries. A refusal (412, 409, or 404 on `If-Match`) is a
+  conflict, and the turn runs again at once. Any other error, as a 5xx, a 429 or a lost connection, may have landed, and
+  the commit reads the head to learn what did (below), and puts itself again only while the head is still its base.
+  - `Store::put` tried a conditional put again itself, up to `TRIES` (4) times, from 50 to 100 ms apart and twice as
+    long each time, and a refusal after a try that may have landed was an error, on which the commit read the head.
+    That was a second loop of tries, with its own rule for what a refusal means, before `Turn::land`'s, which does the
+    same job and puts again only once a read says that nothing has landed. The cost is a GET of the head before each
+    put again, and waits from 100 ms where they were from 50 ms, on an error that S3 rarely gives.
 - **A head names the commit that wrote it, and that id is the name's `ETag`.** A head holds `commit`, the id of the
   commit that wrote it, 128 random bits in hex, which every commit draws afresh. So no head's bytes are ever another's,
   and no head's `ETag` in the bucket is either: S3's `ETag` changes only with an object's contents, and for an object

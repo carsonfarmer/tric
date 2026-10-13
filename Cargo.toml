@@ -28,6 +28,10 @@ ws = ["dep:hyper-util", "dep:tokio-tungstenite"]
 
 [dependencies]
 async-trait = "0.1" # as object_store has it, for a store of tric's own
+# AWS's own reader of an event stream, as `InvokeWithResponseStream` answers, which checks its CRCs; and the types
+# it reads into.
+aws-smithy-eventstream = "0.61"
+aws-smithy-types = "1"
 base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", default-features = false } # as object_store has it, for cron's calendar
