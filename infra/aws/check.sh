@@ -694,8 +694,8 @@ envs() {
   aws lambda get-function-configuration --function-name "$NAME-$1" --query 'Environment.Variables | keys(@)' \
     --output text | tr '\t' '\n'
 }
-is "only $NAME-route holds the origin secret" \
-  "$(for f in route events serve; do envs $f | grep -qx TRIC_ORIGIN && echo $f; done)" route
+is "only the router's functions hold the origin secret, which CloudFront sends both" \
+  "$(for f in route events serve; do envs $f | grep -qx TRIC_ORIGIN && echo $f; done | xargs)" "route events"
 for f in route events serve; do
   is "$NAME-$f has no provisioned concurrency" "$(aws lambda list-provisioned-concurrency-configs \
     --function-name $NAME-$f --query 'length(ProvisionedConcurrencyConfigs)' --output text)" 0
