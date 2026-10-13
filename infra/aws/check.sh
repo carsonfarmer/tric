@@ -40,7 +40,7 @@ awscode() {
 
 echo "== preflight"
 out() { docker compose -p $P run --rm -T tofu output -raw "$1" </dev/null 2>/dev/null; }
-for k in TRIC_BUCKET TRIC_SCHEDULES TRIC_EVENTS TRIC_SCHEDULER_ROLE TRIC_SWEEP_EVERY AWS_REGION; do
+for k in TRIC_BUCKET TRIC_SCHEDULER_GROUP TRIC_SCHEDULER_TARGET TRIC_SCHEDULER_ROLE TRIC_SWEEP_EVERY AWS_REGION; do
   v=$(out $k) && [ -n "$v" ] || die "tofu output $k is empty: is the install applied, and TF_VAR_domain set?"
   export "$k=$v"
 done
@@ -197,11 +197,11 @@ sweepexpr() {
 }
 # The names of app $1's schedules in the cron group, which all begin with the hash of its name (src/deploy.rs).
 schedules() {
-  aws scheduler list-schedules --group-name "$TRIC_SCHEDULES" --name-prefix "$(sha "$1" 24)-" \
+  aws scheduler list-schedules --group-name "$TRIC_SCHEDULER_GROUP" --name-prefix "$(sha "$1" 24)-" \
     --query 'Schedules[].Name' --output text | listed
 }
 # Schedule $1 of the cron group, as JSON.
-schedule() { aws scheduler get-schedule --group-name "$TRIC_SCHEDULES" --name "$1" --output json; }
+schedule() { aws scheduler get-schedule --group-name "$TRIC_SCHEDULER_GROUP" --name "$1" --output json; }
 # The names of the schedules of app $1 that are its sweep: those whose input is {"app", "sweep": true}.
 sweepsof() {
   local n
@@ -283,7 +283,7 @@ toml() {
 deploy() {
   if docker run --rm -v "$PWD:/src" -v ${P}_cargo:/opt/cargo/registry -v ${P}_target:/src/target -v "$work:/work" \
     -w /src -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN -e AWS_REGION \
-    -e TRIC_BUCKET -e TRIC_SCHEDULES -e TRIC_EVENTS -e TRIC_SCHEDULER_ROLE -e TRIC_SWEEP_EVERY \
+    -e TRIC_BUCKET -e TRIC_SCHEDULER_GROUP -e TRIC_SCHEDULER_TARGET -e TRIC_SCHEDULER_ROLE -e TRIC_SWEEP_EVERY \
     $P-build cargo run --locked --release -q -- deploy "/work/$1" </dev/null; then pass "deploy $1"
   else fail "deploy $1"; fi
 }
@@ -307,7 +307,8 @@ unschedule() {
   local a n
   for a in alpha beta gamma delta; do
     for n in $(schedules $a); do
-      aws scheduler delete-schedule --group-name "$TRIC_SCHEDULES" --name "$n" >/dev/null || fail "delete $a's schedule"
+      aws scheduler delete-schedule --group-name "$TRIC_SCHEDULER_GROUP" --name "$n" >/dev/null \
+        || fail "delete $a's schedule"
     done
     is "no schedule of $a is left" "$(schedules $a | grep -c .)" 0
   done
@@ -345,7 +346,7 @@ trap teardown EXIT
 deploy beta
 deploy gamma
 deploy delta
-note "schedules: $(aws scheduler list-schedules --group-name "$TRIC_SCHEDULES" --query 'Schedules[].Name' \
+note "schedules: $(aws scheduler list-schedules --group-name "$TRIC_SCHEDULER_GROUP" --query 'Schedules[].Name' \
   --output text)"
 
 echo "== sweep schedules (each app's, in the cron group)"
@@ -364,7 +365,7 @@ for a in alpha beta gamma delta; do
     is "$a's sweep is in UTC, in no flexible window, and on" "$(jq -r '[.ScheduleExpressionTimezone // "UTC",
       .FlexibleTimeWindow.Mode, .State] | join(" ")' <<<"$sched")" "UTC OFF ENABLED"
     is "$a's sweep is in the cron group, and runs the cron alias as Scheduler's role" "$(jq -r \
-      --arg g "$TRIC_SCHEDULES" --arg t "$TRIC_EVENTS" --arg r "$TRIC_SCHEDULER_ROLE" \
+      --arg g "$TRIC_SCHEDULER_GROUP" --arg t "$TRIC_SCHEDULER_TARGET" --arg r "$TRIC_SCHEDULER_ROLE" \
       '.GroupName == $g and .Target.Arn == $t and .Target.RoleArn == $r' <<<"$sched")" true
   else fail "$a's sweep schedule can be read"; fi
 done
@@ -587,8 +588,8 @@ for p in apps/alpha/values/ apps/alpha/names/ apps/alpha/ outbox/; do
 done
 for t in "lambda:InvokeFunction $FN:$NAME-events" "lambda:InvokeFunction $FN:$NAME-events:outbox" \
   "s3:GetObject $B3/apps/alpha/names/x" "s3:PutObject $B3/apps/alpha/names/x" "s3:PutObject $B3/x" \
-  "s3:ListBucket $B3" "s3:DeleteObject $B3/apps/alpha/current" "scheduler:CreateSchedule $SCHED/$TRIC_SCHEDULES/x" \
-  "iam:PassRole arn:aws:iam::$ACCOUNT:role/$NAME-cron"; do
+  "s3:ListBucket $B3" "s3:DeleteObject $B3/apps/alpha/current" \
+  "scheduler:CreateSchedule $SCHED/$TRIC_SCHEDULER_GROUP/x" "iam:PassRole arn:aws:iam::$ACCOUNT:role/$NAME-cron"; do
   is "the router's role is denied $t" "$(psim $NAME-route $t)" implicitDeny
 done
 is "serve may invoke the outbox alias" "$(psim $NAME-serve lambda:InvokeFunction "$FN:$NAME-events:outbox")" allowed

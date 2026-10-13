@@ -344,9 +344,9 @@ locals {
     TRIC_ROLE   = aws_iam_role.app.arn
     TRIC_ORIGIN = random_password.origin.result
     # Where a delivery that fails waits for its next try: the group the router schedules in, and what it schedules.
-    TRIC_RETRIES    = local.retries
-    TRIC_RETRY      = local.retry
-    TRIC_RETRY_ROLE = aws_iam_role.scheduler["retry"].arn
+    TRIC_SCHEDULER_GROUP  = local.retries
+    TRIC_SCHEDULER_TARGET = local.retry
+    TRIC_SCHEDULER_ROLE   = aws_iam_role.scheduler["retry"].arn
   }
   functions = {
     # Clients' requests, which only CloudFront's secret lets in.
@@ -599,11 +599,11 @@ output "TRIC_BUCKET" {
   value = aws_s3_bucket.store.id
 }
 
-output "TRIC_SCHEDULES" {
+output "TRIC_SCHEDULER_GROUP" {
   value = aws_scheduler_schedule_group.scheduler["cron"].name
 }
 
-output "TRIC_EVENTS" {
+output "TRIC_SCHEDULER_TARGET" {
   value = aws_lambda_alias.events["cron"].arn
 }
 

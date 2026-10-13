@@ -89,6 +89,11 @@ reason.
   schedule can assume it. The module makes the two alike, a group and a role for each alias, named `<name>-cron` and
   `<name>-retry`. The router's two functions share its role, so `route` holds these grants as well; it takes no event,
   and the grants are narrow.
+- **deploy and the router are told where schedules go by the same three settings,** `TRIC_SCHEDULER_GROUP`,
+  `TRIC_SCHEDULER_TARGET` and `TRIC_SCHEDULER_ROLE`, or `--scheduler-*`: deploy is given the cron group's, and the
+  router the retry group's. One clap group parses them for both, and each is required once any is given, so a scheduler
+  set by half fails at start, naming what it lacks. Before, each had three names of its own, which `main` zipped into
+  one by hand.
 - **A delivery event's record is kept two to three days.** serve sends an event's requests only if the name's head holds
   the record its commit made of it, so a record must outlast the last try: Lambda's queue holds an event 6 hours at
   most, the window is 24 hours from the first failure, and Scheduler's minute and Lambda's own two retries of a try add

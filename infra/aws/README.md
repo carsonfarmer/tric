@@ -115,14 +115,14 @@ and its sweep, every `sweep_every` (`1d` by default; hours that divide a day, as
 Install `tric` with `cargo install --locked --path .` in a checkout, then take its settings from the install's outputs:
 
 ```bash
-for k in TRIC_BUCKET TRIC_SCHEDULES TRIC_EVENTS TRIC_SCHEDULER_ROLE TRIC_SWEEP_EVERY AWS_REGION; do
+for k in TRIC_BUCKET TRIC_SCHEDULER_GROUP TRIC_SCHEDULER_TARGET TRIC_SCHEDULER_ROLE TRIC_SWEEP_EVERY AWS_REGION; do
   export "$k=$(docker compose run --rm -T tofu output -raw "$k")"
 done
 tric deploy path/to/app    # then https://<app>.example.com
 ```
 
-`TRIC_EVENTS` is the `cron` alias of `tric-events`, which the app's schedules invoke. A new `sweep_every` reaches
-each app at its next deploy.
+`TRIC_SCHEDULER_TARGET` is the `cron` alias of `tric-events`, which the app's schedules invoke. A new `sweep_every`
+reaches each app at its next deploy.
 
 The app's name must be a DNS label. On AWS, a cron expression may restrict the day of the month or the day of the
 week, but not both, because Scheduler can't express both. tric refuses it everywhere, so an app runs the same in

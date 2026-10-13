@@ -75,21 +75,43 @@ async fn cached<V: Clone>(
     Ok(v)
 }
 
+/// `tric route`'s flags and environment.
+#[derive(clap::Args)]
+pub struct Args {
+    #[arg(long, default_value = "127.0.0.1:3000")]
+    listen: SocketAddr,
+    /// Where serve hands over delivery events
+    #[arg(long, default_value = "127.0.0.1:3001")]
+    outbox_listen: SocketAddr,
+    /// Apps are at `<app>.DOMAIN`, the port included
+    #[arg(long, env = "TRIC_DOMAIN")]
+    domain: String,
+    #[arg(long, env = "TRIC_BUCKET")]
+    bucket: String,
+    /// serve: a Lambda function, by its ARN, which runs this router as Lambda's, or `host:port`
+    #[arg(long, env = "TRIC_SERVE")]
+    serve: String,
+    /// The role whose sessions are the apps' credentials; none where STS takes none, as RustFS's
+    #[arg(long, env = "TRIC_ROLE")]
+    role: Option<String>,
+    /// The secret CloudFront sends as `X-Tric-Origin`, without which a request, or a socket's opening, is refused;
+    /// a router without one takes only events
+    #[arg(long, env = "TRIC_ORIGIN", hide_env_values = true)]
+    origin: Option<String>,
+    /// On AWS, where a failed delivery's retries are scheduled
+    #[command(flatten)]
+    retries: Option<Scheduler>,
+    /// Where it ticks cron itself, how often each app is swept: hours that divide a day, as `6h`, or days, as `2d`
+    #[arg(long, env = "TRIC_SWEEP_EVERY", default_value = "1d")]
+    sweep_every: Every,
+}
+
 /// Routes requests for `<app>.<domain>` on `listen` to serve, with credentials for `bucket` minted as `role`. serve is
 /// a Lambda function, by its ARN, and then `retries` is where deliveries wait, or else at `host:port`, and then the
-/// router takes invocations on `outbox`, and ticks cron, sweeping each app `every` so often.
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    listen: SocketAddr,
-    outbox: SocketAddr,
-    domain: String,
-    bucket: String,
-    serve: String,
-    role: Option<String>,
-    origin: Option<String>,
-    retries: Option<Scheduler>,
-    every: Every,
-) -> Result<()> {
+/// router takes invocations on `outbox_listen`, and ticks cron, sweeping each app `sweep_every` so often.
+pub async fn run(args: Args) -> Result<()> {
+    let Args { listen, outbox_listen, domain, bucket, serve, role, origin, retries, sweep_every: every } = args;
+    let origin = origin.filter(|o| !o.is_empty()); // an empty secret is none
     ensure!(
         serve.starts_with("arn:") == retries.is_some(),
         "a router has retries if, and only if, its serve is a Lambda function"
@@ -103,7 +125,7 @@ pub async fn run(
     // Locally, events have a listener of their own, which is up before the router says it is.
     let events = match route.serve.starts_with("arn:") {
         true => None,
-        false => Some(TcpListener::bind(outbox).await?),
+        false => Some(TcpListener::bind(outbox_listen).await?),
     };
     eprintln!("routing at http://{}", clients.local_addr()?);
     let Some(events) = events else {

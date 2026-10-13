@@ -239,11 +239,12 @@ run "module" {
   }
   assert {
     condition = alltrue([for f in ["route", "events"] : (
-      aws_lambda_function.function[f].environment[0].variables.TRIC_RETRIES == "tric-retry"
-      && aws_lambda_function.function[f].environment[0].variables.TRIC_RETRY
+      aws_lambda_function.function[f].environment[0].variables.TRIC_SCHEDULER_GROUP == "tric-retry"
+      && aws_lambda_function.function[f].environment[0].variables.TRIC_SCHEDULER_TARGET
       == "arn:aws:lambda:us-west-2:123456789012:function:tric-events:retry"
-      && aws_lambda_function.function[f].environment[0].variables.TRIC_RETRY_ROLE == aws_iam_role.scheduler["retry"].arn
-    )]) && !strcontains(jsonencode(aws_lambda_function.function["serve"].environment), "TRIC_RETRY")
+      && aws_lambda_function.function[f].environment[0].variables.TRIC_SCHEDULER_ROLE
+      == aws_iam_role.scheduler["retry"].arn
+    )]) && !strcontains(jsonencode(aws_lambda_function.function["serve"].environment), "TRIC_SCHEDULER")
     error_message = "the router knows where retries go, and serve does not"
   }
   assert {
