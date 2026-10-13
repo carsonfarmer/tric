@@ -155,18 +155,25 @@ reason.
 ## Storage and turns
 
 - **A turn runs again only while it is repeatable, and nothing claims a name.** A turn that another commit beat runs
-  again, unseen, while tric holds all its body (`REPLAY_MAX`, 6 MiB) and it has sent no unsafe outbound request, and
-  until its deadline (`tric::DEADLINE`, 5 s after it began). A body over the buffer can be read once (`Body::Once`), and
-  an unsafe request only marks the turn (`Turn::repeatable`). One that may not run again, or whose deadline has passed,
-  lands nothing, and answers 503 with `Retry-After: 1`: what it sent stays sent, nothing it wrote landed, and the client
-  may try again knowing both. Before, a turn claimed its name at its first irreversible step, or after 1 s, with a put
-  of the head that kept other turns off it: a re-run claimed when it opened, a busy name answered 429, a turn whose
-  claim ran out (`CLAIM_TTL`, 15 s) as it committed answered 500, and clearing `pending` had to keep clear of a claimed
-  head. That was a put of the head for each claim and each release, a lease, two answers and their states, for one gain:
-  an irreversible turn was sure to commit unless its claim ran out. Now it is not, which is the cost. On a busy name
-  such a turn can lose, and answer 503 though it sent what it sent; and a long turn on a busy name runs again until its
-  deadline and then answers 503, where a claim would have held the name for it. A short turn whose body tric holds and
-  that sends nothing unsafe, the common case, loses nothing.
+  again, unseen, while it has sent no unsafe outbound request, and until its deadline (`tric::DEADLINE`, 5 s after it
+  began). An unsafe request only marks the turn (`Turn::repeatable`). One that may not run again, or whose deadline has
+  passed, lands nothing, and answers 503 with `Retry-After: 1`: what it sent stays sent, nothing it wrote landed, and
+  the client may try again knowing both. Before, a turn claimed its name at its first irreversible step, or after 1 s,
+  with a put of the head that kept other turns off it: a re-run claimed when it opened, a busy name answered 429, a turn
+  whose claim ran out (`CLAIM_TTL`, 15 s) as it committed answered 500, and clearing `pending` had to keep clear of a
+  claimed head. That was a put of the head for each claim and each release, a lease, two answers and their states, for
+  one gain: an irreversible turn was sure to commit unless its claim ran out. Now it is not, which is the cost. On a
+  busy name such a turn can lose, and answer 503 though it sent what it sent; and a long turn on a busy name runs again
+  until its deadline and then answers 503, where a claim would have held the name for it. A short turn that sends
+  nothing unsafe, the common case, loses nothing.
+- **A turn's body is held whole, and is 4 MiB at most, else 413** (`tric::BODY_MAX`). That is the most Lambda takes:
+  its events are 6 MB at most, and the body goes in base64, so the router's Lambda client refuses a larger one of any
+  request, and shares the constant. Before, tric kept a turn's body up to 6 MiB, and past that let the guest read the
+  rest as it came, once, so the turn could not run again; a keyed one was 413, as it could not be hashed first. On AWS
+  no body over 4 MiB reached tric, so that path ran only locally. Now dev, a stack and AWS answer alike, every turn's
+  body can be given again, and only an unsafe request or the deadline stops a re-run. A body that fails as it is read
+  is 400. Its trailers are dropped, as Lambda's event has none to carry. A request that is not a turn streams its body
+  into the guest, unbounded locally, and 4 MiB at most on Lambda.
 - **A delivery event is sent once its record is in the name's tree, and dropped once it can never be.** A commit with
   background requests hands them to the outbox as one event before it puts its head, and writes in its tree, so in
   the same compare-and-swap, the empty key `o/<day>/<digest>`, the digest being the SHA-256 of the event's JSON. serve,
@@ -987,9 +994,8 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   without a name commits nothing to record it with. A WebSocket's events do not carry the upgrade's key, which would
   answer each event after the first as the first.
 - **The fingerprint is the SHA-256 of the method, a space, the path and query, a line feed and the body.** Headers are
-  not in it, so a retry is not told apart by its `Content-Type` or its date. A keyed body past `REPLAY_MAX` (6 MiB) is
-  413, as only a kept body can be hashed before the turn runs; hashing a body as it streams into the guest, and
-  recording after, would be more code for uploads that a client can send without a key.
+  not in it, so a retry is not told apart by its `Content-Type` or its date. The body is hashed as tric holds it,
+  whole, before the turn runs.
 - **Every keyed turn that commits records, whatever it changed.** A turn that changed nothing still puts a head, to
   hold the record, so a retry is answered as the first was even when what the first found has changed since: a
   create-if-absent that found the thing there answers 200 again, and does not create it after it was deleted. The cost
@@ -1027,7 +1033,7 @@ What was weighed, and from what. The design is in `docs/plan.md`, under "Files a
   - the key is the bytes sent, checked byte by byte and by its length, with no Structured Field parsing;
   - every keyed commit records, so only a turn that did not commit goes unrecorded;
   - a duplicate in flight that may not run again gets the 503 any such turn does, and not a 409 of its own;
-  - the fingerprint hashes a copy of the method, target and kept body (6 MiB at most) with `store::hash`, rather than
+  - the fingerprint hashes a copy of the method, target and held body (4 MiB at most) with `store::hash`, rather than
     streaming them into a hasher;
   - a `Location` that is not visible ASCII is not recorded;
   - a record's day is its expiry, so it holds no time of its own;

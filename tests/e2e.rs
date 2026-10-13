@@ -461,6 +461,13 @@ async fn turns_commit_or_discard(kind: Kind) {
     assert_eq!(tric.post("/@d/kv?op=delete&key=k").await.status, 200);
     assert_eq!(tric.value("d", "k").await, Value::Null);
 
+    // A turn's body is held whole, so the turn can run again, up to the 4 MiB that Lambda takes; past that, it is 413.
+    let body = |n: usize| Bytes::from(vec![b'x'; n]);
+    for (n, want) in [(4 << 20, 200), ((4 << 20) + 1, 413)] {
+        let res = exchange(&tric.addr, &tric.host, "POST", "/@e/kv?op=set&key=k&value=1", &[], body(n)).await;
+        assert_eq!(res.status, want, "{n} bytes");
+    }
+
     assert_eq!(tric.get("/@-bad/").await.status, 404, "not a name");
     assert_eq!(tric.get(&format!("/@{}/", "n".repeat(129))).await.status, 404, "too long a name");
 }

@@ -6,12 +6,11 @@ use crate::name::{self, Answer, Committed, Conditions, Failed, Idempotency, Reco
 use crate::outbound::{self, Allow, Fut, Sent};
 use crate::outbox::{self, Held, Sink};
 use crate::store::Store;
-use bytes::{Bytes, BytesMut};
-use futures_util::{FutureExt, StreamExt, stream};
+use futures_util::FutureExt;
 use http::header::{CONTENT_TYPE, ETAG, FORWARDED, LOCATION, RETRY_AFTER};
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
-use http_body_util::{BodyExt, BodyStream, StreamBody};
-use hyper::body::{Frame, Incoming};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use hyper::body::Incoming;
 use hyper::{server::conn::http1, service::service_fn};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -32,8 +31,9 @@ pub const CREDENTIALS: HeaderName = HeaderName::from_static("x-tric-credentials"
 /// What marks the answer of a turn sent again with its `Idempotency-Key`, as Stripe marks one.
 const IDEMPOTENT_REPLAYED: HeaderName = HeaderName::from_static("idempotent-replayed");
 
-/// A turn's request body is kept up to this, so the turn can run again; past it, the turn runs once.
-const REPLAY_MAX: usize = 6 << 20;
+/// The most a turn's request body may be, as tric holds it whole so the turn can run again; and on Lambda the most any
+/// request's may be, as Lambda takes events of up to 6 MB, and the body goes in base64.
+pub const BODY_MAX: usize = 4 << 20;
 /// A turn's deadline: one that another commit beat runs again until then, and after it answers 503. A run begun before
 /// it has the guest's `ANSWER`, and its commit `SETTLE`, all in CloudFront's 60 s for an answer from the origin.
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -163,41 +163,6 @@ pub fn forward(headers: &mut HeaderMap, from: HeaderValue) {
     headers.insert(FORWARDED, from);
 }
 
-/// A turn's request body, which can run again if it was kept whole.
-enum Body {
-    Whole(Bytes, Option<HeaderMap>),
-    Once(Option<WasiBody>),
-}
-
-impl Body {
-    /// Keeps `body` up to `REPLAY_MAX`; past that, it can be read once.
-    async fn keep(mut body: WasiBody) -> Result<Self, wasmtime_wasi_http::Error> {
-        let mut data = BytesMut::new();
-        while let Some(frame) = body.frame().await {
-            match frame?.into_data() {
-                Ok(d) if data.len() + d.len() > REPLAY_MAX => {
-                    data.extend_from_slice(&d);
-                    let kept = stream::once(async { Ok(Frame::data(data.freeze())) });
-                    return Ok(Self::Once(Some(StreamBody::new(kept.chain(BodyStream::new(body))).boxed_unsync())));
-                }
-                Ok(d) => data.extend_from_slice(&d),
-                Err(f) => return Ok(Self::Whole(data.freeze(), f.into_trailers().ok())),
-            }
-        }
-        Ok(Self::Whole(data.freeze(), None))
-    }
-
-    fn take(&mut self) -> Option<WasiBody> {
-        match self {
-            Self::Whole(data, trailers) => {
-                let frames = [Some(Frame::data(data.clone())), trailers.clone().map(Frame::trailers)];
-                Some(StreamBody::new(stream::iter(frames.into_iter().flatten().map(Ok))).boxed_unsync())
-            }
-            Self::Once(body) => body.take(),
-        }
-    }
-}
-
 impl Tric {
     /// Runs `req`, from tric itself, as `from` says, at the host its URI names: cron's, and background requests'.
     pub async fn fetch(self: &Arc<Self>, mut req: Request, from: &'static str) -> Response {
@@ -214,7 +179,8 @@ impl Tric {
     }
 
     /// Runs `req` in an instance, as a turn if it is one: again while another commit beats it, if it may run again and
-    /// its deadline has not passed, and else answering 503, as nothing it wrote landed.
+    /// its deadline has not passed, and else answering 503, as nothing it wrote landed. A turn's body is held whole,
+    /// and one over `BODY_MAX` is 413.
     async fn dispatch(self: &Arc<Self>, req: Request, host: &str, chain: Vec<String>, depth: usize) -> Response {
         let named = name::of(req.uri().path()).map(str::to_owned);
         let ctx = |turn, chain| {
@@ -240,16 +206,15 @@ impl Tric {
         let conditions = Conditions::of(req.headers());
         let Ok(key) = Idempotency::key(req.headers()) else { return status(StatusCode::BAD_REQUEST) };
         let (parts, body) = req.into_parts();
-        let Ok(mut body) = Body::keep(body).await else { return status(StatusCode::BAD_REQUEST) };
-        let once = match (key, &body) {
-            (Some(key), Body::Whole(data, _)) => Some(Idempotency::of(key, &parts.method, &parts.uri, data)),
-            (Some(_), Body::Once(_)) => return status(StatusCode::PAYLOAD_TOO_LARGE), // too large to fingerprint
-            (None, _) => None,
+        let body = match Limited::new(body, BODY_MAX).collect().await {
+            Ok(body) => body.to_bytes(),
+            Err(e) if e.is::<LengthLimitError>() => return status(StatusCode::PAYLOAD_TOO_LARGE),
+            Err(_) => return status(StatusCode::BAD_REQUEST),
         };
+        let once = key.map(|key| Idempotency::of(key, &parts.method, &parts.uri, &body));
         let until = Instant::now() + DEADLINE;
         let chain: Vec<String> = chain.into_iter().chain([name.clone()]).collect();
         loop {
-            let Some(body) = body.take() else { return later() }; // read once, so it cannot run again
             let turn = match Turn::open(&self.store, &self.app, &name, &conditions, once.as_ref()).await {
                 Ok(Ok(turn)) => turn,
                 Ok(Err(Answer::Replay(record))) => return replay(record),
@@ -259,6 +224,7 @@ impl Tric {
                     return later();
                 }
             };
+            let body = Full::new(body.clone()).map_err(|n| match n {}).boxed_unsync();
             let req = http::Request::from_parts(parts.clone(), body);
             match self.attempt(&turn, req, ctx(Some(turn.clone()), chain.clone()), host).await {
                 Some(res) => return res,
