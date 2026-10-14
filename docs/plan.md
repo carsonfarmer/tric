@@ -572,6 +572,8 @@ principal, scoped by a tag that the operator sets.
 - a file system;
 - S3 Express;
 - head caches;
+- serving from Lambda Web Functions, which serve many requests in one environment and bill only active CPU, until
+  they take a runtime other than Node.js;
 - GCP and Azure.
 
 ## Acceptance criteria
